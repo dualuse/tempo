@@ -305,14 +305,14 @@ public class Scope implements AutoCloseable, Lap, Iterable<Scope> {
     public String toString() {
         StringBuilder sb = new StringBuilder();
         sb.append(formatSeconds(getElapsedNanos()))
-          .append(" (").append(name).append(")");
+          .append("s (").append(name).append(")");
         if (firstChild != null) {
             sb.append(" = ");
             boolean first = true;
             for (Scope c = firstChild; c != null; c = c.nextSibling) {
                 if (!first) sb.append(" + ");
                 sb.append(formatSeconds(c.getElapsedNanos()))
-                  .append(" (").append(c.name).append(")");
+                  .append("s (").append(c.name).append(")");
                 first = false;
             }
         }
@@ -337,7 +337,7 @@ public class Scope implements AutoCloseable, Lap, Iterable<Scope> {
         String path = prefix.isEmpty() ? segment : prefix + "." + segment;
         if (!first[0]) sb.append(',');
         first[0] = false;
-        sb.append(path).append(";dur=").append(formatMillis(node.getElapsedNanos()));
+        sb.append(path).append(";dur=").append(formatSeconds(node.getElapsedNanos()));
         for (Scope c = node.firstChild; c != null; c = c.nextSibling) {
             emitDeepMetrics(sb, c, path, first);
         }
@@ -393,19 +393,19 @@ public class Scope implements AutoCloseable, Lap, Iterable<Scope> {
         }
 
         if (!hasSameThread) {
-            sb.append(formatMillis(scope.getElapsedNanos()));
+            sb.append(formatSeconds(scope.getElapsedNanos()));
         } else {
             long scopeEnd = scope.endNanos == 0L ? System.nanoTime() : scope.endNanos;
             long lastEnd = lastSame.endNanos == 0L ? System.nanoTime() : lastSame.endNanos;
 
-            sb.append("{\"^\":").append(formatMillis(firstSame.startNanos - scope.startNanos));
+            sb.append("{\"^\":").append(formatSeconds(firstSame.startNanos - scope.startNanos));
             for (Scope c = scope.firstChild; c != null; c = c.nextSibling) {
                 if (c.threadId == scope.threadId) {
                     sb.append(',').append(jsonString(c.name)).append(':');
                     appendLaneScope(sb, c);
                 }
             }
-            sb.append(",\"$\":").append(formatMillis(scopeEnd - lastEnd));
+            sb.append(",\"$\":").append(formatSeconds(scopeEnd - lastEnd));
             sb.append("}");
         }
     }
@@ -438,13 +438,7 @@ public class Scope implements AutoCloseable, Lap, Iterable<Scope> {
     // ---------------------------------------------------------------
 
     private static String formatSeconds(long nanos) {
-        double seconds = nanos / 1e9;
-        return seconds + "s";
-    }
-
-    private static String formatMillis(long nanos) {
-        double millis = nanos / 1e6;
-        return String.valueOf(millis);
+        return String.valueOf(nanos / 1e9);
     }
 
     // RFC 7230 token chars excluding '.' (our path separator) and '%' (our escape prefix)
