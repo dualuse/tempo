@@ -1,5 +1,7 @@
 package io.github.dualuse.tempo;
 
+import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.time.Duration;
@@ -22,7 +24,11 @@ import java.util.concurrent.Future;
  * <p>Scopes are created through {@link Tempo#scope(String)} or instance
  * methods like {@link #scope(String)}. They are {@link AutoCloseable} and
  * intended for use with try-with-resources.
+ *
+ * <p>When Jackson is on the classpath, instances serialize automatically to the
+ * same per-thread-lane JSON format as {@link #toJSON()}.
  */
+@JsonSerialize(using = ScopeSerializer.class)
 public class Scope implements AutoCloseable, Lap, Iterable<Scope> {
 
     // --- VarHandle for lock-free child append ---

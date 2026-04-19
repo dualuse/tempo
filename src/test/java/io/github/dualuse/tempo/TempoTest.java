@@ -1,8 +1,10 @@
 package io.github.dualuse.tempo;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.Map;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -549,6 +551,59 @@ class TempoTest {
         assertTrue(idx >= 0, "missing leaf: " + json);
         char after = json.charAt(idx + "\"leaf\":".length());
         assertTrue(Character.isDigit(after), "leaf should be bare number, got: " + after + " in: " + json);
+    }
+
+    // ---------------------------------------------------------------
+    // Jackson serialization
+    // ---------------------------------------------------------------
+
+    @Test
+    void jacksonSerializationMatchesToJSON() throws Exception {
+        var mapper = new ObjectMapper();
+        Scope root;
+        try (Scope s = Tempo.scope("root")) {
+            s.phase("A"); Thread.sleep(2);
+            s.phase("B"); Thread.sleep(2);
+            root = s;
+        }
+        String jackson = mapper.writeValueAsString(root);
+        String direct = root.toJSON();
+        assertEquals(direct, jackson);
+    }
+
+    @Test
+    void jacksonSerializationWithForksMatchesToJSON() throws Exception {
+        var mapper = new ObjectMapper();
+        ExecutorService exec = Executors.newSingleThreadExecutor();
+        Scope root;
+        try (Scope s = Tempo.scope("root")) {
+            s.phase("before"); Thread.sleep(1);
+            Future<?> f = s.fork("worker", exec, (Scope h) -> {
+                h.phase("step"); Thread.sleep(2);
+            });
+            f.get(5, TimeUnit.SECONDS);
+            root = s;
+        }
+        exec.shutdown();
+        String jackson = mapper.writeValueAsString(root);
+        String direct = root.toJSON();
+        assertEquals(direct, jackson);
+    }
+
+    @Test
+    void jacksonEmbeddedInLargerObject() throws Exception {
+        var mapper = new ObjectMapper();
+        Scope root;
+        try (Scope s = Tempo.scope("request")) {
+            s.phase("work"); Thread.sleep(2);
+            root = s;
+        }
+        // Scope embedded as a field in a map
+        var wrapper = Map.of("status", "ok", "profile", root);
+        String json = mapper.writeValueAsString(wrapper);
+        assertTrue(json.contains("\"status\":\"ok\""), "wrapper field missing: " + json);
+        assertTrue(json.contains("\"profile\":{"), "profile should be an object: " + json);
+        assertBalancedBraces(json);
     }
 
     // ---------------------------------------------------------------
