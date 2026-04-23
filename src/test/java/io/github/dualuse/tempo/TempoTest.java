@@ -1,6 +1,7 @@
 package io.github.dualuse.tempo;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.dualuse.tempo.Tempo.Scope;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 

@@ -1,5 +1,7 @@
 package io.github.dualuse.tempo;
 
+import io.github.dualuse.tempo.Tempo.Scope;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.*;
