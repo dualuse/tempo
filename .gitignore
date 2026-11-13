@@ -2,3 +2,6 @@
 .idea/
 build/
 !gradle/wrapper/gradle-wrapper.jar
+
+# private planning documents, never committed
+/docs/
