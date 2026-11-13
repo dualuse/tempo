@@ -694,8 +694,15 @@ class TempoTest {
     @Test
     void releaseBeforeCloseRetiresTheLaneAtClose() {
         Trace t = Tempo.start(SEARCH, opts());
+        Span load = t.root().span(LOAD);
+        clock.add(50);
         t.release();
-        assertSame(t.root(), Tempo.current());
+        assertSame(load, Tempo.current());
+        assertEquals(0, load.elapsedNanos()); // reads are empty from release on, not only once retired
+        assertEquals(0, t.root().elapsedNanos());
+        assertEquals(0, t.elapsedNanos());
+        assertEquals("", tree(t));
+        load.close();
         t.close();
         assertSame(NOOP, Tempo.current());
         assertEquals(0, t.elapsedNanos());

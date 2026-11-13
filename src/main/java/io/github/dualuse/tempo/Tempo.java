@@ -184,7 +184,7 @@ public final class Tempo {
         final int budget, headerBytes;
         final AtomicInteger misuses = new AtomicInteger();
         volatile int level;
-        volatile boolean detailSeen;
+        volatile boolean detailSeen, released;
         boolean raised; // guarded by this
 
         private Context() {
@@ -452,9 +452,9 @@ public final class Tempo {
             return (long) COMMIT.getAcquire(this);
         }
 
-        /** Duration of row {@code r}, or its age while open; 0 once retired. Safe from any thread. */
+        /** Duration of row {@code r}, or its age while open; 0 once released. Safe from any thread. */
         long elapsed(int r) {
-            if (state == RETIRED) return 0; // volatile read before the commit, as in visit()
+            if (ctx.released || state == RETIRED) return 0; // volatile reads before the commit, as in visit()
             long c = committed();
             if (r < 0 || r >= (int) (c >>> 32)) return 0;
             Rows k = rows[r >>> CHUNK_BITS];
@@ -471,7 +471,7 @@ public final class Tempo {
          */
         int visit(int base, long now, SpanView v, SpanVisitor visitor) {
             int s = state;
-            if (s == RETIRED) return base;
+            if (s == RETIRED || ctx.released) return base;
             long c = committed();
             int nRows = (int) (c >>> 32), nEvents = (int) c;
 
@@ -532,7 +532,6 @@ public final class Tempo {
         private final Lane rootLane;
         private final Span root;
         private volatile Lane lanes; // CAS-linked registry, newest first
-        private volatile boolean released;
 
         Trace(Name name, Options options) {
             ctx = new Context(options == null ? Options.DEFAULTS : options);
@@ -587,7 +586,7 @@ public final class Tempo {
 
         /** Wall time of the root span: running time while open, its duration once closed, 0 after release. */
         public long elapsedNanos() {
-            return released ? 0 : rootLane.elapsed(root.row);
+            return rootLane.elapsed(root.row);
         }
 
         /** Ends the root span, healing any span still open. Idempotent on the owner thread. */
@@ -599,8 +598,8 @@ public final class Tempo {
 
         /** Returns the trace's buffers to the pool. Optional and idempotent; afterwards every read is empty. */
         public void release() {
-            if (released) return;
-            released = true;
+            if (ctx.released) return;
+            ctx.released = true;
             for (Lane l = lanes; l != null; l = l.next) l.requestRetire();
         }
 
@@ -609,7 +608,7 @@ public final class Tempo {
          * clamped to one {@code now} taken for the whole walk. Nothing is visited after release.
          */
         public void forEachSpan(SpanVisitor visitor) {
-            if (released) return;
+            if (ctx.released) return;
             long now = ctx.now();
             SpanView v = new SpanView();
             int base = 0;
