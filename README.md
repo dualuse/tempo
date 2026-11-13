@@ -57,7 +57,7 @@ folded or dropped spans (`x=`), live lanes (`l=`) and cut values.
 | `--agg` | Per path: count, sum, self, min, max, wait sum, wait max, CPU. |
 | `--pools` | Per pool, over time: this request's running and queued tasks, and the `queued`/`active` gauges recorded at submit (the pool-wide signal). A table gives tasks, threads seen, run, wait, CPU, off-CPU and peaks. |
 | `--findings` | Stragglers (ending after their parent), never-started and open handoffs, failures, cancellations, the longest queue waits, and off-CPU time on compute pools. |
-| `--critical` | The chain that determined the end time. It walks back from the root's end, always into the child that finished last, and follows handoffs to other threads instead of the blocking wait on them. Each hop shows its queue wait and run time; totals per pool follow. |
+| `--critical` | The chain that determined the end time. It walks back from the root's end, always into the child that finished last, and follows handoffs to other threads instead of the blocking wait on them. On an early exit, where the wait ends while the work still runs (an aggregate, or a straggler with nothing else ending within 1 ms of the wake-up), it follows the work running at the wake-up. Each hop shows its queue wait and run time; totals per pool follow. |
 | `--diff OTHER` | Per path, B (OTHER) minus A (the input): Δcount, Δsum, Δself, Δwait, ΔCPU, sorted by the largest absolute change. |
 | `--stats FILES...` | Over many traces (also several per file, such as a log): per path, the number of traces containing it, the median count, and p50/p95/max of sum, self and wait (nearest rank). |
 | `--to json` | The JSON form of FORMAT.md. |

@@ -22,16 +22,16 @@
  38.304   46.614  [33m4.478[0m   3.832  [34m       [0m  io-4    rerank/load
  46.614   46.620  [33m     [0m          [34m  0.006[0m  http-3  rerank
  46.620   50.563  [33m2.358[0m   1.585  [34m       [0m  io-3    rerank/load
- 50.563   50.569  [33m     [0m          [34m  0.006[0m  http-3  rerank
- 50.569   73.137  [33m     [0m  22.568  [34m       [0m  io-*    rerank/load ×23 (aggregate: extent; per-occurrence wait not on the wire)
- 73.137   98.901  [33m     [0m   3.258  [34m 22.506[0m  http-3  rerank
+ 50.563   50.571  [33m     [0m          [34m  0.008[0m  http-3  rerank
+ 50.571   95.643  [33m     [0m  45.072  [34m       [0m  cpu-*   rerank/match ×26 (aggregate: extent; per-occurrence wait not on the wire)
+ 95.643   98.901  [33m     [0m   3.258  [34m       [0m  http-3  rerank
  98.901   98.916  [33m     [0m   0.015  [34m       [0m  http-3  GET /search
  98.916  100.466  [33m     [0m   1.550  [34m       [0m  http-3  encode
 100.466  100.496  [33m     [0m   0.030  [34m       [0m  http-3  GET /search
 
-100.496 ms on the path: run 41.176 ms (41.0%), queue wait 14.228 ms (14.2%), blocked 22.524 ms (22.4%),
-    aggregates 22.568 ms (22.5%)
-by pool: http: 12.225 ms running, 22.524 ms blocked; cpu: 7.392 ms waiting, 13.385 ms running; io: 6.836 ms
-    waiting, 15.566 ms running, 22.568 ms in aggregates
+100.496 ms on the path: run 41.176 ms (41.0%), queue wait 14.228 ms (14.2%), blocked 0.020 ms (0.0%),
+    aggregates 45.072 ms (44.8%)
+by pool: http: 12.225 ms running, 0.020 ms blocked; cpu: 7.392 ms waiting, 13.385 ms running, 45.072 ms in
+    aggregates; io: 6.836 ms waiting, 15.566 ms running
 [33mx=: 53 spans folded into aggregates, 0 dropped (not on the wire)[0m
 [35ml=: lanes live at render: cpu-1 (their records are best effort)[0m

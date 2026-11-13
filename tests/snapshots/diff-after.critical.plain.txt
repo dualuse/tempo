@@ -22,16 +22,16 @@ the chain of spans that determined the end time, walking back from the root's en
  38.304   46.614  4.478   3.832           io-4    rerank/load
  46.614   46.620                   0.006  http-3  rerank
  46.620   50.563  2.358   1.585           io-3    rerank/load
- 50.563   50.569                   0.006  http-3  rerank
- 50.569   73.137         22.568           io-*    rerank/load ×23 (aggregate: extent; per-occurrence wait not on the wire)
- 73.137   98.901          3.258   22.506  http-3  rerank
+ 50.563   50.571                   0.008  http-3  rerank
+ 50.571   95.643         45.072           cpu-*   rerank/match ×26 (aggregate: extent; per-occurrence wait not on the wire)
+ 95.643   98.901          3.258           http-3  rerank
  98.901   98.916          0.015           http-3  GET /search
  98.916  100.466          1.550           http-3  encode
 100.466  100.496          0.030           http-3  GET /search
 
-100.496 ms on the path: run 41.176 ms (41.0%), queue wait 14.228 ms (14.2%), blocked 22.524 ms (22.4%),
-    aggregates 22.568 ms (22.5%)
-by pool: http: 12.225 ms running, 22.524 ms blocked; cpu: 7.392 ms waiting, 13.385 ms running; io: 6.836 ms
-    waiting, 15.566 ms running, 22.568 ms in aggregates
+100.496 ms on the path: run 41.176 ms (41.0%), queue wait 14.228 ms (14.2%), blocked 0.020 ms (0.0%),
+    aggregates 45.072 ms (44.8%)
+by pool: http: 12.225 ms running, 0.020 ms blocked; cpu: 7.392 ms waiting, 13.385 ms running, 45.072 ms in
+    aggregates; io: 6.836 ms waiting, 15.566 ms running
 x=: 53 spans folded into aggregates, 0 dropped (not on the wire)
 l=: lanes live at render: cpu-1 (their records are best effort)

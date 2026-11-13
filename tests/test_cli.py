@@ -637,6 +637,62 @@ class Analysis(unittest.TestCase):
         self.assertIn("queue wait", out)
         self.assertIn("describe/infer", out)
 
+    def test_critical_path_follows_early_exit_into_the_running_work(self):
+        # early exit: the await of rerank ends while the match aggregate (or a
+        # straggler) still runs; that work, not 'blocked', belongs on the path
+        for name, agg in (("diff/after", 26), ("batch/find-05", 18), ("batch/find-08", 8)):
+            with self.subTest(trace=name):
+                t = trace_of(os.path.join(SAMPLES, name + ".header"))
+                hops = tempo.critical_hops(t)
+                match = [h for h in hops if h["span"].path == "rerank/match"]
+                self.assertTrue(match, "rerank/match missing from the critical path")
+                self.assertIn(agg, [h["span"].agg["count"] for h in match if h["span"].agg])
+                blocked = sum(h["blocked"] for h in hops)
+                self.assertLess(blocked, 0.01 * (t.root.end - t.root.start))
+                rerank = [h for h in hops if h["span"].path == "rerank"]
+                self.assertLess(sum(h["blocked"] for h in rerank), 100)   # µs: wake-up gaps only
+
+    @staticmethod
+    def early_exit_trace(first_dur):
+        # rerank waits (await) on two matches: match A on cpu-1 ends at
+        # 200 + first_dur, match B on cpu-2 runs 1250..17250, past the wake-up
+        # at 15300 and the end of rerank at 19100
+        spans = [
+            {"id": 0, "parent": -1, "name": "search", "start": 0, "dur": 20000, "thread": 0},
+            {"id": 1, "parent": 0, "name": "rerank", "start": 100, "dur": 19000, "thread": 0},
+            {"id": 2, "parent": 1, "name": "match", "start": 200, "dur": first_dur, "thread": 1,
+             "wait": 0},
+            {"id": 3, "parent": 1, "name": "await", "start": 300, "dur": 15000, "thread": 0,
+             "flags": "w"},
+            {"id": 4, "parent": 1, "name": "match", "start": 250, "dur": 18500, "thread": 2,
+             "wait": 1000},
+        ]
+        doc = {"v": 1, "unit": "us", "wall": 1794560455433, "folded": 0, "dropped": 0,
+               "threads": ["http-1", "cpu-1", "cpu-2"], "live": [], "truncated": False,
+               "spans": spans}
+        [(label, t)] = tempo.load_text(json.dumps(doc), "early-exit")
+        if isinstance(t, Exception):
+            raise t
+        return t
+
+    def test_critical_path_early_exit_straggler(self):
+        # nothing ends within 1 ms of the wake-up: the straggler running then
+        # is the work the wait was for (path clipped at the wake-up)
+        t = self.early_exit_trace(5000)
+        segs = [(s.id, k, a, b) for s, k, a, b in tempo.critical_path(t)]
+        self.assertIn((4, "run", 1250, 15300), segs)
+        self.assertIn((4, "wait", 250, 1250), segs)
+        self.assertEqual([k for _, k, _, _ in segs].count("blocked"), 0)
+
+    def test_critical_path_early_exit_prefers_the_child_that_ended(self):
+        # match A ends 50 µs before the wake-up: it released the wait; the gap
+        # is wake-up latency and the straggler stays off the path
+        t = self.early_exit_trace(15050)
+        segs = [(s.id, k, a, b) for s, k, a, b in tempo.critical_path(t)]
+        self.assertIn((2, "run", 200, 15250), segs)
+        self.assertIn((1, "blocked", 15250, 15300), segs)
+        self.assertNotIn(4, [i for i, _, _, _ in segs])
+
     def test_findings(self):
         def kinds(name):
             t = trace_of(os.path.join(SAMPLES, name + ".header"))

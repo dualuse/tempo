@@ -1620,19 +1620,42 @@ def _asciify(text):
 
 # ---------------------------------------------------------------- critical path
 
+RELEASE_SLACK_US = 1000
+
+
 def critical_path(trace):
     """Segments (span, kind, t0, t1) in time order; kind: self, blocked, wait, run, agg.
 
     Walks back from the root's end: inside each span the child that ended last
     (before the current point) determined the progress; blocking waits are
     skipped in favour of the work they waited for, so handoffs to other
-    threads become hops of the path."""
+    threads become hops of the path.
+
+    Early exit: when a blocking wait ends and no child ended just before (the
+    work still runs past the point the parent resumed), the child running when
+    the wait ended is taken as the work the wait was for. An aggregate always
+    qualifies, since one of its occurrences may have ended right there; an
+    individual straggler only when no child ended within RELEASE_SLACK_US of
+    the wake-up (otherwise that child released the wait and the gap is wake-up
+    latency). Among them aggregates come first, then the latest end."""
     segs = []
+
+    def blocks_of(s):
+        return sorted((c.run_start, c.end) for c in s.children if "w" in c.flags and c.thread == s.thread)
+
+    def release(s, a, b):
+        """(t, gap): the latest end t in (a, b] of a blocking wait of s that was
+        blocked over (t - gap, t] with no child ending there, or None."""
+        best = None
+        for x, y in blocks_of(s):
+            if a < y <= b and y > x and (best is None or y > best[0]):
+                best = (y, y - max(x, a))
+        return best
 
     def self_seg(s, a, b):
         if b <= a:
             return
-        blocks = sorted((c.run_start, c.end) for c in s.children if "w" in c.flags and c.thread == s.thread)
+        blocks = blocks_of(s)
         pieces = []
         t = a
         for x, y in blocks:
@@ -1658,14 +1681,31 @@ def critical_path(trace):
         cur = end
         kids = [c for c in s.children if not c.not_run and "w" not in c.flags]
         kids.sort(key=lambda c: (-c.end, c.start, c.id))
-        for c in kids:
-            if cur <= lo:
+        used = set()
+        while cur > lo:
+            nxt = None
+            for c in kids:
+                if c.id not in used and lo < c.end <= cur:
+                    nxt = c
+                    break
+            rel = release(s, nxt.end if nxt else lo, cur)
+            if rel is not None:
+                t, gap = rel
+                running = [c for c in kids if c.id not in used and c.run_start < t < c.end
+                           and (c.agg or gap >= RELEASE_SLACK_US)]
+                if running:
+                    c = min(running, key=lambda c: (not c.agg, -c.end, c.start, c.id))
+                    used.add(c.id)
+                    self_seg(s, t, cur)
+                    walk(c, t)
+                    cur = max(lo, c.start)
+                    continue
+            if nxt is None:
                 break
-            if c.end > cur or c.end <= lo:
-                continue
-            self_seg(s, c.end, cur)
-            walk(c, c.end)
-            cur = max(lo, c.start)
+            used.add(nxt.id)
+            self_seg(s, nxt.end, cur)
+            walk(nxt, nxt.end)
+            cur = max(lo, nxt.start)
         self_seg(s, lo, cur)
         if s.handoff and s.wait > 0 and lo > s.start:
             segs.append((s, "wait", s.start, lo))
