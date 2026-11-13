@@ -52,6 +52,19 @@ tasks.register<JavaExec>("jmh") {
     args = (providers.gradleProperty("jmh.args").orNull ?: "-prof gc").trim().split(Regex("\\s+"))
 }
 
+// ./gradlew jmhGate [-PtestJdk=11]   the CI allocation gate (AllocationGate), about one minute
+tasks.register<JavaExec>("jmhGate") {
+    group = "verification"
+    description = "Runs the allocation-gated benchmarks and fails above their gc.alloc.rate.norm gates."
+    classpath = jmh.runtimeClasspath
+    mainClass = "io.github.dualuse.tempo.AllocationGate"
+    if (testJdk.isPresent) {
+        javaLauncher = javaToolchains.launcherFor {
+            languageVersion = JavaLanguageVersion.of(testJdk.get())
+        }
+    }
+}
+
 tasks.check {
     dependsOn(tasks.named("jmhClasses"))
 }

@@ -21,7 +21,8 @@ import java.util.concurrent.TimeUnit;
  * Recording cost. Run with {@code -prof gc} and read {@code gc.alloc.rate.norm} (B/op).
  *
  * <p>The cycling benchmarks close, release and replace their trace every {@code cycle} operations,
- * so their B/op includes the per-trace setup ({@link #traceLifecycle}) divided by {@code cycle}.
+ * so their B/op includes the per-trace setup divided by {@code cycle}. {@link AllocationGate} separates
+ * the two and gates them in CI ({@code ./gradlew jmhGate}).
  */
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.NANOSECONDS)

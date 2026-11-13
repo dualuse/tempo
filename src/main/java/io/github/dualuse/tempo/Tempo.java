@@ -297,8 +297,9 @@ public final class Tempo {
         Lane next; // trace registry link, set before the lane is published
 
         // Chunk tables never reallocate; a chunk is stored before the commit that exposes its first element.
+        // The event table is created with the first event, so a lane without attributes never pays for it.
         final Rows[] rows = new Rows[CHUNKS];
-        final Events[] events = new Events[CHUNKS];
+        Events[] events;
 
         // Open stack: rowAt[d] is the open row at depth d < depth; handles[d] is the reusable handle for depth d.
         final int[] rowAt = new int[MAX_DEPTH];
@@ -402,8 +403,10 @@ public final class Tempo {
             if (e == MAX_EVENTS) {
                 dropped++;
             } else {
-                Events c = events[e >>> CHUNK_BITS];
-                if (c == null) events[e >>> CHUNK_BITS] = c = EVENT_POOL.take();
+                Events[] t = events;
+                if (t == null) events = t = new Events[CHUNKS];
+                Events c = t[e >>> CHUNK_BITS];
+                if (c == null) t[e >>> CHUNK_BITS] = c = EVENT_POOL.take();
                 int i = e & MASK;
                 c.row[i] = r;
                 c.key[i] = key;
@@ -438,7 +441,7 @@ public final class Tempo {
         private void retire() {
             if (!STATE.compareAndSet(this, IDLE, RETIRED)) return;
             for (Rows c : rows) if (c != null) ROW_POOL.give(c);
-            for (Events c : events) if (c != null) EVENT_POOL.give(c);
+            if (events != null) for (Events c : events) if (c != null) EVENT_POOL.give(c);
         }
 
         private void publish() {
@@ -451,16 +454,24 @@ public final class Tempo {
 
         /** Duration of row {@code r}, or its age while open; 0 once retired. Safe from any thread. */
         long elapsed(int r) {
+            if (state == RETIRED) return 0; // volatile read before the commit, as in visit()
             long c = committed();
-            if (state == RETIRED || r < 0 || r >= (int) (c >>> 32)) return 0;
+            if (r < 0 || r >= (int) (c >>> 32)) return 0;
             Rows k = rows[r >>> CHUNK_BITS];
             int i = r & MASK;
             long dur = (long) DUR.getOpaque(k.dur, i);
             return dur != OPEN ? dur : Math.max(0, ctx.now() - k.start[i]);
         }
 
-        /** Visits the committed rows in row order, which for one lane is pre-order. Returns the next free id. */
+        /**
+         * Visits the committed rows in row order, which for one lane is pre-order. Returns the next free id.
+         * Reading {@code state} first matters: the owner stores {@code IDLE} after its last write, so a lane
+         * read as {@code IDLE} is seen complete (final durations and flags included). A lane read as
+         * {@code ACTIVE} is best effort and its spans are marked {@link SpanView#live}.
+         */
         int visit(int base, long now, SpanView v, SpanVisitor visitor) {
+            int s = state;
+            if (s == RETIRED) return base;
             long c = committed();
             int nRows = (int) (c >>> 32), nEvents = (int) c;
 
@@ -476,6 +487,7 @@ public final class Tempo {
             int[] depthOf = new int[nRows];
             v.lane = this;
             v.order = order;
+            v.live = s == ACTIVE;
             for (int r = 0; r < nRows; r++) {
                 Rows k = rows[r >>> CHUNK_BITS];
                 int i = r & MASK, p = k.parent[i];
@@ -797,7 +809,7 @@ public final class Tempo {
         int id, parent, depth, flags, attrFrom, attrTo;
         Name name;
         long start, duration;
-        boolean open;
+        boolean open, live;
 
         SpanView() {}
 
@@ -818,6 +830,9 @@ public final class Tempo {
         public long durationNanos() { return duration; }
 
         public boolean open() { return open; }
+
+        /** The span's lane was recording when the walk reached it, so its rows are best effort. */
+        boolean live() { return live; }
 
         public boolean failed() { return (flags & FAILED) != 0; }
 

@@ -41,6 +41,9 @@ class TempoTest {
         }
     }
 
+    /** Bytes for start, one child span, close and release of a trace; measured 848 B on JDK 24. */
+    static final long SETUP_CEILING = 1024;
+
     final Clock clock = new Clock();
 
     Options opts() {
@@ -195,6 +198,20 @@ class TempoTest {
             clock.add(5);
             assertEquals(30, d.elapsedNanos());
         }
+    }
+
+    @Test
+    void spansOfARecordingLaneAreMarkedLive() {
+        Trace t = Tempo.start(SEARCH, opts());
+        t.root().span(DECODE).close();
+        List<Boolean> live = new ArrayList<>();
+        t.forEachSpan(s -> live.add(s.live()));
+        assertEquals(List.of(true, true), live);
+        t.close();
+        t.root().fail(); // a late annotation leaves the lane idle again
+        live.clear();
+        t.forEachSpan(s -> live.add(s.live()));
+        assertEquals(List.of(false, false), live);
     }
 
     @Test
@@ -685,15 +702,22 @@ class TempoTest {
         assertEquals("", tree(t));
     }
 
-    @Test
-    void recordedSpansAllocateNothingOnceWarm() {
+    /** Bytes {@code body} allocates on this thread, net of the probe's own allocation. */
+    static long allocatedBy(Runnable body) {
         java.lang.management.ThreadMXBean bean = ManagementFactory.getThreadMXBean();
         assumeTrue(bean instanceof com.sun.management.ThreadMXBean);
         com.sun.management.ThreadMXBean mx = (com.sun.management.ThreadMXBean) bean;
         assumeTrue(mx.isThreadAllocatedMemorySupported() && mx.isThreadAllocatedMemoryEnabled());
         long tid = Thread.currentThread().getId();
-        int spans = 8_000;
+        long a = mx.getThreadAllocatedBytes(tid), b = mx.getThreadAllocatedBytes(tid);
+        body.run();
+        long c = mx.getThreadAllocatedBytes(tid);
+        return (c - b) - (b - a);
+    }
 
+    @Test
+    void recordedSpansAllocateNothingOnceWarm() {
+        int spans = 8_000;
         for (int round = 0; round < 3; round++) { // fills the chunk pool and loads every class on the path
             Trace warm = Tempo.start(SEARCH, opts().level(DETAIL));
             record(warm.root(), spans);
@@ -702,13 +726,44 @@ class TempoTest {
         }
 
         Trace t = Tempo.start(SEARCH, opts().level(DETAIL));
-        record(t.root(), 1); // creates the depth-1 handle
-        long a = mx.getThreadAllocatedBytes(tid), b = mx.getThreadAllocatedBytes(tid);
-        record(t.root(), spans);
-        long c = mx.getThreadAllocatedBytes(tid);
+        record(t.root(), 1); // creates the depth-1 handle and the event table
+        assertEquals(0, allocatedBy(() -> record(t.root(), spans)), "bytes allocated by " + spans + " spans");
         t.close();
         t.release();
-        assertEquals(b - a, c - b, "bytes allocated by " + spans + " spans beyond the probe's own");
+    }
+
+    @Test
+    void disabledDetailAndDeepAllocateNothing() {
+        Trace coarse = Tempo.start(SEARCH, opts()), detail = Tempo.start(RERANK, opts().level(DETAIL));
+        Span c = coarse.root(), d = detail.root();
+        Runnable calls = () -> {
+            for (int i = 0; i < 8_000; i++) {
+                c.detail(MATCH).close();
+                c.deep(MATCH).close();
+                d.deep(MATCH).close();
+                NOOP.span(LOAD).set(BYTES, i).fail().close();
+            }
+        };
+        calls.run();
+        assertEquals(0, allocatedBy(calls));
+        detail.close();
+        coarse.close();
+        assertEquals(0, coarse.misuses() + detail.misuses());
+        assertEquals(lines("search 0+0"), tree(coarse));
+    }
+
+    @Test
+    void traceSetupStaysUnderItsCeiling() {
+        Options o = opts();
+        Runnable lifecycle = () -> {
+            Trace t = Tempo.start(SEARCH, o);
+            t.root().span(LOAD).close();
+            t.close();
+            t.release();
+        };
+        for (int i = 0; i < 1_000; i++) lifecycle.run();
+        long bytes = allocatedBy(lifecycle);
+        assertTrue(bytes > 0 && bytes <= SETUP_CEILING, "trace setup took " + bytes + " B");
     }
 
     private void record(Span root, int spans) {
