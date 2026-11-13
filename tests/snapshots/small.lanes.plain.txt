@@ -1,0 +1,21 @@
+GET /search  ·  48.675 ms  ·  2026-11-13 09:00:55.433 UTC  ·  26 spans on 9 threads
+            ms 0                  10                  20                 30                  40
+               ┬──────────────────┬───────────────────┬──────────────────┬───────────────────┬────────────────
+http
+  http-6       GET /search████████████████████████████████████████████████████████████████████████████████████
+                decode███████▓▓▓describe██████████████████████████index▓▓rerank███████████████████████████en…▓
+                                await───────────────────────────██await──await────────────────────────
+cpu
+  cpu-1                                                                    match████     match██
+  cpu-2                         infer███████████████████████████             match████    match███████
+  cpu-3                                                                        match██
+  cpu-4                                                                         match██
+io
+  io-1                                                                   lo…█▓▓▓
+  io-2                                                            query██load▓▓
+  io-3                                                            query██load▓▓▓▓▓▓▓▓▓▓▓▓
+  io-4                                                                   ██load▓▓▓▓▓▓▓▓▓
+  queued ≤2                                                              ▅█▆▄▂
+
+█ run  ░ queue wait  ─ blocking wait  ▚ aggregate ×count, ┃ slowest  ✗ failed  ⊘ cancelled  ▶ open
+∅ never started  ● live lane  ▄ this request's queued handoffs

@@ -1,0 +1,33 @@
+GET /search  ·  87.728 ms  ·  2026-11-13 09:01:27.109 UTC  ·  63 spans on 17 threads
+            ms 0         10         20         30         40         50        60         70         80
+               ┬─────────┬──────────┬──────────┬──────────┬──────────┬─────────┬──────────┬──────────┬────────
+http
+  http-8       GET /search████████████████████████████████████████████████████████████████████████████████████
+               de…█▓▓describe██████████████index▓▓▓▓▓▓▓▓▓▓▓▓▓rerank█████████████████████████████████████████▓▓
+                     await─────────────────await─────────────await───────────────────────────────────────
+cpu
+  cpu-1                                                         ░░██mat…▓███
+  cpu-2                                                        ░mat…█mat…▓mat…█
+  cpu-3              infer█████████████████
+  cpu-4
+  cpu-5                                                        ░░ma…█match▓▓▓
+  cpu-6                                                       mat…█ma…▓
+  cpu-7                                                        mat…█match▓ma…█
+  cpu-8                                                        match█▓▓▓mat…█
+  (mixed)                                                            ▚▚▚▚▚▚▚▚▚▚┃match ×30▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚
+  queued ≤13.1                                                 ▁▂▂▃▄▄████▇▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▅
+io
+  io-1                                     query█████████████▓▓███load▓▓▓▓▓▓▓▓
+  io-2                                     qu…█              ██▓▓▓load███
+  io-3                                     query████         ███lo…▓██    ░lo…✗
+  io-4                                     query███          ███▓▓✗██load▓▓▓▓▓▓
+  io-5                                     qu…█              lo…█▓▓▓lo…█
+  io-6                                                       ██ ░██lo…▓
+  io-7                                                       █▓███▓▓▓███
+  io-8                                                       load███▓█
+  (mixed)                                                            ▚▚┃load ×20▚▚▚
+  queued ≤3                                                  ▄▆██▆▆▆▆▆▅▅▅▆█▆▅▅▅▅▅▅▄
+
+█ run  ░ queue wait  ─ blocking wait  ▚ aggregate ×count, ┃ slowest  ✗ failed  ⊘ cancelled  ▶ open
+∅ never started  ● live lane  ▄ this request's queued handoffs
+x=: 50 spans folded into aggregates, 0 dropped (not on the wire)

@@ -1,0 +1,29 @@
+Critical path  ·  GET /search  ·  48.675 ms  ·  2026-11-13 09:00:55.433 UTC  ·  26 spans on 9 threads
+the chain of spans that determined the end time, walking back from the root's end through handoffs
+  from      to  wait     run  blocked  thread  span
+ 0.000   0.284         0.284           http-6  GET /search
+ 0.284   7.173         6.889           http-6  decode
+ 7.173   7.188         0.015           http-6  GET /search
+ 7.188   8.836         1.648           http-6  scale
+ 8.836   8.851         0.015           http-6  GET /search
+ 8.851   8.856         0.005           http-6  describe
+ 8.856  25.291        16.435           cpu-2   describe/infer
+25.291  25.301         0.010           http-6  describe
+25.301  25.940         0.639           http-6  describe/fingerprint
+25.940  25.950         0.010           http-6  describe
+25.950  25.965         0.015           http-6  GET /search
+25.965  25.971         0.006           http-6  index
+25.971  29.641         3.670           io-3    index/query
+29.641  29.910         0.269           http-6  index
+29.910  29.925         0.015           http-6  GET /search
+29.925  29.934         0.009           http-6  rerank
+29.934  38.167         8.233           io-3    rerank/load
+38.167  38.175                  0.008  http-6  rerank
+38.175  44.762         6.587           cpu-2   rerank/match
+44.762  46.751         1.959    0.030  http-6  rerank
+46.751  46.766         0.015           http-6  GET /search
+46.766  48.645         1.879           http-6  encode
+48.645  48.675         0.030           http-6  GET /search
+
+48.675 ms on the path: run 48.637 ms (99.9%), queue wait 0.000 ms (0.0%), blocked 0.038 ms (0.1%)
+by pool: http: 13.712 ms running, 0.038 ms blocked; cpu: 23.022 ms running; io: 11.903 ms running

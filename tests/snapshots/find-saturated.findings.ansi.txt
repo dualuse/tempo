@@ -1,0 +1,12 @@
+[1mFindings[0m  ·  GET /search  ·  151.649 ms  ·  2026-11-13 09:01:27.109 UTC  ·  63 spans on 13 threads
+  [35mstraggler    [0m  rerank/match on cpu-1 ends 1.057 ms after rerank (at 151.649 ms)
+  [33mnever-started[0m  rerank/match (cpu pool) ×13: 13 handoffs queued 81.815 ms until render and never ran
+  [35mopen         [0m  rerank/match on cpu-1: still running at render after 1.344 ms (queued 81.608 ms first)
+  [33mqueue-wait   [0m  rerank/match on cpu-1: waited 81.608 ms before a 1.344 ms run (60.7× the run)
+  [33mqueue-wait   [0m  rerank/match on cpu-* ×18: max 78.839 ms, sum 1192.212 ms over 18
+  [33mqueue-wait   [0m  rerank/match on cpu-3: waited 50.379 ms before a 4.119 ms run (12.2× the run)
+  [33mqueue-wait   [0m  rerank/match on cpu-2: waited 47.555 ms before a 3.512 ms run (13.5× the run)
+  [33mqueue-wait   [0m  rerank/match on cpu-3: waited 47.485 ms before a 3.847 ms run (12.3× the run)
+  [33mqueue-wait   [0m  by pool: cpu 3016.975 ms over 51 (max 81.815), io 119.018 ms over 51 (max 5.989)
+[33mx=: 53 spans folded into aggregates, 0 dropped (not on the wire)[0m
+[35ml=: lanes live at render: cpu-1 (their records are best effort)[0m

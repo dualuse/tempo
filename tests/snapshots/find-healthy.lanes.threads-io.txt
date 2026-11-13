@@ -1,0 +1,18 @@
+GET /search  ·  87.728 ms  ·  2026-11-13 09:01:27.109 UTC  ·  63 spans on 17 threads
+            ms 0                  20                 40                  60                 80
+               ┬──────────────────┬──────────────────┬───────────────────┬──────────────────┬───────
+io
+  io-1                                  query███████████▓▓███load▓▓▓▓▓▓▓
+  io-2                                  qu…█            ██▓▓▓load██
+  io-3                                  query███        ███▓▓▓██    ░lo…✗
+  io-4                                  query██         ███▓✗██load▓▓▓▓▓▓
+  io-5                                  qu…█            ███lo…▓███
+  io-6                                                  ██ ░██▓▓▓
+  io-7                                                  █▓███▓▓███
+  io-8                                                  load███▓█
+  (mixed)                                                      ▚▚┃load ×20▚▚
+  queued ≤3                                             ▃▆██▆▆▆▆▅▅▅▆█▅▅▅▅▅▅▄
+
+█ run  ░ queue wait  ─ blocking wait  ▚ aggregate ×count, ┃ slowest  ✗ failed  ⊘ cancelled  ▶ open
+∅ never started  ● live lane  ▄ this request's queued handoffs
+x=: 50 spans folded into aggregates, 0 dropped (not on the wire)

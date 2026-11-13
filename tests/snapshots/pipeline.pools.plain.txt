@@ -1,0 +1,25 @@
+Pools  ·  PUT /video  ·  790.221 ms  ·  2026-11-13 09:00:39.595 UTC  ·  34 spans on 9 threads
+this request's share of each pool; gauges are the pool's queue depth and active count at submit (all requests)
+                   ms 0          100        200        300        400        500        600        700
+                      ┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────
+cpu
+  running ≤4.9             ▂▆▇▇▆▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▃▃
+  queued ≤5.4              ▁█▇▇▅██████████████████████████████████████████████████████████████████████████▇▄▄
+  queued@submit ≤4         ▆██
+  active@submit ≤4         ███
+io
+  running ≤4               ▅▁ ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+  queued ≤4                █
+  queued@submit ≤3         █
+  active@submit ≤4         █
+(pool unknown)
+  running ≤0.3               ▁███████████████████████████████████████████████████████████████████████████████▂
+  queued ≤0
+
+pool  threads  tasks    run ms   wait ms  wait max    cpu ms  off-cpu  peak run  peak q  q@submit  a@submit
+cpu       4/4    240  1777.802  3394.651    27.451  1724.350   53.452       4.9     5.4         4         4
+io        4/4    120   321.160    11.811     3.054    25.634  295.526         4       4         3         4
+?         0/0    120   232.592     0.000     0.000    23.207  209.385       0.3       0
+threads: seen running this request's tasks / in the thread table. peak: most at once (aggregates count as
+their average).
+x=: 456 spans folded into aggregates, 0 dropped (not on the wire)

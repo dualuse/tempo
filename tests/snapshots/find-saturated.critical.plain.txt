@@ -1,0 +1,35 @@
+Critical path  ·  GET /search  ·  151.649 ms  ·  2026-11-13 09:01:27.109 UTC  ·  63 spans on 13 threads
+the chain of spans that determined the end time, walking back from the root's end through handoffs
+   from       to    wait     run  blocked  thread  span
+  0.000    0.042           0.042           http-8  GET /search
+  0.042    4.161           4.119           http-8  decode
+  4.161    4.176           0.015           http-8  GET /search
+  4.176    5.868           1.692           http-8  scale
+  5.868    5.883           0.015           http-8  GET /search
+  5.883    5.894           0.011           http-8  describe
+  5.894   41.800  16.705  19.201           cpu-2   describe/infer
+ 41.800   41.810           0.010           http-8  describe
+ 41.810   42.462           0.652           http-8  describe/fingerprint
+ 42.462   42.472           0.010           http-8  describe
+ 42.472   42.487           0.015           http-8  GET /search
+ 42.487   42.491           0.004           http-8  index
+ 42.491   50.643           8.152           io-4    index/query
+ 50.643   50.958           0.315           http-8  index
+ 50.958   50.973           0.015           http-8  GET /search
+ 50.973   50.984           0.011           http-8  rerank
+ 50.984   53.809           2.825           io-6    rerank/load
+ 53.809   53.815                    0.006  http-8  rerank
+ 53.815   57.765   1.223   2.727           io-1    rerank/load
+ 57.765   57.773                    0.008  http-8  rerank
+ 57.773  150.305          92.532           cpu-*   rerank/match ×18 (aggregate: extent; per-occurrence wait not on the wire)
+150.305  150.592           0.287           http-8  rerank
+150.592  150.607           0.015           http-8  GET /search
+150.607  151.619           1.012           http-8  encode
+151.619  151.649           0.030           http-8  GET /search
+
+151.649 ms on the path: run 41.175 ms (27.2%), queue wait 17.928 ms (11.8%), blocked 0.014 ms (0.0%),
+    aggregates 92.532 ms (61.0%)
+by pool: http: 8.270 ms running, 0.014 ms blocked; cpu: 16.705 ms waiting, 19.201 ms running, 92.532 ms in
+    aggregates; io: 1.223 ms waiting, 13.704 ms running
+x=: 53 spans folded into aggregates, 0 dropped (not on the wire)
+l=: lanes live at render: cpu-1 (their records are best effort)

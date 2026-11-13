@@ -1,0 +1,2202 @@
+#!/usr/bin/env python3
+"""tempo - read Tempo-Trace values in the terminal.
+
+Reads a trace from files or stdin: `curl -i` output (the Tempo-Trace header line,
+also folded or wrapped over several lines), a bare header value starting with
+`v1;`, or a JSON document holding a tempo object anywhere (for example under
+"info"). The format is specified in FORMAT.md.
+
+Python 3.8+, standard library only, one file.
+"""
+
+import argparse
+import datetime
+import json
+import math
+import os
+import re
+import shutil
+import sys
+import textwrap
+
+VERSION = "1.0"
+
+# ======================================================================
+# Decoder (FORMAT.md section 6; mirrors tools/tempo_ref.py)
+# ======================================================================
+
+ALPHABET = frozenset("0123456789abcdefghijklmnopqrstuvwxyz"
+                     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                     "./:;=@~*+^_%-")
+WHITESPACE = "\t\n\x0b\x0c\r "
+FLAG_ORDER = "fconwm"
+MAX_DEPTH = 35
+
+RECORD_RE = re.compile(
+    r"^([0-9a-z])([0-9a-z]+)\.([0-9a-z]+)\.([0-9a-z]+)"
+    r"(?:@([0-9a-z]+|_))?"
+    r"(?:~([0-9a-z]+)(?:\.([0-9a-z]+))?)?"
+    r"(?:\*([0-9a-z]+))?"
+    r"(?:\+([0-9a-z]+)\.([0-9a-z]+)\.([0-9a-z]+)\.([0-9a-z]+)\.([0-9a-z]+))?"
+    r"(?:\^([a-z]+))?"
+    r"((?::[0-9a-z]+=-?[0-9]+(?:\.[0-9]+)?)*)$")
+ATTR_RE = re.compile(r":([0-9a-z]+)=(-?[0-9]+(?:\.[0-9]+)?)")
+B36_RE = re.compile(r"^[0-9a-z]+$")
+NAME_RE = re.compile(r"^(?:[A-Za-z0-9._-]|%[0-9A-Fa-f]{2})+$")
+FIELD_ORDER = ["w", "x", "l", "T", "N", "S"]
+
+
+class TempoFormatError(ValueError):
+    """A value that must be rejected; `code` is one of the E_* codes of FORMAT.md."""
+
+    def __init__(self, code, message):
+        ValueError.__init__(self, "%s: %s" % (code, message))
+        self.code = code
+
+
+def strip_ws(value):
+    return "".join(ch for ch in value if ch not in WHITESPACE)
+
+
+def b36(text, what="number"):
+    if not B36_RE.match(text):
+        raise TempoFormatError("E_FIELD", "bad base-36 %s %r" % (what, text))
+    return int(text, 36)
+
+
+def decode_name(text):
+    if not text:
+        raise TempoFormatError("E_NAME", "empty name")
+    if not NAME_RE.match(text):
+        raise TempoFormatError("E_NAME", "bad name %r" % text)
+    raw = bytearray()
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "%":
+            raw.append(int(text[i + 1:i + 3], 16))
+            i += 3
+        else:
+            raw.append(0x20 if ch == "_" else ord(ch))
+            i += 1
+    try:
+        return bytes(raw).decode("utf-8")
+    except UnicodeDecodeError:
+        raise TempoFormatError("E_NAME", "name %r is not valid UTF-8" % text)
+
+
+def decode_number(text):
+    if "." in text:
+        v = float(text)
+        return 0.0 if v == 0 else v
+    v = int(text)
+    return 0 if v == 0 else v
+
+
+def decode(value):
+    """Decode a Tempo-Trace value (whitespace allowed) into the JSON form (a dict)."""
+    v = strip_ws(value)
+    if not v.startswith("v1;"):
+        raise TempoFormatError("E_VERSION", "value does not start with 'v1;'")
+    for ch in v:
+        if ch not in ALPHABET:
+            raise TempoFormatError("E_CHAR", "character %r outside the alphabet" % ch)
+    fields = v[3:].split(";")
+    expected = None
+    cut = False
+    last = fields[-1]
+    if last.startswith("e=") and B36_RE.match(last[2:]):
+        expected = int(last[2:], 36)
+        fields = fields[:-1]
+    else:
+        cut = True
+        if last in ("", "e", "e="):
+            fields = fields[:-1]
+        if not fields or not fields[-1].startswith("S="):
+            raise TempoFormatError("E_CUT", "value cut before the span list")
+    seen = {}
+    pos = -1
+    for f in fields:
+        if "=" not in f:
+            raise TempoFormatError("E_FIELD", "field %r has no '='" % f)
+        key, val = f.split("=", 1)
+        if key not in FIELD_ORDER:
+            raise TempoFormatError("E_FIELD", "unknown field %r" % key)
+        idx = FIELD_ORDER.index(key)
+        if idx <= pos:
+            raise TempoFormatError("E_FIELD", "field %r duplicated or out of order" % key)
+        pos = idx
+        seen[key] = val
+    for key in ("T", "N", "S"):
+        if key not in seen:
+            raise TempoFormatError("E_MISSING", "required field %s= is missing" % key)
+    doc = {"v": 1, "unit": "us"}
+    if "w" in seen:
+        doc["wall"] = b36(seen["w"], "w=")
+    folded = dropped = 0
+    if "x" in seen:
+        parts = seen["x"].split(".")
+        if len(parts) != 2:
+            raise TempoFormatError("E_FIELD", "x= must be folded.dropped")
+        folded, dropped = b36(parts[0], "x="), b36(parts[1], "x=")
+    doc["folded"] = folded
+    doc["dropped"] = dropped
+    threads = [decode_name(t) for t in seen["T"].split(":")]
+    names = [decode_name(n) for n in seen["N"].split(":")]
+    live = []
+    if "l" in seen:
+        for p in seen["l"].split("."):
+            i = b36(p, "l=")
+            if i >= len(threads):
+                raise TempoFormatError("E_INDEX", "l= thread index %d out of range" % i)
+            live.append(i)
+    doc["threads"] = threads
+    doc["live"] = live
+    records = seen["S"].split("/")
+    truncated = cut or (expected is not None and expected != len(records))
+    if truncated:
+        records = records[:-1]
+    doc["truncated"] = truncated
+    doc["spans"] = _decode_records(records, names, threads)
+    return doc
+
+
+def _decode_records(records, names, threads):
+    spans = []
+    cur = [0] * (MAX_DEPTH + 2)
+    path = [None] * (MAX_DEPTH + 1)
+    prev_depth = -1
+    prev_agg = False
+    for i, rec in enumerate(records):
+        m = RECORD_RE.match(rec)
+        if not m:
+            raise TempoFormatError("E_RECORD", "record %d %r is malformed" % (i, rec))
+        (depth_s, name_s, delta_s, dur_s, thr_s, wait_s, wmax_s, cpu_s,
+         a_count, a_min, a_max, a_ext, a_at, flags_s, attrs_s) = m.groups()
+        depth = int(depth_s, 36)
+        is_agg = a_count is not None
+        if i == 0:
+            if depth != 0:
+                raise TempoFormatError("E_ROOT", "first record has depth %d" % depth)
+            if thr_s is not None or wait_s is not None or is_agg:
+                raise TempoFormatError("E_ROOT", "root record carries @, ~ or +")
+            if int(delta_s, 36) != 0:
+                raise TempoFormatError("E_ROOT", "root startDelta is not 0")
+        else:
+            if depth == 0:
+                raise TempoFormatError("E_ROOT", "record %d is a second root" % i)
+            if depth > prev_depth + 1:
+                raise TempoFormatError("E_DEPTH", "record %d jumps from depth %d to %d"
+                                       % (i, prev_depth, depth))
+            if prev_agg and depth > prev_depth:
+                raise TempoFormatError("E_AGG", "record %d is a child of an aggregate" % i)
+        name_idx = int(name_s, 36)
+        if name_idx >= len(names):
+            raise TempoFormatError("E_INDEX", "record %d name index %d out of range" % (i, name_idx))
+        start = cur[depth] + int(delta_s, 36)
+        cur[depth] = start
+        cur[depth + 1] = start
+        parent = path[depth - 1] if depth > 0 else None
+        if thr_s is None:
+            thread = parent["thread"] if parent is not None else 0
+        elif thr_s == "_":
+            if not is_agg:
+                raise TempoFormatError("E_AGG", "record %d: '@_' on a non-aggregate" % i)
+            thread = -1
+        else:
+            thread = int(thr_s, 36)
+            if thread >= len(threads):
+                raise TempoFormatError("E_INDEX", "record %d thread index %d out of range" % (i, thread))
+        span = {"id": i, "parent": parent["id"] if parent is not None else -1,
+                "name": names[name_idx], "start": start, "dur": int(dur_s, 36),
+                "thread": thread}
+        if wait_s is not None and not is_agg:
+            if wmax_s is not None:
+                raise TempoFormatError("E_AGG", "record %d: '~sum.max' on a non-aggregate" % i)
+            span["wait"] = int(wait_s, 36)
+        if cpu_s is not None:
+            span["cpu"] = int(cpu_s, 36)
+        if flags_s is not None:
+            for f in flags_s:
+                if f not in FLAG_ORDER:
+                    raise TempoFormatError("E_FLAG", "record %d: unknown flag %r" % (i, f))
+            span["flags"] = "".join(f for f in FLAG_ORDER if f in flags_s)
+        if attrs_s:
+            attrs = {}
+            for km in ATTR_RE.finditer(attrs_s):
+                k = int(km.group(1), 36)
+                if k >= len(names):
+                    raise TempoFormatError("E_INDEX", "record %d attribute key %d out of range" % (i, k))
+                attrs[names[k]] = decode_number(km.group(2))
+            span["attrs"] = attrs
+        if is_agg:
+            agg = {"count": int(a_count, 36), "min": int(a_min, 36), "max": int(a_max, 36),
+                   "extent": int(a_ext, 36), "maxAt": int(a_at, 36)}
+            if agg["count"] < 1:
+                raise TempoFormatError("E_AGG", "record %d: aggregate count 0" % i)
+            if wait_s is not None:
+                if wmax_s is None:
+                    raise TempoFormatError("E_AGG", "record %d: aggregate wait needs sum.max" % i)
+                agg["waitSum"] = int(wait_s, 36)
+                agg["waitMax"] = int(wmax_s, 36)
+            span["agg"] = agg
+        path[depth] = span
+        prev_depth = depth
+        prev_agg = is_agg
+        spans.append(span)
+    return spans
+
+
+TOP_KEYS = ["v", "unit", "wall", "folded", "dropped", "threads", "live", "truncated"]
+
+
+def dump_json(doc):
+    """The JSON form, one span per line (same layout as tools/tempo_ref.py)."""
+    lines = ["{"]
+    for k in TOP_KEYS:
+        if k in doc:
+            lines.append("  %s: %s," % (json.dumps(k), json.dumps(doc[k], ensure_ascii=False)))
+    spans = doc.get("spans", [])
+    if not spans:
+        lines.append('  "spans": []')
+    else:
+        lines.append('  "spans": [')
+        for i, s in enumerate(spans):
+            sep = "," if i + 1 < len(spans) else ""
+            lines.append("    " + json.dumps(s, ensure_ascii=False, separators=(",", ":")) + sep)
+        lines.append("  ]")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+# ======================================================================
+# JSON input: validation of the JSON form
+# ======================================================================
+
+def _int(v, what, lo=0):
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v:
+        raise TempoFormatError("E_JSON", "%s is not a number: %r" % (what, v))
+    v = int(round(v))
+    if v < lo:
+        raise TempoFormatError("E_JSON", "%s out of range: %r" % (what, v))
+    return v
+
+
+def normalize_doc(obj):
+    """Validate a JSON-form object and return a clean copy (FORMAT.md section 8)."""
+    if not isinstance(obj, dict) or obj.get("v") != 1 or not isinstance(obj.get("spans"), list):
+        raise TempoFormatError("E_JSON", "not a tempo object (needs \"v\": 1 and \"spans\")")
+    if obj.get("unit", "us") != "us":
+        raise TempoFormatError("E_JSON", "unit %r is not \"us\"" % obj.get("unit"))
+    doc = {"v": 1, "unit": "us"}
+    if obj.get("wall") is not None:
+        doc["wall"] = _int(obj["wall"], "wall")
+    doc["folded"] = _int(obj.get("folded", 0), "folded")
+    doc["dropped"] = _int(obj.get("dropped", 0), "dropped")
+    threads = obj.get("threads", [])
+    if not isinstance(threads, list) or not all(isinstance(t, str) for t in threads):
+        raise TempoFormatError("E_JSON", "threads must be a list of strings")
+    threads = [t or "?" for t in threads] or ["?"]
+    doc["threads"] = threads
+    live = obj.get("live", [])
+    if not isinstance(live, list):
+        raise TempoFormatError("E_JSON", "live must be a list")
+    doc["live"] = [_int(i, "live index") for i in live]
+    for i in doc["live"]:
+        if i >= len(threads):
+            raise TempoFormatError("E_JSON", "live index %d out of range" % i)
+    doc["truncated"] = bool(obj.get("truncated", False))
+    spans = []
+    for i, s in enumerate(obj["spans"]):
+        if not isinstance(s, dict):
+            raise TempoFormatError("E_JSON", "span %d is not an object" % i)
+        if s.get("id", i) != i:
+            raise TempoFormatError("E_JSON", "span %d has id %r" % (i, s.get("id")))
+        parent = _int(s.get("parent", -1), "span %d parent" % i, -1)
+        if (i == 0) != (parent == -1) or parent >= i:
+            raise TempoFormatError("E_JSON", "span %d has parent %d" % (i, parent))
+        if parent >= 0 and "agg" in spans[parent]:
+            raise TempoFormatError("E_JSON", "span %d is a child of an aggregate" % i)
+        name = s.get("name")
+        if name is None or name == "":
+            name = "?"
+        if not isinstance(name, str):
+            raise TempoFormatError("E_JSON", "span %d name is not a string" % i)
+        thread = _int(s.get("thread", 0 if i == 0 else spans[parent]["thread"]), "span %d thread" % i, -1)
+        if thread >= len(threads):
+            raise TempoFormatError("E_JSON", "span %d thread %d out of range" % (i, thread))
+        out = {"id": i, "parent": parent, "name": name,
+               "start": _int(s.get("start", 0), "span %d start" % i),
+               "dur": _int(s.get("dur", 0), "span %d dur" % i), "thread": thread}
+        if thread == -1 and "agg" not in s:
+            raise TempoFormatError("E_JSON", "span %d: thread -1 outside an aggregate" % i)
+        if s.get("wait") is not None and "agg" not in s:
+            out["wait"] = _int(s["wait"], "span %d wait" % i)
+        if s.get("cpu") is not None:
+            out["cpu"] = _int(s["cpu"], "span %d cpu" % i)
+        flags = s.get("flags") or ""
+        if not isinstance(flags, str) or any(f not in FLAG_ORDER for f in flags):
+            raise TempoFormatError("E_JSON", "span %d has bad flags %r" % (i, flags))
+        if flags:
+            out["flags"] = "".join(f for f in FLAG_ORDER if f in flags)
+        attrs = s.get("attrs")
+        if attrs:
+            if not isinstance(attrs, dict):
+                raise TempoFormatError("E_JSON", "span %d attrs is not an object" % i)
+            clean = {}
+            for k, val in attrs.items():
+                if isinstance(val, bool) or not isinstance(val, (int, float)):
+                    raise TempoFormatError("E_JSON", "span %d attribute %r is not a number" % (i, k))
+                clean[k or "?"] = val
+            out["attrs"] = clean
+        agg = s.get("agg")
+        if agg is not None:
+            if not isinstance(agg, dict):
+                raise TempoFormatError("E_JSON", "span %d agg is not an object" % i)
+            a = {}
+            for k in ("count", "min", "max", "extent", "maxAt"):
+                a[k] = _int(agg.get(k, 0), "span %d agg.%s" % (i, k))
+            if a["count"] < 1:
+                raise TempoFormatError("E_JSON", "span %d: aggregate count 0" % i)
+            if agg.get("waitSum") is not None:
+                a["waitSum"] = _int(agg["waitSum"], "span %d agg.waitSum" % i)
+                a["waitMax"] = _int(agg.get("waitMax", 0), "span %d agg.waitMax" % i)
+            out["agg"] = a
+        spans.append(out)
+    doc["spans"] = spans
+    return doc
+
+
+# ======================================================================
+# Input extraction
+# ======================================================================
+
+VALUE_CHARS = frozenset(ALPHABET | frozenset(WHITESPACE))
+HEADER_RE = re.compile(r"^[ \t]*tempo-trace[ \t]*:(.*)$", re.I)
+FIELD_LINE_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+:[ \t]+\S")
+COMPLETE_RE = re.compile(r";e=[0-9a-z]+$")
+VALUE_START_RE = re.compile(r"(?m)^[ \t]*(?=v1;)")
+BARE_RE = re.compile(r"(?:^|(?<=[^0-9A-Za-z./:;=@~*+^_%-]))v1;")
+
+
+class InputError(Exception):
+    def __init__(self, code, message):
+        Exception.__init__(self, "%s: %s" % (code, message))
+        self.code = code
+
+
+def _header_values(lines):
+    """Values of Tempo-Trace header lines, with folded or wrapped continuation lines."""
+    out = []
+    i = 0
+    while i < len(lines):
+        m = HEADER_RE.match(lines[i])
+        i += 1
+        if not m:
+            continue
+        value = m.group(1)
+        while i < len(lines):
+            nxt = lines[i]
+            if not nxt.strip():
+                break
+            folded = nxt[:1] in (" ", "\t")
+            if not folded:
+                if COMPLETE_RE.search(strip_ws(value)):
+                    break
+                if FIELD_LINE_RE.match(nxt) or nxt.startswith("HTTP/") or nxt.lstrip().startswith("v1;"):
+                    break
+            if any(ch not in VALUE_CHARS for ch in nxt):
+                break
+            value += nxt
+            i += 1
+        out.append(value)
+    return out
+
+
+def _find_tempo(obj, out):
+    """Collect tempo objects (and tempo header strings) anywhere in a JSON value."""
+    if isinstance(obj, dict):
+        if obj.get("v") == 1 and isinstance(obj.get("spans"), list):
+            out.append(("json", obj))
+            return
+        for k, v in obj.items():
+            if k.lower() == "tempo" and isinstance(v, str) and strip_ws(v).startswith("v1;"):
+                out.append(("header", v))
+            else:
+                _find_tempo(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _find_tempo(v, out)
+
+
+def _json_candidates(text):
+    found = []
+    dec = json.JSONDecoder()
+    pos = 0
+    n = len(text)
+    while pos < n:
+        # a JSON value starts at the beginning of a line (whole body, NDJSON, curl -i body)
+        j = pos
+        while j < n and text[j] in " \t\r":
+            j += 1
+        if j < n and text[j] in "{[":
+            try:
+                obj, end = dec.raw_decode(text, j)
+            except ValueError:
+                obj, end = None, None
+            if end is not None:
+                _find_tempo(obj, found)
+                pos = end
+                continue
+        nl = text.find("\n", pos)
+        if nl < 0:
+            break
+        pos = nl + 1
+    return found
+
+
+def extract(text):
+    """Find the traces in an input text: list of ("header", str) or ("json", dict)."""
+    if text.startswith("﻿"):
+        text = text[1:]
+    found = _json_candidates(text)
+    if found:
+        return found
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    values = _header_values(lines)
+    if values:
+        return [("header", v) for v in values]
+    stripped = text.strip(WHITESPACE)
+    if stripped.startswith("v1;") or not BARE_RE.search(text):
+        if stripped[:1] in ("{", "["):
+            return []
+        # the input is the value itself: decode all of it strictly; several values
+        # may follow each other, one per line (continuation lines are joined)
+        return [("header", c) for c in VALUE_START_RE.split(text) if c.strip(WHITESPACE)] \
+            or [("header", text)]
+    out = []
+    starts = [m.start() for m in BARE_RE.finditer(text)]
+    for k, st in enumerate(starts):
+        e = starts[k + 1] if k + 1 < len(starts) else len(text)
+        j = st
+        while j < e and text[j] in VALUE_CHARS:
+            if text[j] in WHITESPACE and COMPLETE_RE.search(strip_ws(text[st:j])):
+                break
+            j += 1
+        out.append(("header", text[st:j]))
+    return out
+
+
+def load_text(text, label):
+    """All traces of one input as a list of (label, Trace or TempoFormatError)."""
+    cands = extract(text)
+    if not cands:
+        return [(label, InputError("E_INPUT", "no Tempo-Trace value or tempo JSON found"))]
+    out = []
+    for k, (kind, payload) in enumerate(cands):
+        lab = label if len(cands) == 1 else "%s#%d" % (label, k + 1)
+        try:
+            doc = decode(payload) if kind == "header" else normalize_doc(payload)
+            out.append((lab, Trace(doc, lab)))
+        except TempoFormatError as e:
+            out.append((lab, e))
+    return out
+
+
+# ======================================================================
+# Model
+# ======================================================================
+
+THREAD_N_RE = re.compile(r"^Thread-\d+$")
+POOL_RE = re.compile(r"^(.+?)-\d+$")
+
+
+def pool_of(thread_name):
+    """Pool of a thread: the name without a trailing -<digits>; Thread-N stays alone."""
+    if THREAD_N_RE.match(thread_name):
+        return thread_name
+    m = POOL_RE.match(thread_name)
+    return m.group(1) if m else thread_name
+
+
+class Span(object):
+    __slots__ = ("id", "parent", "name", "start", "dur", "thread", "wait", "cpu", "flags",
+                 "attrs", "agg", "children", "depth", "path", "key", "handoff", "not_run",
+                 "run_start", "end", "self_time", "pool", "lane")
+
+    def label(self):
+        return "%s ×%d" % (self.name, self.agg["count"]) if self.agg else self.name
+
+    @property
+    def wait_max(self):
+        if self.agg:
+            return self.agg.get("waitMax", 0)
+        return self.wait
+
+    @property
+    def offcpu(self):
+        if self.cpu is None:
+            return None
+        return max(0, self.dur - self.cpu)
+
+
+class Trace(object):
+    def __init__(self, doc, label="-"):
+        self.doc = doc
+        self.label = label
+        self.threads = list(doc.get("threads") or ["?"])
+        self.wall = doc.get("wall")
+        self.folded = doc.get("folded", 0)
+        self.dropped = doc.get("dropped", 0)
+        self.live = list(doc.get("live") or [])
+        self.truncated = bool(doc.get("truncated"))
+        self.spans = []
+        for d in doc["spans"]:
+            s = Span()
+            s.id = d["id"]
+            s.parent = self.spans[d["parent"]] if d["parent"] >= 0 else None
+            s.name = d["name"]
+            s.start = d["start"]
+            s.dur = d["dur"]
+            s.thread = d["thread"]
+            s.cpu = d.get("cpu")
+            s.flags = d.get("flags", "")
+            s.attrs = d.get("attrs") or {}
+            s.agg = d.get("agg")
+            s.children = []
+            if s.agg:
+                s.handoff = "waitSum" in s.agg
+                s.wait = s.agg.get("waitSum", 0)
+            else:
+                s.handoff = "wait" in d
+                s.wait = d.get("wait", 0)
+            s.not_run = s.handoff and ("n" in s.flags or ("c" in s.flags and s.dur == 0))
+            s.run_start = s.start + s.wait if (s.handoff and not s.agg) else s.start
+            s.end = s.start + s.agg["extent"] if s.agg else s.run_start + s.dur
+            if s.not_run and not s.agg:
+                s.end = s.start + s.wait
+            if s.parent is None:
+                s.depth = 0
+                s.path = s.name
+                s.key = ""
+            else:
+                s.parent.children.append(s)
+                s.depth = s.parent.depth + 1
+                s.key = s.name if s.parent.parent is None else s.parent.key + "/" + s.name
+                s.path = s.key
+            self.spans.append(s)
+        self.root = self.spans[0] if self.spans else None
+        for s in self.spans:
+            s.self_time = s.dur if s.agg else max(0, s.dur - sum(
+                c.dur for c in s.children if self._nested(c, s)))
+        self._assign_pools()
+        self.end = max([s.end for s in self.spans] or [0])
+
+    @staticmethod
+    def _nested(c, s):
+        """A child whose run time is part of its parent's run time on the same lane."""
+        return (c.thread == s.thread and c.thread >= 0 and not c.handoff and not c.not_run)
+
+    def _assign_pools(self):
+        by_key = {}
+        by_name = {}
+        for s in self.spans:
+            if s.thread >= 0 and not s.not_run:
+                p = pool_of(self.threads[s.thread])
+                by_key.setdefault(s.key, {}).setdefault(p, 0)
+                by_key[s.key][p] += 1
+                by_name.setdefault(s.name, {}).setdefault(p, 0)
+                by_name[s.name][p] += 1
+
+        def guess(s):
+            # prefer a pool that is not the parent's own (where it would sit nominally)
+            for table in (by_key.get(s.key), by_name.get(s.name)):
+                if table:
+                    own = pool_of(self.threads[s.parent.thread]) if (s.parent and s.parent.thread >= 0) else None
+                    best = sorted(table.items(), key=lambda kv: (kv[0] == own and s.not_run, -kv[1], kv[0]))
+                    return best[0][0]
+            return "?"
+
+        for s in self.spans:
+            if s.not_run:
+                s.pool = guess(s)
+                s.lane = ("queued", s.pool)
+            elif s.thread < 0:
+                s.pool = guess(s)
+                s.lane = ("mixed", s.pool)
+            else:
+                s.pool = pool_of(self.threads[s.thread])
+                s.lane = ("t", s.thread)
+
+    def thread_label(self, s):
+        if s.not_run:
+            return "-"
+        if s.thread < 0:
+            return s.pool + "-*"
+        return self.threads[s.thread]
+
+    def is_task(self, s):
+        """A unit of work this request handed to a pool (or ran on another thread)."""
+        if s.parent is None:
+            return False
+        if s.handoff:
+            return True
+        return s.thread != s.parent.thread
+
+    def pool_order(self):
+        order = []
+        for t in self.threads:
+            p = pool_of(t)
+            if p not in order:
+                order.append(p)
+        for s in self.spans:
+            if s.pool not in order:
+                order.append(s.pool)
+        return order
+
+
+# ======================================================================
+# Filters
+# ======================================================================
+
+class Filter(object):
+    def __init__(self, threads=None, focus=None, depth=None, min_ms=None):
+        self.threads_re = re.compile(threads) if threads else None
+        self.focus = focus.strip("/") if focus else None
+        self.depth = depth
+        self.min_us = int(round(min_ms * 1000)) if min_ms else 0
+
+    @property
+    def active(self):
+        return bool(self.threads_re or self.focus or self.depth is not None or self.min_us)
+
+    def matches_focus(self, s):
+        f = self.focus
+        return s.path == f or s.key == f or s.key.endswith("/" + f)
+
+    def apply(self, trace):
+        """Return (visible set of span ids, focus roots)."""
+        roots = []
+        if self.focus:
+            for s in trace.spans:
+                if self.matches_focus(s) and not any(a in roots for a in ancestors(s)):
+                    roots.append(s)
+        else:
+            roots = [trace.root] if trace.root else []
+        vis = set()
+        for r in roots:
+            base = r.depth
+            stack = [r]
+            while stack:
+                s = stack.pop()
+                if self.depth is not None and s.depth - base > self.depth:
+                    continue
+                if self.min_us and s.end - s.start < self.min_us and s is not r:
+                    continue
+                if not self.threads_re or self.threads_re.search(thread_filter_label(trace, s)):
+                    vis.add(s.id)
+                stack.extend(s.children)
+        return vis, roots
+
+
+def thread_filter_label(trace, s):
+    if s.not_run or s.thread < 0:
+        return s.pool + "-*"
+    return trace.threads[s.thread]
+
+
+def ancestors(s):
+    out = []
+    p = s.parent
+    while p is not None:
+        out.append(p)
+        p = p.parent
+    return out
+
+
+# ======================================================================
+# Terminal output
+# ======================================================================
+
+UNI = {"run": "█", "run2": "▓", "wait": "░", "block": "─", "agg": "▚",
+       "tick": "┃", "f": "✗", "c": "⊘", "o": "▶", "n": "∅", "m": "!",
+       "live": "●", "axis": "─", "axis_tick": "┬", "end": "┊",
+       "ell": "…", "times": "×", "delta": "Δ", "arrow": "→", "le": "≤",
+       "dot": "·", "tm": "├─ ", "tl": "└─ ", "tp": "│  ", "tb": "   ",
+       "spark": " ▁▂▃▄▅▆▇█", "gauge": "•"}
+ASCII = {"run": "#", "run2": "=", "wait": ".", "block": "-", "agg": "%", "tick": "|",
+         "f": "X", "c": "/", "o": ">", "n": "0", "m": "!", "live": "*", "axis": "-",
+         "axis_tick": "+", "end": ":", "ell": "~", "times": "x", "delta": "d", "arrow": "->",
+         "le": "<=", "dot": "-", "tm": "|- ", "tl": "`- ", "tp": "|  ", "tb": "   ",
+         "spark": " .:-=+*#@", "gauge": "o"}
+
+STYLES = {
+    "run": "36", "lbl": "30;46", "blk": "34", "blk_lbl": "34",
+    "wait": "2;33", "wait_lbl": "33", "fail": "31", "fail_lbl": "97;41",
+    "agg": "36", "agg_lbl": "30;46", "tick": "1;97",
+    "mark_f": "1;31", "mark_c": "33", "mark_o": "1;35", "mark_n": "1;33", "mark_m": "35",
+    "axis": "2", "dim": "2", "bold": "1", "head": "1;4", "red": "31", "green": "32",
+    "yellow": "33", "magenta": "35", "live": "35", "spark_run": "36", "spark_wait": "33",
+    "spark_gauge": "35", "end": "1;35", "blue": "34",
+}
+MARK_ORDER = "fcom"
+
+
+class Painter(object):
+    def __init__(self, color=False, ascii_only=False):
+        self.color = color
+        self.g = ASCII if ascii_only else UNI
+
+    def c(self, text, style):
+        if not self.color or not style or not text:
+            return text
+        return "\x1b[%sm%s\x1b[0m" % (STYLES.get(style, style), text)
+
+    def cells(self, cells):
+        cells = list(cells)
+        while cells and cells[-1] == (" ", None):
+            cells.pop()
+        out = []
+        run = []
+        cur = None
+        for ch, st in cells:
+            if st != cur and run:
+                out.append(self.c("".join(run), cur))
+                run = []
+            cur = st
+            run.append(ch)
+        if run:
+            out.append(self.c("".join(run), cur))
+        return "".join(out)
+
+
+def pad(p, text, n, style):
+    """`text` in `style`, padded to n columns outside the colour codes."""
+    text = text.rstrip(" ")
+    return p.c(text, style) + " " * max(0, n - len(text))
+
+
+def ms(us):
+    return "" if us is None else "%.3f" % (us / 1000.0)
+
+
+def ms_signed(us):
+    return "%+.3f" % (us / 1000.0)
+
+
+def fmt_num(v):
+    if isinstance(v, float):
+        t = ("%.6f" % v).rstrip("0").rstrip(".")
+        return "0" if t in ("-0", "") else t
+    return str(v)
+
+
+def fit(text, n, g):
+    if len(text) <= n:
+        return text
+    if n <= 1:
+        return text[:n]
+    return text[:n - 1] + g["ell"]
+
+
+def wall_str(wall):
+    try:
+        dt = datetime.datetime.fromtimestamp(wall / 1000.0, tz=datetime.timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return "w=%d" % wall
+    return dt.strftime("%Y-%m-%d %H:%M:%S") + ".%03d UTC" % (wall % 1000)
+
+
+def span_label(s, g):
+    return "%s %s%d" % (s.name, g["times"], s.agg["count"]) if s.agg else s.name
+
+
+def header_line(trace, p, title=None, width=None):
+    """The title line(s): name, duration, wall time, size; wrapped at part boundaries."""
+    g = p.g
+    r = trace.root
+    parts = []
+    if title:
+        parts.append((title, "bold"))
+    parts.append((r.name, None if title else "bold"))
+    parts.append(("%s ms" % ms(r.dur), None))
+    if trace.wall is not None:
+        parts.append((wall_str(trace.wall), None))
+    parts.append(("%d spans on %d threads" % (len(trace.spans), len(trace.threads)), None))
+    sep = "  %s  " % g["dot"]
+    lines = []
+    cur = []
+    n = 0
+    for text, st in parts:
+        if cur and width and n + len(sep) + len(text) > width:
+            lines.append(sep.join(cur))
+            cur = []
+            n = 0
+        cur.append(p.c(fit(text, width, g) if width else text, st))
+        n += (len(sep) if n else 0) + len(text)
+    lines.append(sep.join(cur))
+    return "\n".join(lines)
+
+
+def wrap(text, width, style, p, indent="    "):
+    if not width:
+        return [p.c(text, style)]
+    return [p.c(t, style) for t in textwrap.wrap(text, width, subsequent_indent=indent,
+                                                 break_long_words=True, break_on_hyphens=False)]
+
+
+def notices(trace, p, width=None):
+    out = []
+    if trace.truncated:
+        out.extend(wrap("truncated: the value was cut; the last record was discarded",
+                        width, "red", p))
+    if trace.folded or trace.dropped:
+        out.extend(wrap("x=: %d spans folded into aggregates, %d dropped (not on the wire)"
+                        % (trace.folded, trace.dropped), width, "yellow", p))
+    if trace.live:
+        out.extend(wrap("l=: lanes live at render: %s (their records are best effort)"
+                        % ", ".join(trace.threads[i] for i in trace.live), width, "magenta", p))
+    return out
+
+
+def no_spans(trace, p, width=None):
+    out = wrap("no spans: the value was cut inside the root record", width, None, p)
+    out.extend(notices(trace, p, width))
+    return out
+
+
+# ---------------------------------------------------------------- time axis
+
+class Scale(object):
+    def __init__(self, t0, t1, width):
+        self.t0 = t0
+        self.t1 = max(t1, t0 + 1)
+        self.w = width
+        self.k = width / float(self.t1 - self.t0)
+
+    def lo(self, t):
+        return min(self.w, max(0, int(math.floor((t - self.t0) * self.k))))
+
+    def hi(self, t):
+        return min(self.w, max(0, int(math.ceil((t - self.t0) * self.k))))
+
+    def rd(self, t):
+        return min(self.w, max(0, int(math.floor((t - self.t0) * self.k + 0.5))))
+
+    def cols(self, a, b):
+        """Cells [c0, c1) of the interval [a, b); rounded so that touching spans share no cell."""
+        c0 = self.rd(a)
+        c1 = max(c0 + 1, self.rd(b))
+        if c0 >= self.w:
+            c0 = self.w - 1
+        return c0, min(c1, self.w)
+
+
+def nice_step(raw):
+    if raw <= 0:
+        return 1.0
+    e = math.floor(math.log10(raw))
+    for m in (1, 2, 2.5, 5, 10):
+        if m * 10 ** e >= raw:
+            return m * 10 ** e
+    return 10 ** (e + 1)
+
+
+def tick_text(v):
+    t = ("%.6f" % v).rstrip("0").rstrip(".")
+    return "0" if t in ("", "-0") else t
+
+
+def axis_lines(scale, lw, p, marks=None):
+    """Tick labels in ms and a ruler. `marks` maps time -> (glyph, style)."""
+    g = p.g
+    w = scale.w
+    span_ms = (scale.t1 - scale.t0) / 1000.0
+    step = nice_step(span_ms / max(1, w // 10))
+    first = math.ceil(scale.t0 / 1000.0 / step - 1e-9)
+    labels = [" "] * w
+    ruler = [(g["axis"], "axis")] * w
+    k = first
+    last_end = -1
+    while True:
+        v = round(k * step, 6)
+        if v * 1000.0 > scale.t1 + 1e-6:
+            break
+        c = scale.lo(v * 1000.0)
+        if c < w:
+            ruler[c] = (g["axis_tick"], "axis")
+            text = tick_text(v)
+            if c > last_end and c + len(text) <= w:
+                labels[c:c + len(text)] = list(text)
+                last_end = c + len(text)
+        k += 1
+    for t, (ch, st) in sorted((marks or {}).items()):
+        c = min(w - 1, scale.lo(t))
+        ruler[c] = (ch, st)
+    head = (" " * max(0, lw - 3) + "ms ")[:lw]
+    return [p.c(head, "dim") + p.c("".join(labels).rstrip(), "dim"),
+            " " * lw + p.cells(ruler)]
+
+
+def legend_lines(items, width, p):
+    out = []
+    line = []
+    n = 0
+    for glyph, style, text in items:
+        piece_len = len(glyph) + 1 + len(text)
+        if line and n + 2 + piece_len > width:
+            out.append("  ".join(line))
+            line = []
+            n = 0
+        line.append(p.c(glyph, style) + " " + text)
+        n += piece_len + (2 if n else 0)
+    if line:
+        out.append("  ".join(line))
+    return out
+
+
+# ---------------------------------------------------------------- lanes
+
+def lane_groups(trace, spans, flt):
+    """[(pool, grouped, [lane keys])] in display order."""
+    by_lane = {}
+    for s in spans:
+        by_lane.setdefault(s.lane, []).append(s)
+    groups = []
+    for pool in trace.pool_order():
+        keys = []
+        grouped = False
+        for i, t in enumerate(trace.threads):
+            if pool_of(t) != pool:
+                continue
+            if t != pool:
+                grouped = True
+            k = ("t", i)
+            if k in by_lane or not flt.active:
+                keys.append(k)
+        for kind in ("mixed", "queued"):
+            if (kind, pool) in by_lane:
+                keys.append((kind, pool))
+                grouped = True
+        if keys:
+            groups.append((pool, grouped, keys))
+    return groups, by_lane
+
+
+def lane_label(trace, key, grouped, g):
+    if key[0] == "t":
+        name = trace.threads[key[1]]
+        if key[1] in trace.live:
+            name += " " + g["live"]
+    else:
+        name = "(%s)" % key[0]
+    return ("  " + name) if grouped else name
+
+
+def pool_title(pool):
+    return "(pool unknown)" if pool == "?" else pool
+
+
+def draw_lane(spans, scale, p):
+    """Pack the spans of one lane into rows; returns a list of cell rows."""
+    g = p.g
+    w = scale.w
+    rows = []
+    occ = []
+    last = []
+    rowof = {}
+    for s in spans:
+        # rows separate nesting and true concurrency; spans that merely share a
+        # cell at this resolution stay in one row (the later one draws over)
+        ta = s.start if (s.not_run or s.agg) else s.run_start
+        tb = s.end
+        c0, c1 = scale.cols(ta, tb)
+        floor = 0
+        if not s.handoff and not s.not_run:
+            a = s.parent
+            while a is not None:
+                if a.id in rowof and a.lane == s.lane:
+                    floor = rowof[a.id] + 1
+                    break
+                a = a.parent
+        r = floor
+        while True:
+            while r >= len(rows):
+                rows.append([(" ", None)] * w)
+                occ.append([])
+                last.append((-1, 0))
+            if not any(_clash(ta, tb, c0, c1, o) for o in occ[r]):
+                break
+            r += 1
+        occ[r].append((ta, tb, c0, c1))
+        rowof[s.id] = r
+        cells = rows[r]
+        failed = "f" in s.flags
+        if s.not_run:
+            for c in range(c0, c1):
+                cells[c] = (g["wait"], "wait")
+            _label(cells, c0, c1, span_label(s, g), "wait_lbl", g)
+            _marker(cells, c1 - 1, "n" if "n" in s.flags else "c", g)
+        elif s.agg:
+            st = "fail" if failed else "agg"
+            for c in range(c0, c1):
+                cells[c] = (g["agg"], st)
+            tick = min(c1 - 1, max(c0, scale.lo(s.start + s.agg["maxAt"])))
+            text = span_label(s, g)
+            if tick - c0 >= c1 - tick - 1:
+                _label(cells, c0, tick + 1, text, "fail_lbl" if failed else "agg_lbl", g)
+            else:
+                _label(cells, tick + 1, c1, text, "fail_lbl" if failed else "agg_lbl", g)
+            cells[tick] = (g["tick"], "tick")
+            for f in MARK_ORDER:
+                if f in s.flags and c1 - 1 != tick:
+                    _marker(cells, c1 - 1, f, g)
+                    break
+        else:
+            if "w" in s.flags and not failed:
+                ch, st, lst = g["block"], "blk", "blk_lbl"
+            else:
+                lc1, lshade = last[r]
+                shade = 1 - lshade if lc1 >= c0 else 0
+                ch = g["run2"] if shade else g["run"]
+                st, lst = ("fail", "fail_lbl") if failed else ("run", "lbl")
+                last[r] = (c1, shade)
+            for c in range(c0, c1):
+                cells[c] = (ch, st)
+            _label(cells, c0, c1, s.name, lst, g)
+            for f in MARK_ORDER:
+                if f in s.flags:
+                    _marker(cells, c1 - 1, f, g)
+                    break
+            if s.handoff and s.wait > 0:
+                w0 = scale.rd(s.start)
+                c = c0 - 1
+                while c >= w0 and cells[c][0] == " ":
+                    cells[c] = (g["wait"], "wait")
+                    c -= 1
+    return rows
+
+
+def _clash(ta, tb, c0, c1, other):
+    a, b, d0, d1 = other
+    if ta == tb or a == b:          # instants: keep their cell free
+        return d0 < c1 and c0 < d1
+    return a < tb and ta < b
+
+
+def _label(cells, a, b, text, style, g):
+    n = b - a - 1
+    if n < 3:
+        return
+    t = text if len(text) <= n else text[:n - 1] + g["ell"]
+    for i, ch in enumerate(t):
+        cells[a + i] = (ch, style)
+
+
+def _marker(cells, c, flag, g):
+    if 0 <= c < len(cells):
+        cells[c] = (g[flag], "mark_" + flag)
+
+
+def view_lanes(trace, flt, p, width):
+    g = p.g
+    if not trace.spans:
+        return no_spans(trace, p, width)
+    vis, roots = flt.apply(trace)
+    if flt.focus and not roots:
+        raise UsageError("no span matches --focus %r" % flt.focus)
+    spans = [s for s in trace.spans if s.id in vis]
+    if flt.focus:
+        t0 = min(r.start for r in roots)
+        t1 = max(s.end for s in spans)
+    else:
+        t0, t1 = 0, trace.end
+    groups, by_lane = lane_groups(trace, spans, flt)
+    labels = []
+    for pool, grouped, keys in groups:
+        if grouped:
+            labels.append(pool_title(pool))
+        labels.extend(lane_label(trace, k, grouped, g) for k in keys)
+    labels.append("  queued %s999" % g["le"])
+    lw = min(max([len(x) for x in labels] + [8]) + 2, max(10, width // 4))
+    cw = max(10, width - lw)
+    scale = Scale(t0, t1, cw)
+    marks = {}
+    root = trace.root
+    if not flt.focus and root.end < scale.t1:
+        marks[root.end] = (g["end"], "end")
+    out = [header_line(trace, p, width=width)]
+    if flt.focus:
+        out.extend(wrap("focus %s: %s %s %s ms" % (flt.focus, ms(t0), g["arrow"], ms(t1)),
+                        width, None, p))
+    out.extend(axis_lines(scale, lw, p, marks))
+    any_wait = False
+    for pool, grouped, keys in groups:
+        if grouped:
+            out.append(p.c(fit(pool_title(pool), lw - 1, g), "bold"))
+        for k in keys:
+            rows = draw_lane(by_lane.get(k, []), scale, p) or [[(" ", None)] * cw]
+            lab = fit(lane_label(trace, k, grouped, g), lw - 1, g)
+            live = k[0] == "t" and k[1] in trace.live
+            for i, cells in enumerate(rows):
+                head = (lab if i == 0 else "").ljust(lw)
+                out.append(pad(p, head, lw, "live" if (live and i == 0) else None) + p.cells(cells))
+        if grouped:
+            act = pool_activity(trace, [s for s in spans if s.pool == pool], scale)
+            if act["peak_queued"] > 0:
+                any_wait = True
+                vmax = max(act["queued"])
+                head = fit("  queued %s%s" % (g["le"], _short(act["peak_queued"])), lw - 1, g)
+                out.append(pad(p, head, lw, "dim") + p.cells(
+                    [(spark(v, vmax, g), "spark_wait" if v > 0 else None) for v in act["queued"]]))
+    out.append("")
+    items = [(g["run"], "run", "run"), (g["wait"], "wait", "queue wait"),
+             (g["block"], "blk", "blocking wait"),
+             (g["agg"], "agg", "aggregate %scount, %s slowest" % (g["times"], g["tick"])),
+             (g["f"], "mark_f", "failed"), (g["c"], "mark_c", "cancelled"),
+             (g["o"], "mark_o", "open"), (g["n"], "mark_n", "never started"),
+             (g["live"], "live", "live lane")]
+    if any_wait:
+        items.append((g["spark"][4], "spark_wait", "this request's queued handoffs"))
+    if marks:
+        items.append((g["end"], "end", "response end"))
+    out.extend(legend_lines(items, width, p))
+    out.extend(notices(trace, p, width))
+    return out
+
+
+def _short(v):
+    return ("%.1f" % v).rstrip("0").rstrip(".") if v != int(v) else "%d" % v
+
+
+def spark(v, vmax, g):
+    if v is None or v <= 0 or vmax <= 0:
+        return " "
+    return g["spark"][max(1, min(8, int(math.ceil(v / vmax * 8 - 1e-9))))]
+
+
+# ---------------------------------------------------------------- pools
+
+QUEUED_KEYS = ("queued", "queue", "queue.depth", "queuedepth", "queue_depth")
+ACTIVE_KEYS = ("active", "active.count", "activecount", "active_count")
+
+
+def _gauge(attrs, keys):
+    for k, v in attrs.items():
+        if k.lower() in keys:
+            return v
+    return None
+
+
+def pool_activity(trace, spans, scale):
+    """This request's share of one pool over time (spans already restricted to the pool)."""
+    w = scale.w
+    bw = (scale.t1 - scale.t0) / float(w)
+    running = [0.0] * w
+    queued = [0.0] * w
+    gq = [None] * w
+    ga = [None] * w
+    events_run = []
+    events_q = []
+    tasks = [s for s in spans if trace.is_task(s)]
+
+    def add(arr, ev, a, b, weight):
+        if b <= a or weight <= 0:
+            return
+        ev.append((a, 1, weight))
+        ev.append((b, 0, -weight))
+        a = max(a, scale.t0)
+        b = min(b, scale.t1)
+        if b <= a:
+            return
+        i0 = int((a - scale.t0) / bw)
+        i1 = min(w - 1, int((b - scale.t0) / bw))
+        for i in range(i0, i1 + 1):
+            lo = scale.t0 + i * bw
+            ov = min(b, lo + bw) - max(a, lo)
+            if ov > 0:
+                arr[i] += weight * ov / bw
+
+    for s in tasks:
+        if s.agg:
+            ext = float(max(1, s.agg["extent"]))
+            add(running, events_run, s.start, s.end, s.dur / ext)
+            add(queued, events_q, s.start, s.end, s.wait / ext)
+        else:
+            if not s.not_run:
+                add(running, events_run, s.run_start, s.end, 1)
+            add(queued, events_q, s.start, s.end if s.not_run else s.run_start, 1)
+        if scale.t0 <= s.start <= scale.t1:
+            i = min(w - 1, int((s.start - scale.t0) / bw))
+            q = _gauge(s.attrs, QUEUED_KEYS)
+            a = _gauge(s.attrs, ACTIVE_KEYS)
+            if q is not None:
+                gq[i] = q if gq[i] is None else max(gq[i], q)
+            if a is not None:
+                ga[i] = a if ga[i] is None else max(ga[i], a)
+    seen = set(s.thread for s in tasks if s.thread >= 0 and not s.not_run)
+    gqs = [_gauge(s.attrs, QUEUED_KEYS) for s in tasks]
+    gas = [_gauge(s.attrs, ACTIVE_KEYS) for s in tasks]
+    return {"running": running, "queued": queued, "gauge_queued": gq, "gauge_active": ga,
+            "tasks": tasks, "threads_seen": seen,
+            "peak_running": _peak(events_run), "peak_queued": _peak(events_q),
+            "max_gauge_queued": max([v for v in gqs if v is not None] or [None], key=lambda v: -1 if v is None else v),
+            "max_gauge_active": max([v for v in gas if v is not None] or [None], key=lambda v: -1 if v is None else v)}
+
+
+def _peak(events):
+    cur = 0.0
+    best = 0.0
+    for _, _, d in sorted(events):
+        cur += d
+        best = max(best, cur)
+    return round(best, 2)
+
+
+def view_pools(trace, flt, p, width):
+    g = p.g
+    if not trace.spans:
+        return no_spans(trace, p, width)
+    vis, roots = flt.apply(trace)
+    spans = [s for s in trace.spans if s.id in vis]
+    t0, t1 = 0, trace.end
+    if flt.focus and roots:
+        t0 = min(r.start for r in roots)
+        t1 = max(s.end for s in spans)
+    lw = min(22, max(12, width // 4))
+    scale = Scale(t0, t1, max(10, width - lw))
+    out = [header_line(trace, p, "Pools", width=width)]
+    out.extend(wrap("this request's share of each pool; gauges are the pool's queue depth and "
+                    "active count at submit (all requests)", width, "dim", p, ""))
+    out.extend(axis_lines(scale, lw, p))
+    table = []
+    for pool in trace.pool_order():
+        act = pool_activity(trace, [s for s in spans if s.pool == pool], scale)
+        tasks = act["tasks"]
+        if not tasks:
+            continue
+        total = sum(1 for t in trace.threads if pool_of(t) == pool)
+        seen = act["threads_seen"]
+        out.append(p.c(fit(pool_title(pool), lw - 1, g), "bold"))
+        vmax = max(float(total), act["peak_running"], max(act["running"]))
+        rows = [("running", act["running"], vmax, act["peak_running"], "spark_run"),
+                ("queued", act["queued"], max(act["queued"]), act["peak_queued"], "spark_wait")]
+        if act["max_gauge_queued"] is not None:
+            vals = act["gauge_queued"]
+            rows.append(("queued@submit", vals, max(v for v in vals if v is not None) or 1,
+                         act["max_gauge_queued"], "spark_gauge"))
+        if act["max_gauge_active"] is not None:
+            vals = act["gauge_active"]
+            rows.append(("active@submit", vals, max(v for v in vals if v is not None) or 1,
+                         act["max_gauge_active"], "spark_gauge"))
+        for name, vals, vm, peak, st in rows:
+            head = fit("  %s %s%s" % (name, g["le"], _short(peak)), lw - 1, g).ljust(lw)
+            cells = []
+            for v in vals:
+                if v is None:
+                    cells.append((" ", None))
+                elif v <= 0:
+                    cells.append((g["spark"][1] if st == "spark_gauge" else " ",
+                                  "dim" if st == "spark_gauge" else None))
+                else:
+                    cells.append((spark(v, vm, g), st))
+            out.append(pad(p, head, lw, "dim") + p.cells(cells))
+        table.append((pool, "%d/%d" % (len(seen), total), len(tasks) and sum(
+            (t.agg["count"] if t.agg else 1) for t in tasks),
+            sum(t.dur for t in tasks), sum(t.wait for t in tasks),
+            max(t.wait_max for t in tasks),
+            sum(t.cpu for t in tasks if t.cpu is not None) if any(t.cpu is not None for t in tasks) else None,
+            sum(t.offcpu for t in tasks if t.cpu is not None) if any(t.cpu is not None for t in tasks) else None,
+            act["peak_running"], act["peak_queued"], act["max_gauge_queued"], act["max_gauge_active"]))
+    if not table:
+        out.append("no handoffs: every span ran on the request's own thread")
+        return out
+    out.append("")
+    heads = ["pool", "threads", "tasks", "run ms", "wait ms", "wait max", "cpu ms", "off-cpu",
+             "peak run", "peak q", "q@submit", "a@submit"]
+    rows = []
+    for (pool, thr, n, run, wait, wmax, cpu, off, pr, pq, gq, ga) in table:
+        rows.append([pool, thr, str(n), ms(run), ms(wait), ms(wmax), ms(cpu), ms(off),
+                     _short(pr), _short(pq), "" if gq is None else fmt_num(gq),
+                     "" if ga is None else fmt_num(ga)])
+    out.extend(render_table(heads, rows, p, left=1))
+    out.extend(wrap("threads: seen running this request's tasks / in the thread table. "
+                    "peak: most at once (aggregates count as their average).", width, "dim", p, ""))
+    out.extend(notices(trace, p, width))
+    return out
+
+
+def render_table(heads, rows, p, left=1, styles=None):
+    widths = [max(len(h), max([len(r[i]) for r in rows] or [0])) for i, h in enumerate(heads)]
+    out = []
+
+    def line(cells, row_styles=None):
+        parts = []
+        for i, c in enumerate(cells):
+            t = c.ljust(widths[i]) if i < left else c.rjust(widths[i])
+            if row_styles and row_styles[i]:
+                t = p.c(t, row_styles[i])
+            parts.append(t)
+        return "  ".join(parts).rstrip()
+
+    out.append(p.c(line(heads), "bold") if p.color else line(heads))
+    for k, r in enumerate(rows):
+        out.append(line(r, styles[k] if styles else None))
+    return out
+
+
+# ---------------------------------------------------------------- tree
+
+def view_tree(trace, flt, p, width):
+    g = p.g
+    if not trace.spans:
+        return no_spans(trace, p, width)
+    vis, roots = flt.apply(trace)
+    if flt.focus and not roots:
+        raise UsageError("no span matches --focus %r" % flt.focus)
+    shown = set(vis)
+    root_ids = set(r.id for r in roots)
+    for s in trace.spans:
+        if s.id in vis:
+            a = s
+            while a.id not in root_ids and a.parent is not None:
+                a = a.parent
+                shown.add(a.id)
+    lines = []
+
+    def walk(s, prefix, last, top):
+        if top:
+            name_prefix = ""
+            child_prefix = ""
+        else:
+            name_prefix = prefix + (g["tl"] if last else g["tm"])
+            child_prefix = prefix + (g["tb"] if last else g["tp"])
+        lines.append((name_prefix, s))
+        kids = [c for c in s.children if c.id in shown]
+        for i, c in enumerate(kids):
+            walk(c, child_prefix, i == len(kids) - 1, False)
+
+    for r in roots:
+        if r.id in shown:
+            walk(r, "", True, True)
+    tw = max([len(trace.thread_label(s)) for _, s in lines] + [6])
+    fixed = 6 * 10 + tw + 2 + 6
+    nw = max(20, min(max(len(pre) + len(span_label(s, g)) for pre, s in lines), width - fixed))
+    out = [header_line(trace, p, width=width)]
+    head = ("span".ljust(nw) + "".join(h.rjust(10) for h in
+                                         ("start", "wait", "dur", "self", "cpu", "off-cpu"))
+            + "  " + "thread".ljust(tw) + "  flags  attributes")
+    out.append(p.c(head, "bold"))
+    for pre, s in lines:
+        name = fit(pre + span_label(s, g), nw, g)
+        ctx = s.id not in vis
+        name_st = "dim" if ctx else ("red" if "f" in s.flags else None)
+        tail = name[len(pre):] if name.startswith(pre) else name
+        cols = [p.c(pre, "dim") + p.c(tail, name_st) + " " * (nw - len(name))]
+        vals = [ms(s.start), ms(s.wait) if s.handoff else "", ms(s.dur), ms(s.self_time),
+                ms(s.cpu), ms(s.offcpu)]
+        for k, v in enumerate(vals):
+            st = "dim" if ctx else ("yellow" if (k == 1 and s.wait > 0) else None)
+            cols.append(p.c(v.rjust(10), st))
+        cols.append("  " + trace.thread_label(s).ljust(tw))
+        cols.append("  " + p.c(s.flags, "red" if "f" in s.flags else ("magenta" if s.flags else None))
+                    + " " * (5 - len(s.flags)))
+        cols.append("  " + attr_text(s))
+        out.append("".join(cols).rstrip())
+    out.extend(notices(trace, p, width))
+    return out
+
+
+def attr_text(s):
+    parts = []
+    if s.agg:
+        a = s.agg
+        par = s.dur / float(a["extent"]) if a["extent"] else 0.0
+        bits = ["min=%s" % ms(a["min"]), "max=%s" % ms(a["max"]), "extent=%s" % ms(a["extent"]),
+                "maxAt=+%s" % ms(a["maxAt"])]
+        if "waitMax" in a:
+            bits.append("waitMax=%s" % ms(a["waitMax"]))
+        bits.append("par=%.2f" % par)
+        parts.append("[%s]" % " ".join(bits))
+    parts.extend("%s=%s" % (k, fmt_num(v)) for k, v in s.attrs.items())
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------- per-path tables
+
+def path_table(trace, vis):
+    """Per-path totals in first-appearance (pre-)order."""
+    table = {}
+    order = []
+    for s in trace.spans:
+        if s.id not in vis:
+            continue
+        e = table.get(s.key)
+        if e is None:
+            e = table[s.key] = {"key": s.key, "label": s.path, "count": 0, "sum": 0, "self": 0,
+                                "min": None, "max": 0, "wait": 0, "wmax": 0, "cpu": 0,
+                                "cpu_known": False, "flags": set(), "depth": s.depth}
+            order.append(s.key)
+        n = s.agg["count"] if s.agg else 1
+        lo = s.agg["min"] if s.agg else s.dur
+        hi = s.agg["max"] if s.agg else s.dur
+        e["count"] += n
+        e["sum"] += s.dur
+        e["self"] += s.self_time
+        e["min"] = lo if e["min"] is None else min(e["min"], lo)
+        e["max"] = max(e["max"], hi)
+        e["wait"] += s.wait
+        e["wmax"] = max(e["wmax"], s.wait_max or 0)
+        if s.cpu is not None:
+            e["cpu"] += s.cpu
+            e["cpu_known"] = True
+        e["flags"].update(s.flags)
+    return [table[k] for k in order]
+
+
+def flags_str(fs):
+    return "".join(f for f in FLAG_ORDER if f in fs)
+
+
+def view_agg(trace, flt, p, width):
+    if not trace.spans:
+        return no_spans(trace, p, width)
+    vis, roots = flt.apply(trace)
+    if flt.focus and not roots:
+        raise UsageError("no span matches --focus %r" % flt.focus)
+    rows = []
+    styles = []
+    for e in path_table(trace, vis):
+        rows.append([e["label"], str(e["count"]), ms(e["sum"]), ms(e["self"]), ms(e["min"]),
+                     ms(e["max"]), ms(e["wait"]), ms(e["wmax"]),
+                     ms(e["cpu"]) if e["cpu_known"] else "", flags_str(e["flags"])])
+        st = [None] * 10
+        if "f" in e["flags"]:
+            st[0] = "red"
+        if e["wait"]:
+            st[6] = st[7] = "yellow"
+        styles.append(st)
+    out = [header_line(trace, p, "Aggregates", width=width)]
+    out.extend(render_table(["path", "count", "sum", "self", "min", "max", "wait sum",
+                             "wait max", "cpu", "flags"], rows, p, left=1, styles=styles))
+    out.extend(wrap("times in ms; aggregates contribute their count, sum, min and max",
+                    width, "dim", p, ""))
+    out.extend(notices(trace, p, width))
+    return out
+
+
+# ---------------------------------------------------------------- findings
+
+CPU_POOL_RE = re.compile(r"cpu|compute|fork|work", re.I)
+
+
+def is_cpu_pool(trace, pool):
+    if CPU_POOL_RE.search(pool):
+        return True
+    dur = cpu = 0
+    for s in trace.spans:
+        if s.pool == pool and s.cpu is not None and s.parent is not None:
+            dur += s.dur
+            cpu += s.cpu
+    return dur > 0 and cpu >= 0.7 * dur
+
+
+def findings(trace, vis):
+    """List of (kind, span or None, text, numbers) tuples."""
+    out = []
+    spans = [s for s in trace.spans if s.id in vis]
+    g = UNI
+
+    def where(s):
+        return "%s on %s" % (s.path if s.parent else s.name, trace.thread_label(s)) \
+            if not s.not_run else "%s (%s pool)" % (s.path, s.pool)
+
+    def lab(s):
+        return ("%s %s%d" % (where(s), g["times"], s.agg["count"])) if s.agg else where(s)
+
+    strag = []
+    for s in spans:
+        par = s.parent
+        if par is None or "o" in par.flags or s.not_run:
+            continue
+        if s.end > par.end:
+            strag.append((s.end - par.end, s))
+    strag.sort(key=lambda x: (-x[0], x[1].id))
+    for over, s in strag[:10]:
+        out.append(("straggler", s, "%s ends %s ms after %s (at %s ms)"
+                    % (lab(s), ms(over), s.parent.path if s.parent.parent else s.parent.name,
+                       ms(s.end)), over))
+    if len(strag) > 10:
+        out.append(("straggler", None, "%d more stragglers" % (len(strag) - 10), 0))
+    for s in spans:
+        if "n" in s.flags:
+            n = s.agg["count"] if s.agg else 1
+            out.append(("never-started", s, "%s: %d handoff%s queued %s ms until render and never ran"
+                        % (lab(s), n, "" if n == 1 else "s", ms(s.wait_max)), n))
+    for s in spans:
+        if "o" in s.flags:
+            out.append(("open", s, "%s: still running at render after %s ms%s"
+                        % (lab(s), ms(s.dur), (" (queued %s ms first)" % ms(s.wait))
+                           if s.handoff and s.wait and not s.agg else ""), s.dur))
+    for s in spans:
+        if "f" in s.flags:
+            out.append(("failed", s, "%s: failed after %s ms" % (lab(s), ms(s.dur)), s.dur))
+    for s in spans:
+        if "c" in s.flags:
+            what = "cancelled before it started" if s.not_run else "cancelled after %s ms" % ms(s.dur)
+            out.append(("cancelled", s, "%s: %s" % (lab(s), what), s.dur))
+    for s in spans:
+        if "m" in s.flags:
+            out.append(("misuse", s, "%s: misuse detected and healed by the recorder" % lab(s), 0))
+    waits = [s for s in spans if s.handoff and not s.not_run and (s.wait_max or 0) > 0]
+    waits.sort(key=lambda s: (-(s.wait_max or 0), s.id))
+    for s in waits[:5]:
+        if s.agg:
+            text = "%s: max %s ms, sum %s ms over %d" % (lab(s), ms(s.wait_max), ms(s.wait),
+                                                         s.agg["count"])
+        else:
+            ratio = (" (%.1f%s the run)" % (s.wait / float(s.dur), g["times"])) if s.dur else ""
+            text = "%s: waited %s ms before a %s ms run%s" % (lab(s), ms(s.wait), ms(s.dur), ratio)
+        out.append(("queue-wait", s, text, s.wait_max))
+    per_pool = {}
+    for s in spans:
+        if s.handoff:
+            e = per_pool.setdefault(s.pool, [0, 0, 0])
+            e[0] += s.agg["count"] if s.agg else 1
+            e[1] += s.wait
+            e[2] = max(e[2], s.wait_max or 0)
+    if any(e[1] for e in per_pool.values()):
+        parts = ["%s %s ms over %d (max %s)" % (k, ms(e[1]), e[0], ms(e[2]))
+                 for k, e in sorted(per_pool.items(), key=lambda kv: (-kv[1][1], kv[0])) if e[1]]
+        out.append(("queue-wait", None, "by pool: " + ", ".join(parts), 0))
+    off = []
+    for s in spans:
+        if s.cpu is None or s.parent is None or s.not_run or "w" in s.flags:
+            continue
+        if not is_cpu_pool(trace, s.pool):
+            continue
+        o = s.offcpu
+        if o >= 1000 and o >= 0.25 * s.dur:
+            off.append((o, s))
+    off.sort(key=lambda x: (-x[0], x[1].id))
+    for o, s in off[:5]:
+        out.append(("off-cpu", s, "%s: %s ms off-CPU of %s ms (%d%%) on a compute pool"
+                    % (lab(s), ms(o), ms(s.dur), int(round(100.0 * o / s.dur))), o))
+    if len(off) > 5:
+        out.append(("off-cpu", None, "%d more spans off-CPU on compute pools (%s ms in total)"
+                    % (len(off) - 5, ms(sum(o for o, _ in off[5:]))), 0))
+    return out
+
+
+FINDING_STYLE = {"straggler": "magenta", "never-started": "yellow", "open": "magenta",
+                 "failed": "red", "cancelled": "yellow", "misuse": "magenta",
+                 "queue-wait": "yellow", "off-cpu": "blue"}
+
+
+def view_findings(trace, flt, p, width):
+    if not trace.spans:
+        return no_spans(trace, p, width)
+    vis, roots = flt.apply(trace)
+    if flt.focus and not roots:
+        raise UsageError("no span matches --focus %r" % flt.focus)
+    items = findings(trace, vis)
+    out = [header_line(trace, p, "Findings", width=width)]
+    if not items:
+        out.extend(wrap("no findings: nothing failed, straggled, stayed open or never started; "
+                        "no queue wait; no off-CPU time on compute pools", width, None, p))
+    kw = max(len(k) for k, _, _, _ in items) if items else 0
+    for kind, s, text, _ in items:
+        t = text if p.g is UNI else _asciify(text)
+        body = textwrap.wrap(t, max(20, width - kw - 4)) or [""]
+        out.append("  " + p.c(kind.ljust(kw), FINDING_STYLE.get(kind, "bold")) + "  " + body[0])
+        out.extend(" " * (kw + 4) + b for b in body[1:])
+    out.extend(notices(trace, p, width))
+    return out
+
+
+def _asciify(text):
+    return text.replace(UNI["times"], ASCII["times"])
+
+
+# ---------------------------------------------------------------- critical path
+
+def critical_path(trace):
+    """Segments (span, kind, t0, t1) in time order; kind: self, blocked, wait, run, agg.
+
+    Walks back from the root's end: inside each span the child that ended last
+    (before the current point) determined the progress; blocking waits are
+    skipped in favour of the work they waited for, so handoffs to other
+    threads become hops of the path."""
+    segs = []
+
+    def self_seg(s, a, b):
+        if b <= a:
+            return
+        blocks = sorted((c.run_start, c.end) for c in s.children if "w" in c.flags and c.thread == s.thread)
+        pieces = []
+        t = a
+        for x, y in blocks:
+            x, y = max(x, a), min(y, b)
+            if y <= x or y <= t:
+                continue
+            if x > t:
+                pieces.append(("self", t, x))
+            pieces.append(("blocked", max(t, x), y))
+            t = y
+        if t < b:
+            pieces.append(("self", t, b))
+        kind_run = "run" if s.parent is not None and trace.is_task(s) else "self"
+        for kind, x, y in reversed(pieces):
+            segs.append((s, kind_run if kind == "self" else kind, x, y))
+
+    def walk(s, limit):
+        end = min(s.end, limit)
+        if s.agg:
+            segs.append((s, "agg", s.start, end))
+            return
+        lo = s.run_start
+        cur = end
+        kids = [c for c in s.children if not c.not_run and "w" not in c.flags]
+        kids.sort(key=lambda c: (-c.end, c.start, c.id))
+        for c in kids:
+            if cur <= lo:
+                break
+            if c.end > cur or c.end <= lo:
+                continue
+            self_seg(s, c.end, cur)
+            walk(c, c.end)
+            cur = max(lo, c.start)
+        self_seg(s, lo, cur)
+        if s.handoff and s.wait > 0 and lo > s.start:
+            segs.append((s, "wait", s.start, lo))
+
+    if trace.root is not None:
+        walk(trace.root, trace.root.end)
+    segs.reverse()
+    return segs
+
+
+def critical_hops(trace):
+    """Merge consecutive segments of one span into hops."""
+    hops = []
+    for s, kind, a, b in critical_path(trace):
+        if hops and hops[-1]["span"] is s and hops[-1]["end"] == a:
+            h = hops[-1]
+        else:
+            h = {"span": s, "start": a, "end": a, "wait": 0, "run": 0, "blocked": 0, "agg": 0}
+            hops.append(h)
+        h[kind if kind != "self" else "run"] += b - a
+        h["end"] = b
+    return hops
+
+
+def view_critical(trace, flt, p, width):
+    g = p.g
+    if not trace.spans:
+        return no_spans(trace, p, width)
+    hops = critical_hops(trace)
+    total = trace.root.end - trace.root.start
+    out = [header_line(trace, p, "Critical path", width=width)]
+    out.extend(wrap("the chain of spans that determined the end time, walking back from the "
+                    "root's end through handoffs", width, "dim", p, ""))
+    rows = []
+    styles = []
+    for h in hops:
+        s = h["span"]
+        name = s.path if s.parent else s.name
+        if s.agg:
+            name = "%s %s%d (aggregate: extent; per-occurrence wait not on the wire)" % (
+                name, g["times"], s.agg["count"])
+        run = h["run"] + h["agg"]
+        rows.append([ms(h["start"]), ms(h["end"]), ms(h["wait"]) if h["wait"] else "",
+                     ms(run) if run else "", ms(h["blocked"]) if h["blocked"] else "",
+                     trace.thread_label(s), name])
+        styles.append([None, None, "yellow", None, "blue", None,
+                       "red" if "f" in s.flags else None])
+    widths_head = ["from", "to", "wait", "run", "blocked", "thread", "span"]
+    out.extend(_render_left_last(widths_head, rows, p, styles))
+    kinds = {"run": 0, "wait": 0, "blocked": 0, "agg": 0}
+    by_pool = {}
+    for h in hops:
+        for k in kinds:
+            kinds[k] += h[k]
+        pool = h["span"].pool
+        e = by_pool.setdefault(pool, {"run": 0, "wait": 0, "blocked": 0, "agg": 0})
+        for k in kinds:
+            e[k] += h[k]
+    out.append("")
+
+    def pct(v):
+        return "%.1f%%" % (100.0 * v / total) if total else "-"
+
+    parts = ["run %s ms (%s)" % (ms(kinds["run"]), pct(kinds["run"])),
+             "queue wait %s ms (%s)" % (ms(kinds["wait"]), pct(kinds["wait"]))]
+    if kinds["blocked"]:
+        parts.append("blocked %s ms (%s)" % (ms(kinds["blocked"]), pct(kinds["blocked"])))
+    if kinds["agg"]:
+        parts.append("aggregates %s ms (%s)" % (ms(kinds["agg"]), pct(kinds["agg"])))
+    out.extend(wrap("%s ms on the path: %s" % (ms(total), ", ".join(parts)), width, None, p))
+    pools = []
+    for pool in trace.pool_order():
+        e = by_pool.get(pool)
+        if not e:
+            continue
+        bits = []
+        for k, word in (("wait", "waiting"), ("run", "running"), ("agg", "in aggregates"),
+                        ("blocked", "blocked")):
+            if e[k]:
+                bits.append("%s ms %s" % (ms(e[k]), word))
+        pools.append("%s: %s" % (pool, ", ".join(bits)))
+    out.extend(wrap("by pool: " + "; ".join(pools), width, None, p))
+    out.extend(notices(trace, p, width))
+    return out
+
+
+def _render_left_last(heads, rows, p, styles):
+    widths = [max(len(h), max([len(r[i]) for r in rows] or [0])) for i, h in enumerate(heads)]
+    out = []
+
+    def line(cells, st=None):
+        parts = []
+        for i, c in enumerate(cells):
+            if i == len(cells) - 1:
+                t = c
+            elif i >= len(cells) - 2:
+                t = c.ljust(widths[i])
+            else:
+                t = c.rjust(widths[i])
+            if st and st[i]:
+                t = p.c(t, st[i])
+            parts.append(t)
+        return "  ".join(parts).rstrip()
+
+    out.append(p.c(line(heads), "bold") if p.color else line(heads))
+    for k, r in enumerate(rows):
+        out.append(line(r, styles[k] if styles else None))
+    return out
+
+
+# ---------------------------------------------------------------- diff
+
+def view_diff(a, b, flt, p, width):
+    g = p.g
+    if not a.spans or not b.spans:
+        raise UsageError("cannot diff a trace without spans")
+    ta = {e["key"]: e for e in path_table(a, flt.apply(a)[0])}
+    tb = {e["key"]: e for e in path_table(b, flt.apply(b)[0])}
+    keys = list(ta)
+    keys.extend(k for k in tb if k not in ta)
+    zero = {"count": 0, "sum": 0, "self": 0, "wait": 0, "cpu": 0, "label": None}
+    rows = []
+    for k in keys:
+        x = ta.get(k, zero)
+        y = tb.get(k, zero)
+        d = {f: y[f] - x[f] for f in ("count", "sum", "self", "wait", "cpu")}
+        mag = max(abs(d["sum"]), abs(d["self"]), abs(d["wait"]), abs(d["cpu"]))
+        label = (x["label"] or y["label"]) if k else a.root.name
+        state = "" if (k in ta and k in tb) else ("only B" if k in tb else "only A")
+        rows.append((mag, keys.index(k), label, x, y, d, state))
+    rows.sort(key=lambda r: (-r[0], r[1]))
+    da = a.root.end
+    db = b.root.end
+    out = [p.c("Diff", "bold") + "  A %s %s ms  %s  B %s %s ms  %s  %s %s ms (%s)" % (
+        a.label, ms(da), g["arrow"], b.label, ms(db), g["dot"], g["delta"],
+        ms_signed(db - da), ("%+.1f%%" % (100.0 * (db - da) / da)) if da else "-")]
+    D = g["delta"]
+    heads = ["path", "count A%sB" % g["arrow"], D + "count", D + "sum", D + "self", D + "wait",
+             D + "cpu", "sum A", "sum B", ""]
+    body = []
+    styles = []
+    for mag, _, label, x, y, d, state in rows:
+        body.append([label, "%d%s%d" % (x["count"], g["arrow"], y["count"]),
+                     "%+d" % d["count"], ms_signed(d["sum"]), ms_signed(d["self"]),
+                     ms_signed(d["wait"]), ms_signed(d["cpu"]), ms(x["sum"]), ms(y["sum"]), state])
+        st = [None] * 10
+        for i, f in ((3, "sum"), (4, "self"), (5, "wait"), (6, "cpu")):
+            if d[f] > 0:
+                st[i] = "red"
+            elif d[f] < 0:
+                st[i] = "green"
+        styles.append(st)
+    out.extend(render_table(heads, body, p, left=1, styles=styles))
+    out.extend(wrap("%s = B %s A in ms, sorted by the largest absolute change; red is slower, "
+                    "green faster" % (D, "-" if g is ASCII else "−"), width, "dim", p, ""))
+    return out
+
+
+# ---------------------------------------------------------------- stats
+
+def percentile(values, q):
+    """Nearest-rank percentile of a non-empty list."""
+    v = sorted(values)
+    k = max(0, int(math.ceil(q / 100.0 * len(v))) - 1)
+    return v[k]
+
+
+def view_stats(traces, flt, p, width):
+    g = p.g
+    per = {}
+    order = []
+    roots = {}
+    for t in traces:
+        if not t.spans:
+            continue
+        roots[t.root.name] = roots.get(t.root.name, 0) + 1
+        for e in path_table(t, flt.apply(t)[0]):
+            k = e["key"]
+            if k not in per:
+                per[k] = {"label": e["label"], "n": 0, "count": [],
+                          "sum": [], "self": [], "wait": []}
+                order.append(k)
+            r = per[k]
+            r["n"] += 1
+            for f in ("count", "sum", "self", "wait"):
+                r[f].append(e[f])
+    n = sum(1 for t in traces if t.spans)
+    if "" in per and len(roots) > 1:
+        per[""]["label"] = "(root)"
+    out = [p.c("Stats", "bold") + " over %d trace%s: %s" % (
+        n, "" if n == 1 else "s",
+        ", ".join("%s %s%d" % (k, g["times"], v) for k, v in sorted(roots.items())))]
+    heads = ["path", "traces", "count p50", "sum p50", "p95", "max", "self p50", "p95", "max",
+             "wait p50", "p95", "max"]
+    rows = []
+    styles = []
+    for k in order:
+        r = per[k]
+        row = [r["label"], "%d/%d" % (r["n"], n), _short(percentile(r["count"], 50))]
+        for f in ("sum", "self", "wait"):
+            row.extend([ms(percentile(r[f], 50)), ms(percentile(r[f], 95)), ms(max(r[f]))])
+        rows.append(row)
+        styles.append([None] * 9 + ["yellow" if max(r["wait"]) else None] * 3)
+    out.extend(render_table(heads, rows, p, left=1, styles=styles))
+    out.extend(wrap("ms per trace; percentiles by nearest rank over the traces that contain "
+                    "the path", width, "dim", p, ""))
+    return out
+
+
+# ======================================================================
+# Converters
+# ======================================================================
+
+def to_chrome(trace):
+    """Chrome Trace Event JSON (opens in Perfetto and chrome://tracing)."""
+    ev = []
+    pid = 1
+    root_name = trace.root.name if trace.root else "trace"
+    ev.append({"ph": "M", "pid": pid, "tid": 0, "name": "process_name", "args": {"name": root_name}})
+    tids = {}
+    for i, t in enumerate(trace.threads):
+        tids[("t", i)] = i + 1
+        ev.append({"ph": "M", "pid": pid, "tid": i + 1, "name": "thread_name", "args": {"name": t}})
+        ev.append({"ph": "M", "pid": pid, "tid": i + 1, "name": "thread_sort_index",
+                   "args": {"sort_index": i}})
+    nxt = len(trace.threads) + 1
+    for s in trace.spans:
+        if s.lane[0] == "mixed":
+            key = ("agg", s.id)
+            tids[key] = nxt
+            ev.append({"ph": "M", "pid": pid, "tid": nxt, "name": "thread_name",
+                       "args": {"name": "%s-* %s ×%d" % (s.pool, s.name, s.agg["count"])}})
+            ev.append({"ph": "M", "pid": pid, "tid": nxt, "name": "thread_sort_index",
+                       "args": {"sort_index": nxt}})
+            nxt += 1
+
+    def tid_of(s):
+        if s.lane[0] == "mixed":
+            return tids[("agg", s.id)]
+        if s.thread >= 0:
+            return tids[("t", s.thread)]
+        return 0
+
+    for s in trace.spans:
+        args = {"path": s.path, "id": s.id}
+        if s.handoff:
+            args["wait_us"] = s.wait
+        if s.cpu is not None:
+            args["cpu_us"] = s.cpu
+        if s.flags:
+            args["flags"] = s.flags
+        if s.attrs:
+            args["attrs"] = s.attrs
+        if s.agg:
+            args["agg"] = s.agg
+        cat = "aggregate" if s.agg else ("handoff" if s.handoff else "span")
+        if s.not_run:
+            e = None
+        elif s.agg:
+            e = {"ph": "X", "pid": pid, "tid": tid_of(s), "ts": s.start, "dur": s.agg["extent"],
+                 "name": "%s ×%d" % (s.name, s.agg["count"]), "cat": cat, "args": args}
+        else:
+            e = {"ph": "X", "pid": pid, "tid": tid_of(s), "ts": s.run_start, "dur": s.dur,
+                 "name": s.name, "cat": cat, "args": args}
+        if e is not None:
+            if "f" in s.flags:
+                e["cname"] = "terrible"
+            ev.append(e)
+        if (s.not_run or (s.handoff and not s.agg)) and s.parent is not None:
+            src = tid_of(s.parent)
+            qid = "q%d" % s.id
+            qname = "%s (%s)" % (span_label(s, UNI), "never started" if s.not_run else "queued")
+            ev.append({"ph": "b", "pid": pid, "tid": src, "ts": s.start, "id": qid, "cat": "queue",
+                       "name": qname, "args": args})
+            ev.append({"ph": "e", "pid": pid, "tid": src, "ts": s.end if s.not_run else s.run_start,
+                       "id": qid, "cat": "queue", "name": qname})
+            if not s.not_run:
+                ev.append({"ph": "s", "pid": pid, "tid": src, "ts": s.start, "id": s.id,
+                           "cat": "handoff", "name": "handoff"})
+                ev.append({"ph": "f", "bp": "e", "pid": pid, "tid": tid_of(s), "ts": s.run_start,
+                           "id": s.id, "cat": "handoff", "name": "handoff"})
+    other = {"source": "tempo", "label": trace.label, "folded": trace.folded,
+             "dropped": trace.dropped, "truncated": trace.truncated}
+    if trace.wall is not None:
+        other["wall_ms"] = trace.wall
+    return json.dumps({"traceEvents": ev, "displayTimeUnit": "ms", "otherData": other},
+                      ensure_ascii=False, indent=None, separators=(",", ":")) + "\n"
+
+
+def to_folded(trace):
+    """Collapsed stacks: `root;child;leaf <self µs>` (thread time, queue waits excluded)."""
+    totals = {}
+    order = []
+    stacks = {}
+    for s in trace.spans:
+        frame = s.name.replace(";", ":").replace("\n", " ")
+        stacks[s.id] = frame if s.parent is None else stacks[s.parent.id] + ";" + frame
+        v = s.self_time
+        if v <= 0:
+            continue
+        k = stacks[s.id]
+        if k not in totals:
+            totals[k] = 0
+            order.append(k)
+        totals[k] += v
+    return "".join("%s %d\n" % (k, totals[k]) for k in order)
+
+
+# ======================================================================
+# Command line
+# ======================================================================
+
+class UsageError(Exception):
+    pass
+
+
+EPILOG = """\
+input:
+  curl -si "$URL" | tempo            the Tempo-Trace line of curl -i output
+  pbpaste | tempo --tree             a bare value (v1;...), wrapped lines are fine
+  tempo response.json                JSON with a tempo object anywhere
+  Quote a value on the command line or pipe it: ; * ~ ^ are shell syntax.
+
+views (default: lanes per thread, grouped into pools):
+  --tree, --agg, --pools, --findings, --critical, --diff OTHER, --stats FILES...
+
+exit status: 0 ok, 1 malformed or (with --check) truncated input, 2 usage error.
+"""
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="tempo", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Read Tempo-Trace values in the terminal (format: FORMAT.md).",
+        epilog=EPILOG)
+    ap.add_argument("inputs", nargs="*", metavar="FILE",
+                    help="input files; none or '-' reads stdin")
+    v = ap.add_argument_group("views").add_mutually_exclusive_group()
+    v.add_argument("--tree", action="store_true",
+                   help="indented tree: start, wait, duration, self, cpu, off-cpu, attributes")
+    v.add_argument("--agg", action="store_true",
+                   help="per path: count, sum, self, min, max, wait sum/max, cpu")
+    v.add_argument("--pools", action="store_true",
+                   help="this request's share of each pool over time, with submit gauges")
+    v.add_argument("--findings", action="store_true",
+                   help="stragglers, never started, open, failed, queue waits, off-CPU")
+    v.add_argument("--critical", action="store_true",
+                   help="critical path across handoffs, wait vs run per hop")
+    v.add_argument("--diff", metavar="OTHER",
+                   help="per-path change from the input (A) to OTHER (B)")
+    v.add_argument("--stats", nargs="*", metavar="FILE",
+                   help="per-path count and p50/p95/max of sum, self, wait over many traces")
+    v.add_argument("--to", choices=["json", "chrome", "folded"],
+                   help="convert: JSON form, Chrome trace events (Perfetto), collapsed stacks")
+    v.add_argument("--check", action="store_true",
+                   help="validate only; exit 1 on a malformed or truncated value")
+    f = ap.add_argument_group("filters")
+    f.add_argument("--threads", metavar="REGEX", help="only spans on threads matching REGEX")
+    f.add_argument("--focus", metavar="PATH",
+                   help="only the subtree(s) at PATH, e.g. rerank or rerank/load")
+    f.add_argument("--depth", type=int, metavar="N", help="at most N levels below the root/focus")
+    f.add_argument("--min-ms", type=float, metavar="X",
+                   help="hide spans (and their subtrees) shorter than X ms")
+    o = ap.add_argument_group("layout")
+    o.add_argument("--width", type=int, metavar="N", help="output width (default: terminal)")
+    o.add_argument("--no-color", action="store_true", help="no ANSI colours (also NO_COLOR)")
+    o.add_argument("--color", action="store_true", help="ANSI colours even when not a terminal")
+    o.add_argument("--ascii", action="store_true", help="ASCII instead of Unicode block characters")
+    ap.add_argument("--version", action="version", version="tempo " + VERSION)
+    return ap
+
+
+def _read(name, stdin):
+    if name == "-":
+        data = stdin.read()
+        if isinstance(data, bytes):
+            data = data.decode("utf-8", "replace")
+        return data
+    with open(name, "rb") as fh:
+        return fh.read().decode("utf-8", "replace")
+
+
+def run(argv, stdin=None, stdout=None, stderr=None, env=None, isatty=None):
+    """Entry point; returns the exit status. Streams and environment are injectable for tests."""
+    stdin = stdin if stdin is not None else getattr(sys.stdin, "buffer", sys.stdin)
+    stdout = stdout if stdout is not None else sys.stdout
+    stderr = stderr if stderr is not None else sys.stderr
+    env = os.environ if env is None else env
+    if isatty is None:
+        isatty = hasattr(stdout, "isatty") and stdout.isatty()
+    ap = build_parser()
+    try:
+        args = ap.parse_args(argv)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 2
+
+    def err(msg):
+        stderr.write("tempo: %s\n" % msg)
+
+    color = False
+    if args.color:
+        color = True
+    elif not args.no_color and not env.get("NO_COLOR") and env.get("TERM") != "dumb":
+        color = isatty
+    if args.no_color:
+        color = False
+    if args.width:
+        width = args.width
+    elif isatty:
+        width = shutil.get_terminal_size((100, 24)).columns
+    else:
+        try:
+            width = int(env.get("COLUMNS") or 100)
+        except ValueError:
+            width = 100
+    width = max(40, width)
+    p = Painter(color, args.ascii)
+    try:
+        flt = Filter(args.threads, args.focus, args.depth, args.min_ms)
+    except re.error as e:
+        err("bad --threads expression: %s" % e)
+        return 2
+
+    names = list(args.inputs)
+    if args.stats is not None:
+        names.extend(args.stats)
+    if not names:
+        if hasattr(sys.stdin, "isatty") and stdin is getattr(sys.stdin, "buffer", None) and sys.stdin.isatty():
+            err("no input: pipe a trace in or name a file (tempo --help)")
+            return 2
+        names = ["-"]
+
+    loaded = []
+    for name in names:
+        try:
+            text = _read(name, stdin)
+        except (IOError, OSError) as e:
+            err("%s: %s" % (name, e.strerror or e))
+            return 1
+        loaded.extend(load_text(text, "stdin" if name == "-" else name))
+
+    if args.check:
+        status = 0
+        for label, t in loaded:
+            if isinstance(t, Exception):
+                err("%s: %s" % (label, t))
+                status = 1
+            elif t.truncated:
+                err("%s: truncated: the value was cut (%d spans survive)" % (label, len(t.spans)))
+                status = 1
+            else:
+                stdout.write("ok  %s: %d spans, %d threads%s\n" % (
+                    label, len(t.spans), len(t.threads),
+                    (", %d folded, %d dropped" % (t.folded, t.dropped)) if (t.folded or t.dropped) else ""))
+        return status
+
+    if args.stats is not None:
+        traces = []
+        status = 0
+        for label, t in loaded:
+            if isinstance(t, Exception):
+                err("%s: %s (skipped)" % (label, t))
+                status = 1
+            else:
+                traces.append(t)
+        if not traces:
+            err("no valid traces")
+            return 1
+        lines = view_stats(traces, flt, p, width)
+        stdout.write("\n".join(line.rstrip(" ") for line in lines) + "\n")
+        return status
+
+    label, trace = loaded[0]
+    if isinstance(trace, Exception):
+        err("%s: %s" % (label, trace))
+        return 1
+    if len(loaded) > 1:
+        err("%s: %d traces found, showing the first (--stats reads all)" % (label, len(loaded)))
+    try:
+        if args.to == "json":
+            stdout.write(dump_json(trace.doc))
+            return 0
+        if args.to == "chrome":
+            stdout.write(to_chrome(trace))
+            return 0
+        if args.to == "folded":
+            stdout.write(to_folded(trace))
+            return 0
+        if args.diff:
+            try:
+                other = load_text(_read(args.diff, stdin), args.diff)
+            except (IOError, OSError) as e:
+                err("%s: %s" % (args.diff, e.strerror or e))
+                return 1
+            olabel, otrace = other[0]
+            if isinstance(otrace, Exception):
+                err("%s: %s" % (olabel, otrace))
+                return 1
+            lines = view_diff(trace, otrace, flt, p, width)
+        elif args.tree:
+            lines = view_tree(trace, flt, p, width)
+        elif args.agg:
+            lines = view_agg(trace, flt, p, width)
+        elif args.pools:
+            lines = view_pools(trace, flt, p, width)
+        elif args.findings:
+            lines = view_findings(trace, flt, p, width)
+        elif args.critical:
+            lines = view_critical(trace, flt, p, width)
+        else:
+            lines = view_lanes(trace, flt, p, width)
+    except UsageError as e:
+        err(str(e))
+        return 2
+    stdout.write("\n".join(line.rstrip(" ") for line in "\n".join(lines).split("\n")) + "\n")
+    return 0
+
+
+def main():
+    try:
+        code = run(sys.argv[1:])
+        sys.stdout.flush()
+    except BrokenPipeError:
+        try:
+            sys.stdout = None
+        finally:
+            code = 0
+    except KeyboardInterrupt:
+        code = 130
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main()

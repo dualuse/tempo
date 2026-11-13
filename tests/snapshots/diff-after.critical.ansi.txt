@@ -1,0 +1,37 @@
+[1mCritical path[0m  ·  GET /search  ·  100.496 ms  ·  2026-11-13 09:02:46.299 UTC  ·  58 spans on 13 threads
+[2mthe chain of spans that determined the end time, walking back from the root's end through handoffs[0m
+[1m   from       to   wait     run  blocked  thread  span[0m
+  0.000    0.291  [33m     [0m   0.291  [34m       [0m  http-3  GET /search
+  0.291    4.551  [33m     [0m   4.260  [34m       [0m  http-3  decode
+  4.551    4.566  [33m     [0m   0.015  [34m       [0m  http-3  GET /search
+  4.566    5.996  [33m     [0m   1.430  [34m       [0m  http-3  scale
+  5.996    6.011  [33m     [0m   0.015  [34m       [0m  http-3  GET /search
+  6.011    6.019  [33m     [0m   0.008  [34m       [0m  http-3  describe
+  6.019   26.796  [33m7.392[0m  13.385  [34m       [0m  cpu-5   describe/infer
+ 26.796   26.806  [33m     [0m   0.010  [34m       [0m  http-3  describe
+ 26.806   27.586  [33m     [0m   0.780  [34m       [0m  http-3  describe/fingerprint
+ 27.586   27.596  [33m     [0m   0.010  [34m       [0m  http-3  describe
+ 27.596   27.611  [33m     [0m   0.015  [34m       [0m  http-3  GET /search
+ 27.611   27.617  [33m     [0m   0.006  [34m       [0m  http-3  index
+ 27.617   36.612  [33m     [0m   8.995  [34m       [0m  io-5    index/query
+ 36.612   37.120  [33m     [0m   0.508  [34m       [0m  http-3  index
+ 37.120   37.135  [33m     [0m   0.015  [34m       [0m  http-3  GET /search
+ 37.135   37.144  [33m     [0m   0.009  [34m       [0m  http-3  rerank
+ 37.144   38.298  [33m     [0m   1.154  [34m       [0m  io-5    [31mrerank/load[0m
+ 38.298   38.304  [33m     [0m          [34m  0.006[0m  http-3  rerank
+ 38.304   46.614  [33m4.478[0m   3.832  [34m       [0m  io-4    rerank/load
+ 46.614   46.620  [33m     [0m          [34m  0.006[0m  http-3  rerank
+ 46.620   50.563  [33m2.358[0m   1.585  [34m       [0m  io-3    rerank/load
+ 50.563   50.569  [33m     [0m          [34m  0.006[0m  http-3  rerank
+ 50.569   73.137  [33m     [0m  22.568  [34m       [0m  io-*    rerank/load ×23 (aggregate: extent; per-occurrence wait not on the wire)
+ 73.137   98.901  [33m     [0m   3.258  [34m 22.506[0m  http-3  rerank
+ 98.901   98.916  [33m     [0m   0.015  [34m       [0m  http-3  GET /search
+ 98.916  100.466  [33m     [0m   1.550  [34m       [0m  http-3  encode
+100.466  100.496  [33m     [0m   0.030  [34m       [0m  http-3  GET /search
+
+100.496 ms on the path: run 41.176 ms (41.0%), queue wait 14.228 ms (14.2%), blocked 22.524 ms (22.4%),
+    aggregates 22.568 ms (22.5%)
+by pool: http: 12.225 ms running, 22.524 ms blocked; cpu: 7.392 ms waiting, 13.385 ms running; io: 6.836 ms
+    waiting, 15.566 ms running, 22.568 ms in aggregates
+[33mx=: 53 spans folded into aggregates, 0 dropped (not on the wire)[0m
+[35ml=: lanes live at render: cpu-1 (their records are best effort)[0m

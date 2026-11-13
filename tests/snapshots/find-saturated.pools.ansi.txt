@@ -1,0 +1,22 @@
+[1mPools[0m  ·  GET /search  ·  151.649 ms  ·  2026-11-13 09:01:27.109 UTC  ·  63 spans on 13 threads
+[2mthis request's share of each pool; gauges are the pool's queue depth and active count at submit (all requests)[0m
+[2m                   ms [0m[2m0          20          40         60          80          100        120         140[0m
+                      [2m┬──────────┬───────────┬──────────┬───────────┬───────────┬──────────┬───────────┬──────[0m
+[1mcpu[0m
+[2m  running ≤5.1[0m                   [36m▁▂▅▅▅▅▅▅▅▅▅▄▂▁[0m        [36m▁▂▂▂▂▂▂▂▂▂▂▂▂▂▃▄▂▂▄▅▇██▇▇▇▇▇▇▆▅▅▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂[0m
+[2m  queued ≤42.4[0m           [33m▁▁▁▁▁▁▁▁▁▁▁[0m                [33m▁▂▃▅▆▆▆▆▆▆▇█████████████▇▇▇▇▆▆▆▆▆▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▃[0m
+[2m  queued@submit ≤56[0m      [35m▂[0m                          [35m▃▄▅▅[0m     [35m█[0m
+[2m  active@submit ≤4[0m       [35m█[0m                          [35m████[0m     [35m█[0m
+[1mio[0m
+[2m  running ≤8[0m                                  [36m▂▃▂▁▁▄█▇▆▆▇▆▄▃▃▃▃▃▃▃▂[0m
+[2m  queued ≤8.7[0m                                      [33m▂▃▅▆█▇▆▆▆▆▆▆▆▆▆▅[0m
+[2m  queued@submit ≤5[0m                            [2m▁[0m    [35m▅▅███[0m
+[2m  active@submit ≤8[0m                            [35m▅[0m    [35m█████[0m
+
+[1mpool  threads  tasks   run ms   wait ms  wait max   cpu ms  off-cpu  peak run  peak q  q@submit  a@submit[0m
+cpu       4/4     51  224.522  3016.975    81.815  218.262    6.260       5.1    42.4        56         4
+io        8/8     51  119.529   119.018     5.989    8.491  111.038         8     8.7         5         8
+[2mthreads: seen running this request's tasks / in the thread table. peak: most at once (aggregates count as[0m
+[2mtheir average).[0m
+[33mx=: 53 spans folded into aggregates, 0 dropped (not on the wire)[0m
+[35ml=: lanes live at render: cpu-1 (their records are best effort)[0m

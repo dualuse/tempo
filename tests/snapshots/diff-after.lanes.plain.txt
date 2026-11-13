@@ -1,0 +1,31 @@
+GET /search  ·  100.496 ms  ·  2026-11-13 09:02:46.299 UTC  ·  58 spans on 13 threads
+            ms 0                 20                 40                 60                 80
+               ┬─────────────────┬──────────────────┬──────────────────┬──────────────────┬──────────────────┬
+http
+  http-3       GET /search████████████████████████████████████████████████████████████████████████████████████
+               de…█▓▓describe████████████index▓▓▓▓rerank████████████████████████████████████████████████████ █
+                     await──────────────█await────await──────────────────────────────────────────────────
+cpu
+  cpu-1 ●                                            ░░░░███                  ░░░░░░░░░░░░░░░░░░░░░░░░░░match▶
+  cpu-2                                                     ░░mat…█
+  cpu-3
+  cpu-4              ░░infer██████████               ░░███mat…▓ma…█▓▓ma…█
+  cpu-5              ░░░░░░░infer███████            ░ma…█mat…▓███▓▓░░match█
+  cpu-6                                              ░match██match▓▓
+  (mixed)                                                      ▚▚▚▚▚▚┃match ×26▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚
+  (queued)                                                                    match ×4░░░░░░░░░░░░░░░░░░⊘
+  queued ≤15.1      ▁▂▂▁▁▁▁▁                        ▁▂▂▂▃▂▁▂▃▃▄███▇▇▇▆▆▆▆▆▆▆▆▆███████████████████████████▇▆▆▆▂
+io
+  io-1                                            ░██          ░██
+  io-2                                            ██lo…▓░░░█▓▓▓███░░█✗  ░█✗
+  io-3                                            ░░██░░lo…█▓██
+  io-4                                   ███      ███░░lo…█lo…▓
+  io-5                                   query████✗██░░░░load██▓███
+  io-6                                            lo…█░░░░░██lo…▓█
+  (mixed)                                                      ▚▚▚▚┃load ×23▚▚▚▚▚▚▚▚
+  queued ≤7                                       ▄▄▄▆███▇▆▄▅▄▄▆▃▃▃▃▃▃▃▃▄▃▃▃▃▃▃▃▃▃▃▃▁
+
+█ run  ░ queue wait  ─ blocking wait  ▚ aggregate ×count, ┃ slowest  ✗ failed  ⊘ cancelled  ▶ open
+∅ never started  ● live lane  ▄ this request's queued handoffs
+x=: 53 spans folded into aggregates, 0 dropped (not on the wire)
+l=: lanes live at render: cpu-1 (their records are best effort)
