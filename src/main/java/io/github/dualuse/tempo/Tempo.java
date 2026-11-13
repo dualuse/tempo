@@ -283,13 +283,14 @@ public final class Tempo {
         static final int IDLE = 0, ACTIVE = 1, RETIRED = 2;
         static final long OPEN = Long.MIN_VALUE;
 
-        private static final VarHandle COMMIT, STATE, DUR = MethodHandles.arrayElementVarHandle(long[].class);
+        private static final VarHandle COMMIT, STATE, LABELS, DUR = MethodHandles.arrayElementVarHandle(long[].class);
 
         static {
             try {
                 MethodHandles.Lookup l = MethodHandles.lookup();
                 COMMIT = l.findVarHandle(Lane.class, "commit", long.class);
                 STATE = l.findVarHandle(Lane.class, "state", int.class);
+                LABELS = l.findVarHandle(Lane.class, "labels", String[].class);
             } catch (ReflectiveOperationException e) {
                 throw new ExceptionInInitializerError(e);
             }
@@ -318,9 +319,10 @@ public final class Tempo {
         long[] mark;
         int[] lastPhase, lapOrdinal;
 
-        // Legacy labels, referenced by LABEL events. Grown by copy; a reader reads the array after the
-        // commit, so it sees a copy holding every label that commit exposes.
-        String[] labels;
+        // Legacy labels, referenced by LABEL events. Grown by copy and stored via LABELS.setRelease, so a
+        // reader that acquires the commit and then the array sees every label that commit exposes, even
+        // in a copy stored after that commit. The owner reads the field plainly.
+        private String[] labels;
         int labelCount;
 
         @SuppressWarnings("unused") // via COMMIT: (rowCount << 32) | eventCount
@@ -532,8 +534,8 @@ public final class Tempo {
             rows[r >>> CHUNK_BITS].flags[r & MASK] |= flags;
             if (label == null || eventCount == MAX_EVENTS) return;
             String[] t = labels;
-            if (t == null) labels = t = new String[8];
-            else if (labelCount == t.length) labels = t = Arrays.copyOf(t, 2 * labelCount);
+            if (t == null) LABELS.setRelease(this, t = new String[8]);
+            else if (labelCount == t.length) LABELS.setRelease(this, t = Arrays.copyOf(t, 2 * labelCount));
             t[labelCount] = label;
             append(r, LABEL, labelCount++);
         }
@@ -657,7 +659,7 @@ public final class Tempo {
             int[] order = new int[from[nRows]], fill = Arrays.copyOf(from, nRows);
             for (int e = 0; e < nEvents; e++)
                 if (isAttribute(e)) order[fill[events[e >>> CHUNK_BITS].row[e & MASK]]++] = e;
-            String[] text = labelOf == null ? null : labels;
+            String[] text = labelOf == null ? null : (String[]) LABELS.getAcquire(this);
 
             // Child lists, row order within a parent; index nRows is a virtual parent of the lane roots.
             // A RETRO lap adopts the run of preceding siblings that started at or after it, back to the

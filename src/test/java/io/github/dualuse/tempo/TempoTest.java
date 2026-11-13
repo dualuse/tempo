@@ -876,6 +876,33 @@ class TempoTest {
         for (int i = 0; i < 20; i++) assertEquals(i + ":load #" + i, labels.get(i + 1));
     }
 
+    /** A render racing the label table's growth never sees a committed lap without its label (stress, weak memory). */
+    @Test
+    void liveRenderSeesEveryCommittedLabel() throws Exception {
+        String[] text = new String[64];
+        for (int i = 0; i < text.length; i++) text[i] = "load #" + i;
+        AtomicReference<Trace> live = new AtomicReference<>();
+        AtomicReference<String> bad = new AtomicReference<>();
+        Thread owner = new Thread(() -> {
+            for (int round = 0; round < 20000 && bad.get() == null; round++) {
+                Trace t = Tempo.start(SEARCH, opts());
+                live.set(t);
+                for (String s : text) t.root().done(LOAD, s);
+                t.close();
+            }
+            live.set(null);
+        });
+        owner.start();
+        while (owner.isAlive()) {
+            Trace t = live.get();
+            if (t != null) t.forEachSpan(v -> {
+                if (v.retro() && v.label() == null) bad.set("lap " + v.id() + " rendered without its label");
+            });
+        }
+        owner.join();
+        assertNull(bad.get());
+    }
+
     @Test
     void legacyAndPhaseSetNeedAPhaseOrLap() {
         try (Trace t = Tempo.start(SEARCH, opts())) {
