@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "unit": "us",
+  "folded": 0,
+  "dropped": 0,
+  "threads": ["main"],
+  "live": [],
+  "truncated": true,
+  "spans": []
+}

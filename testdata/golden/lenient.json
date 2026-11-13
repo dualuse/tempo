@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "unit": "us",
+  "wall": 1794567890135,
+  "folded": 0,
+  "dropped": 0,
+  "threads": ["http-1", "io-1"],
+  "live": [],
+  "truncated": false,
+  "spans": [
+    {"id":0,"parent":-1,"name":"GET /search","start":0,"dur":2000,"thread":0},
+    {"id":1,"parent":0,"name":"load","start":10,"dur":500,"thread":0,"flags":"fo","attrs":{"k":0}},
+    {"id":2,"parent":0,"name":"load","start":20,"dur":500,"thread":1,"wait":10,"flags":"f"}
+  ]
+}

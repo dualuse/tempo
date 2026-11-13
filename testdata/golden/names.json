@@ -1,0 +1,21 @@
+{
+  "v": 1,
+  "unit": "us",
+  "wall": 1794567890132,
+  "folded": 0,
+  "dropped": 0,
+  "threads": ["pool 1-worker", "Ölmühle-2", "io_3"],
+  "live": [],
+  "truncated": false,
+  "spans": [
+    {"id":0,"parent":-1,"name":"GET /search","start":0,"dur":9000,"thread":0,"attrs":{"bytes read":512,"snake_case":1}},
+    {"id":1,"parent":0,"name":"Größe","start":10,"dur":1000,"thread":0},
+    {"id":2,"parent":0,"name":"日本語","start":1100,"dur":1000,"thread":1},
+    {"id":3,"parent":0,"name":"🚀 launch","start":2200,"dur":1000,"thread":2},
+    {"id":4,"parent":0,"name":"?","start":3300,"dur":100,"thread":0},
+    {"id":5,"parent":0,"name":"a.b-c","start":3400,"dur":100,"thread":0},
+    {"id":6,"parent":0,"name":"100%","start":3500,"dur":100,"thread":0},
+    {"id":7,"parent":0,"name":"x:y;z/w=v","start":3600,"dur":100,"thread":0},
+    {"id":8,"parent":0,"name":"snake_case","start":3700,"dur":100,"thread":0}
+  ]
+}

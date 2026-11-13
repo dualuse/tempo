@@ -1,0 +1,21 @@
+{
+  "v": 1,
+  "unit": "us",
+  "wall": 1794567890130,
+  "folded": 481,
+  "dropped": 0,
+  "threads": ["http-2", "cpu-1", "cpu-2", "io-1"],
+  "live": [],
+  "truncated": false,
+  "spans": [
+    {"id":0,"parent":-1,"name":"search","start":0,"dur":200000,"thread":0},
+    {"id":1,"parent":0,"name":"rerank","start":500,"dur":190000,"thread":0},
+    {"id":2,"parent":1,"name":"load","start":600,"dur":2000,"thread":3,"wait":10},
+    {"id":3,"parent":1,"name":"load","start":650,"dur":3000,"thread":3,"wait":1950},
+    {"id":4,"parent":1,"name":"load","start":5000,"dur":70000,"thread":3,"cpu":4000,"agg":{"count":40,"min":900,"max":4500,"extent":90000,"maxAt":41000,"waitSum":9000,"waitMax":700}},
+    {"id":5,"parent":1,"name":"match","start":5100,"dur":150000,"thread":-1,"cpu":148000,"flags":"f","agg":{"count":40,"min":2000,"max":9000,"extent":120000,"maxAt":7000,"waitSum":30000,"waitMax":2500}},
+    {"id":6,"parent":1,"name":"score","start":5200,"dur":800,"thread":0,"attrs":{"hits":12},"agg":{"count":400,"min":1,"max":9,"extent":180000,"maxAt":179000}},
+    {"id":7,"parent":1,"name":"match","start":6000,"dur":9000,"thread":1,"agg":{"count":1,"min":9000,"max":9000,"extent":9100,"maxAt":0,"waitSum":100,"waitMax":100}},
+    {"id":8,"parent":0,"name":"encode","start":191000,"dur":8000,"thread":0}
+  ]
+}

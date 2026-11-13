@@ -1,0 +1,14 @@
+{
+  "v": 1,
+  "unit": "us",
+  "wall": 1794567890134,
+  "folded": 0,
+  "dropped": 0,
+  "threads": ["main"],
+  "live": [],
+  "truncated": true,
+  "spans": [
+    {"id":0,"parent":-1,"name":"search","start":0,"dur":2000,"thread":0},
+    {"id":1,"parent":0,"name":"decode","start":10,"dur":500,"thread":0}
+  ]
+}
