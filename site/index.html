@@ -880,6 +880,11 @@ const TempoParse = (function () {
 
   const HEADER_LINE_RE = /^\s*(?:[<>]\s*)?tempo-trace\s*:(.*)$/i;
   const COMPLETE_RE = /;e=[0-9a-z]+$/;
+  // The next HTTP header after a cut value ("content-type: application/json", "< Server: x"):
+  // a token, a colon, a space, then the field value. Terminal wraps never put a space inside a
+  // value, so a line of this shape always ends the value instead of continuing it. (A wrapped
+  // piece that merely ends in ":" plus trailing padding still continues.)
+  const HEADER_FIELD_RE = /^\s*(?:[<>]\s*)?[!#$%&'*+.^_`|~0-9A-Za-z-]+:[ \t]+\S/;
 
   function collectJson(x, out) {
     if (Array.isArray(x)) { for (const y of x) collectJson(y, out); return; }
@@ -918,7 +923,7 @@ const TempoParse = (function () {
       const s = stripWs(line);
       if (cur) {
         const done = COMPLETE_RE.test(cur.value);
-        if (s && PURE_RE.test(s) && !s.startsWith("v1;") && (!done || /^[0-9a-z]+$/.test(s))) { cur.value += s; continue; }
+        if (s && PURE_RE.test(s) && !s.startsWith("v1;") && !HEADER_FIELD_RE.test(line) && (!done || /^[0-9a-z]+$/.test(s))) { cur.value += s; continue; }
         flush();
       }
       if (s.startsWith("v1;")) cur = { source: "value", value: s };

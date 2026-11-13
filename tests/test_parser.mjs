@@ -144,7 +144,29 @@ for (const [label, input, n] of jsonCases) {
   const ok = items.length === n && items.every((it) => it.doc && same(P.load(it).doc, exampleDoc));
   check("extract " + label, ok, JSON.stringify(items.map((i) => i.source)));
 }
-check("extract empty input", P.extractTraces("  \n ").length === 0);
+// a header cut in transit (no ;e=) followed by another header in curl -i output: the next header
+// ends the value instead of being glued on as a wrapped continuation
+const small = P.stripWs(read("samples/small.header"));
+const smallCut = small.slice(0, Math.floor(small.length * 0.7));
+const cutCases = [
+  ["cut header, then lowercase header (HTTP/2)", "HTTP/2 200 \r\ntempo-trace: " + smallCut + "\r\ncontent-type: application/json\r\n\r\n{}\n"],
+  ["cut header, then Content-Type (HTTP/1.1)", "HTTP/1.1 200 OK\nTempo-Trace: " + smallCut + "\nContent-Type: application/json\n\n{}\n"],
+  ["cut wrapped header, then header", "HTTP/1.1 200 OK\nTempo-Trace: " + wrap(smallCut, 41) + "\nx-request-id: 7f3a\nContent-Length: 2\n\n{}\n"],
+  ["cut header, then header (curl -v)", "< HTTP/1.1 200 OK\n< Tempo-Trace: " + smallCut + "\n< Content-Type: application/json\n<\n{}"],
+  ["cut header as the last header", "HTTP/1.1 200 OK\nTempo-Trace: " + smallCut + "\n\n{}\n"]
+];
+for (const [label, input] of cutCases) {
+  let got;
+  try { got = P.extractTraces(input).map(P.load); } catch (e) { check("extract " + label, false, "threw " + e.message); continue; }
+  check("extract " + label, got.length === 1 && got[0].header === smallCut && got[0].doc.truncated === true,
+    JSON.stringify(got.map((t) => [t.header.length, t.doc.truncated])));
+}
+// a wrapped piece that ends in ":" with trailing terminal padding still continues the value
+const colonAt = example.indexOf(":", 40) + 1;
+const colonWrapped = "Tempo-Trace: " + example.slice(0, 30) + "\n" + example.slice(30, colonAt) + "   \n" + example.slice(colonAt) + "\n";
+check("extract wrap ending in a colon plus padding", colonAt > 30 && same(P.extractTraces(colonWrapped).map((t) => t.header), [example]));
+
+check("extract empty input",P.extractTraces("  \n ").length === 0);
 check("extract garbage reports E_VERSION", codeOf(() => P.extractTraces("hello world").map((t) => P.load(t))) === "E_VERSION");
 check("extract JSON without trace reports E_INPUT", codeOf(() => P.extractTraces("{\"a\": 1}")) === "E_INPUT");
 check("load JSON form re-encodes to the canonical header", P.load({ doc: exampleDoc }).header === example);
