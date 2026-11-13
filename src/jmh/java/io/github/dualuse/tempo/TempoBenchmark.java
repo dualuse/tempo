@@ -103,6 +103,18 @@ public class TempoBenchmark {
         return parent.span(CHILD);
     }
 
+    /** One boundary: ends the previous phase and opens the next at a single clock read. */
+    @Benchmark
+    public Tempo.Span phase(Cycling s) {
+        return s.root().phase(CHILD);
+    }
+
+    /** One label-after lap from the last boundary to now. */
+    @Benchmark
+    public Tempo.Span done(Cycling s) {
+        return s.root().done(CHILD);
+    }
+
     @Benchmark
     public void setLong(Cycling s) {
         s.root().set(KEY, 42L);

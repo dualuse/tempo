@@ -27,7 +27,7 @@ public final class AllocationGate {
 
     public static void main(String[] args) throws RunnerException {
         Iterable<RunResult> results = new Runner(new OptionsBuilder()
-                .include(TempoBenchmark.class.getName() + "\\.(span|spanNotInlined|setLong|detailDisabled|traceLifecycle)$")
+                .include(TempoBenchmark.class.getName() + "\\.(span|spanNotInlined|phase|done|setLong|detailDisabled|traceLifecycle)$")
                 .addProfiler(GCProfiler.class)
                 .forks(1)
                 .warmupIterations(3).warmupTime(TimeValue.seconds(1))
@@ -57,8 +57,8 @@ public final class AllocationGate {
                 ok &= check(e.getKey(), byCycle.get(0), PER_OP, " B/op");
             }
         }
-        if (norm.size() != 5) {
-            System.out.println("FAIL  expected 5 gated benchmarks, ran " + norm.keySet());
+        if (norm.size() != 7) {
+            System.out.println("FAIL  expected 7 gated benchmarks, ran " + norm.keySet());
             ok = false;
         }
         System.exit(ok ? 0 : 1);

@@ -68,12 +68,17 @@ public final class Tempo {
     }
 
     /**
-     * The innermost open span of the calling thread, or {@link #NOOP}. Costs one {@code ThreadLocal}
-     * lookup, so {@code Tempo.current().detail(n)} is not free even when detail is off.
+     * The innermost open span of the calling thread, or {@link #NOOP}. An open phase is not a span of
+     * its own here: inside {@code s.phase(n)} this returns {@code s}, whose new children still nest
+     * under the phase. Costs one {@code ThreadLocal} lookup, so {@code Tempo.current().detail(n)} is
+     * not free even when detail is off.
      */
     public static Span current() {
         Lane l = SLOT.get().current;
-        return l == null || l.depth == 0 ? NOOP : l.handles[l.depth - 1];
+        if (l == null) return NOOP;
+        int d = l.depth - 1;
+        while (d > 0 && l.isPhase(d)) d--;
+        return d < 0 ? NOOP : l.handles[d];
     }
 
     static int clampLevel(int level) {
@@ -306,6 +311,18 @@ public final class Tempo {
         final Span[] handles = new Span[MAX_DEPTH];
         int depth, rowCount, eventCount, dropped;
 
+        // Phase state of the span at depth d, created with the lane's first phase or lap: the time of its
+        // last phase boundary (valid unless lastPhase[d] == NO_PHASE), its last phase or lap row (or
+        // NO_PHASE, DROPPED_PHASE) and the number of boundaries so far.
+        static final int NO_PHASE = -1, DROPPED_PHASE = -2;
+        long[] mark;
+        int[] lastPhase, lapOrdinal;
+
+        // Legacy labels, referenced by LABEL events. Grown by copy; a reader reads the array after the
+        // commit, so it sees a copy holding every label that commit exposes.
+        String[] labels;
+        int labelCount;
+
         @SuppressWarnings("unused") // via COMMIT: (rowCount << 32) | eventCount
         private long commit;
         private volatile int state;
@@ -331,50 +348,194 @@ public final class Tempo {
         }
 
         Span push(Name n, int flags) {
-            int d = depth, r = rowCount;
-            if (d == MAX_DEPTH || r == MAX_ROWS) {
+            Span h = stack(n, flags);
+            if (h != NOOP) {
+                rows[h.row >>> CHUNK_BITS].start[h.row & MASK] = ctx.now(); // read last: the bookkeeping is not timed
+                publish();
+            }
+            return h;
+        }
+
+        /** Opens a row on top of the stack and hands out the depth's handle; the caller sets the start and publishes. */
+        private Span stack(Name n, int flags) {
+            int d = depth;
+            if (d == MAX_DEPTH) {
                 dropped++;
                 return NOOP;
+            }
+            int r = row(n, flags, d == 0 ? -1 : rowAt[d - 1]);
+            if (r < 0) return NOOP;
+            DUR.setOpaque(rows[r >>> CHUNK_BITS].dur, r & MASK, OPEN);
+            rowAt[d] = r;
+            depth = d + 1;
+            if (lastPhase != null) {
+                lastPhase[d] = NO_PHASE;
+                lapOrdinal[d] = 0;
+            }
+            Span h = handles[d];
+            if (h == null) handles[d] = h = new Span(this, ctx, d);
+            h.row = r;
+            return h;
+        }
+
+        /** Writes name, parent and flags of a new row; at the row cap counts a drop and returns -1. */
+        private int row(Name n, int flags, int parent) {
+            int r = rowCount;
+            if (r == MAX_ROWS) {
+                dropped++;
+                return -1;
             }
             Rows c = rows[r >>> CHUNK_BITS];
             if (c == null) rows[r >>> CHUNK_BITS] = c = ROW_POOL.take();
             int i = r & MASK;
             c.name[i] = n.id;
-            c.parent[i] = d == 0 ? -1 : rowAt[d - 1];
+            c.parent[i] = parent;
             c.flags[i] = (short) flags;
-            DUR.setOpaque(c.dur, i, OPEN);
-            rowAt[d] = r;
-            depth = d + 1;
             rowCount = r + 1;
-            Span h = handles[d];
-            if (h == null) handles[d] = h = new Span(this, ctx, d);
-            h.row = r;
-            c.start[i] = ctx.now();
-            publish();
-            return h;
+            return r;
+        }
+
+        /** Sets start and duration of a row that is closed from the moment it is published. */
+        private void closed(int r, long start, long dur) {
+            Rows c = rows[r >>> CHUNK_BITS];
+            c.start[r & MASK] = start;
+            DUR.setOpaque(c.dur, r & MASK, dur < 0 ? 0L : dur);
         }
 
         /** Closes the row at depth {@code d}, healing everything above it first. */
         void close(int d) {
             long now = ctx.now();
-            boolean healed = false;
-            for (int k = depth - 1; k > d; k--) healed |= end(rowAt[k], now, true);
-            end(rowAt[d], now, false);
+            boolean healed = unwind(d, now);
+            end(d, now, false);
             depth = d;
             publish();
             if (d == 0) exitRoot();
             if (healed) ctx.misuse("span closed while a child span was open");
         }
 
-        /** Flags first, duration last (the commit protocol). Returns whether a non-phase row was healed. */
-        private boolean end(int r, long now, boolean heal) {
+        /** Ends every row above depth {@code d}; returns whether one of them was a span healed (phases end normally). */
+        private boolean unwind(int d, long now) {
+            boolean healed = false;
+            for (int k = depth - 1; k > d; k--) healed |= end(k, now, true);
+            depth = d + 1;
+            return healed;
+        }
+
+        /** Ends the row at depth {@code k}: flags first, duration last (the commit protocol). */
+        private boolean end(int k, long now, boolean heal) {
+            int r = rowAt[k];
             Rows c = rows[r >>> CHUNK_BITS];
             int i = r & MASK;
-            boolean healed = heal && (c.flags[i] & PHASE) == 0;
+            boolean phase = (c.flags[i] & PHASE) != 0, healed = heal && !phase;
             if (healed) c.flags[i] |= HEALED;
+            if (phase) mark[k - 1] = now; // however the phase ends, its end is the owner's last boundary
             long dur = now - c.start[i];
             DUR.setOpaque(c.dur, i, dur < 0 ? 0L : dur);
             return healed;
+        }
+
+        boolean isPhase(int d) {
+            int r = rowAt[d];
+            return (rows[r >>> CHUNK_BITS].flags[r & MASK] & PHASE) != 0;
+        }
+
+        // ---- phases and laps (owner thread, the span at depth d is open) ----
+
+        private void laps() {
+            mark = new long[MAX_DEPTH];
+            lapOrdinal = new int[MAX_DEPTH];
+            int[] p = new int[MAX_DEPTH];
+            Arrays.fill(p, NO_PHASE);
+            lastPhase = p;
+        }
+
+        /** Label first: ends whatever is open above depth {@code d} and opens a phase row at one {@code now}. */
+        void phase(int d, Name n, int flags) {
+            if (lastPhase == null) laps();
+            long now = ctx.now();
+            boolean healed = unwind(d, now);
+            mark[d] = now;
+            lapOrdinal[d]++;
+            Span h = stack(n, flags | PHASE);
+            if (h != NOOP) rows[h.row >>> CHUNK_BITS].start[h.row & MASK] = now;
+            lastPhase[d] = h == NOOP ? DROPPED_PHASE : h.row;
+            publish();
+            if (healed) ctx.misuse("phase started while a child span was open");
+        }
+
+        /**
+         * Label after. An open label-first phase ends under its own name; a different {@code n} is kept as
+         * a zero-length misuse row. Otherwise a closed RETRO row covers {@code [mark, now)}; the render
+         * moves the spans opened since {@code mark} under it. {@code n} is null when the caller passed none.
+         */
+        void done(int d, Name n, int flags, String label) {
+            if (lastPhase == null) laps();
+            long now = ctx.now();
+            int p = lastPhase[d];
+            boolean healed, mismatch = false;
+            if (p >= 0 && depth > d + 1 && rowAt[d + 1] == p) {
+                annotate(p, flags, label);
+                healed = unwind(d, now); // ends p and sets mark[d]
+                if (n != null && nameOf(p) != n.id) {
+                    mismatch = true;
+                    int m = row(n, RETRO | PHASE | MISUSE, rowAt[d]);
+                    if (m >= 0) closed(m, now, 0);
+                }
+            } else {
+                healed = unwind(d, now);
+                long from = p == NO_PHASE ? rows[rowAt[d] >>> CHUNK_BITS].start[rowAt[d] & MASK] : mark[d];
+                int lap = n == null ? row(Name.UNKNOWN, RETRO | PHASE | MISUSE | flags, rowAt[d])
+                        : row(n, RETRO | PHASE | flags, rowAt[d]);
+                if (lap >= 0) {
+                    closed(lap, from, now - from);
+                    annotate(lap, 0, label);
+                }
+                lastPhase[d] = lap >= 0 ? lap : DROPPED_PHASE;
+                mark[d] = now;
+                lapOrdinal[d]++;
+            }
+            publish();
+            if (healed) ctx.misuse("lap ended while a child span was open");
+            if (mismatch) ctx.misuse("done(" + n + ") while phase " + Name.byId(nameOf(p)) + " is open");
+        }
+
+        void legacy(int d) {
+            int p = lastPhase(d, "legacy()");
+            if (p < 0) return;
+            rows[p >>> CHUNK_BITS].flags[p & MASK] |= LEGACY;
+            publish();
+        }
+
+        void phaseSet(int d, int key, long value) {
+            int p = lastPhase(d, "phaseSet()");
+            if (p < 0) return;
+            append(p, key, value);
+            publish();
+        }
+
+        /** The open phase or last lap of the span at depth {@code d}; none is misuse, a dropped one is not. */
+        private int lastPhase(int d, String call) {
+            int p = lastPhase == null ? NO_PHASE : lastPhase[d];
+            if (p == NO_PHASE) ctx.misuse(call + " without a phase or lap");
+            return p;
+        }
+
+        int lapOrdinal(int d) {
+            return lapOrdinal == null ? 0 : lapOrdinal[d];
+        }
+
+        private int nameOf(int r) {
+            return rows[r >>> CHUNK_BITS].name[r & MASK];
+        }
+
+        private void annotate(int r, int flags, String label) {
+            rows[r >>> CHUNK_BITS].flags[r & MASK] |= flags;
+            if (label == null || eventCount == MAX_EVENTS) return;
+            String[] t = labels;
+            if (t == null) labels = t = new String[8];
+            else if (labelCount == t.length) labels = t = Arrays.copyOf(t, 2 * labelCount);
+            t[labelCount] = label;
+            append(r, LABEL, labelCount++);
         }
 
         /** Restores the slot's previous lane, skipping lanes that closed out of order meanwhile. */
@@ -399,22 +560,27 @@ public final class Tempo {
 
         void event(int r, int key, long value) {
             if (!enter()) return;
+            append(r, key, value);
+            publish();
+            leave();
+        }
+
+        /** Writes an event without publishing it; at the event cap counts a drop. */
+        private void append(int r, int key, long value) {
             int e = eventCount;
             if (e == MAX_EVENTS) {
                 dropped++;
-            } else {
-                Events[] t = events;
-                if (t == null) events = t = new Events[CHUNKS];
-                Events c = t[e >>> CHUNK_BITS];
-                if (c == null) t[e >>> CHUNK_BITS] = c = EVENT_POOL.take();
-                int i = e & MASK;
-                c.row[i] = r;
-                c.key[i] = key;
-                c.value[i] = value;
-                eventCount = e + 1;
-                publish();
+                return;
             }
-            leave();
+            Events[] t = events;
+            if (t == null) events = t = new Events[CHUNKS];
+            Events c = t[e >>> CHUNK_BITS];
+            if (c == null) t[e >>> CHUNK_BITS] = c = EVENT_POOL.take();
+            int i = e & MASK;
+            c.row[i] = r;
+            c.key[i] = key;
+            c.value[i] = value;
+            eventCount = e + 1;
         }
 
         /** Owner only: makes a lane whose root has closed writable for a late annotation; false once retired. */
@@ -464,7 +630,7 @@ public final class Tempo {
         }
 
         /**
-         * Visits the committed rows in row order, which for one lane is pre-order. Returns the next free id.
+         * Visits the committed rows as a tree in pre-order. Returns the next free id.
          * Reading {@code state} first matters: the owner stores {@code IDLE} after its last write, so a lane
          * read as {@code IDLE} is seen complete (final durations and flags included). A lane read as
          * {@code ACTIVE} is best effort and its spans are marked {@link SpanView#live}.
@@ -476,36 +642,98 @@ public final class Tempo {
             int nRows = (int) (c >>> 32), nEvents = (int) c;
 
             // Attribute events grouped by row (counting sort), keeping append order within a row.
-            int[] from = new int[nRows + 1];
-            for (int e = 0; e < nEvents; e++)
-                if (isAttribute(e)) from[events[e >>> CHUNK_BITS].row[e & MASK] + 1]++;
+            int[] from = new int[nRows + 1], labelOf = null;
+            for (int e = 0; e < nEvents; e++) {
+                Events k = events[e >>> CHUNK_BITS];
+                int kind = k.key[e & MASK] & KIND_MASK, r = k.row[e & MASK];
+                if (kind == ATTR_LONG || kind == ATTR_DOUBLE) {
+                    from[r + 1]++;
+                } else if (kind == LABEL) {
+                    if (labelOf == null) Arrays.fill(labelOf = new int[nRows], -1);
+                    labelOf[r] = (int) k.value[e & MASK];
+                }
+            }
             for (int r = 0; r < nRows; r++) from[r + 1] += from[r];
             int[] order = new int[from[nRows]], fill = Arrays.copyOf(from, nRows);
             for (int e = 0; e < nEvents; e++)
                 if (isAttribute(e)) order[fill[events[e >>> CHUNK_BITS].row[e & MASK]]++] = e;
+            String[] text = labelOf == null ? null : labels;
 
-            int[] depthOf = new int[nRows];
+            // Child lists, row order within a parent; index nRows is a virtual parent of the lane roots.
+            // A RETRO lap adopts the run of preceding siblings that started at or after it, back to the
+            // previous phase row, and takes the place of the first of them.
+            int top = nRows;
+            int[] parent = new int[nRows + 1], first = new int[nRows + 1], last = new int[nRows + 1],
+                    next = new int[nRows + 1], prev = new int[nRows + 1];
+            Arrays.fill(first, -1);
+            Arrays.fill(last, -1);
+            for (int r = 0; r < nRows; r++) {
+                Rows k = rows[r >>> CHUNK_BITS];
+                int i = r & MASK, p = k.parent[i] < 0 ? top : k.parent[i];
+                parent[r] = p;
+                if ((k.flags[i] & RETRO) != 0) {
+                    int a = last[p], b = -1;
+                    while (a >= 0 && (flagsOf(a) & PHASE) == 0 && startOf(a) >= k.start[i]) {
+                        parent[a] = r;
+                        b = a;
+                        a = prev[a];
+                    }
+                    if (b >= 0) {
+                        first[r] = b;
+                        last[r] = last[p];
+                        prev[b] = -1;
+                        last[p] = a;
+                        if (a >= 0) next[a] = -1;
+                        else first[p] = -1;
+                    }
+                }
+                next[r] = -1;
+                prev[r] = last[p];
+                if (last[p] >= 0) next[last[p]] = r;
+                else first[p] = r;
+                last[p] = r;
+            }
+
+            int[] id = new int[nRows], depthOf = new int[nRows];
             v.lane = this;
             v.order = order;
             v.live = s == ACTIVE;
-            for (int r = 0; r < nRows; r++) {
+            int n = base;
+            for (int r = first[top]; r >= 0; ) {
                 Rows k = rows[r >>> CHUNK_BITS];
-                int i = r & MASK, p = k.parent[i];
-                depthOf[r] = p < 0 ? 0 : depthOf[p] + 1;
+                int i = r & MASK, p = parent[r];
                 long start = k.start[i], dur = (long) DUR.getOpaque(k.dur, i);
-                v.id = base + r;
-                v.parent = p < 0 ? -1 : base + p;
+                id[r] = n++;
+                depthOf[r] = p == top ? 0 : depthOf[p] + 1;
+                v.id = id[r];
+                v.parent = p == top ? -1 : id[p];
                 v.depth = depthOf[r];
                 v.name = Name.byId(k.name[i]);
                 v.start = start;
                 v.open = dur == OPEN;
                 v.duration = v.open ? Math.max(0, now - start) : dur;
                 v.flags = k.flags[i];
+                v.label = labelOf == null || labelOf[r] < 0 ? null : text[labelOf[r]];
                 v.attrFrom = from[r];
                 v.attrTo = from[r + 1];
                 visitor.visit(v);
+
+                if (first[r] >= 0) {
+                    r = first[r];
+                } else {
+                    while (r != top && next[r] < 0) r = parent[r];
+                    r = r == top ? -1 : next[r];
+                }
             }
-            return base + nRows;
+            return n;
+        }
+
+        private long startOf(int r) {
+            return rows[r >>> CHUNK_BITS].start[r & MASK];
+        }
+
+        private int flagsOf(int r) {
+            return rows[r >>> CHUNK_BITS].flags[r & MASK];
         }
 
         private boolean isAttribute(int e) {
@@ -717,6 +945,87 @@ public final class Tempo {
             }
         }
 
+        /**
+         * Starts a phase of this span, label first: ends the open phase or any span still open below this
+         * one (a span left open is healed and counted as misuse), then opens the phase at the same instant.
+         * Spans opened until the next boundary nest under the phase. Returns this span.
+         */
+        public Span phase(Name name) {
+            if (live()) {
+                if (name != null) lane.phase(depth, name, 0);
+                else lane.phase(depth, nullName(), MISUSE);
+            }
+            return this;
+        }
+
+        /**
+         * Ends a lap of this span, label after. If a {@link #phase} is open, ends that phase under its own
+         * name (a different {@code name} is kept as a zero-length misuse entry). Otherwise records a lap
+         * from the last phase boundary, or this span's start, to now; the spans opened in that time are
+         * shown under the lap. Returns this span.
+         */
+        public Span done(Name name) {
+            return done(name, 0, null);
+        }
+
+        /**
+         * Like {@link #done(Name)}, and selects the lap for the legacy headers, shown there as
+         * {@code legacyLabel} or, if that is {@code null}, as the name.
+         */
+        public Span done(Name name, String legacyLabel) {
+            return done(name, LEGACY, legacyLabel);
+        }
+
+        private Span done(Name name, int flags, String label) {
+            if (live()) {
+                if (name == null) nullName();
+                lane.done(depth, name, flags, label);
+            }
+            return this;
+        }
+
+        /** Selects the open phase or the last lap of this span for the legacy headers. */
+        public Span legacy() {
+            if (live()) lane.legacy(depth);
+            return this;
+        }
+
+        /** Attaches a number to the open phase or the last lap of this span. */
+        public Span phaseSet(Name key, long value) {
+            if (live()) lane.phaseSet(depth, key(key) << KIND_BITS | ATTR_LONG, value);
+            return this;
+        }
+
+        /**
+         * Runs {@code body}, then {@link #done(Name) done(name)}. If the body throws, the lap is recorded
+         * as failed, never for the legacy headers, and the throwable is rethrown unwrapped.
+         */
+        public <T, E extends Exception> T lap(Name name, ThrowingSupplier<T, E> body) throws E {
+            T result;
+            try {
+                result = body.get();
+            } catch (Throwable t) {
+                try {
+                    done(name, FAILED, null);
+                } catch (AssertionError misuse) { // strict mode must not hide the body's throwable
+                    if (misuse != t) t.addSuppressed(misuse);
+                }
+                throw t;
+            }
+            done(name);
+            return result;
+        }
+
+        /** Phase boundaries of this span so far; separates the laps for aggregation. */
+        int lapOrdinal() {
+            return lane == null ? 0 : lane.lapOrdinal(depth);
+        }
+
+        private Name nullName() {
+            ctx.misuse("null name");
+            return Name.UNKNOWN;
+        }
+
         /** Attaches a number to this span, also after it closed (e.g. in a catch block). */
         public Span set(Name key, long value) {
             if (owned()) lane.event(row, key(key) << KIND_BITS | ATTR_LONG, value);
@@ -807,6 +1116,7 @@ public final class Tempo {
         int[] order;
         int id, parent, depth, flags, attrFrom, attrTo;
         Name name;
+        String label;
         long start, duration;
         boolean open, live;
 
@@ -842,8 +1152,20 @@ public final class Tempo {
         /** Closed implicitly by an ancestor's close. */
         public boolean healed() { return (flags & HEALED) != 0; }
 
-        /** Recorded through a misused call, e.g. with a null name. */
+        /** Recorded through a misused call, e.g. with a null name or a {@code done} that names another phase. */
         public boolean misuse() { return (flags & MISUSE) != 0; }
+
+        /** A phase ({@link Span#phase}) or a lap ({@link Span#done}, {@link Span#lap}) of its parent. */
+        public boolean phase() { return (flags & PHASE) != 0; }
+
+        /** A lap recorded label after; its children are the spans opened during it. */
+        boolean retro() { return (flags & RETRO) != 0; }
+
+        /** Selected for the legacy headers. */
+        public boolean legacy() { return (flags & LEGACY) != 0; }
+
+        /** The legacy label given to {@link Span#done(Name, String)}, or {@code null}. */
+        public String label() { return label; }
 
         /** {@link #COARSE}, {@link #DETAIL} or {@link #DEEP}. */
         public int level() {
