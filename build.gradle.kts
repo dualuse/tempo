@@ -18,10 +18,6 @@ val jmhImplementation: Configuration by configurations.getting
 val jmhAnnotationProcessor: Configuration by configurations.getting
 
 dependencies {
-    // Needed only by the pre-rewrite Tempo.java; goes away with it.
-    compileOnly("com.fasterxml.jackson.core:jackson-databind:2.18.2")
-    testImplementation("com.fasterxml.jackson.core:jackson-databind:2.18.2")
-
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 
@@ -47,7 +43,7 @@ tasks.test {
 }
 
 // ./gradlew jmh                                  all benchmarks, with -prof gc
-// ./gradlew jmh -Pjmh.args="Smoke -f 1 -prof gc" explicit JMH command line
+// ./gradlew jmh -Pjmh.args="Tempo -f 1 -prof gc" explicit JMH command line
 tasks.register<JavaExec>("jmh") {
     group = "verification"
     description = "Runs the JMH benchmarks."

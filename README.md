@@ -18,7 +18,7 @@ being redesigned on this branch; nothing here is stable or released yet.
 ./gradlew test                                   # unit tests
 ./gradlew test -PtestJdk=11                      # run the tests on another installed JDK
 ./gradlew jmh                                    # benchmarks, with -prof gc
-./gradlew jmh -Pjmh.args="Smoke -f 1 -prof gc"   # explicit JMH command line
+./gradlew jmh -Pjmh.args="Tempo -f 1 -prof gc"   # explicit JMH command line
 ```
 
 Gradle itself needs JDK 17 or newer; the library is compiled with `--release 11`.

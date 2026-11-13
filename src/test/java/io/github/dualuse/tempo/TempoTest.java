@@ -1,626 +1,723 @@
 package io.github.dualuse.tempo;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import io.github.dualuse.tempo.Tempo.Scope;
+import io.github.dualuse.tempo.Tempo.Name;
+import io.github.dualuse.tempo.Tempo.Options;
+import io.github.dualuse.tempo.Tempo.Span;
+import io.github.dualuse.tempo.Tempo.Trace;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
-import java.util.Map;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicLong;
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 
+import static io.github.dualuse.tempo.Tempo.COARSE;
+import static io.github.dualuse.tempo.Tempo.DEEP;
+import static io.github.dualuse.tempo.Tempo.DETAIL;
+import static io.github.dualuse.tempo.Tempo.NOOP;
 import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class TempoTest {
 
+    static final Name SEARCH = Tempo.name("search"), DECODE = Tempo.name("decode"), RERANK = Tempo.name("rerank"),
+            LOAD = Tempo.name("load"), MATCH = Tempo.name("match"), JOIN = Tempo.name("join"),
+            BYTES = Tempo.name("bytes"), SCORE = Tempo.name("score");
+
+    /** Manually advanced clock; starts away from zero so the epoch subtraction is exercised. */
+    static final class Clock implements LongSupplier {
+        long t = 1_000_000_000L;
+
+        @Override
+        public long getAsLong() {
+            return t;
+        }
+
+        void add(long nanos) {
+            t += nanos;
+        }
+    }
+
+    final Clock clock = new Clock();
+
+    Options opts() {
+        return new Options().clock(clock);
+    }
+
+    Options strict() {
+        return opts().strict(true);
+    }
+
     @AfterEach
-    void clearThreadLocal() {
-        while (Tempo.CURRENT.get() != null) {
-            Tempo.CURRENT.get().close();
-        }
+    void noTraceLeftOnThread() {
+        assertSame(NOOP, Tempo.current(), "a test left a span open on the test thread");
     }
 
-    // ---------------------------------------------------------------
-    // Construction & ThreadLocal
-    // ---------------------------------------------------------------
-
-    @Test
-    void tempoScopeCreatesRoot() {
-        assertNull(Tempo.CURRENT.get());
-        try (Scope s = Tempo.scope("root")) {
-            assertSame(s, Tempo.CURRENT.get());
-            assertEquals("root", s.getName());
-            assertNull(s.parent);
-        }
-        assertNull(Tempo.CURRENT.get());
-    }
-
-    @Test
-    void nestedScopesAutoNest() {
-        try (Scope outer = Tempo.scope("outer")) {
-            try (Scope inner = Tempo.scope("inner")) {
-                assertSame(inner, Tempo.CURRENT.get());
-                assertSame(outer, inner.parent);
+    /** One line per span: indent, name, start+duration and the flags/attributes that are set. */
+    static String tree(Trace t) {
+        StringBuilder b = new StringBuilder();
+        t.forEachSpan(s -> {
+            b.append("  ".repeat(s.depth())).append(s.name()).append(' ').append(s.startNanos()).append('+').append(s.durationNanos());
+            if (s.level() == DETAIL) b.append(" detail");
+            if (s.level() == DEEP) b.append(" deep");
+            if (s.open()) b.append(" open");
+            if (s.failed()) b.append(" failed");
+            if (s.cancelled()) b.append(" cancelled");
+            if (s.waiting()) b.append(" waiting");
+            if (s.healed()) b.append(" healed");
+            if (s.misuse()) b.append(" misuse");
+            for (int i = 0; i < s.attributes(); i++) {
+                b.append(' ').append(s.attributeKey(i)).append('=');
+                if (s.attributeIsDouble(i)) b.append(s.doubleAttribute(i));
+                else b.append(s.longAttribute(i));
             }
-            assertSame(outer, Tempo.CURRENT.get());
-        }
+            b.append('\n');
+        });
+        return b.toString();
     }
 
-    @Test
-    void scopeInstanceMethodCreatesChild() {
-        try (Scope s = Tempo.scope("root")) {
-            try (Scope c = s.scope("child")) {
-                assertSame(s, c.parent);
-                assertSame(c, Tempo.CURRENT.get());
+    static String lines(String... lines) {
+        return String.join("\n", lines) + "\n";
+    }
+
+    static Throwable onOtherThread(Runnable r) throws InterruptedException {
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        Thread t = new Thread(() -> {
+            try {
+                r.run();
+            } catch (Throwable e) {
+                thrown.set(e);
             }
-            assertSame(s, Tempo.CURRENT.get());
-        }
+        });
+        t.start();
+        t.join();
+        return thrown.get();
     }
 
-    // ---------------------------------------------------------------
-    // Sequential phases (pre-named)
-    // ---------------------------------------------------------------
+    // ---- names --------------------------------------------------------------------------------------
 
     @Test
-    void sequentialPreNamedPhases() throws Exception {
-        try (Scope s = Tempo.scope("root")) {
-            s.phase("a");
-            Thread.sleep(5);
-            s.phase("b");
-            Thread.sleep(5);
-            s.phase("c");
-            Thread.sleep(5);
-        }
-        // After close, we can't inspect children easily without holding a ref,
-        // so keep the reference:
+    void namesAreInterned() {
+        assertSame(SEARCH, Tempo.name("search"));
+        assertNotSame(SEARCH, DECODE);
+        assertEquals("search", SEARCH.toString());
+        assertSame(Tempo.name(null), Tempo.name(""));
+        assertEquals("?", Tempo.name(null).toString());
+        assertSame(Tempo.name("?"), Tempo.name(null));
     }
 
-    @Test
-    void preNamedPhasesCreateChildren() throws Exception {
-        Scope root;
-        try (Scope s = Tempo.scope("root")) {
-            s.phase("a"); Thread.sleep(2);
-            s.phase("b"); Thread.sleep(2);
-            s.phase("c"); Thread.sleep(2);
-            root = s;
-        }
-        assertEquals(3, root.getChildren().size());
-        assertEquals("a", root.getChildren().get(0).getName());
-        assertEquals("b", root.getChildren().get(1).getName());
-        assertEquals("c", root.getChildren().get(2).getName());
-        for (Scope child : root.getChildren()) {
-            assertTrue(child.getElapsedNanos() >= 0, "child should have non-negative elapsed");
-            assertTrue(child.getEndNanos() > 0, "child should be ended after parent close");
-        }
-    }
-
-    // ---------------------------------------------------------------
-    // Post-named phases (done)
-    // ---------------------------------------------------------------
+    // ---- spans and nesting ----------------------------------------------------------------------------
 
     @Test
-    void postNamedPhasesCreateChildren() throws Exception {
-        Scope root;
-        try (Scope s = Tempo.scope("root")) {
-            Thread.sleep(2); s.done("a");
-            Thread.sleep(2); s.done("b");
-            Thread.sleep(2); s.done("c");
-            root = s;
-        }
-        assertEquals(3, root.getChildren().size());
-        assertEquals("a", root.getChildren().get(0).getName());
-        assertEquals("b", root.getChildren().get(1).getName());
-        assertEquals("c", root.getChildren().get(2).getName());
+    void rootSpanHasExactDuration() {
+        Trace t = Tempo.start(SEARCH, opts());
+        clock.add(250);
+        assertEquals(250, t.elapsedNanos());
+        t.close();
+        clock.add(1000);
+        assertEquals(250, t.elapsedNanos());
+        assertEquals(lines("search 0+250"), tree(t));
+        assertEquals(0, t.misuses());
     }
 
     @Test
-    void preAndPostNamedEquivalent() throws Exception {
-        Scope preRoot;
-        try (Scope s = Tempo.scope("r")) {
-            s.phase("x"); Thread.sleep(2);
-            s.phase("y"); Thread.sleep(2);
-            preRoot = s;
-        }
-
-        Scope postRoot;
-        try (Scope s = Tempo.scope("r")) {
-            Thread.sleep(2); s.done("x");
-            Thread.sleep(2); s.done("y");
-            postRoot = s;
-        }
-
-        assertEquals(preRoot.getChildren().size(), postRoot.getChildren().size());
-        for (int i = 0; i < preRoot.getChildren().size(); i++) {
-            assertEquals(
-                preRoot.getChildren().get(i).getName(),
-                postRoot.getChildren().get(i).getName());
+    void nestedSpansHaveExactStartsAndDurations() {
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            Span root = t.root();
+            clock.add(10);
+            try (Span d = root.span(DECODE)) {
+                clock.add(5);
+                try (Span l = d.span(LOAD)) {
+                    clock.add(20);
+                }
+                clock.add(3);
+            }
+            clock.add(7);
+            try (Span r = root.span(RERANK)) {
+                clock.add(40);
+            }
+            clock.add(1);
+            t.close();
+            assertEquals(lines(
+                    "search 0+86",
+                    "  decode 10+28",
+                    "    load 15+20",
+                    "  rerank 45+40"), tree(t));
         }
     }
 
     @Test
-    void doneWithMismatchedNameThrows() {
-        try (Scope s = Tempo.scope("root")) {
-            s.phase("step1");
-            assertThrows(IllegalStateException.class, () -> s.done("other"));
+    void forEachSpanReportsIdsParentsAndThread() {
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            Span root = t.root();
+            root.span(DECODE).span(LOAD).close();
+            root.span(RERANK).close(); // lands under the still-open decode
+            List<String> seen = new ArrayList<>();
+            t.close();
+            t.forEachSpan(s -> seen.add(s.id() + "<" + s.parent() + ":" + s.name() + "@" + s.thread()));
+            String th = Thread.currentThread().getName();
+            assertEquals(List.of("0<-1:search@" + th, "1<0:decode@" + th, "2<1:load@" + th, "3<1:rerank@" + th), seen);
         }
     }
 
     @Test
-    void doneWithMatchingNameSucceeds() throws Exception {
-        Scope root;
-        try (Scope s = Tempo.scope("root")) {
-            s.phase("step1");
-            Thread.sleep(2);
-            s.done("step1"); // matches, should succeed
-            Thread.sleep(2);
-            s.done("step2"); // retroactive post-named phase
-            root = s;
-        }
-        assertEquals(2, root.getChildren().size());
-        assertEquals("step1", root.getChildren().get(0).getName());
-        assertEquals("step2", root.getChildren().get(1).getName());
-    }
-
-    // ---------------------------------------------------------------
-    // Chain form
-    // ---------------------------------------------------------------
-
-    @Test
-    void chainedDoneNext() throws Exception {
-        Scope root;
-        try (Scope s = Tempo.scope("root")) {
-            Thread.sleep(2);
-            s.done("a").next("b");
-            Thread.sleep(2);
-            s.done("b");
-            root = s;
-        }
-        assertEquals(2, root.getChildren().size());
-        assertEquals("a", root.getChildren().get(0).getName());
-        assertEquals("b", root.getChildren().get(1).getName());
-    }
-
-    // ---------------------------------------------------------------
-    // Sub-scope equivalence
-    // ---------------------------------------------------------------
-
-    @Test
-    void nestedScopesProduceSameTopLevelChildCount() throws Exception {
-        Scope viaPhases;
-        try (Scope s = Tempo.scope("r")) {
-            s.phase("a"); Thread.sleep(1);
-            s.phase("b"); Thread.sleep(1);
-            viaPhases = s;
-        }
-
-        Scope viaScopes;
-        try (Scope s = Tempo.scope("r")) {
-            try (Scope a = s.scope("a")) { Thread.sleep(1); }
-            try (Scope b = s.scope("b")) { Thread.sleep(1); }
-            viaScopes = s;
-        }
-
-        assertEquals(viaPhases.getChildren().size(), viaScopes.getChildren().size());
-        assertEquals("a", viaScopes.getChildren().get(0).getName());
-        assertEquals("b", viaScopes.getChildren().get(1).getName());
-    }
-
-    @Test
-    void scopeWithLambdaRunnable() {
-        Scope root;
-        try (Scope s = Tempo.scope("root")) {
-            final boolean[] ran = {false};
-            s.scope("work", () -> ran[0] = true);
-            assertTrue(ran[0]);
-            root = s;
-        }
-        assertEquals(1, root.getChildren().size());
-        assertEquals("work", root.getChildren().get(0).getName());
-    }
-
-    @Test
-    void scopeWithLambdaCallableReturnsValue() {
-        try (Scope s = Tempo.scope("root")) {
-            String result = s.scope("compute", () -> "hello");
-            assertEquals("hello", result);
-            assertEquals(1, s.getChildren().size());
+    void parentIsTheInnermostOpenSpanOfTheLane() {
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            Span s = t.root();
+            try (Span a = s.span(DECODE)) {
+                clock.add(1);
+                s.span(LOAD).close(); // called on the root handle, lands under DECODE
+                clock.add(1);
+            }
+            t.close();
+            assertEquals(lines(
+                    "search 0+2",
+                    "  decode 0+2",
+                    "    load 1+0"), tree(t));
+            assertEquals(0, t.misuses());
         }
     }
 
     @Test
-    void scopeWithCallableWrapsCheckedException() {
-        try (Scope s = Tempo.scope("root")) {
-            RuntimeException ex = assertThrows(RuntimeException.class,
-                () -> s.scope("bad", () -> { throw new Exception("boom"); }));
-            assertEquals("boom", ex.getCause().getMessage());
+    void openSpansRenderAsOpenAtOneNow() {
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            clock.add(10);
+            Span d = t.root().span(DECODE);
+            clock.add(30);
+            assertEquals(30, d.elapsedNanos());
+            assertEquals(lines(
+                    "search 0+40 open",
+                    "  decode 10+30 open"), tree(t));
+            d.close();
+            clock.add(5);
+            assertEquals(30, d.elapsedNanos());
         }
     }
 
-    // ---------------------------------------------------------------
-    // Fork
-    // ---------------------------------------------------------------
+    @Test
+    void elapsedOfNoopIsZero() {
+        assertEquals(0, NOOP.elapsedNanos());
+        assertFalse(NOOP.recording());
+        assertFalse(NOOP.detailed());
+    }
 
     @Test
-    void forkRunnableRecordsChildOnWorkerThread() throws Exception {
-        ExecutorService exec = Executors.newSingleThreadExecutor();
-        try (Scope s = Tempo.scope("root")) {
-            final long callerThread = Thread.currentThread().getId();
-            final AtomicLong workerThread = new AtomicLong();
-            Future<?> f = s.fork("worker", exec, () -> {
-                workerThread.set(Thread.currentThread().getId());
-                Scope current = Tempo.CURRENT.get();
-                assertNotNull(current);
-                assertEquals("worker", current.getName());
-                assertSame(s, current.parent);
+    void stringNamesAreLookedUp() {
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            t.root().span("decode").close();
+            t.close();
+            assertEquals(lines("search 0+0", "  decode 0+0"), tree(t));
+        }
+    }
+
+    // ---- misuse, non-strict -------------------------------------------------------------------------
+
+    @Test
+    void closingAParentHealsOpenChildren() {
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            Span d = t.root().span(DECODE);
+            Span l = d.span(LOAD);
+            clock.add(8);
+            d.close();
+            assertEquals(1, t.misuses());
+            l.close(); // already healed
+            assertEquals(2, t.misuses());
+            t.close();
+            assertEquals(lines(
+                    "search 0+8",
+                    "  decode 0+8",
+                    "    load 0+8 healed"), tree(t));
+        }
+    }
+
+    @Test
+    void doubleCloseIsCountedAndChangesNothing() {
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            Span d = t.root().span(DECODE);
+            clock.add(4);
+            d.close();
+            clock.add(4);
+            d.close();
+            assertEquals(1, t.misuses());
+            t.close();
+            t.close(); // a trace closes idempotently
+            assertEquals(1, t.misuses());
+            assertEquals(lines("search 0+8", "  decode 0+4"), tree(t));
+        }
+    }
+
+    @Test
+    void useAfterCloseReturnsNoop() {
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            Span d = t.root().span(DECODE);
+            d.close();
+            assertSame(NOOP, d.span(LOAD));
+            assertEquals(1, t.misuses());
+            t.close();
+            assertSame(NOOP, t.root().span(LOAD));
+            assertEquals(2, t.misuses());
+            assertEquals(lines("search 0+0", "  decode 0+0"), tree(t));
+        }
+    }
+
+    @Test
+    void closingTheTraceHealsForgottenSpans() {
+        Trace t = Tempo.start(SEARCH, opts());
+        t.root().span(DECODE);
+        clock.add(3);
+        t.close();
+        assertEquals(1, t.misuses());
+        assertEquals(lines("search 0+3", "  decode 0+3 healed"), tree(t));
+    }
+
+    @Test
+    void foreignThreadCallsAreIgnoredAndCounted() throws Exception {
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            Span d = t.root().span(DECODE);
+            AtomicReference<Span> child = new AtomicReference<>();
+            assertNull(onOtherThread(() -> {
+                d.close();
+                child.set(d.span(LOAD));
+                d.set(BYTES, 1).fail();
+            }));
+            assertSame(NOOP, child.get());
+            assertEquals(4, t.misuses());
+            clock.add(6);
+            t.close(); // the owner heals the row the foreign thread failed to close
+            assertEquals(5, t.misuses());
+            assertEquals(lines("search 0+6", "  decode 0+6 healed"), tree(t));
+        }
+    }
+
+    @Test
+    void foreignThreadCannotCloseTheTrace() throws Exception {
+        Trace t = Tempo.start(SEARCH, opts());
+        assertNull(onOtherThread(t::close));
+        assertEquals(1, t.misuses());
+        clock.add(2);
+        t.close();
+        assertEquals(lines("search 0+2"), tree(t));
+    }
+
+    @Test
+    void nullAndEmptyNamesBecomeQuestionMark() {
+        Trace t = Tempo.start(null, opts());
+        Span root = t.root();
+        root.span((Name) null).close();
+        root.span((String) null).close();
+        root.span("").close();
+        root.span(Tempo.name("")).close(); // an interned "?" is a legitimate name
+        root.set(null, 1);
+        t.close();
+        assertEquals(5, t.misuses());
+        assertEquals(lines(
+                "? 0+0 misuse ?=1",
+                "  ? 0+0 misuse",
+                "  ? 0+0 misuse",
+                "  ? 0+0 misuse",
+                "  ? 0+0"), tree(t));
+    }
+
+    @Test
+    void depthIsCappedAt35() {
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            Span s = t.root();
+            for (int d = 1; d < 35; d++) s = s.span(LOAD);
+            assertTrue(s.recording());
+            assertSame(NOOP, s.span(MATCH));
+            assertEquals(1, t.dropped());
+            assertEquals(0, t.misuses());
+            t.close();
+            int[] spans = {0}, maxDepth = {0};
+            t.forEachSpan(v -> {
+                spans[0]++;
+                maxDepth[0] = Math.max(maxDepth[0], v.depth());
             });
-            f.get(5, TimeUnit.SECONDS);
-            // worker should have been on a different thread
-            assertNotEquals(callerThread, workerThread.get());
-            assertEquals(1, s.getChildren().size());
-            Scope workerScope = s.getChildren().get(0);
-            assertEquals("worker", workerScope.getName());
-            assertEquals(workerThread.get(), workerScope.getThreadId());
-        } finally {
-            exec.shutdown();
+            assertEquals(35, spans[0]);
+            assertEquals(34, maxDepth[0]);
+            assertEquals(1, t.misuses()); // one close healed the 34 open spans
         }
     }
 
     @Test
-    void forkCallableReturnsValue() throws Exception {
-        ExecutorService exec = Executors.newSingleThreadExecutor();
-        try (Scope s = Tempo.scope("root")) {
-            Future<String> f = s.fork("worker", exec, () -> "hi");
-            assertEquals("hi", f.get(5, TimeUnit.SECONDS));
-        } finally {
-            exec.shutdown();
+    void rowsAreCappedPerLane() {
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            Span root = t.root();
+            for (int i = 1; i < Tempo.Lane.MAX_ROWS; i++) root.span(LOAD).close();
+            assertFalse(t.root().span(LOAD).recording());
+            assertEquals(1, t.dropped());
+            t.close();
+            int[] n = {0};
+            t.forEachSpan(v -> n[0]++);
+            assertEquals(Tempo.Lane.MAX_ROWS, n[0]);
+        }
+    }
+
+    // ---- misuse, strict -------------------------------------------------------------------------------
+
+    @Test
+    void strictThrowsOnDoubleClose() {
+        try (Trace t = Tempo.start(SEARCH, strict())) {
+            Span d = t.root().span(DECODE);
+            d.close();
+            AssertionError e = assertThrows(AssertionError.class, d::close);
+            assertEquals("Tempo misuse: span used after close", e.getMessage());
+            assertEquals(1, t.misuses());
         }
     }
 
     @Test
-    void forkScopedCallableReceivesHandle() throws Exception {
-        ExecutorService exec = Executors.newSingleThreadExecutor();
-        try (Scope s = Tempo.scope("root")) {
-            Future<Integer> f = s.fork("worker", exec, (Scope handle) -> {
-                handle.phase("download");
-                Thread.sleep(2);
-                handle.phase("unpack");
-                Thread.sleep(2);
+    void strictThrowsOnOutOfOrderCloseAfterHealing() {
+        Trace t = Tempo.start(SEARCH, strict());
+        Span d = t.root().span(DECODE);
+        d.span(LOAD);
+        clock.add(5);
+        assertThrows(AssertionError.class, d::close);
+        t.close();
+        assertEquals(lines("search 0+5", "  decode 0+5", "    load 0+5 healed"), tree(t));
+    }
+
+    @Test
+    void strictThrowsOnNullNamesBeforeRecording() {
+        Trace t = Tempo.start(SEARCH, strict());
+        assertThrows(AssertionError.class, () -> t.root().span((Name) null));
+        assertThrows(AssertionError.class, () -> t.root().span(""));
+        assertThrows(AssertionError.class, () -> t.root().set(null, 1L));
+        assertThrows(AssertionError.class, () -> Tempo.start(null, strict()));
+        t.close();
+        assertEquals(lines("search 0+0"), tree(t));
+    }
+
+    @Test
+    void strictThrowsOnTheForeignThread() throws Exception {
+        try (Trace t = Tempo.start(SEARCH, strict())) {
+            Throwable e = onOtherThread(() -> t.root().span(DECODE));
+            assertTrue(e instanceof AssertionError);
+            assertEquals("Tempo misuse: span used on a foreign thread", e.getMessage());
+        }
+    }
+
+    @Test
+    void strictThrowsOnRefusedRaise() {
+        try (Trace t = Tempo.start(SEARCH, strict())) {
+            assertTrue(t.raise(DETAIL));
+            assertThrows(AssertionError.class, () -> t.raise(DEEP));
+            assertEquals(DETAIL, t.level());
+        }
+    }
+
+    @Test
+    void strictStaysSilentOnCorrectUse() {
+        try (Trace t = Tempo.start(SEARCH, strict().level(DEEP))) {
+            t.root().run(DECODE, () -> t.root().detail(LOAD).set(BYTES, 3).close());
+            t.root().deep(MATCH).fail().close();
+            assertEquals(0, t.misuses());
+        }
+    }
+
+    // ---- levels ---------------------------------------------------------------------------------------
+
+    @Test
+    void coarseRecordsNoDetail() {
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            Span root = t.root();
+            assertEquals(COARSE, t.level());
+            assertFalse(root.detailed());
+            Span d = root.detail(LOAD);
+            assertSame(NOOP, d);
+            assertSame(NOOP, d.span(MATCH));
+            assertSame(NOOP, d.set(BYTES, 1).set(SCORE, 0.5).fail().cancel().waiting());
+            d.close();
+            assertSame(NOOP, root.deep(MATCH));
+            t.close();
+            assertEquals(lines("search 0+0"), tree(t));
+            assertEquals(0, t.misuses());
+        }
+    }
+
+    @Test
+    void detailAndDeepFollowTheLevel() {
+        try (Trace t = Tempo.start(SEARCH, opts().level(DETAIL))) {
+            Span root = t.root();
+            assertTrue(root.detailed());
+            root.detail(LOAD).close();
+            assertSame(NOOP, root.deep(MATCH));
+            t.close();
+            assertEquals(lines("search 0+0", "  load 0+0 detail"), tree(t));
+        }
+        try (Trace t = Tempo.start(SEARCH, opts().level(DEEP))) {
+            try (Span l = t.root().detail(LOAD)) {
+                l.deep(MATCH).close();
+            }
+            t.close();
+            assertEquals(lines("search 0+0", "  load 0+0 detail", "    match 0+0 deep"), tree(t));
+        }
+    }
+
+    @Test
+    void levelsAreClamped() {
+        try (Trace t = Tempo.start(SEARCH, opts().level(7))) {
+            assertEquals(DEEP, t.level());
+        }
+        try (Trace t = Tempo.start(SEARCH, opts().level(-3))) {
+            assertEquals(COARSE, t.level());
+        }
+    }
+
+    @Test
+    void levelRaisesOnceBeforeAnyDetailSpan() {
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            Span root = t.root();
+            assertSame(NOOP, root.detail(LOAD)); // not recorded, so it does not block the raise
+            assertTrue(t.raise(COARSE));         // asking for what is there is not a raise
+            assertTrue(t.raise(DETAIL));
+            assertEquals(DETAIL, t.level());
+            root.detail(LOAD).close();
+            assertFalse(t.raise(DEEP));
+            assertEquals(DETAIL, t.level());
+            assertTrue(t.raise(DETAIL));
+            assertEquals(1, t.misuses());
+        }
+    }
+
+    @Test
+    void levelCannotBeRaisedAfterDetailSpansExist() {
+        try (Trace t = Tempo.start(SEARCH, opts().level(DETAIL))) {
+            t.root().detail(LOAD).close();
+            assertFalse(t.raise(DEEP));
+            assertEquals(DETAIL, t.level());
+            assertEquals(1, t.misuses());
+        }
+    }
+
+    // ---- attributes and flags -------------------------------------------------------------------------
+
+    @Test
+    void attributesKeepTypeValueAndOrder() {
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            Span root = t.root();
+            try (Span l = root.span(LOAD)) {
+                l.set(BYTES, 48213L).set(SCORE, 0.83).set(BYTES, -1L);
+            }
+            root.set(SCORE, -0.0).set(BYTES, Long.MAX_VALUE);
+            t.close();
+            assertEquals(lines(
+                    "search 0+0 score=-0.0 bytes=9223372036854775807",
+                    "  load 0+0 bytes=48213 score=0.83 bytes=-1"), tree(t));
+            t.forEachSpan(v -> {
+                if (v.depth() == 1) {
+                    assertEquals(0.83, v.doubleAttribute(1));
+                    assertEquals(0, v.longAttribute(1));
+                    assertEquals(48213.0, v.doubleAttribute(0));
+                    assertThrows(IndexOutOfBoundsException.class, () -> v.attributeKey(3));
+                }
+            });
+        }
+    }
+
+    @Test
+    void flagsAreRecorded() {
+        try (Trace t = Tempo.start(SEARCH, opts().level(DETAIL))) {
+            Span root = t.root();
+            root.span(DECODE).fail().close();
+            root.span(LOAD).fail(new IOException("gone")).close();
+            root.span(MATCH).cancel().close();
+            try (Span j = root.detail(JOIN).waiting()) {
+                clock.add(9);
+            }
+            t.close();
+            assertEquals(lines(
+                    "search 0+9",
+                    "  decode 0+0 failed",
+                    "  load 0+0 failed",
+                    "  match 0+0 cancelled",
+                    "  join 0+9 detail waiting"), tree(t));
+        }
+    }
+
+    @Test
+    void annotationsWorkAfterCloseForCatchBlocks() {
+        Trace t = Tempo.start(SEARCH, opts());
+        Span d = t.root().span(DECODE);
+        try (d) {
+            throw new IllegalStateException("bad input");
+        } catch (IllegalStateException e) {
+            d.fail(e).set(BYTES, 7);
+        }
+        t.close();
+        t.root().fail().set(SCORE, 1.5); // the lane root has closed too
+        assertEquals(0, t.misuses());
+        assertEquals(lines("search 0+0 failed score=1.5", "  decode 0+0 failed bytes=7"), tree(t));
+        t.release();
+        t.root().fail(); // after release: ignored
+        assertEquals("", tree(t));
+    }
+
+    // ---- run / call -----------------------------------------------------------------------------------
+
+    @Test
+    void runAndCallTimeTheirBody() {
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            Span root = t.root();
+            root.run(DECODE, () -> clock.add(12));
+            int n = root.call(LOAD, () -> {
+                clock.add(30);
                 return 42;
             });
-            assertEquals(42, f.get(5, TimeUnit.SECONDS));
-            assertEquals(1, s.getChildren().size());
-            Scope worker = s.getChildren().get(0);
-            assertEquals("worker", worker.getName());
-            assertEquals(2, worker.getChildren().size());
-            assertEquals("download", worker.getChildren().get(0).getName());
-            assertEquals("unpack", worker.getChildren().get(1).getName());
-        } finally {
-            exec.shutdown();
+            assertEquals(42, n);
+            t.close();
+            assertEquals(lines("search 0+42", "  decode 0+12", "  load 12+30"), tree(t));
         }
     }
 
     @Test
-    void parallelForksOverlap() throws Exception {
-        ExecutorService exec = Executors.newFixedThreadPool(2);
-        try (Scope s = Tempo.scope("root")) {
-            long t0 = System.nanoTime();
-            Future<?> a = s.fork("a", exec, () -> { try { Thread.sleep(50); } catch (InterruptedException e) {} });
-            Future<?> b = s.fork("b", exec, () -> { try { Thread.sleep(50); } catch (InterruptedException e) {} });
-            a.get(5, TimeUnit.SECONDS);
-            b.get(5, TimeUnit.SECONDS);
-            long elapsed = System.nanoTime() - t0;
-            // parallel execution: elapsed should be well under the sum (100ms),
-            // allowing for some scheduling overhead
-            assertTrue(elapsed < 90_000_000L, "expected parallel execution, elapsed=" + elapsed + "ns");
-            assertEquals(2, s.getChildren().size());
-        } finally {
-            exec.shutdown();
-        }
-    }
-
-    // ---------------------------------------------------------------
-    // Tree traversal
-    // ---------------------------------------------------------------
-
-    @Test
-    void rootWalksUpParentPointers() {
-        try (Scope a = Tempo.scope("a")) {
-            try (Scope b = a.scope("b")) {
-                try (Scope c = b.scope("c")) {
-                    assertSame(a, c.root());
-                    assertSame(a, b.root());
-                    assertSame(a, a.root());
-                }
+    void runAndCallFlagFailuresAndRethrowUnwrapped() {
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            Span root = t.root();
+            IOException io = new IOException("disk");
+            try {
+                root.run(LOAD, () -> {
+                    clock.add(3);
+                    throw io;
+                });
+                fail();
+            } catch (IOException e) { // the checked type is preserved
+                assertSame(io, e);
             }
+            RuntimeException boom = new IllegalArgumentException("boom");
+            assertSame(boom, assertThrows(IllegalArgumentException.class, () -> root.call(MATCH, () -> {
+                throw boom;
+            })));
+            t.close();
+            assertEquals(lines("search 0+3", "  load 0+3 failed", "  match 3+0 failed"), tree(t));
+            assertEquals(0, t.misuses());
         }
     }
 
     @Test
-    void iteratorYieldsChildren() throws Exception {
-        Scope root;
-        try (Scope s = Tempo.scope("root")) {
-            s.phase("x");
-            s.phase("y");
-            s.phase("z");
-            root = s;
-        }
-        StringBuilder names = new StringBuilder();
-        for (Scope child : root) {
-            names.append(child.getName());
-        }
-        assertEquals("xyz", names.toString());
+    void runOnNoopStillRunsTheBody() throws Exception {
+        int[] ran = {0};
+        NOOP.run(LOAD, () -> ran[0]++);
+        int seven = NOOP.call(LOAD, () -> 7);
+        assertEquals(7, seven);
+        assertEquals(1, ran[0]);
     }
 
-    // ---------------------------------------------------------------
-    // Close semantics
-    // ---------------------------------------------------------------
+    // ---- thread slot ----------------------------------------------------------------------------------
 
     @Test
-    void useAfterCloseThrows() {
-        Scope s = Tempo.scope("root");
-        s.close();
-        assertThrows(IllegalStateException.class, () -> s.phase("x"));
-        assertThrows(IllegalStateException.class, () -> s.scope("x"));
-        assertThrows(IllegalStateException.class, () -> s.done("x"));
-    }
-
-    @Test
-    void closeIsIdempotent() {
-        Scope s = Tempo.scope("root");
-        s.close();
-        s.close(); // should not throw
-        s.close();
-    }
-
-    @Test
-    void closingParentEndsOpenChildPhase() throws Exception {
-        Scope root;
-        try (Scope s = Tempo.scope("root")) {
-            s.phase("open");
-            Thread.sleep(2);
-            root = s;
-        }
-        assertEquals(1, root.getChildren().size());
-        Scope child = root.getChildren().get(0);
-        assertTrue(child.getEndNanos() > 0, "child phase should have been ended by parent close");
-    }
-
-    // ---------------------------------------------------------------
-    // Output: toString (unchanged format)
-    // ---------------------------------------------------------------
-
-    @Test
-    void toStringHasExpectedShape() throws Exception {
-        Scope root;
-        try (Scope s = Tempo.scope("Request")) {
-            s.phase("A"); Thread.sleep(2);
-            s.phase("B"); Thread.sleep(2);
-            root = s;
-        }
-        String out = root.toString();
-        assertTrue(out.contains("(Request)"));
-        assertTrue(out.contains("(A)"));
-        assertTrue(out.contains("(B)"));
-        assertTrue(out.contains(" = "));
-        assertTrue(out.contains(" + "));
-        assertTrue(out.endsWith("(B)"));
-    }
-
-    // ---------------------------------------------------------------
-    // Output: toServerTiming (deep flat-path)
-    // ---------------------------------------------------------------
-
-    @Test
-    void toServerTimingDeepPaths() throws Exception {
-        Scope root;
-        try (Scope s = Tempo.scope("root")) {
-            try (Scope load = s.scope("load")) {
-                load.phase("fetch"); Thread.sleep(1);
-                load.phase("decode"); Thread.sleep(1);
+    void currentFollowsTheInnermostOpenSpan() {
+        assertSame(NOOP, Tempo.current());
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            assertSame(t.root(), Tempo.current());
+            try (Span d = t.root().span(DECODE)) {
+                assertSame(d, Tempo.current());
+                Tempo.current().span(LOAD).close();
             }
-            s.phase("render"); Thread.sleep(1);
-            root = s;
+            assertSame(t.root(), Tempo.current());
+            t.close();
+            assertSame(NOOP, Tempo.current());
+            assertEquals(lines("search 0+0", "  decode 0+0", "    load 0+0"), tree(t));
         }
-        String st = root.toServerTiming();
-        // Should contain deep paths: load, load.fetch, load.decode, render
-        assertTrue(st.contains("load;dur="), "missing load: " + st);
-        assertTrue(st.contains("load.fetch;dur="), "missing load.fetch: " + st);
-        assertTrue(st.contains("load.decode;dur="), "missing load.decode: " + st);
-        assertTrue(st.contains("render;dur="), "missing render: " + st);
     }
 
     @Test
-    void toServerTimingPercentEncodesSpecialChars() throws Exception {
-        Scope root;
-        try (Scope s = Tempo.scope("root")) {
-            s.phase("load data,x"); Thread.sleep(1);
-            root = s;
+    void nestedTracesRestoreTheOuterOne() {
+        try (Trace outer = Tempo.start(SEARCH, opts())) {
+            try (Trace inner = Tempo.start(RERANK, opts())) {
+                assertSame(inner.root(), Tempo.current());
+            }
+            assertSame(outer.root(), Tempo.current());
         }
-        String st = root.toServerTiming();
-        // Spaces → %20, commas → %2C in metric name (before ;dur=)
-        String metricName = st.substring(0, st.indexOf(";"));
-        assertTrue(metricName.contains("%20"), "space should be percent-encoded: " + metricName);
-        assertTrue(metricName.contains("%2C"), "comma should be percent-encoded: " + metricName);
-        assertFalse(metricName.contains(" "), "literal space should not appear: " + metricName);
+        assertSame(NOOP, Tempo.current());
     }
 
     @Test
-    void toServerTimingEncodesDotsInNames() throws Exception {
-        Scope root;
-        try (Scope s = Tempo.scope("root")) {
-            s.phase("v2.0"); Thread.sleep(1);
-            root = s;
-        }
-        String st = root.toServerTiming();
-        // The dot in "v2.0" must be encoded as %2E so it doesn't look like a path separator
-        assertTrue(st.contains("v2%2E0;dur="), "dot in name should be encoded: " + st);
+    void tracesClosedOutOfOrderLeaveNoStaleCurrent() {
+        Trace a = Tempo.start(SEARCH, opts());
+        Trace b = Tempo.start(DECODE, opts());
+        Trace c = Tempo.start(RERANK, opts());
+        b.close();
+        assertSame(c.root(), Tempo.current());
+        c.close();
+        assertSame(a.root(), Tempo.current()); // skips b, which closed meanwhile
+        a.close();
+        assertSame(NOOP, Tempo.current());
     }
 
     @Test
-    void toServerTimingCrossesThreadBoundaries() throws Exception {
-        ExecutorService exec = Executors.newSingleThreadExecutor();
-        Scope root;
-        try (Scope s = Tempo.scope("root")) {
-            Future<?> f = s.fork("worker", exec, (Scope h) -> {
-                h.phase("step"); Thread.sleep(2);
-            });
-            f.get(5, TimeUnit.SECONDS);
-            root = s;
+    void otherThreadsSeeNoCurrentSpan() throws Exception {
+        try (Trace t = Tempo.start(SEARCH, opts())) {
+            AtomicReference<Span> seen = new AtomicReference<>();
+            onOtherThread(() -> seen.set(Tempo.current()));
+            assertSame(NOOP, seen.get());
         }
-        exec.shutdown();
-        String st = root.toServerTiming();
-        // worker and worker.step should both appear, crossing thread boundary
-        assertTrue(st.contains("worker;dur="), "missing worker: " + st);
-        assertTrue(st.contains("worker.step;dur="), "missing worker.step: " + st);
     }
 
-    // ---------------------------------------------------------------
-    // Output: toJSON (per-thread lane map)
-    // ---------------------------------------------------------------
+    // ---- release and memory ---------------------------------------------------------------------------
 
     @Test
-    void toJSONSingleThreadLane() throws Exception {
-        Scope root;
-        try (Scope s = Tempo.scope("root")) {
-            s.phase("A"); Thread.sleep(2);
-            s.phase("B"); Thread.sleep(2);
-            root = s;
-        }
-        String json = root.toJSON();
-        // Should have a single thread lane key containing thread name and id
-        String threadKey = Thread.currentThread().getName() + ":" + Thread.currentThread().getId();
-        assertTrue(json.contains(jsonEscape(threadKey)), "missing thread key: " + json);
-        // Should contain ^ and $ padding
-        assertTrue(json.contains("\"^\":"), "missing head gap: " + json);
-        assertTrue(json.contains("\"$\":"), "missing tail gap: " + json);
-        // Should contain phase names
-        assertTrue(json.contains("\"A\":"), "missing phase A: " + json);
-        assertTrue(json.contains("\"B\":"), "missing phase B: " + json);
-        // Balanced braces
-        assertBalancedBraces(json);
+    void releaseEmptiesEveryReadAndIsIdempotent() {
+        Trace t = Tempo.start(SEARCH, opts());
+        t.root().span(DECODE).close();
+        clock.add(5);
+        t.close();
+        assertEquals(5, t.elapsedNanos());
+        t.release();
+        t.release();
+        assertEquals(0, t.elapsedNanos());
+        assertEquals(0, t.root().elapsedNanos());
+        assertEquals("", tree(t));
+        assertSame(NOOP, t.root().span(LOAD)); // use after close
     }
 
     @Test
-    void toJSONForkCreatesIndependentLane() throws Exception {
-        ExecutorService exec = Executors.newSingleThreadExecutor();
-        Scope root;
-        try (Scope s = Tempo.scope("root")) {
-            s.phase("before"); Thread.sleep(1);
-            Future<?> f = s.fork("worker", exec, (Scope h) -> {
-                h.phase("download"); Thread.sleep(2);
-                h.phase("unpack"); Thread.sleep(2);
-            });
-            f.get(5, TimeUnit.SECONDS);
-            root = s;
-        }
-        exec.shutdown();
-        String json = root.toJSON();
-        // Should have two thread lanes
-        String mainKey = Thread.currentThread().getName() + ":" + Thread.currentThread().getId();
-        assertTrue(json.contains(jsonEscape(mainKey)), "missing main thread lane: " + json);
-        // Worker thread lane should contain "worker" scope with children
-        assertTrue(json.contains("\"worker\":{"), "worker should be object with children: " + json);
-        assertTrue(json.contains("\"download\":"), "missing download in worker lane: " + json);
-        assertTrue(json.contains("\"unpack\":"), "missing unpack in worker lane: " + json);
-        // Worker phases should NOT appear under main thread's scope
-        // (main thread shows "worker" as a bare number or doesn't show it at all)
-        assertBalancedBraces(json);
+    void releaseBeforeCloseRetiresTheLaneAtClose() {
+        Trace t = Tempo.start(SEARCH, opts());
+        t.release();
+        assertSame(t.root(), Tempo.current());
+        t.close();
+        assertSame(NOOP, Tempo.current());
+        assertEquals(0, t.elapsedNanos());
+        assertEquals("", tree(t));
     }
 
     @Test
-    void toJSONPercentEncodesSlashInNames() throws Exception {
-        Scope root;
-        try (Scope s = Tempo.scope("POST /compute")) {
-            s.phase("step"); Thread.sleep(1);
-            root = s;
+    void recordedSpansAllocateNothingOnceWarm() {
+        java.lang.management.ThreadMXBean bean = ManagementFactory.getThreadMXBean();
+        assumeTrue(bean instanceof com.sun.management.ThreadMXBean);
+        com.sun.management.ThreadMXBean mx = (com.sun.management.ThreadMXBean) bean;
+        assumeTrue(mx.isThreadAllocatedMemorySupported() && mx.isThreadAllocatedMemoryEnabled());
+        long tid = Thread.currentThread().getId();
+        int spans = 8_000;
+
+        for (int round = 0; round < 3; round++) { // fills the chunk pool and loads every class on the path
+            Trace warm = Tempo.start(SEARCH, opts().level(DETAIL));
+            record(warm.root(), spans);
+            warm.close();
+            warm.release();
         }
-        String json = root.toJSON();
-        // The / in "POST /compute" should be encoded as %2F in the path key
-        assertTrue(json.contains("POST %2Fcompute"), "slash should be percent-encoded: " + json);
+
+        Trace t = Tempo.start(SEARCH, opts().level(DETAIL));
+        record(t.root(), 1); // creates the depth-1 handle
+        long a = mx.getThreadAllocatedBytes(tid), b = mx.getThreadAllocatedBytes(tid);
+        record(t.root(), spans);
+        long c = mx.getThreadAllocatedBytes(tid);
+        t.close();
+        t.release();
+        assertEquals(b - a, c - b, "bytes allocated by " + spans + " spans beyond the probe's own");
     }
 
-    @Test
-    void toJSONLeafScopeIsBareNumber() throws Exception {
-        Scope root;
-        try (Scope s = Tempo.scope("root")) {
-            s.phase("leaf"); Thread.sleep(2);
-            root = s;
+    private void record(Span root, int spans) {
+        for (int i = 0; i < spans; i++) {
+            try (Span s = root.span(LOAD)) {
+                s.set(BYTES, i);
+                clock.add(1);
+            }
+            root.detail(MATCH).close();
         }
-        String json = root.toJSON();
-        // "leaf" should be followed by a number, not a { object
-        int idx = json.indexOf("\"leaf\":");
-        assertTrue(idx >= 0, "missing leaf: " + json);
-        char after = json.charAt(idx + "\"leaf\":".length());
-        assertTrue(Character.isDigit(after), "leaf should be bare number, got: " + after + " in: " + json);
-    }
-
-    // ---------------------------------------------------------------
-    // Jackson serialization
-    // ---------------------------------------------------------------
-
-    @Test
-    void jacksonSerializationMatchesToJSON() throws Exception {
-        var mapper = new ObjectMapper();
-        Scope root;
-        try (Scope s = Tempo.scope("root")) {
-            s.phase("A"); Thread.sleep(2);
-            s.phase("B"); Thread.sleep(2);
-            root = s;
-        }
-        String jackson = mapper.writeValueAsString(root);
-        String direct = root.toJSON();
-        assertEquals(direct, jackson);
-    }
-
-    @Test
-    void jacksonSerializationWithForksMatchesToJSON() throws Exception {
-        var mapper = new ObjectMapper();
-        ExecutorService exec = Executors.newSingleThreadExecutor();
-        Scope root;
-        try (Scope s = Tempo.scope("root")) {
-            s.phase("before"); Thread.sleep(1);
-            Future<?> f = s.fork("worker", exec, (Scope h) -> {
-                h.phase("step"); Thread.sleep(2);
-            });
-            f.get(5, TimeUnit.SECONDS);
-            root = s;
-        }
-        exec.shutdown();
-        String jackson = mapper.writeValueAsString(root);
-        String direct = root.toJSON();
-        assertEquals(direct, jackson);
-    }
-
-    @Test
-    void jacksonEmbeddedInLargerObject() throws Exception {
-        var mapper = new ObjectMapper();
-        Scope root;
-        try (Scope s = Tempo.scope("request")) {
-            s.phase("work"); Thread.sleep(2);
-            root = s;
-        }
-        // Scope embedded as a field in a map
-        var wrapper = Map.of("status", "ok", "profile", root);
-        String json = mapper.writeValueAsString(wrapper);
-        assertTrue(json.contains("\"status\":\"ok\""), "wrapper field missing: " + json);
-        assertTrue(json.contains("\"profile\":{"), "profile should be an object: " + json);
-        assertBalancedBraces(json);
-    }
-
-    // ---------------------------------------------------------------
-    // Test helpers
-    // ---------------------------------------------------------------
-
-    private static String jsonEscape(String s) {
-        return s.replace("\\", "\\\\").replace("\"", "\\\"");
-    }
-
-    private static void assertBalancedBraces(String json) {
-        int open = 0, close = 0;
-        for (int i = 0; i < json.length(); i++) {
-            if (json.charAt(i) == '{') open++;
-            else if (json.charAt(i) == '}') close++;
-        }
-        assertEquals(open, close, "unbalanced braces in JSON: " + json);
     }
 }
