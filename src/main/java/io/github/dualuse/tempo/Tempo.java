@@ -168,13 +168,14 @@ public final class Tempo {
         private static final ConcurrentHashMap<String, Name> TABLE = new ConcurrentHashMap<>();
         private static volatile Name[] byId = new Name[256];
         private static int size, dynamicSize; // guarded by TABLE
-        static volatile boolean sinks;      // some name has a sink; read once per trace
+        static volatile boolean anySink;    // some name has a sink; read once per trace
+        private static final LongConsumer[] NO_SINKS = {};
         static final Name UNKNOWN = intern("?", false), OTHER = intern("<other>", false);
 
         public final int id;
         final String text;
         boolean marked; // always-on; set at class init in practice, so a plain read on the detail path
-        volatile LongConsumer sink;
+        volatile LongConsumer[] sinks = NO_SINKS; // replaced whole on add, so a racy read sees it whole
 
         private Name(int id, String text) {
             this.id = id;
@@ -190,11 +191,12 @@ public final class Tempo {
         public Name sink(LongConsumer nanos) {
             if (nanos == null) return this;
             synchronized (this) {
-                LongConsumer s = sink;
-                sink = s == null ? nanos : s.andThen(nanos);
+                LongConsumer[] s = Arrays.copyOf(sinks, sinks.length + 1);
+                s[s.length - 1] = nanos;
+                sinks = s;
             }
             marked = true;
-            sinks = true;
+            anySink = true;
             return this;
         }
 
@@ -367,7 +369,7 @@ public final class Tempo {
             headerBytes = o.headerBytes;
             maxLanes = o.lanes;
             level = o.level;
-            listening = Name.sinks;
+            listening = Name.anySink;
             epoch = clock.getAsLong();
         }
 
@@ -396,11 +398,16 @@ public final class Tempo {
         }
 
         /**
-         * Calls the global sink and this trace's listeners of {@code n}. A throwable is caught and counted
-         * as misuse, so the recording stays consistent; the first one is returned for strict mode.
+         * Calls the global sinks and this trace's listeners of {@code n}, each on its own: a throwable is
+         * caught and counted as misuse, so the others still run and the recording stays consistent; the
+         * first one is returned for strict mode.
          */
         Throwable notify(Name n, long nanos) {
-            Throwable first = call(n.sink, nanos);
+            Throwable first = null;
+            for (LongConsumer s : n.sinks) {
+                Throwable t = call(s, nanos);
+                if (first == null) first = t;
+            }
             Listeners l = on;
             if (l != null) {
                 for (int i = 0; i < l.ids.length; i++) {
@@ -413,7 +420,6 @@ public final class Tempo {
         }
 
         private Throwable call(LongConsumer sink, long nanos) {
-            if (sink == null) return null;
             try {
                 sink.accept(nanos);
                 return null;

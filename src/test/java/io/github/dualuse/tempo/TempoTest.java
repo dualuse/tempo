@@ -2150,6 +2150,27 @@ class TempoTest {
     }
 
     @Test
+    void aThrowingGlobalSinkDoesNotSkipTheSinksAfterIt() {
+        List<Long> got = new ArrayList<>();
+        Name rerank = Tempo.name("sink-isolated").sink(n -> {
+            throw new IllegalStateException("first");
+        }).sink(got::add).sink(n -> {
+            throw new IllegalStateException("third");
+        }).sink(n -> got.add(-n));
+        Trace t = Tempo.start(SEARCH, opts());
+        t.add(rerank, 5);
+        t.close();
+        assertEquals(List.of(5L, -5L), got);
+        assertEquals(2, t.misuses());
+
+        Trace u = Tempo.start(SEARCH, strict());
+        AssertionError e = assertThrows(AssertionError.class, () -> u.add(rerank, 7));
+        assertEquals("first", e.getCause().getMessage());
+        assertEquals(List.of(5L, -5L, 7L, -7L), got);
+        u.close();
+    }
+
+    @Test
     void secondsAndSerializedAdaptListeners() throws Exception {
         double[] seconds = {0};
         Tempo.seconds(v -> seconds[0] = v).accept(1_500_000_000L);
