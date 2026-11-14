@@ -401,8 +401,25 @@ const TempoParse = (function () {
   // The next HTTP header after a cut value ("content-type: application/json", "< Server: x"):
   // a token, a colon, a space, then the field value. Terminal wraps never put a space inside a
   // value, so a line of this shape always ends the value instead of continuing it. (A wrapped
-  // piece that merely ends in ":" plus trailing padding still continues.)
+  // piece that merely ends in ":" plus trailing padding still continues.) A header without the
+  // space ("Content-Type:application/json") looks like a wrapped piece of a name table, so line
+  // shape cannot tell; settle() lets the decoder decide instead.
   const HEADER_FIELD_RE = /^\s*(?:[<>]\s*)?[!#$%&'*+.^_`|~0-9A-Za-z-]+:[ \t]+\S/;
+
+  // A cut value (no ;e=) with glued continuation lines that does not decode: drop glued lines
+  // from the end until it does, so a header that followed the cut is not taken for its tail.
+  // If nothing decodes, keep everything and let load() report the error.
+  function settle(cur) {
+    if (!cur.glued.length || COMPLETE_RE.test(cur.value)) return cur.value;
+    const ok = function (v) { try { decode(v); return true; } catch (e) { return false; } };
+    if (ok(cur.value)) return cur.value;
+    let v = cur.value;
+    for (let k = cur.glued.length - 1; k >= 0; k--) {
+      v = v.slice(0, v.length - cur.glued[k].length);
+      if (ok(v)) return v;
+    }
+    return cur.value;
+  }
 
   function collectJson(x, out) {
     if (Array.isArray(x)) { for (const y of x) collectJson(y, out); return; }
@@ -434,17 +451,17 @@ const TempoParse = (function () {
     }
     const out = [];
     let cur = null;
-    const flush = function () { if (cur) { out.push({ source: cur.source, header: cur.value }); cur = null; } };
+    const flush = function () { if (cur) { out.push({ source: cur.source, header: settle(cur) }); cur = null; } };
     for (const line of text.split(/\r\n|\n|\r/)) {
       const m = HEADER_LINE_RE.exec(line);
-      if (m) { flush(); cur = { source: "header", value: stripWs(m[1]) }; continue; }
+      if (m) { flush(); cur = { source: "header", value: stripWs(m[1]), glued: [] }; continue; }
       const s = stripWs(line);
       if (cur) {
         const done = COMPLETE_RE.test(cur.value);
-        if (s && PURE_RE.test(s) && !s.startsWith("v1;") && !HEADER_FIELD_RE.test(line) && (!done || /^[0-9a-z]+$/.test(s))) { cur.value += s; continue; }
+        if (s && PURE_RE.test(s) && !s.startsWith("v1;") && !HEADER_FIELD_RE.test(line) && (!done || /^[0-9a-z]+$/.test(s))) { cur.value += s; cur.glued.push(s); continue; }
         flush();
       }
-      if (s.startsWith("v1;")) cur = { source: "value", value: s };
+      if (s.startsWith("v1;")) cur = { source: "value", value: s, glued: [] };
     }
     flush();
     if (out.length) return out;

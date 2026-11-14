@@ -153,14 +153,30 @@ const cutCases = [
   ["cut header, then Content-Type (HTTP/1.1)", "HTTP/1.1 200 OK\nTempo-Trace: " + smallCut + "\nContent-Type: application/json\n\n{}\n"],
   ["cut wrapped header, then header", "HTTP/1.1 200 OK\nTempo-Trace: " + wrap(smallCut, 41) + "\nx-request-id: 7f3a\nContent-Length: 2\n\n{}\n"],
   ["cut header, then header (curl -v)", "< HTTP/1.1 200 OK\n< Tempo-Trace: " + smallCut + "\n< Content-Type: application/json\n<\n{}"],
-  ["cut header as the last header", "HTTP/1.1 200 OK\nTempo-Trace: " + smallCut + "\n\n{}\n"]
+  ["cut header as the last header", "HTTP/1.1 200 OK\nTempo-Trace: " + smallCut + "\n\n{}\n"],
+  // no space after the colon (legal HTTP): line shape cannot tell it from a wrapped name table,
+  // so the decoder decides and the glued header is dropped again
+  ["cut header, then Content-Type without a space", "HTTP/1.1 200 OK\nTempo-Trace: " + smallCut + "\nContent-Type:application/json\n\n{}\n"],
+  ["cut wrapped header, then two headers without a space", "HTTP/1.1 200 OK\nTempo-Trace: " + wrap(smallCut, 41) + "\nx-request-id:7f3a\nContent-Type:application/json\n\n{}\n"],
+  ["cut header, then header without a space (curl -v)", "< HTTP/1.1 200 OK\n< Tempo-Trace: " + smallCut + "\n< Content-Type:application/json\n<\n{}"]
 ];
-for (const [label, input] of cutCases) {
+const healthy = P.stripWs(read("samples/find-healthy.header"));
+const healthyCut = healthy.slice(0, Math.floor(healthy.length * 0.6));
+const cutRuns = cutCases.map(([label, input]) => [label, input, smallCut]).concat([
+  ["cut find-healthy at 60%, then Content-Type without a space", "HTTP/1.1 200 OK\ntempo-trace: " + healthyCut + "\nContent-Type:application/json\n\n{}\n", healthyCut],
+  ["cut wrapped find-healthy at 60%, then Content-Type without a space", "HTTP/1.1 200 OK\nTempo-Trace: " + wrap(healthyCut, 80) + "\nContent-Type:application/json\n\n{}\n", healthyCut]
+]);
+for (const [label, input, want] of cutRuns) {
   let got;
   try { got = P.extractTraces(input).map(P.load); } catch (e) { check("extract " + label, false, "threw " + e.message); continue; }
-  check("extract " + label, got.length === 1 && got[0].header === smallCut && got[0].doc.truncated === true,
-    JSON.stringify(got.map((t) => [t.header.length, t.doc.truncated])));
+  // the header is what arrived, minus glued headers; a glued piece that lands in the discarded
+  // last record may stay (it never reaches a span), so compare the decoded document
+  check("extract " + label, got.length === 1 && got[0].header.startsWith(want) && got[0].doc.truncated === true && same(got[0].doc, P.decode(want)),
+    JSON.stringify(got.map((t) => [t.header.length, want.length, t.doc.truncated])));
 }
+// a complete wrapped value is never shortened by the retry, even when a header without a space follows
+check("extract complete value, then Content-Type without a space",
+  same(P.extractTraces("HTTP/1.1 200 OK\nTempo-Trace: " + wrap(example, 37) + "\nContent-Type:application/json\n\n{}\n").map((t) => t.header), [example]));
 // a wrapped piece that ends in ":" with trailing terminal padding still continues the value
 const colonAt = example.indexOf(":", 40) + 1;
 const colonWrapped = "Tempo-Trace: " + example.slice(0, 30) + "\n" + example.slice(30, colonAt) + "   \n" + example.slice(colonAt) + "\n";

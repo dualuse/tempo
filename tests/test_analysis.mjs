@@ -207,6 +207,15 @@ check("critical path: saturated pool shows more queue wait than healthy", share[
   check("pools: gauges read from queued/active attributes", sat.gauges.length > 0 && sat.gauges.every((g) => g.queued !== null));
   check("pools: never-started matches are attributed to the cpu pool", sat.notStarted === 13);
   check("pools: grouping strips -<digits>, Thread-N stays", A.poolOf("cpu-12") === "cpu" && A.poolOf("Thread-3") === "Thread-3" && A.poolOf("main") === "main");
+  // aggregates are spread over their extent, an estimate; it must never claim more threads than the pool has
+  const over = [];
+  for (const f of ALL) for (const q of A.pools(load(f))) {
+    const n = Math.max(q.threads.length, q.distinct);
+    if (!n) continue;
+    if (q.peakRun > n + 1e-9 || q.running.some((r) => r[1] > n + 1e-9)) over.push(f + ":" + q.name + " " + q.peakRun + "/" + n);
+  }
+  check("pools: peak running never exceeds the pool's threads (" + ALL.length + " traces)", over.length === 0, over.join(", "));
+  check("pools: healthy cpu peak is an estimate, capped at 8 threads, spans-only peak beside it", ok.runEstimated && ok.peakRun === 8 && ok.peakRunSpans <= 8 && ok.peakRunSpans > 0, ok.peakRun + " " + ok.peakRunSpans);
 }
 
 // ---------------------------------------------------------------- converters
