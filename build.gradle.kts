@@ -46,6 +46,10 @@ val testJdk = providers.gradleProperty("testJdk")
 
 tasks.test {
     useJUnitPlatform()
+    // the format's test vectors, shared with the Python and JavaScript tests
+    val testdata = layout.projectDirectory.dir("testdata")
+    inputs.dir(testdata).withPropertyName("testdata")
+    systemProperty("tempo.testdata", testdata.asFile.absolutePath)
     if (testJdk.isPresent) {
         javaLauncher = javaToolchains.launcherFor {
             languageVersion = JavaLanguageVersion.of(testJdk.get())

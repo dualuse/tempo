@@ -48,7 +48,7 @@ public final class Tempo {
     // Row flag bits (16-bit column).
     static final int PHASE = 1, RETRO = 1 << 1, HANDOFF = 1 << 2, WAIT = 1 << 3, FAILED = 1 << 4,
             CANCELLED = 1 << 5, HEALED = 1 << 6, MISUSE = 1 << 7, DETAIL_ROW = 1 << 8, DEEP_ROW = 1 << 9,
-            LEGACY = 1 << 10, TASK = 1 << 11;
+            LEGACY = 1 << 10, TASK = 1 << 11, UNRUN = 1 << 12; // UNRUN: a task cancelled before it began
 
     // Event kinds, in the low KIND_BITS of an event's key; the rest is a Name id for attributes.
     static final int KIND_BITS = 4, KIND_MASK = (1 << KIND_BITS) - 1,
@@ -257,6 +257,11 @@ public final class Tempo {
             return byId[id];
         }
 
+        /** More than the largest id so far. */
+        static int capacity() {
+            return byId.length;
+        }
+
         @Override
         public String toString() {
             return text;
@@ -270,6 +275,7 @@ public final class Tempo {
         int level = COARSE, budget = 512, headerBytes = 3000, lanes = 256, cpu = CPU_AUTO;
         boolean strict;
         LongSupplier clock = SYSTEM_CLOCK, cpuClock; // cpuClock: tests only; null reads the thread's CPU time
+        LongSupplier wallClock = System::currentTimeMillis; // tests only
 
         /** {@link #COARSE} (default), {@link #DETAIL} or {@link #DEEP}; out-of-range values are clamped. */
         public Options level(int level) {
@@ -304,7 +310,13 @@ public final class Tempo {
             return this;
         }
 
-        /** Byte limit of the detailed header; default 3000. */
+        /** A fake wall clock in epoch milliseconds for tests, read once when the trace starts. */
+        Options wallClock(LongSupplier millis) {
+            this.wallClock = millis;
+            return this;
+        }
+
+        /** Byte limit of the detailed header ({@link Trace#toHeader()}); default 3000. */
         public Options headerBytes(int max) {
             this.headerBytes = Math.max(0, max);
             return this;
@@ -358,7 +370,7 @@ public final class Tempo {
 
         static final Context NONE = new Context();
 
-        final long id, epoch;
+        final long id, epoch, wall; // wall: epoch milliseconds at the start
         final LongSupplier clock, cpuClock;
         final boolean strict;
         final int budget, block, headerBytes, maxLanes, cpu;
@@ -380,7 +392,7 @@ public final class Tempo {
 
         private Context() {
             id = -1;
-            epoch = 0;
+            epoch = wall = 0;
             clock = SYSTEM_CLOCK;
             cpuClock = null;
             strict = false;
@@ -401,6 +413,7 @@ public final class Tempo {
             maxLanes = o.lanes;
             level = o.level;
             listening = Name.anySink;
+            wall = o.wallClock.getAsLong();
             epoch = clock.getAsLong();
         }
 
@@ -1009,7 +1022,7 @@ public final class Tempo {
                 s = stack(n, TASK);
                 r = s == NOOP ? -1 : s.row;
             } else {
-                r = row(n, TASK | CANCELLED, root ? -1 : rowAt[depth - 1]);
+                r = row(n, TASK | CANCELLED | UNRUN, root ? -1 : rowAt[depth - 1]);
             }
             if (r < 0) {
                 if (root) idle();
@@ -1892,16 +1905,18 @@ public final class Tempo {
     public static final class Snapshot {
         static final Snapshot EMPTY = new Snapshot();
 
-        private final Shape[] shapes; // by lane id
+        final Shape[] shapes; // by lane id
         private final Totals totals;
         private final long now;
+        final long wall;
+        final int headerBytes;
         private final int misuses, dropped, folded;
 
         private Snapshot() {
             shapes = new Shape[0];
             totals = null;
-            now = 0;
-            misuses = dropped = folded = 0;
+            now = wall = 0;
+            misuses = dropped = folded = headerBytes = 0;
         }
 
         /**
@@ -1923,6 +1938,8 @@ public final class Tempo {
 
         private Snapshot(Context ctx) {
             now = ctx.now();
+            wall = ctx.wall;
+            headerBytes = ctx.headerBytes;
             Lane[] lanes = ctx.lanesById();
             shapes = new Shape[lanes.length];
             for (int i = 0; i < lanes.length; i++) if (lanes[i] != null) shapes[i] = Shape.of(lanes[i]);
@@ -2017,6 +2034,7 @@ public final class Tempo {
             v.attrFrom = v.attrTo = v.subFrom = v.subTo = 0;
             v.shape = v.subShape = s;
             v.live = s.live;
+            v.inline = false;
             if (r > s.rows) {
                 int k = (r - s.rows - 1) * Aggs.KEY, b = (r - s.rows - 1) * Aggs.CELLS;
                 long[] c = s.aggCell;
@@ -2050,6 +2068,7 @@ public final class Tempo {
             v.flags = begun ? flags | b.flags[br] : flags;
             v.handoff = handoff;
             v.begun = begun;
+            v.inline = begun && b == s && b.parent[br] >= 0;
             v.wait = begun ? (b.wait == null ? 0 : b.wait[br]) : handoff ? Math.max(0, now - v.start) : 0;
             v.cpu = b.cpu == null || handoff && !begun ? -1 : b.cpu[br];
             v.label = b.label == null ? null : b.label[br];
@@ -2110,6 +2129,14 @@ public final class Tempo {
             Shape s = shapes.length == 0 ? null : shapes[0];
             if (s == null || s.rows == 0) return 0;
             return s.dur[0] != Lane.OPEN ? s.dur[0] : Math.max(0, now - s.start[0]);
+        }
+
+        /**
+         * The {@code Tempo-Timing} header value, as specified in {@code FORMAT.md}, at most
+         * {@link Options#headerBytes} long (see {@link Trace#toHeader()}); empty if taken after release.
+         */
+        public String toHeader() {
+            return Header.of(this, headerBytes);
         }
 
         /** Like {@link Trace#forEachTop}, as the snapshot was taken. */
@@ -2275,6 +2302,291 @@ public final class Tempo {
 
     // ---------------------------------------------------------------------------------------------
 
+    /**
+     * Writes a {@link Snapshot} as a {@code Tempo-Timing} v1 value in the canonical form of FORMAT.md §7.
+     * Two walks over the stitched tree: the first numbers the threads and names the records use, the
+     * second writes the records into the one builder. Records deeper than {@link #maxDepth}, and the
+     * aggregates of aggregate-only spans nested in others (the wire has no children under an aggregate),
+     * are left out with their subtrees and counted as dropped, like a non-finite attribute value.
+     */
+    static final class Header implements SpanVisitor {
+        static final int MAX_DEPTH = 35, MIN_BYTES = 256;
+        private static final char[] DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz".toCharArray(),
+                HEX = "0123456789ABCDEF".toCharArray();
+        private static final int SHOWN = FAILED | CANCELLED | WAIT | HEALED | MISUSE;
+
+        private final Snapshot snap;
+        private final int maxDepth;
+        private final boolean attributes;
+        private final int[] nameIndex; // by name id: wire index + 1; -1 for an attribute key not numbered yet
+        private final int[] laneIndex; // by lane id: wire thread index + 1, 0 for a lane no record uses
+        private int[] order = new int[16], keys = new int[16]; // name ids by wire index; keys by first use
+        private int names, nKeys;
+        private final long[] cur = new long[MAX_DEPTH + 2];
+        private final int[] threadAt = new int[MAX_DEPTH + 1];
+        private final boolean[] aggregateAt = new boolean[MAX_DEPTH + 1];
+        private StringBuilder out; // null during the first walk
+        private int limit, records, skip;
+        private long rootStart, rootDur, left, written, nonFinite; // left, written: spans, aggregates by count
+
+        private Header(Snapshot snap, int maxDepth, boolean attributes) {
+            this.snap = snap;
+            this.maxDepth = maxDepth;
+            this.attributes = attributes;
+            nameIndex = new int[Name.capacity()];
+            laneIndex = new int[snap.shapes.length];
+        }
+
+        /**
+         * The value of {@code s}, at most {@code maxBytes} long when {@code maxBytes >= 256}. A value that
+         * does not fit keeps the root and its children only, without attributes (ladder step 4 of FORMAT.md
+         * §7.1); below 256 bytes, or if that does not fit either, it is the fallback. Empty without a root.
+         */
+        static String of(Snapshot s, int maxBytes) {
+            StringBuilder b = new StringBuilder(Math.max(64, Math.min(maxBytes, 4096)));
+            Header full = new Header(s, MAX_DEPTH, true);
+            if (full.write(b, maxBytes)) return b.toString();
+            if (full.records == 0) return "";
+            if (maxBytes >= MIN_BYTES && new Header(s, 1, false).write(b, maxBytes)) return b.toString();
+            b.setLength(0);
+            b36(b.append("v1;x=0."), s.dropped() + full.left + full.written);
+            b36(b.append(";T=%3F;N=%3F;S=00.0."), us(full.rootDur));
+            return b.append(";e=1").toString();
+        }
+
+        /** Writes the value into {@code b}, giving up once it is longer than {@code max}; whether it fits. */
+        private boolean write(StringBuilder b, int max) {
+            snap.forEachSpan(this);
+            if (records == 0) return false;
+            for (int i = 0; i < nKeys; i++) if (nameIndex[keys[i]] < 0) number(keys[i]);
+            for (int l = 0, n = 0; l < laneIndex.length; l++) if (laneIndex[l] != 0) laneIndex[l] = ++n;
+
+            b.setLength(0);
+            b.append("v1");
+            if (snap.wall > 0) b36(b.append(";w="), snap.wall);
+            long dropped = snap.dropped() + left + nonFinite;
+            if (snap.folded() > 0 || dropped > 0) b36(b36(b.append(";x="), snap.folded()).append('.'), dropped);
+            boolean live = false;
+            for (int l = 0; l < laneIndex.length; l++) {
+                if (laneIndex[l] == 0 || !snap.shapes[l].live) continue;
+                b36(b.append(live ? "." : ";l="), laneIndex[l] - 1);
+                live = true;
+            }
+            b.append(";T=");
+            for (int l = 0, n = 0; l < laneIndex.length; l++) {
+                if (laneIndex[l] != 0) name(n++ == 0 ? b : b.append(':'), snap.shapes[l].thread);
+            }
+            b.append(";N=");
+            for (int i = 0; i < names; i++) name(i == 0 ? b : b.append(':'), Name.byId(order[i]).text);
+            b.append(";S=");
+            out = b;
+            limit = max;
+            records = 0;
+            skip = -1;
+            snap.forEachSpan(this);
+            b36(b.append(";e="), records);
+            return b.length() <= max;
+        }
+
+        @Override
+        public void visit(SpanView v) {
+            int d = v.depth;
+            if (skip >= 0 && d > skip || d > maxDepth || d == 0 && records > 0 || d > 0 && aggregateAt[d - 1]) {
+                if (skip < 0 || d <= skip) skip = d; // left out with its subtree
+                if (out == null) left += v.count;
+                return;
+            }
+            skip = -1;
+            aggregateAt[d] = v.aggregate;
+            if (out == null) count(v);
+            else if (out.length() <= limit) record(out, v);
+            records++;
+        }
+
+        /** First walk: numbers the record's thread, name and attribute keys. */
+        private void count(SpanView v) {
+            if (records == 0) {
+                rootStart = v.start;
+                rootDur = v.duration;
+            } else {
+                written += v.count;
+            }
+            if (!unrun(v)) laneIndex[v.shape.lane] = 1;
+            if (nameIndex[v.name.id] <= 0) number(v.name.id);
+            for (int i = 0, n = attributes ? v.attributes() : 0; i < n; i++) {
+                if (!first(v, i)) continue;
+                int j = last(v, i), key = v.key(j) >>> KIND_BITS;
+                if (!finite(v, j)) {
+                    nonFinite++;
+                } else if (nameIndex[key] == 0) {
+                    nameIndex[key] = -1;
+                    if (nKeys == keys.length) keys = Arrays.copyOf(keys, 2 * nKeys);
+                    keys[nKeys++] = key;
+                }
+            }
+        }
+
+        private void number(int id) {
+            if (names == order.length) order = Arrays.copyOf(order, 2 * names);
+            order[names++] = id;
+            nameIndex[id] = names;
+        }
+
+        /** Second walk: {@code depth nameIdx.startDelta.dur [@thread] [~wait] [*cpu] [+agg] [^flags] [:key=value]}. */
+        private void record(StringBuilder b, SpanView v) {
+            int d = v.depth;
+            if (records > 0) b.append('/');
+            long start = us(v.start - rootStart), delta = Math.max(0, start - cur[d]);
+            cur[d] = cur[d + 1] = cur[d] + delta;
+            b36(b36(b36(b.append(DIGITS[d]), nameIndex[v.name.id] - 1).append('.'), delta).append('.'), us(v.duration));
+            int thread = d == 0 ? 0 : unrun(v) ? threadAt[d - 1] : laneIndex[v.shape.lane] - 1;
+            threadAt[d] = thread;
+            if (d > 0 && thread != threadAt[d - 1]) b36(b.append('@'), thread);
+            if (v.handoff && !v.aggregate && !(v.inline && v.wait < 1000)) b36(b.append('~'), us(v.wait));
+            if (v.cpu >= 0) b36(b.append('*'), us(v.cpu));
+            if (v.aggregate) {
+                b36(b36(b36(b.append('+'), v.count).append('.'), us(v.min)).append('.'), us(v.max));
+                b36(b36(b.append('.'), us(v.extent)).append('.'), us(v.maxAt));
+            }
+            int f = v.flags;
+            if ((f & SHOWN) != 0 || v.open || v.neverStarted()) {
+                b.append('^');
+                if ((f & FAILED) != 0) b.append('f');
+                if ((f & CANCELLED) != 0) b.append('c');
+                if (v.open) b.append('o');
+                if (v.neverStarted()) b.append('n');
+                if ((f & WAIT) != 0) b.append('w');
+                if ((f & (HEALED | MISUSE)) != 0) b.append('m');
+            }
+            for (int i = 0, n = attributes ? v.attributes() : 0; i < n; i++) {
+                if (!first(v, i)) continue;
+                int j = last(v, i);
+                if (!finite(v, j)) continue;
+                b36(b.append(':'), nameIndex[v.key(j) >>> KIND_BITS] - 1).append('=');
+                if ((v.key(j) & KIND_MASK) == ATTR_DOUBLE) number(b, Double.longBitsToDouble(v.value(j)));
+                else b.append(v.value(j));
+            }
+        }
+
+        /** A task cancelled before it began: no thread ran it, so it sits on its parent's (FORMAT.md §6.5). */
+        private static boolean unrun(SpanView v) {
+            return (v.flags & UNRUN) != 0;
+        }
+
+        /** Whether attribute {@code i} is the first of its key, which is written at its place with the last value. */
+        private static boolean first(SpanView v, int i) {
+            int key = v.key(i) >>> KIND_BITS;
+            for (int k = 0; k < i; k++) if (v.key(k) >>> KIND_BITS == key) return false;
+            return true;
+        }
+
+        private static int last(SpanView v, int i) {
+            int key = v.key(i) >>> KIND_BITS, j = i;
+            for (int k = i + 1, n = v.attributes(); k < n; k++) if (v.key(k) >>> KIND_BITS == key) j = k;
+            return j;
+        }
+
+        private static boolean finite(SpanView v, int j) {
+            return (v.key(j) & KIND_MASK) != ATTR_DOUBLE || Double.isFinite(Double.longBitsToDouble(v.value(j)));
+        }
+
+        static long us(long nanos) {
+            return nanos <= 0 ? 0 : nanos / 1000;
+        }
+
+        /** Appends {@code v}, at least 0, in lowercase base 36. */
+        static StringBuilder b36(StringBuilder b, long v) {
+            if (v <= 0) return b.append('0');
+            int from = b.length();
+            for (; v > 0; v /= 36) b.append(DIGITS[(int) (v % 36)]);
+            for (int i = from, j = b.length() - 1; i < j; i++, j--) {
+                char c = b.charAt(i);
+                b.setCharAt(i, b.charAt(j));
+                b.setCharAt(j, c);
+            }
+            return b;
+        }
+
+        /**
+         * Appends a name: {@code A-Z a-z 0-9 . -} as themselves, a space as {@code _}, every other UTF-8 byte
+         * as {@code %XX}; an unpaired surrogate as {@code ?}, and a null or empty name as {@code %3F}.
+         */
+        static void name(StringBuilder b, String s) {
+            if (s == null || s.isEmpty()) {
+                escape(b, '?');
+                return;
+            }
+            for (int i = 0, n = s.length(); i < n; i++) {
+                int c = s.charAt(i);
+                if (c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '-') {
+                    b.append((char) c);
+                } else if (c == ' ') {
+                    b.append('_');
+                } else if (c < 0x80) {
+                    escape(b, c);
+                } else if (c < 0x800) {
+                    escape(b, 0xC0 | c >> 6);
+                    escape(b, 0x80 | c & 0x3F);
+                } else if (!Character.isSurrogate((char) c)) {
+                    escape(b, 0xE0 | c >> 12);
+                    escape(b, 0x80 | c >> 6 & 0x3F);
+                    escape(b, 0x80 | c & 0x3F);
+                } else if (Character.isHighSurrogate((char) c) && i + 1 < n && Character.isLowSurrogate(s.charAt(i + 1))) {
+                    int p = Character.toCodePoint((char) c, s.charAt(++i));
+                    escape(b, 0xF0 | p >> 18);
+                    escape(b, 0x80 | p >> 12 & 0x3F);
+                    escape(b, 0x80 | p >> 6 & 0x3F);
+                    escape(b, 0x80 | p & 0x3F);
+                } else {
+                    escape(b, '?');
+                }
+            }
+        }
+
+        private static void escape(StringBuilder b, int octet) {
+            b.append('%').append(HEX[octet >> 4]).append(HEX[octet & 15]);
+        }
+
+        /**
+         * Appends a finite double as {@code printf("%.6f")} would, then without trailing zeros and point,
+         * {@code -0} as {@code 0}. The six-digit rounding is exact (half to even on the binary value):
+         * one fused multiply-add tells whether the product's rounding moved it across a half, and a value
+         * at an exact half, or too large for a long, goes through {@link BigDecimal}.
+         */
+        static void number(StringBuilder b, double v) {
+            if (v == Math.rint(v) && Math.abs(v) < 0x1p62) {
+                b.append((long) v); // -0.0 is 0
+                return;
+            }
+            long q;
+            double r = Math.rint(v * 1e6), e = Math.fma(v, 1e6, -r); // e: the exact v * 1e6 - r, rounded once
+            if (Math.abs(r) >= 0x1p52 || Math.abs(e) == 0.5) {
+                BigDecimal d = new BigDecimal(v).setScale(6, RoundingMode.HALF_EVEN);
+                b.append(d.signum() == 0 ? "0" : d.stripTrailingZeros().toPlainString());
+                return;
+            }
+            q = (long) (e > 0.5 ? r + 1 : e < -0.5 ? r - 1 : r);
+            if (q == 0) {
+                b.append('0');
+                return;
+            }
+            if (q < 0) {
+                b.append('-');
+                q = -q;
+            }
+            b.append(q / 1_000_000);
+            long f = q % 1_000_000;
+            if (f == 0) return;
+            b.append('.');
+            for (long m = 100_000; f != 0; m /= 10) {
+                b.append((char) ('0' + f / m));
+                f %= m;
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+
     /** One request's recording. Not pooled. Reads stay valid after {@link #close()} until {@link #release()}. */
     public static final class Trace implements AutoCloseable {
         final Context ctx;
@@ -2411,6 +2723,17 @@ public final class Tempo {
          */
         public Aggregate aggregate(Name name) {
             return name == null ? Aggregate.EMPTY : ctx.aggregate(name.id);
+        }
+
+        /**
+         * The {@code Tempo-Timing} header value, as specified in {@code FORMAT.md}: one line of at most
+         * {@link Options#headerBytes} bytes. Over that limit only the root and its children are written,
+         * without attributes; if that does not fit either (or the limit is below 256 bytes), the
+         * fixed fallback {@code v1;x=0.<n>;T=%3F;N=%3F;S=00.0.<dur>;e=1}. Renders a {@link #snapshot()},
+         * so spans still open end at one instant; empty after release.
+         */
+        public String toHeader() {
+            return snapshot().toHeader();
         }
 
         /**
@@ -2810,6 +3133,7 @@ public final class Tempo {
         String label;
         long start, duration, wait, cpu, count, min, max, extent, maxAt;
         boolean open, live, handoff, begun, aggregate;
+        boolean inline; // a handoff begun on the submitting thread inside the submitter's lane
 
         SpanView() {}
 

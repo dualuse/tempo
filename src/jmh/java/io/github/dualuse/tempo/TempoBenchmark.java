@@ -282,6 +282,51 @@ public class TempoBenchmark {
         h.begin().close();
     }
 
+    /**
+     * A closed trace of 300 spans to render: 30 spans of 9 children each, a long attribute on every third
+     * child and a double on every fifth. The header limit is raised so the whole value is written.
+     */
+    @State(Scope.Thread)
+    public static class Rendered {
+        Tempo.Trace trace;
+        Tempo.Snapshot snapshot;
+
+        @Setup(Level.Trial)
+        public void setUp() {
+            trace = Tempo.start(ROOT, new Tempo.Options().headerBytes(1 << 16));
+            Tempo.Span root = trace.root();
+            for (int i = 0; i < 30; i++) {
+                try (Tempo.Span parent = root.span(CHILD)) {
+                    for (int j = 0; j < 9; j++) {
+                        Tempo.Span c = parent.span(j % 2 == 0 ? CHILD : KEY);
+                        if (j % 3 == 0) c.set(KEY, 1000L * i + j);
+                        if (j % 5 == 0) c.set(ALWAYS, i / 7.0);
+                        c.close();
+                    }
+                }
+            }
+            trace.close();
+            snapshot = trace.snapshot();
+        }
+
+        @TearDown(Level.Trial)
+        public void tearDown() {
+            trace.release();
+        }
+    }
+
+    /** {@code Trace.toHeader()}: a snapshot of the trace, then the value. */
+    @Benchmark
+    public String toHeader(Rendered s) {
+        return s.trace.toHeader();
+    }
+
+    /** The value of a snapshot taken once: the encoder alone. */
+    @Benchmark
+    public String snapshotToHeader(Rendered s) {
+        return s.snapshot.toHeader();
+    }
+
     @Benchmark
     public void traceLifecycle() {
         Tempo.Trace t = Tempo.start(ROOT);
