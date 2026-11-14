@@ -90,6 +90,30 @@ class SetupTimeTest {
         }
     }
 
+    /**
+     * The zero point is the first thing {@code Tempo.start} does, before it constructs anything (and so
+     * before the classes it loads on first use in a JVM): the clock's first read comes from {@code start}
+     * itself, not from a constructor it calls.
+     */
+    @Test
+    void theZeroPointIsReadBeforeStartConstructsAnything() {
+        List<String> firstRead = new ArrayList<>();
+        Stepping steps = new Stepping(10);
+        LongSupplier clock = () -> {
+            if (firstRead.isEmpty()) {
+                StackWalker.getInstance().forEach(f -> {
+                    if (f.getClassName().startsWith(Tempo.class.getName())) firstRead.add(f.getClassName() + "." + f.getMethodName());
+                });
+            }
+            return steps.getAsLong();
+        };
+        Trace t = Tempo.start(SEARCH, new Options().clock(clock).cpu(false));
+        t.close();
+        assertEquals(List.of(Tempo.class.getName() + ".start"), firstRead.subList(0, 1), String.valueOf(firstRead));
+        assertFalse(firstRead.stream().anyMatch(f -> f.endsWith(".<init>")), String.valueOf(firstRead));
+        assertEquals(lines("search 0+10"), starts(t)); // the zero point, then the close
+    }
+
     @Test
     void theRootStartsAtZeroWithTheSystemClock() {
         for (int level : new int[] {COARSE, DETAIL}) {

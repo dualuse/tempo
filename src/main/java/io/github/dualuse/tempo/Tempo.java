@@ -85,11 +85,17 @@ public final class Tempo {
 
     /** Starts a {@link #COARSE} trace whose root span is opened on the calling thread. */
     public static Trace start(Name root) {
-        return new Trace(root, null);
+        return start(root, null);
     }
 
+    /**
+     * Starts a trace whose root span is opened on the calling thread. The clock is read first, before
+     * anything else (not even a class Tempo loads on first use): that reading is the trace's zero point and
+     * the root's start, so all of Tempo's setup is counted in the root's time.
+     */
     public static Trace start(Name root, Options options) {
-        return new Trace(root, options);
+        long zero = options == null ? SYSTEM_CLOCK.getAsLong() : options.clock.getAsLong(); // DEFAULTS.clock is SYSTEM_CLOCK
+        return new Trace(root, options == null ? Options.DEFAULTS : options, zero);
     }
 
     /**
@@ -437,11 +443,16 @@ public final class Tempo {
         }
 
         /**
-         * Reads the clock first: that reading is the trace's zero point and the root's start, so the setup
-         * that follows (the lane, the first CPU read of a JVM) is counted in the root's time, not hidden.
+         * {@code zero}: the clock read as {@link Tempo#start} was entered, the trace's zero point and the
+         * root's start, so the setup that follows (the classes Tempo loads on first use, the lane, the first
+         * CPU read of a JVM) is counted in the root's time, not hidden.
          */
-        Context(Options o) {
-            epoch = o.clock.getAsLong();
+        Context(Options o) { // tests: a context without a trace, its zero point now
+            this(o, o.clock.getAsLong());
+        }
+
+        Context(Options o, long zero) {
+            epoch = zero;
             wall = o.wallClock.getAsLong();
             id = IDS.incrementAndGet();
             clock = o.clock;
@@ -3722,8 +3733,8 @@ public final class Tempo {
         private final Lane rootLane;
         private final Span root;
 
-        Trace(Name name, Options options) {
-            ctx = new Context(options == null ? Options.DEFAULTS : options); // reads the clock first: the root's start
+        Trace(Name name, Options options, long zero) {
+            ctx = new Context(options, zero); // zero: the clock read as start was entered, the root's start
             // Right after: CPU covers the root like its wall time, and the first CPU read of a JVM (it loads
             // the management bean, milliseconds) happens here, counted in the root's own time.
             long cpu = ctx.cpu() ? ctx.cpuNow() : -1;
