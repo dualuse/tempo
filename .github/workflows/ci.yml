@@ -34,3 +34,9 @@ jobs:
           -PtestJdk=${{ matrix.java }}
           -Porg.gradle.java.installations.auto-download=false
           -Porg.gradle.java.installations.fromEnv=JAVA_HOME_${{ matrix.java }}_X64
+      - name: Concurrency tests on JDK ${{ matrix.java }}
+        run: >
+          ./gradlew jcstress
+          -PtestJdk=${{ matrix.java }}
+          -Porg.gradle.java.installations.auto-download=false
+          -Porg.gradle.java.installations.fromEnv=JAVA_HOME_${{ matrix.java }}_X64

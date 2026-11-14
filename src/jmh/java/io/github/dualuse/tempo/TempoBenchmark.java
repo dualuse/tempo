@@ -120,6 +120,25 @@ public class TempoBenchmark {
         }
     }
 
+    /** A DETAIL trace without budget: every detail span folds into the lane's aggregate. */
+    @State(Scope.Thread)
+    public static class Folding {
+        Tempo.Trace trace;
+        Tempo.Span root;
+
+        @Setup(Level.Trial)
+        public void setUp() {
+            trace = Tempo.start(ROOT, new Tempo.Options().level(Tempo.DETAIL).budget(0));
+            root = trace.root();
+        }
+
+        @TearDown(Level.Trial)
+        public void tearDown() {
+            trace.close();
+            trace.release();
+        }
+    }
+
     @Benchmark
     public long baselineNanoTime() {
         return System.nanoTime();
@@ -181,6 +200,14 @@ public class TempoBenchmark {
     @Benchmark
     public Tempo.Span alwaysOn(Coarse s) {
         Tempo.Span d = s.root.detail(ALWAYS);
+        d.close();
+        return d;
+    }
+
+    /** Explicit handle, DETAIL trace over its budget: a folded span (two clock reads, an aggregate update). */
+    @Benchmark
+    public Tempo.Span folded(Folding s) {
+        Tempo.Span d = s.root.detail(CHILD);
         d.close();
         return d;
     }

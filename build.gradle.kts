@@ -17,12 +17,23 @@ val jmh: SourceSet by sourceSets.creating {
 val jmhImplementation: Configuration by configurations.getting
 val jmhAnnotationProcessor: Configuration by configurations.getting
 
+// The jcstress source set holds the concurrency tests of the lane state and the commit protocol.
+val jcstress: SourceSet by sourceSets.creating {
+    compileClasspath += sourceSets.main.get().output
+    runtimeClasspath += sourceSets.main.get().output
+}
+val jcstressImplementation: Configuration by configurations.getting
+val jcstressAnnotationProcessor: Configuration by configurations.getting
+
 dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 
     jmhImplementation("org.openjdk.jmh:jmh-core:1.37")
     jmhAnnotationProcessor("org.openjdk.jmh:jmh-generator-annprocess:1.37")
+
+    jcstressImplementation("org.openjdk.jcstress:jcstress-core:0.16")
+    jcstressAnnotationProcessor("org.openjdk.jcstress:jcstress-core:0.16")
 }
 
 tasks.withType<JavaCompile>().configureEach {
@@ -65,6 +76,23 @@ tasks.register<JavaExec>("jmhGate") {
     }
 }
 
+// ./gradlew jcstress                                   the jcstress tests, -m quick
+// ./gradlew jcstress -Pjcstress.args="-m default"     explicit jcstress command line
+tasks.register<JavaExec>("jcstress") {
+    group = "verification"
+    description = "Runs the jcstress tests of the lane state and the commit protocol."
+    classpath = jcstress.runtimeClasspath
+    mainClass = "org.openjdk.jcstress.Main"
+    args = (providers.gradleProperty("jcstress.args").orNull ?: "-m quick").trim().split(Regex("\\s+"))
+    workingDir = layout.buildDirectory.dir("jcstress").get().asFile
+    doFirst { workingDir.mkdirs() }
+    if (testJdk.isPresent) {
+        javaLauncher = javaToolchains.launcherFor {
+            languageVersion = JavaLanguageVersion.of(testJdk.get())
+        }
+    }
+}
+
 tasks.check {
-    dependsOn(tasks.named("jmhClasses"))
+    dependsOn(tasks.named("jmhClasses"), tasks.named("jcstressClasses"))
 }

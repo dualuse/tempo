@@ -222,7 +222,8 @@ public final class Tempo {
         /**
          * Marks the name always-on: below the trace's level {@link Span#detail} and {@link Span#deep}
          * return an aggregate-only span instead of {@link Tempo#NOOP}. It writes no row, costs two clock
-         * reads, adds its duration to {@link Trace#aggregate(Name)} and calls the listeners.
+         * reads, adds its duration to its lane's aggregate and so to {@link Trace#aggregate(Name)}, and
+         * calls the listeners.
          */
         public Name aggregate() {
             marked = true;
@@ -273,7 +274,11 @@ public final class Tempo {
             return this;
         }
 
-        /** Detail spans recorded individually per trace before they fold into aggregates; default 512. */
+        /**
+         * {@link #DETAIL} and {@link #DEEP} spans recorded individually per trace, default 512; past it they
+         * fold into aggregates ({@link SpanView#aggregate()}). Lanes take the budget in blocks of
+         * {@code max(1, budget / 64)} and give back what they did not use when their task ends.
+         */
         public Options budget(int detailSpans) {
             this.budget = Math.max(0, detailSpans);
             return this;
@@ -334,7 +339,7 @@ public final class Tempo {
      */
     static final class Context {
         private static final AtomicLong IDS = new AtomicLong();
-        private static final VarHandle LANES, TOTALS, DROPPED;
+        private static final VarHandle LANES, TOTALS, DROPPED, CREDITS;
 
         static {
             try {
@@ -342,6 +347,7 @@ public final class Tempo {
                 LANES = l.findVarHandle(Context.class, "lanes", Lane.class);
                 TOTALS = l.findVarHandle(Context.class, "totals", Totals.class);
                 DROPPED = l.findVarHandle(Context.class, "dropped", int.class);
+                CREDITS = l.findVarHandle(Context.class, "credits", int.class);
             } catch (ReflectiveOperationException e) {
                 throw new ExceptionInInitializerError(e);
             }
@@ -352,7 +358,7 @@ public final class Tempo {
         final long id, epoch;
         final LongSupplier clock, cpuClock;
         final boolean strict;
-        final int budget, headerBytes, maxLanes, cpu;
+        final int budget, block, headerBytes, maxLanes, cpu;
         final AtomicInteger misuses = new AtomicInteger();
         volatile int level;
         volatile boolean detailSeen, released;
@@ -364,6 +370,7 @@ public final class Tempo {
         private volatile Lane lanes;    // CAS-linked registry, newest first
         private volatile Totals totals; // created with the first lane-less record
         private volatile int dropped;   // tasks left unrecorded at the lane cap
+        private volatile int credits;   // detail budget not handed out to a lane
         private long[] lost;            // guarded by this: (laneId << 32 | row) of handoffs whose task has no record
         private int lostCount;
 
@@ -373,7 +380,7 @@ public final class Tempo {
             clock = SYSTEM_CLOCK;
             cpuClock = null;
             strict = false;
-            budget = headerBytes = maxLanes = 0;
+            budget = block = headerBytes = maxLanes = 0;
             cpu = CPU_OFF;
             level = -1; // below COARSE, so NOOP.detail() returns at the level check
         }
@@ -384,7 +391,8 @@ public final class Tempo {
             cpuClock = o.cpuClock;
             strict = o.strict;
             cpu = o.cpu;
-            budget = o.budget;
+            budget = credits = o.budget;
+            block = Math.max(1, budget / 64);
             headerBytes = o.headerBytes;
             maxLanes = o.lanes;
             level = o.level;
@@ -504,6 +512,36 @@ public final class Tempo {
             return n;
         }
 
+        int folded() {
+            int n = 0;
+            for (Lane l = lanes; l != null; l = l.next) n += l.folded;
+            return n;
+        }
+
+        /** Hands a lane up to one block of the detail budget; 0 when it is spent. */
+        int credits() {
+            int c, n;
+            do {
+                c = credits;
+                if (c <= 0) return 0;
+                n = Math.min(block, c);
+            } while (!CREDITS.compareAndSet(this, c, c - n));
+            return n;
+        }
+
+        void refund(int n) {
+            CREDITS.getAndAdd(this, n);
+        }
+
+        int unspent() {
+            return credits;
+        }
+
+        Totals frozenTotals() {
+            Totals t = totals;
+            return t == null ? null : t.copy();
+        }
+
         Totals totals() {
             Totals t = totals;
             if (t == null && !TOTALS.compareAndSet(this, null, t = new Totals(8))) t = totals;
@@ -516,7 +554,9 @@ public final class Tempo {
          */
         void lost(Handoff h, boolean count) {
             if (count) DROPPED.getAndAdd(this, 1);
-            totals().add(h.lane.nameOf(h.row), true, Math.max(0, now() - h.submit));
+            int name = h.lane.nameAt(h.row);
+            if (name < 0 || released) return;
+            totals().add(name, true, Math.max(0, now() - h.submit));
             synchronized (this) {
                 if (lost == null) lost = new long[8];
                 else if (lostCount == lost.length) lost = Arrays.copyOf(lost, 2 * lostCount);
@@ -568,6 +608,20 @@ public final class Tempo {
         Totals(int capacity) {
             keys = new int[capacity];
             cells = new long[capacity * CELLS];
+        }
+
+        private Totals(Totals t) {
+            keys = new int[t.keys.length];
+            cells = new long[t.cells.length];
+            for (int i = 0; i < keys.length; i++) keys[i] = (int) KEY.getAcquire(t.keys, i);
+            for (int i = 0; i < cells.length; i++) cells[i] = cell(t.cells, i);
+            Totals n = t.next;
+            next = n == null ? null : new Totals(n);
+        }
+
+        /** A copy that no later add changes. */
+        Totals copy() {
+            return new Totals(this);
         }
 
         void add(int id, boolean wait, long nanos) {
@@ -677,31 +731,80 @@ public final class Tempo {
         final long[] value = new long[Lane.CHUNK];
     }
 
-    /** Bounded stack of recycled chunks; a chunk that does not fit goes to the GC. */
+    /**
+     * Bounded lock-free pool of recycled chunks; a chunk that does not fit goes to the GC. The slots
+     * move between two Treiber stacks of slot indexes, {@code full} and {@code empty}, whose heads pack
+     * {@code (version << 32) | (index + 1)}: the version changes with every push and pop, so a pop that
+     * read a stale {@code next} fails its CAS instead of corrupting the stack (no ABA). Allocation-free.
+     */
     static final class Pool<T> {
-        private final Object[] items;
+        private static final VarHandle FULL, EMPTY;
+        private static final long STEP = 1L << 32, INDEX = STEP - 1;
+
+        static {
+            try {
+                MethodHandles.Lookup l = MethodHandles.lookup();
+                FULL = l.findVarHandle(Pool.class, "full", long.class);
+                EMPTY = l.findVarHandle(Pool.class, "empty", long.class);
+            } catch (ReflectiveOperationException e) {
+                throw new ExceptionInInitializerError(e);
+            }
+        }
+
+        private final Object[] items; // items[i] holds a chunk while slot i is on the full stack
+        private final int[] next;     // index + 1 of the slot below slot i on its stack, 0 at the bottom
         private final Supplier<T> fresh;
-        private int size;
+        @SuppressWarnings("unused") private volatile long full, empty;
 
         Pool(int capacity, Supplier<T> fresh) {
-            this.items = new Object[capacity];
+            items = new Object[capacity];
+            next = new int[capacity];
+            for (int i = 0; i < capacity; i++) next[i] = i;
+            empty = capacity;
             this.fresh = fresh;
         }
 
         @SuppressWarnings("unchecked")
         T take() {
-            synchronized (this) {
-                if (size > 0) {
-                    T chunk = (T) items[--size];
-                    items[size] = null;
-                    return chunk;
-                }
-            }
-            return fresh.get();
+            int i = pop(FULL);
+            if (i < 0) return fresh.get();
+            T chunk = (T) items[i];
+            items[i] = null;
+            push(EMPTY, i);
+            return chunk;
         }
 
-        synchronized void give(Object chunk) {
-            if (size < items.length) items[size++] = chunk;
+        void give(Object chunk) {
+            int i = pop(EMPTY);
+            if (i < 0) return;
+            items[i] = chunk;
+            push(FULL, i);
+        }
+
+        /** Chunks held; for tests, while no thread uses the pool. */
+        int size() {
+            int n = 0;
+            for (long s = (long) FULL.getVolatile(this) & INDEX; s != 0; s = next[(int) s - 1]) n++;
+            return n;
+        }
+
+        private int pop(VarHandle head) {
+            long top;
+            int i;
+            do {
+                top = (long) head.getVolatile(this);
+                i = (int) (top & INDEX) - 1;
+                if (i < 0) return -1;
+            } while (!head.compareAndSet(this, top, (top & ~INDEX) + STEP | next[i]));
+            return i;
+        }
+
+        private void push(VarHandle head, int i) {
+            long top;
+            do {
+                top = (long) head.getVolatile(this);
+                next[i] = (int) (top & INDEX);
+            } while (!head.compareAndSet(this, top, (top & ~INDEX) + STEP | (i + 1)));
         }
     }
 
@@ -715,10 +818,12 @@ public final class Tempo {
     static final class Lane {
         static final int CHUNK_BITS = 8, CHUNK = 1 << CHUNK_BITS, MASK = CHUNK - 1, CHUNKS = 64,
                 MAX_ROWS = CHUNK * CHUNKS, MAX_EVENTS = CHUNK * CHUNKS, MAX_DEPTH = 35;
-        static final int IDLE = 0, ACTIVE = 1, RETIRED = 2, FRAME = -1;
+        // state = epoch * EPOCH + kind; the epoch counts the owner's IDLE -> ACTIVE moves, so a reader that
+        // finds the same IDLE state before and after its reads knows nothing was written in between.
+        static final int IDLE = 0, ACTIVE = 1, RETIRED = 2, KIND = 3, EPOCH = 4, FRAME = -1;
         static final long OPEN = Long.MIN_VALUE;
 
-        private static final VarHandle COMMIT, STATE, LABELS, DUR = MethodHandles.arrayElementVarHandle(long[].class);
+        private static final VarHandle COMMIT, STATE, LABELS, AGGS, DUR = MethodHandles.arrayElementVarHandle(long[].class);
 
         static {
             try {
@@ -726,6 +831,7 @@ public final class Tempo {
                 COMMIT = l.findVarHandle(Lane.class, "commit", long.class);
                 STATE = l.findVarHandle(Lane.class, "state", int.class);
                 LABELS = l.findVarHandle(Lane.class, "labels", String[].class);
+                AGGS = l.findVarHandle(Lane.class, "aggs", Aggs.class);
             } catch (ReflectiveOperationException e) {
                 throw new ExceptionInInitializerError(e);
             }
@@ -749,6 +855,10 @@ public final class Tempo {
         final Span[] handles = new Span[MAX_DEPTH];
         int depth, rowCount, eventCount, dropped;
         boolean framed; // a frame was ever opened: the trace's listeners are frozen
+        int credit, folded; // detail budget held by this lane; detail spans folded for want of it
+
+        // Folded and aggregate-only spans; replaced by a grown copy via AGGS.setRelease, like labels.
+        private Aggs aggs;
 
         // CPU time at open of the rows at the depths whose bit is set in cpuMask; created on first use.
         long cpuMask;
@@ -762,6 +872,7 @@ public final class Tempo {
         static final int NO_PHASE = -1, DROPPED_PHASE = -2;
         long[] mark;
         int[] lastPhase, lapOrdinal;
+        int[] lapFrom; // aggregates created before the current lap of depth d; the lap's own come after
 
         // Legacy labels, referenced by LABEL events. Grown by copy and stored via LABELS.setRelease, so a
         // reader that acquires the commit and then the array sees every label that commit exposes, even
@@ -782,7 +893,17 @@ public final class Tempo {
         }
 
         boolean retired() {
-            return state == RETIRED;
+            return (state & KIND) == RETIRED;
+        }
+
+        int state() {
+            return state;
+        }
+
+        /** Owner only: IDLE -> ACTIVE in a new epoch; false once retired. */
+        private boolean activate() {
+            int s = state;
+            return (s & KIND) == IDLE && STATE.compareAndSet(this, s, s + EPOCH + ACTIVE);
         }
 
         /** Writes a closed handoff row under the innermost open span at the submit time. */
@@ -804,8 +925,13 @@ public final class Tempo {
          */
         Span task(Handoff h, boolean run) {
             boolean root = depth == 0;
-            if (root && !STATE.compareAndSet(this, IDLE, ACTIVE)) return NOOP;
-            Name n = Name.byId(h.lane.nameOf(h.row));
+            if (root && !activate()) return NOOP;
+            int id = h.lane.nameAt(h.row);
+            if (id < 0) { // the submitter's lane is retired: the trace was released
+                if (root) idle();
+                return NOOP;
+            }
+            Name n = Name.byId(id);
             Span s = NOOP;
             int r = -1;
             if (eventCount > MAX_EVENTS - 2) {
@@ -838,7 +964,7 @@ public final class Tempo {
         }
 
         Span openRoot(Name n, int flags) {
-            if (!STATE.compareAndSet(this, IDLE, ACTIVE)) return NOOP;
+            if (!activate()) return NOOP;
             Span h = stack(n, flags);
             if (h == NOOP) {
                 idle();
@@ -857,18 +983,40 @@ public final class Tempo {
             return h;
         }
 
+        /**
+         * A {@link #DETAIL} or {@link #DEEP} span: a row while the lane holds budget, refilled a block at
+         * a time from the trace; once the trace's budget is spent, folded into the lane's aggregates.
+         */
+        Span budgeted(Name n, int flags) {
+            if (credit == 0 && (credit = ctx.credits()) == 0) {
+                Span h = frame(n);
+                if (h != NOOP) folded++;
+                return h;
+            }
+            Span h = push(n, flags);
+            if (h != NOOP) credit--;
+            return h;
+        }
+
         private void start(Span h) {
             rows[h.row >>> CHUNK_BITS].start[h.row & MASK] = ctx.now(); // read last: the bookkeeping is not timed
             publish();
         }
 
-        /** Opens an aggregate-only span above the open one: no row, its start kept in the handle. */
+        /**
+         * Opens an aggregate-only span above the open one: no row, its start kept in the handle; it ends
+         * into the aggregate keyed by its anchor (the nearest recorded span), the anchor's lap, its parent
+         * (-1 when that is the anchor, else the name of the enclosing aggregate-only span) and its name.
+         */
         Span frame(Name n) {
             int d = depth;
             if (d == MAX_DEPTH) {
                 dropped++;
                 return NOOP;
             }
+            int a = d - 1;
+            while (handles[a].row == FRAME) a--;
+            int agg = aggregate(rowAt[d - 1], lapOrdinal(a), a == d - 1 ? -1 : handles[d - 1].frame.id, n.id);
             rowAt[d] = rowAt[d - 1];
             depth = d + 1;
             framed = true;
@@ -876,14 +1024,48 @@ public final class Tempo {
             if (h == null) handles[d] = h = new Span(this, ctx, d);
             h.row = FRAME;
             h.frame = n;
+            h.agg = agg;
             h.time = ctx.now();
             return h;
         }
 
+        /** The entry of an aggregate key, created if new; -1 past {@link Aggs#MAX} entries (counted as a drop). */
+        private int aggregate(int anchor, int lap, int parent, int name) {
+            Aggs a = aggs;
+            if (a == null) AGGS.setRelease(this, a = new Aggs(8));
+            int e = a.find(anchor, lap, parent, name);
+            if (e >= 0) return e;
+            if (a.size() == Aggs.MAX) {
+                dropped++;
+                return -1;
+            }
+            if (a.full()) AGGS.setRelease(this, a = a.grow());
+            return a.create(anchor, lap, parent, name);
+        }
+
+        int aggregates() {
+            Aggs a = aggs;
+            return a == null ? 0 : a.size();
+        }
+
+        /** The aggregates of the lap of depth {@code d} that just ended as RETRO row {@code row} move under it. */
+        private void reanchor(int d, int lap, int row) {
+            Aggs a = aggs;
+            if (a != null) a.reanchor(lapFrom[d], rowAt[d], lap, row);
+        }
+
         /** Elapsed time of frame handle {@code h}, which holds its start while open, then its duration; best effort off the owner. */
         long frameElapsed(Span h) {
-            if (ctx.released || state == RETIRED) return 0;
+            if (ctx.released || retired()) return 0;
             return h.depth < depth ? Math.max(0, ctx.now() - h.time) : h.time;
+        }
+
+        /** CPU time since {@link #sampleCpu} of depth {@code k}, read after the end so the read is not timed; -1 if not measured. */
+        private long cpuSince(int k) {
+            if (cpuMask == 0 || (cpuMask >>> k & 1) == 0) return -1;
+            cpuMask &= ~(1L << k);
+            long t = ctx.cpuNow();
+            return t < 0 ? -1 : Math.max(0, t - cpuAt[k]);
         }
 
         /** Starts measuring the CPU time of the span at depth {@code d}, unless it is already or the read is -1. */
@@ -911,6 +1093,7 @@ public final class Tempo {
             if (lastPhase != null) {
                 lastPhase[d] = NO_PHASE;
                 lapOrdinal[d] = 0;
+                lapFrom[d] = aggregates();
             }
             Span h = handles[d];
             if (h == null) handles[d] = h = new Span(this, ctx, d);
@@ -968,9 +1151,9 @@ public final class Tempo {
         private boolean end(int k, long now, boolean heal) {
             Span h = handles[k];
             if (h.row == FRAME) {
-                long dur = Math.max(0, now - h.time);
+                long start = h.time, dur = Math.max(0, now - start), cpu = cpuSince(k);
                 h.time = dur;
-                if (!ctx.released) ctx.totals().add(h.frame.id, false, dur);
+                if (h.agg >= 0) aggs.add(h.agg, start, dur, cpu);
                 return heal;
             }
             int r = h.row;
@@ -978,12 +1161,12 @@ public final class Tempo {
             int i = r & MASK;
             boolean phase = (c.flags[i] & PHASE) != 0, healed = heal && !phase;
             if (healed) c.flags[i] |= HEALED;
-            if (phase) mark[k - 1] = now; // however the phase ends, its end is the owner's last boundary
-            if (cpuMask != 0 && (cpuMask >>> k & 1) != 0) {
-                cpuMask &= ~(1L << k);
-                long t = ctx.cpuNow(); // after the end was read, so the read is not timed
-                if (t >= 0) append(r, CPU, Math.max(0, t - cpuAt[k]));
+            if (phase) { // however the phase ends, its end is the owner's last boundary
+                mark[k - 1] = now;
+                lapFrom[k - 1] = aggregates();
             }
+            long cpu = cpuSince(k);
+            if (cpu >= 0) append(r, CPU, cpu);
             long dur = now - c.start[i];
             DUR.setOpaque(c.dur, i, dur < 0 ? 0L : dur);
             return healed;
@@ -1022,6 +1205,7 @@ public final class Tempo {
         private void laps() {
             mark = new long[MAX_DEPTH];
             lapOrdinal = new int[MAX_DEPTH];
+            lapFrom = new int[MAX_DEPTH];
             int[] p = new int[MAX_DEPTH];
             Arrays.fill(p, NO_PHASE);
             lastPhase = p;
@@ -1036,6 +1220,7 @@ public final class Tempo {
             if (ctx.listening) fire(d + 1, top); // before the new phase takes the depth of the old one
             mark[d] = now;
             lapOrdinal[d]++;
+            lapFrom[d] = aggregates();
             Span h = stack(n, flags | PHASE);
             if (h != NOOP) rows[h.row >>> CHUNK_BITS].start[h.row & MASK] = now;
             lastPhase[d] = h == NOOP ? DROPPED_PHASE : h.row;
@@ -1070,10 +1255,12 @@ public final class Tempo {
                 if (r >= 0) {
                     closed(r, from, now - from);
                     annotate(r, 0, label);
+                    reanchor(d, lapOrdinal[d], r);
                 }
                 lastPhase[d] = r >= 0 ? r : DROPPED_PHASE;
                 mark[d] = now;
                 lapOrdinal[d]++;
+                lapFrom[d] = aggregates();
                 if (n != null) lap = Math.max(0, now - from);
             }
             publish();
@@ -1113,6 +1300,12 @@ public final class Tempo {
 
         int nameOf(int r) {
             return rows[r >>> CHUNK_BITS].name[r & MASK];
+        }
+
+        /** {@link #nameOf} from any thread: -1 once the lane is retired and its chunks are gone. */
+        int nameAt(int r) {
+            Rows c = rows[r >>> CHUNK_BITS];
+            return c == null ? -1 : c.name[r & MASK];
         }
 
         private void annotate(int r, int flags, String label) {
@@ -1178,18 +1371,23 @@ public final class Tempo {
         }
 
         /** Owner only: makes a lane whose root has closed writable for a late annotation; false once retired. */
-        private boolean enter() {
-            return depth > 0 || STATE.compareAndSet(this, IDLE, ACTIVE);
+        boolean enter() {
+            return depth > 0 || activate();
         }
 
-        private void leave() {
+        void leave() {
             if (depth == 0) idle();
         }
 
         // The owner stores IDLE then reads retireRequested; release() stores retireRequested then CASes
         // IDLE->RETIRED. Both accesses are volatile, so at least one side sees the other and retires.
+        // Unspent budget goes back to the trace first, so no idle lane strands credits.
         private void idle() {
-            state = IDLE;
+            if (credit != 0) {
+                ctx.refund(credit);
+                credit = 0;
+            }
+            state = state & ~KIND;
             if (retireRequested) retire();
         }
 
@@ -1198,10 +1396,27 @@ public final class Tempo {
             retire();
         }
 
+        /**
+         * IDLE -> RETIRED, once, by whichever of the owner and release() gets there; then the chunks go back
+         * to the pool. A table entry is cleared before its chunk is given away, and a reader that still
+         * picked one up discards what it read, because it finds the trace released (see Snapshot).
+         */
         private void retire() {
-            if (!STATE.compareAndSet(this, IDLE, RETIRED)) return;
-            for (Rows c : rows) if (c != null) ROW_POOL.give(c);
-            if (events != null) for (Events c : events) if (c != null) EVENT_POOL.give(c);
+            int s = state;
+            if ((s & KIND) != IDLE || !STATE.compareAndSet(this, s, s | RETIRED)) return;
+            for (int i = 0; i < CHUNKS && rows[i] != null; i++) {
+                Rows c = rows[i];
+                rows[i] = null;
+                ROW_POOL.give(c);
+            }
+            Events[] t = events;
+            for (int i = 0; t != null && i < CHUNKS && t[i] != null; i++) {
+                Events c = t[i];
+                t[i] = null;
+                EVENT_POOL.give(c);
+            }
+            aggs = null;
+            labels = null;
         }
 
         private void publish() {
@@ -1214,49 +1429,191 @@ public final class Tempo {
 
         /** Duration of row {@code r}, or its age while open; 0 once released. Safe from any thread. */
         long elapsed(int r) {
-            if (ctx.released || state == RETIRED) return 0; // volatile reads before the commit, as in visit()
+            if (ctx.released || retired()) return 0; // volatile reads before the commit, as in Shape
             long c = committed();
             if (r < 0 || r >= (int) (c >>> 32)) return 0;
             Rows k = rows[r >>> CHUNK_BITS];
+            if (k == null) return 0;
             int i = r & MASK;
-            long dur = (long) DUR.getOpaque(k.dur, i);
-            return dur != OPEN ? dur : Math.max(0, ctx.now() - k.start[i]);
+            long dur = (long) DUR.getOpaque(k.dur, i), start = k.start[i];
+            VarHandle.acquireFence();
+            if (ctx.released) return 0; // the chunk may have been recycled while it was read
+            return dur != OPEN ? dur : Math.max(0, ctx.now() - start);
         }
     }
 
     /**
-     * One lane's committed rows as one render reads them: attribute events grouped by row, labels, task
-     * links and child lists. Reading {@code state} before the commit matters: the owner stores
-     * {@code IDLE} after its last write, so a lane read as {@code IDLE} is seen complete (final durations
-     * and flags included). A lane read as {@code ACTIVE} is best effort and its spans are marked
-     * {@link SpanView#live}.
+     * The aggregates of one lane: its folded and aggregate-only spans, keyed by (anchor row, lap ordinal,
+     * parent, name) where the parent is -1 for the anchor itself or the name of an enclosing aggregate-only
+     * span. The owner appends entries and updates them in place; a reader takes the size with acquire and
+     * reads the entries below it, exact once the lane is idle and best effort while it records.
+     */
+    static final class Aggs {
+        static final int MAX = 4096, KEY = 4, ANCHOR = 0, LAP = 1, PARENT = 2, NAME = 3;
+        static final int CELLS = 8, COUNT = 0, SUM = 1, MIN = 2, MAX_DUR = 3, FIRST = 4, LAST = 5, MAX_AT = 6, CPU = 7;
+        private static final VarHandle SIZE;
+
+        static {
+            try {
+                SIZE = MethodHandles.lookup().findVarHandle(Aggs.class, "size", int.class);
+            } catch (ReflectiveOperationException e) {
+                throw new ExceptionInInitializerError(e);
+            }
+        }
+
+        final int[] keys;
+        final long[] cells;
+        private final int[] index; // entry + 1 by key hash, 0 free; owner only, at most half full
+        @SuppressWarnings("unused") private int size; // via SIZE
+
+        Aggs(int capacity) {
+            keys = new int[capacity * KEY];
+            cells = new long[capacity * CELLS];
+            index = new int[capacity * 2];
+        }
+
+        /** Entries published so far; any thread. */
+        int size() {
+            return (int) SIZE.getAcquire(this);
+        }
+
+        boolean full() {
+            return size == keys.length / KEY;
+        }
+
+        int find(int anchor, int lap, int parent, int name) {
+            int mask = index.length - 1;
+            for (int i = hash(anchor, lap, parent, name) & mask; ; i = (i + 1) & mask) {
+                int e = index[i] - 1, k = e * KEY;
+                if (e < 0) return -1;
+                if (keys[k] == anchor && keys[k + LAP] == lap && keys[k + PARENT] == parent && keys[k + NAME] == name) return e;
+            }
+        }
+
+        int create(int anchor, int lap, int parent, int name) {
+            int e = size, k = e * KEY, b = e * CELLS;
+            keys[k] = anchor;
+            keys[k + LAP] = lap;
+            keys[k + PARENT] = parent;
+            keys[k + NAME] = name;
+            cells[b + COUNT] = cells[b + SUM] = cells[b + MAX_AT] = 0;
+            cells[b + MIN] = cells[b + FIRST] = Long.MAX_VALUE;
+            cells[b + MAX_DUR] = cells[b + LAST] = Long.MIN_VALUE;
+            cells[b + CPU] = -1;
+            index(e);
+            SIZE.setRelease(this, e + 1);
+            return e;
+        }
+
+        private void index(int e) {
+            int k = e * KEY, mask = index.length - 1, i = hash(keys[k], keys[k + LAP], keys[k + PARENT], keys[k + NAME]) & mask;
+            while (index[i] != 0) i = (i + 1) & mask;
+            index[i] = e + 1;
+        }
+
+        /** A copy with twice the room; the owner publishes it in place of this one. */
+        Aggs grow() {
+            Aggs a = new Aggs(2 * keys.length / KEY);
+            System.arraycopy(keys, 0, a.keys, 0, keys.length);
+            System.arraycopy(cells, 0, a.cells, 0, cells.length);
+            for (int e = 0; e < size; e++) a.index(e);
+            a.size = size;
+            return a;
+        }
+
+        void add(int e, long start, long dur, long cpu) {
+            long[] c = cells;
+            int b = e * CELLS;
+            c[b + SUM] += dur;
+            if (dur < c[b + MIN]) c[b + MIN] = dur;
+            if (dur > c[b + MAX_DUR]) {
+                c[b + MAX_DUR] = dur;
+                c[b + MAX_AT] = start;
+            }
+            if (start < c[b + FIRST]) c[b + FIRST] = start;
+            if (start + dur > c[b + LAST]) c[b + LAST] = start + dur;
+            if (cpu >= 0) c[b + CPU] = c[b + CPU] < 0 ? cpu : c[b + CPU] + cpu;
+            c[b + COUNT]++;
+        }
+
+        /**
+         * Entries from {@code from} on of a lap that ended as a label-after row move under that row. The
+         * index keeps their old keys, which no later lookup asks for: the lap's ordinal has moved on.
+         */
+        void reanchor(int from, int anchor, int lap, int row) {
+            for (int e = from, k = from * KEY; e < size; e++, k += KEY) {
+                if (keys[k] == anchor && keys[k + LAP] == lap) keys[k] = row;
+            }
+        }
+
+        private static int hash(int anchor, int lap, int parent, int name) {
+            int h = ((anchor * 31 + lap) * 31 + parent) * 31 + name;
+            h *= 0x9E3779B9;
+            return h ^ (h >>> 16);
+        }
+    }
+
+    /**
+     * A copy of one lane's committed rows, events and aggregates, taken by a {@link Snapshot}. The lane's
+     * state is read before and after the copy: the owner writes only while ACTIVE and moves to a new
+     * epoch whenever it leaves IDLE, so a lane found in the same IDLE state both times was copied
+     * complete, final durations and flags included. Otherwise the copy is best effort and its spans are
+     * marked {@link SpanView#live}.
      */
     static final class Shape {
-        final Lane lane;
-        final int rows;
-        final boolean live;
-        final int[] from, order;  // attribute events of row r: order[from[r] .. from[r + 1]), in append order
-        int[] labelOf;
-        String[] text;
-        long[] link, wait;        // XPARENT and QWAIT by row; null in a lane without tasks
-        long[] cpu;               // CPU by row, -1 where not measured; null in a lane without
-        int[] bodyLane, bodyRow;  // by handoff row: the task row linked to it, or -1
-        boolean[] hidden;         // not in its parent's child list: a task drawn at its handoff, or a lost handoff
-        int[] first, next;        // child lists; index rows is a virtual parent of the lane roots
+        final int lane, rows, aggs;
+        final String thread;
+        boolean live;
+        final long[] start, dur;
+        final int[] name, parent;
+        final short[] flags;
+        final int[] from, attrKey;  // attributes of row r: [from[r], from[r + 1]), in append order
+        final long[] attrValue;
+        String[] label;             // by row; null in a lane without labels
+        long[] link, wait;          // XPARENT and QWAIT by row; null in a lane without tasks
+        long[] cpu;                 // CPU by row, -1 where not measured; null in a lane without
+        final int[] aggKey;         // Aggs.KEY ints per aggregate that has ended at least once
+        final long[] aggCell;       // Aggs.CELLS longs per aggregate
+        int[] bodyLane, bodyRow;    // by handoff row: the task row linked to it, or -1
+        boolean[] hidden;           // not in its parent's child list: a task drawn at its handoff, or a lost handoff
+        int[] first, next;          // child lists over the nodes: rows, a virtual parent of the lane roots, aggregates
 
         /** Null for a lane that is retired or whose trace is released. */
         static Shape of(Lane l) {
-            int s = l.state;
-            if (s == Lane.RETIRED || l.ctx.released) return null;
-            return new Shape(l, s == Lane.ACTIVE, l.committed());
+            return of(l, l.state());
         }
 
-        private Shape(Lane l, boolean live, long commit) {
-            lane = l;
-            this.live = live;
+        /** The copy given the state read before it; separate so a test can write in between. */
+        static Shape of(Lane l, int before) {
+            if ((before & Lane.KIND) == Lane.RETIRED || l.ctx.released) return null;
+            Shape s = new Shape(l, l.committed());
+            VarHandle.acquireFence(); // the copy's reads stay before the second read of the state
+            s.live = (before & Lane.KIND) != Lane.IDLE || l.state() != before;
+            return s;
+        }
+
+        private Shape(Lane l, long commit) {
+            lane = l.id;
+            thread = l.owner.getName();
             rows = (int) (commit >>> 32);
             int nEvents = (int) commit;
+            start = new long[rows];
+            dur = new long[rows];
+            name = new int[rows];
+            parent = new int[rows];
+            flags = new short[rows];
+            for (int o = 0; o < rows; o += Lane.CHUNK) {
+                Rows c = l.rows[o >>> Lane.CHUNK_BITS];
+                int n = Math.min(Lane.CHUNK, rows - o);
+                System.arraycopy(c.start, 0, start, o, n);
+                System.arraycopy(c.name, 0, name, o, n);
+                System.arraycopy(c.parent, 0, parent, o, n);
+                System.arraycopy(c.flags, 0, flags, o, n);
+                for (int i = 0; i < n; i++) dur[o + i] = (long) Lane.DUR.getOpaque(c.dur, i);
+            }
+
             Events[] events = l.events;
+            int[] labelOf = null;
             from = new int[rows + 1];
             for (int e = 0; e < nEvents; e++) {
                 Events k = events[e >>> Lane.CHUNK_BITS];
@@ -1278,34 +1635,41 @@ public final class Tempo {
                 }
             }
             for (int r = 0; r < rows; r++) from[r + 1] += from[r];
-            order = new int[from[rows]];
+            attrKey = new int[from[rows]];
+            attrValue = new long[from[rows]];
             int[] fill = Arrays.copyOf(from, rows);
             for (int e = 0; e < nEvents; e++) {
                 Events k = events[e >>> Lane.CHUNK_BITS];
                 int i = e & Lane.MASK, kind = k.key[i] & KIND_MASK;
-                if (kind == ATTR_LONG || kind == ATTR_DOUBLE) order[fill[k.row[i]]++] = e;
+                if (kind != ATTR_LONG && kind != ATTR_DOUBLE) continue;
+                int j = fill[k.row[i]]++;
+                attrKey[j] = k.key[i];
+                attrValue[j] = k.value[i];
             }
-            if (labelOf != null) text = (String[]) Lane.LABELS.getAcquire(l);
+            if (labelOf != null) {
+                String[] text = (String[]) Lane.LABELS.getAcquire(l);
+                label = new String[rows];
+                for (int r = 0; r < rows; r++) if (labelOf[r] >= 0) label[r] = text[labelOf[r]];
+            }
+
+            Aggs a = (Aggs) Lane.AGGS.getAcquire(l);
+            int n = a == null ? 0 : a.size(), kept = 0;
+            aggKey = new int[n * Aggs.KEY];
+            aggCell = new long[n * Aggs.CELLS];
+            for (int e = 0; e < n; e++) {
+                int k = e * Aggs.KEY, b = e * Aggs.CELLS;
+                // not ended yet, or (in a live copy) moved under a lap row this copy does not have
+                if (a.cells[b + Aggs.COUNT] == 0 || a.keys[k] >= rows) continue;
+                System.arraycopy(a.keys, k, aggKey, kept * Aggs.KEY, Aggs.KEY);
+                System.arraycopy(a.cells, b, aggCell, kept * Aggs.CELLS, Aggs.CELLS);
+                kept++;
+            }
+            aggs = kept;
         }
 
-        int flags(int r) {
-            return lane.rows[r >>> Lane.CHUNK_BITS].flags[r & Lane.MASK];
-        }
-
-        long start(int r) {
-            return lane.rows[r >>> Lane.CHUNK_BITS].start[r & Lane.MASK];
-        }
-
-        long dur(int r) {
-            return (long) Lane.DUR.getOpaque(lane.rows[r >>> Lane.CHUNK_BITS].dur, r & Lane.MASK);
-        }
-
-        int name(int r) {
-            return lane.rows[r >>> Lane.CHUNK_BITS].name[r & Lane.MASK];
-        }
-
-        String label(int r) {
-            return labelOf == null || labelOf[r] < 0 ? null : text[labelOf[r]];
+        /** Start of a row, or the first start of an aggregate node. */
+        long startOf(int x) {
+            return x < rows ? start[x] : aggCell[(x - rows - 1) * Aggs.CELLS + Aggs.FIRST];
         }
 
         void hide(int r) {
@@ -1323,29 +1687,28 @@ public final class Tempo {
         }
 
         boolean begun(int r) {
-            return bodyLane != null && bodyLane[r] >= 0;
+            return r < rows && bodyLane != null && bodyLane[r] >= 0;
         }
 
         /**
          * Child lists in row order. A RETRO lap adopts the run of preceding siblings that started at or
-         * after it, back to the previous phase row, and takes the place of the first of them.
+         * after it, back to the previous phase row, and takes the place of the first of them. Aggregates
+         * join their parent's list in start order.
          */
         void tree() {
-            int top = rows;
-            int[] parent = new int[rows + 1], last = new int[rows + 1], prev = new int[rows + 1];
-            first = new int[rows + 1];
-            next = new int[rows + 1];
+            int top = rows, nodes = rows + 1 + aggs;
+            int[] last = new int[rows + 1], prev = new int[rows + 1];
+            first = new int[nodes];
+            next = new int[nodes];
             Arrays.fill(first, -1);
+            Arrays.fill(next, -1);
             Arrays.fill(last, -1);
             for (int r = 0; r < rows; r++) {
                 if (hidden != null && hidden[r]) continue;
-                Rows k = lane.rows[r >>> Lane.CHUNK_BITS];
-                int i = r & Lane.MASK, p = k.parent[i] < 0 ? top : k.parent[i];
-                parent[r] = p;
-                if ((k.flags[i] & RETRO) != 0) {
+                int p = parent[r] < 0 ? top : parent[r];
+                if ((flags[r] & RETRO) != 0) {
                     int a = last[p], b = -1;
-                    while (a >= 0 && (flags(a) & PHASE) == 0 && start(a) >= k.start[i]) {
-                        parent[a] = r;
+                    while (a >= 0 && (flags[a] & PHASE) == 0 && start[a] >= start[r]) {
                         b = a;
                         a = prev[a];
                     }
@@ -1364,23 +1727,90 @@ public final class Tempo {
                 else first[p] = r;
                 last[p] = r;
             }
+            for (int e = 0; e < aggs; e++) attach(rows + 1 + e, aggregateParent(e));
+        }
+
+        /**
+         * The anchor row, or for an aggregate nested in another aggregate-only span the earlier aggregate
+         * of that name under the same anchor and lap (created when that span opened, so before this one).
+         */
+        private int aggregateParent(int e) {
+            int k = e * Aggs.KEY, outer = aggKey[k + Aggs.PARENT];
+            for (int f = 0; outer >= 0 && f < e; f++) {
+                int j = f * Aggs.KEY;
+                if (aggKey[j + Aggs.NAME] == outer && aggKey[j] == aggKey[k] && aggKey[j + Aggs.LAP] == aggKey[k + Aggs.LAP]) {
+                    return rows + 1 + f;
+                }
+            }
+            return aggKey[k];
+        }
+
+        private void attach(int x, int p) {
+            long s = startOf(x);
+            int a = -1;
+            for (int c = first[p]; c >= 0 && startOf(c) <= s; c = next[c]) a = c;
+            if (a < 0) {
+                next[x] = first[p];
+                first[p] = x;
+            } else {
+                next[x] = next[a];
+                next[a] = x;
+            }
         }
     }
 
-    /**
-     * The lanes of one trace stitched into one tree. A handoff row is drawn as one record with the task
-     * linked to it (submit time, queue wait, the task's duration, thread and children); a handoff without
-     * a task is drawn never started.
-     */
-    static final class Stitch {
-        private final Shape[] shapes; // by lane id
-        private final long now;
+    // ---------------------------------------------------------------------------------------------
 
-        Stitch(Context ctx, long now) {
-            this.now = now;
+    /**
+     * An immutable copy of a trace stitched into one tree: its lanes, their aggregates and the lane-less
+     * aggregates as they were when {@link Trace#snapshot()} took it. It references no lane, so it stays
+     * complete after {@link Trace#release()}, and any thread may read it. Taken after release it is empty.
+     *
+     * <p>A handoff row is drawn as one record with the task linked to it (submit time, queue wait, the
+     * task's duration, thread and children); a handoff without a task is drawn never started.
+     */
+    public static final class Snapshot {
+        static final Snapshot EMPTY = new Snapshot();
+
+        private final Shape[] shapes; // by lane id
+        private final Totals totals;
+        private final long now;
+        private final int misuses, dropped, folded;
+
+        private Snapshot() {
+            shapes = new Shape[0];
+            totals = null;
+            now = 0;
+            misuses = dropped = folded = 0;
+        }
+
+        /**
+         * The trace now, or {@link #EMPTY} once it is released. A copy racing {@link Trace#release()} may
+         * read chunks that went back to the pool; it is thrown away, also when what it read made it fail.
+         */
+        static Snapshot of(Context ctx, boolean stitch) {
+            if (ctx.released) return EMPTY;
+            try {
+                Snapshot s = new Snapshot(ctx, stitch);
+                VarHandle.acquireFence();
+                return ctx.released ? EMPTY : s;
+            } catch (RuntimeException e) {
+                VarHandle.acquireFence();
+                if (ctx.released) return EMPTY;
+                throw e;
+            }
+        }
+
+        private Snapshot(Context ctx, boolean stitch) {
+            now = ctx.now();
             Lane[] lanes = ctx.lanesById();
             shapes = new Shape[lanes.length];
             for (int i = 0; i < lanes.length; i++) if (lanes[i] != null) shapes[i] = Shape.of(lanes[i]);
+            totals = ctx.frozenTotals();
+            misuses = ctx.misuses.get();
+            dropped = ctx.dropped();
+            folded = ctx.folded();
+            if (!stitch) return;
             for (long x : ctx.lost()) {
                 Shape s = shape(x);
                 if (s != null && (int) x < s.rows) s.hide((int) x);
@@ -1394,7 +1824,7 @@ public final class Tempo {
                     s.hide(r);
                     Shape t = shape(x);
                     int h = (int) x;
-                    if (t != null && h < t.rows && (t.flags(h) & HANDOFF) != 0) t.link(h, s.lane.id, r);
+                    if (t != null && h < t.rows && (t.flags[h] & HANDOFF) != 0) t.link(h, s.lane, r);
                 }
             }
             for (Shape s : shapes) if (s != null) s.tree();
@@ -1409,18 +1839,22 @@ public final class Tempo {
             return id < shapes.length ? shapes[id] : null;
         }
 
-        /** Visits the records in pre-order; the lane roots of each lane, by lane id, are the top level. */
-        void walk(SpanVisitor visitor) {
+        /**
+         * Visits every span in pre-order with a reused, read-only view: the lane roots of each lane, by
+         * lane id, are the top level. Spans open when the snapshot was taken are clamped to that instant.
+         * Aggregates ({@link SpanView#aggregate()}) come among their parent's children in start order.
+         */
+        public void forEachSpan(SpanVisitor visitor) {
             SpanView v = new SpanView();
-            int limit = 0; // a record per row at most, whatever the links say
-            for (Shape s : shapes) if (s != null) limit += s.rows;
+            int limit = 0; // a record per node at most, whatever the links say
+            for (Shape s : shapes) if (s != null) limit += s.rows + s.aggs;
             int[] lane = new int[16], row = new int[16], id = new int[16]; // the path to the current record
             int n = 0;
             for (Shape top : shapes) {
                 if (top == null) continue;
                 for (int r = top.first[top.rows]; r >= 0 && n < limit; r = top.next[r]) {
                     int d = 0;
-                    lane[0] = top.lane.id;
+                    lane[0] = top.lane;
                     row[0] = r;
                     id[0] = n;
                     emit(v, top, r, -1, 0, n++, visitor);
@@ -1447,7 +1881,7 @@ public final class Tempo {
                             row = Arrays.copyOf(row, 2 * d);
                             id = Arrays.copyOf(id, 2 * d);
                         }
-                        lane[d] = s.lane.id;
+                        lane[d] = s.lane;
                         row[d] = c;
                         id[d] = n;
                         emit(v, s, c, id[d - 1], d, n++, visitor);
@@ -1457,34 +1891,123 @@ public final class Tempo {
         }
 
         private void emit(SpanView v, Shape s, int r, int parent, int depth, int id, SpanVisitor visitor) {
-            int flags = s.flags(r);
-            boolean handoff = (flags & HANDOFF) != 0, begun = handoff && s.begun(r);
-            Shape b = begun ? shapes[s.bodyLane[r]] : s;
-            int br = begun ? s.bodyRow[r] : r;
-            long dur = b.dur(br);
             v.id = id;
             v.parent = parent;
             v.depth = depth;
-            v.lane = b.lane;
+            v.label = null;
+            v.attrFrom = v.attrTo = v.subFrom = v.subTo = 0;
+            v.shape = v.subShape = s;
+            v.live = s.live;
+            if (r > s.rows) {
+                int k = (r - s.rows - 1) * Aggs.KEY, b = (r - s.rows - 1) * Aggs.CELLS;
+                long[] c = s.aggCell;
+                v.name = Name.byId(s.aggKey[k + Aggs.NAME]);
+                v.start = c[b + Aggs.FIRST];
+                v.duration = c[b + Aggs.SUM];
+                v.cpu = c[b + Aggs.CPU];
+                v.open = v.handoff = v.begun = false;
+                v.flags = 0;
+                v.wait = 0;
+                v.aggregate = true;
+                v.count = c[b + Aggs.COUNT];
+                v.min = c[b + Aggs.MIN];
+                v.max = c[b + Aggs.MAX_DUR];
+                v.extent = c[b + Aggs.LAST] - v.start;
+                v.maxAt = c[b + Aggs.MAX_AT] - v.start;
+                visitor.visit(v);
+                return;
+            }
+            int flags = s.flags[r];
+            boolean handoff = (flags & HANDOFF) != 0, begun = handoff && s.begun(r);
+            Shape b = begun ? shapes[s.bodyLane[r]] : s;
+            int br = begun ? s.bodyRow[r] : r;
+            long dur = b.dur[br];
+            v.shape = b;
             v.live = b.live;
-            v.name = Name.byId(b.name(br));
-            v.start = s.start(r);
+            v.name = Name.byId(b.name[br]);
+            v.start = s.start[r];
             v.open = dur == Lane.OPEN;
-            v.duration = v.open ? Math.max(0, now - b.start(br)) : dur;
-            v.flags = begun ? flags | b.flags(br) : flags;
+            v.duration = v.open ? Math.max(0, now - b.start[br]) : dur;
+            v.flags = begun ? flags | b.flags[br] : flags;
             v.handoff = handoff;
             v.begun = begun;
             v.wait = begun ? (b.wait == null ? 0 : b.wait[br]) : handoff ? Math.max(0, now - v.start) : 0;
             v.cpu = b.cpu == null || handoff && !begun ? -1 : b.cpu[br];
-            v.label = b.label(br);
-            v.order = b.order;
+            v.label = b.label == null ? null : b.label[br];
             v.attrFrom = b.from[br];
             v.attrTo = b.from[br + 1];
-            v.subLane = s.lane;
-            v.subOrder = s.order;
             v.subFrom = begun ? s.from[r] : 0;
             v.subTo = begun ? s.from[r + 1] : 0;
+            v.aggregate = false;
+            v.count = 1;
+            v.min = v.max = v.extent = v.duration;
+            v.maxAt = 0;
             visitor.visit(v);
+        }
+
+        /**
+         * Count, sum and extremes of the spans of {@code name} that ended, recorded or folded into
+         * aggregates in any lane, plus those added without a lane ({@link Trace#add}); and the queue waits
+         * of its tasks, begun or cancelled, plus those added without a lane. Handoff entries and cancelled
+         * tasks add no occurrence.
+         */
+        public Aggregate aggregate(Name name) {
+            if (name == null) return Aggregate.EMPTY;
+            int id = name.id;
+            long count = 0, sum = 0, min = Long.MAX_VALUE, max = 0, waits = 0, waitSum = 0, waitMax = 0;
+            for (Shape s : shapes) {
+                if (s == null) continue;
+                for (int r = 0; r < s.rows; r++) {
+                    int f = s.flags[r];
+                    if (s.name[r] != id || (f & HANDOFF) != 0 || (f & (RETRO | MISUSE)) == (RETRO | MISUSE)) continue;
+                    boolean task = s.link != null && s.link[r] >= 0;
+                    if (task) {
+                        long w = s.wait == null ? 0 : s.wait[r];
+                        waits++;
+                        waitSum += w;
+                        waitMax = Math.max(waitMax, w);
+                    }
+                    long d = s.dur[r];
+                    if (d == Lane.OPEN || task && (f & CANCELLED) != 0) continue;
+                    count++;
+                    sum += d;
+                    min = Math.min(min, d);
+                    max = Math.max(max, d);
+                }
+                for (int e = 0; e < s.aggs; e++) {
+                    if (s.aggKey[e * Aggs.KEY + Aggs.NAME] != id) continue;
+                    int b = e * Aggs.CELLS;
+                    count += s.aggCell[b + Aggs.COUNT];
+                    sum += s.aggCell[b + Aggs.SUM];
+                    min = Math.min(min, s.aggCell[b + Aggs.MIN]);
+                    max = Math.max(max, s.aggCell[b + Aggs.MAX_DUR]);
+                }
+            }
+            Aggregate t = totals == null ? Aggregate.EMPTY : totals.get(id);
+            if (t.count() > 0) min = Math.min(min, t.minNanos());
+            return new Aggregate(count + t.count(), sum + t.sumNanos(), count + t.count() == 0 ? 0 : min,
+                    Math.max(max, t.maxNanos()), waits + t.waitCount(), waitSum + t.waitSumNanos(),
+                    Math.max(waitMax, t.waitMaxNanos()));
+        }
+
+        /** Wall time of the root span: its duration, or while it was open its age when the snapshot was taken. */
+        public long elapsedNanos() {
+            Shape s = shapes.length == 0 ? null : shapes[0];
+            if (s == null || s.rows == 0) return 0;
+            return s.dur[0] != Lane.OPEN ? s.dur[0] : Math.max(0, now - s.start[0]);
+        }
+
+        int misuses() {
+            return misuses;
+        }
+
+        int dropped() {
+            return dropped;
+        }
+
+        /** Detail spans folded into aggregates for want of budget: the wire's {@code x=} folded count. */
+        int folded() {
+            return folded;
         }
     }
 
@@ -1549,7 +2072,11 @@ public final class Tempo {
             root.close();
         }
 
-        /** Returns the trace's buffers to the pool. Optional and idempotent; afterwards every read is empty. */
+        /**
+         * Returns the trace's buffers to the pool. Optional and idempotent; afterwards every read is empty
+         * and never throws, so take a {@link #snapshot()} first to render later. A thread still inside a
+         * task of this trace keeps its lane until the task ends; handoffs begun after release record nothing.
+         */
         public void release() {
             ctx.release();
         }
@@ -1613,24 +2140,31 @@ public final class Tempo {
         }
 
         /**
-         * Count, sum, extremes and queue waits of {@code name} recorded through {@link #add},
-         * {@link #addWait} and {@link #waited}, by aggregate-only spans (an always-on name below the
-         * level, see {@link Name#aggregate()}), and the queue waits of tasks left unrecorded at the lane
-         * cap. Exact once the contributing threads are done, best effort while they run; empty after release.
+         * Count, sum and extremes of every span of {@code name} that ended: recorded, folded over the
+         * budget, aggregate-only (an always-on name below the level, see {@link Name#aggregate()}) and
+         * added through {@link #add}; and the queue waits of its tasks, of tasks left unrecorded at a cap,
+         * and those added through {@link #addWait} and {@link #waited}. Exact once the contributing threads
+         * are done, best effort while they run; empty after release. Copies the trace, see {@link #snapshot()}.
          */
         public Aggregate aggregate(Name name) {
-            Totals t = ctx.totals;
-            return name == null || t == null || ctx.released ? Aggregate.EMPTY : t.get(name.id);
+            return name == null ? Aggregate.EMPTY : Snapshot.of(ctx, false).aggregate(name);
         }
 
         /**
-         * Visits every recorded span in pre-order with a reused, read-only view. Spans still open are
-         * clamped to one {@code now} taken for the whole walk. A handoff is one span on the thread that
-         * ran its task, see {@link SpanView#handoff()}. Nothing is visited after release.
+         * Visits every recorded span in pre-order with a reused, read-only view, from a {@link #snapshot()}.
+         * Spans still open are clamped to one {@code now} taken for the whole walk. A handoff is one span on
+         * the thread that ran its task, see {@link SpanView#handoff()}. Nothing is visited after release.
          */
         public void forEachSpan(SpanVisitor visitor) {
-            if (ctx.released) return;
-            new Stitch(ctx, ctx.now()).walk(visitor);
+            snapshot().forEachSpan(visitor);
+        }
+
+        /**
+         * An immutable copy of the trace as it is now, which stays readable after {@link #release()}: take
+         * it before releasing when the trace is rendered later. Empty after release.
+         */
+        public Snapshot snapshot() {
+            return Snapshot.of(ctx, true);
         }
 
         int misuses() {
@@ -1639,6 +2173,11 @@ public final class Tempo {
 
         int dropped() {
             return ctx.dropped();
+        }
+
+        /** Detail spans folded into aggregates for want of budget so far: the wire's {@code x=} folded count. */
+        int folded() {
+            return ctx.folded();
         }
     }
 
@@ -1654,8 +2193,9 @@ public final class Tempo {
         final Context ctx;
         final Thread owner;
         final int depth;
-        int row;    // Lane.FRAME for an aggregate-only span, which has the next two
+        int row;    // Lane.FRAME for an aggregate-only span, which has the next three
         Name frame;
+        int agg;    // its entry in the lane's aggregates, or -1
         long time;  // start while open, then duration
 
         Span(Lane lane, Context ctx, int depth) {
@@ -1680,22 +2220,25 @@ public final class Tempo {
         }
 
         /**
-         * A child span recorded at {@link #DETAIL} and above. Below, {@link #NOOP}, unless the name is
-         * always-on ({@link Name#aggregate()}, {@link Name#sink}, {@link Trace#on}): then an aggregate-only
-         * span that only times itself into {@link Trace#aggregate(Name)} and the listeners. Spans opened
-         * inside it are recorded under its nearest recorded ancestor; anything else on it is ignored.
+         * A child span recorded at {@link #DETAIL} and above while the trace's budget lasts
+         * ({@link Options#budget}); past it, folded. Below the level, {@link #NOOP}, unless the name is
+         * always-on ({@link Name#aggregate()}, {@link Name#sink}, {@link Trace#on}): then aggregate-only.
+         * A folded or aggregate-only span writes no row: it times itself into an aggregate of its lane
+         * (see {@link SpanView#aggregate()}), {@link Trace#aggregate(Name)} and the listeners. Spans opened
+         * inside it are recorded under its nearest recorded ancestor; flags, attributes and phases on it
+         * are ignored, {@link #cpu()} adds to the aggregate's CPU time.
          */
         public Span detail(Name name) {
             if (ctx.level < DETAIL) return name != null && (name.marked || ctx.on != null) ? below(name) : NOOP;
             if (!ctx.detailSeen) ctx.detailSeen = true;
-            return open(name, DETAIL_ROW);
+            return budgeted(name, DETAIL_ROW);
         }
 
         /** A child span recorded at {@link #DEEP}; below, like {@link #detail} below {@link #DETAIL}. */
         public Span deep(Name name) {
             if (ctx.level < DEEP) return name != null && (name.marked || ctx.on != null) ? below(name) : NOOP;
             if (!ctx.detailSeen) ctx.detailSeen = true;
-            return open(name, DEEP_ROW);
+            return budgeted(name, DEEP_ROW);
         }
 
         private Span below(Name name) {
@@ -1709,6 +2252,14 @@ public final class Tempo {
                 return lane.push(Name.UNKNOWN, flags | MISUSE);
             }
             return lane.push(name, flags);
+        }
+
+        /** Counts against the trace's budget; over it the span folds into an aggregate. */
+        private Span budgeted(Name name, int flags) {
+            if (!live()) return NOOP;
+            if (name != null) return lane.budgeted(name, flags);
+            ctx.misuse("null name");
+            return lane.budgeted(Name.UNKNOWN, flags | MISUSE);
         }
 
         /** Runs {@code body} inside a child span; a throwable flags the span failed and is rethrown unwrapped. */
@@ -1790,10 +2341,11 @@ public final class Tempo {
 
         /**
          * Measures the thread's CPU time from now until the span closes, when the trace measures CPU
-         * ({@link Options#cpu}); see {@link SpanView#cpuNanos()}. A read costs a system call.
+         * ({@link Options#cpu}); see {@link SpanView#cpuNanos()}. A read costs a system call. On a folded
+         * or aggregate-only span it adds to the aggregate's CPU time.
          */
         public Span cpu() {
-            if (recorded() && ctx.cpu()) lane.sampleCpu(depth);
+            if (live() && ctx.cpu()) lane.sampleCpu(depth);
             return this;
         }
 
@@ -1926,13 +2478,12 @@ public final class Tempo {
 
     /** Read-only view of one recorded span, reused across {@link SpanVisitor#visit} calls. */
     public static final class SpanView {
-        Lane lane, subLane; // the span's lane; for a begun handoff the submitter's, whose attributes come first
-        int[] order, subOrder;
+        Shape shape, subShape; // the span's lane; for a begun handoff the submitter's, whose attributes come first
         int id, parent, depth, flags, attrFrom, attrTo, subFrom, subTo;
         Name name;
         String label;
-        long start, duration, wait, cpu;
-        boolean open, live, handoff, begun;
+        long start, duration, wait, cpu, count, min, max, extent, maxAt;
+        boolean open, live, handoff, begun, aggregate;
 
         SpanView() {}
 
@@ -1949,8 +2500,30 @@ public final class Tempo {
         /** Nanoseconds from the trace start; for a {@link #handoff()} the submit time. */
         public long startNanos() { return start; }
 
-        /** Duration; for an open span the time up to the walk's {@code now}. For a handoff its task's run time. */
+        /**
+         * Duration; for an open span the time up to the walk's {@code now}. For a handoff its task's run
+         * time; for an {@link #aggregate()} the sum of its occurrences.
+         */
         public long durationNanos() { return duration; }
+
+        /**
+         * Spans of one name folded into one entry: aggregate-only spans and detail spans past the budget,
+         * per lane, anchor and lap. Its start is the first occurrence's; it has no flags and no attributes.
+         */
+        public boolean aggregate() { return aggregate; }
+
+        /** Occurrences of an {@link #aggregate()}; 1 for a span. */
+        public long count() { return count; }
+
+        public long minNanos() { return min; }
+
+        public long maxNanos() { return max; }
+
+        /** Wall time from the first occurrence's start to the last one's end; a span's duration. */
+        public long extentNanos() { return extent; }
+
+        /** Start of the slowest occurrence, from {@link #startNanos()}; 0 for a span. */
+        public long maxAtNanos() { return maxAt; }
 
         /**
          * A task handed to another thread ({@link Span#handoff}): it was submitted at {@link #startNanos()},
@@ -1969,7 +2542,8 @@ public final class Tempo {
 
         /**
          * CPU time of the thread while the span ran, or -1 if not measured (see {@link Options#cpu}).
-         * Wall minus CPU is the time off CPU: waiting, blocked or descheduled. Measured for closed spans only.
+         * Wall minus CPU is the time off CPU: waiting, blocked or descheduled. Measured for closed spans
+         * only; for an aggregate the sum over its occurrences that measured it.
          */
         public long cpuNanos() { return cpu; }
 
@@ -2007,14 +2581,14 @@ public final class Tempo {
         }
 
         /** The thread that ran the span; for a handoff that never started, the submitting thread. */
-        public String thread() { return lane.owner.getName(); }
+        public String thread() { return shape.thread; }
 
         /** Attributes; a handoff has those set at submit ({@link Handoff#set}) first, then its task's. */
         public int attributes() { return (subTo - subFrom) + (attrTo - attrFrom); }
 
-        public Name attributeKey(int i) { return Name.byId(events(i).key[event(i) & Lane.MASK] >>> KIND_BITS); }
+        public Name attributeKey(int i) { return Name.byId(key(i) >>> KIND_BITS); }
 
-        public boolean attributeIsDouble(int i) { return (events(i).key[event(i) & Lane.MASK] & KIND_MASK) == ATTR_DOUBLE; }
+        public boolean attributeIsDouble(int i) { return (key(i) & KIND_MASK) == ATTR_DOUBLE; }
 
         /** The value of a long attribute, or a double attribute truncated. */
         public long longAttribute(int i) {
@@ -2027,18 +2601,20 @@ public final class Tempo {
             return attributeIsDouble(i) ? Double.longBitsToDouble(v) : v;
         }
 
+        private int key(int i) {
+            int j = index(i);
+            return i < subTo - subFrom ? subShape.attrKey[j] : shape.attrKey[j];
+        }
+
         private long value(int i) {
-            return events(i).value[event(i) & Lane.MASK];
+            int j = index(i);
+            return i < subTo - subFrom ? subShape.attrValue[j] : shape.attrValue[j];
         }
 
-        private Events events(int i) {
-            return (i < subTo - subFrom ? subLane : lane).events[event(i) >>> Lane.CHUNK_BITS];
-        }
-
-        private int event(int i) {
+        private int index(int i) {
             if (i < 0 || i >= attributes()) throw new IndexOutOfBoundsException("attribute " + i);
             int sub = subTo - subFrom;
-            return i < sub ? subOrder[subFrom + i] : order[attrFrom + i - sub];
+            return i < sub ? subFrom + i : attrFrom + i - sub;
         }
     }
 

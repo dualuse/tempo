@@ -28,6 +28,7 @@ import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -78,13 +79,22 @@ class TempoTest {
     }
 
     /**
-     * One line per span: indent, name, start+duration, the flags that are set, for a handoff its queue
-     * wait, the thread where it differs from the root's, and the attributes.
+     * One line per span: indent, name, start+duration, the flags that are set, for an aggregate its
+     * count and extremes, for a handoff its queue wait, the thread where it differs from the root's, and
+     * the attributes.
      */
     static String tree(Trace t) {
+        return tree(t::forEachSpan);
+    }
+
+    static String tree(Tempo.Snapshot s) {
+        return tree(s::forEachSpan);
+    }
+
+    static String tree(Consumer<Tempo.SpanVisitor> spans) {
         StringBuilder b = new StringBuilder();
         String[] rootThread = {null};
-        t.forEachSpan(s -> {
+        spans.accept(s -> {
             if (rootThread[0] == null) rootThread[0] = s.thread();
             b.append("  ".repeat(s.depth())).append(s.name()).append(' ').append(s.startNanos()).append('+').append(s.durationNanos());
             if (s.level() == DETAIL) b.append(" detail");
@@ -98,6 +108,8 @@ class TempoTest {
             if (s.waiting()) b.append(" waiting");
             if (s.healed()) b.append(" healed");
             if (s.misuse()) b.append(" misuse");
+            if (s.aggregate()) b.append(" agg*").append(s.count()).append(" min=").append(s.minNanos())
+                    .append(" max=").append(s.maxNanos()).append(" maxAt=").append(s.maxAtNanos()).append(" extent=").append(s.extentNanos());
             if (s.handoff()) b.append(" handoff~").append(s.waitNanos());
             if (s.neverStarted()) b.append(" unstarted");
             if (!s.thread().equals(rootThread[0])) b.append(" @").append(s.thread());
@@ -1707,7 +1719,8 @@ class TempoTest {
         t.close();
         assertEquals(1, t.dropped());
         assertEquals(0, t.misuses());
-        assertEquals("count=0 sum=0 min=0 max=0 waits=1 waitSum=7 waitMax=7", t.aggregate(MATCH).toString());
+        // the two tasks that ran, and the waits of all three
+        assertEquals("count=2 sum=0 min=0 max=0 waits=3 waitSum=18 waitMax=7", t.aggregate(MATCH).toString());
         assertEquals(lines(
                 "search 0+7",
                 "  match 0+0 handoff~4 @w1",
@@ -1736,7 +1749,8 @@ class TempoTest {
             assertEquals(n - 1, handoffs[0]);
             assertEquals(0, unstarted[0]);
             assertEquals(1, t.dropped());
-            assertEquals("count=0 sum=0 min=0 max=0 waits=1 waitSum=3 waitMax=3", t.aggregate(MATCH).toString());
+            assertEquals("count=" + (n - 1) + " sum=0 min=0 max=0 waits=" + n + " waitSum=" + 3 * n + " waitMax=3",
+                    t.aggregate(MATCH).toString());
             assertEquals(0, t.misuses());
         } finally {
             pool.shutdown();
@@ -1975,7 +1989,10 @@ class TempoTest {
         t.close();
         assertEquals(List.of(7L), global);
         assertEquals(List.of(3L), local);
-        assertEquals(lines("search 0+11"), tree(t)); // aggregate-only: no rows
+        assertEquals(lines( // aggregate-only: no rows, an aggregate each
+                "search 0+11",
+                "  coarse-fetch 0+7 agg*1 min=7 max=7 maxAt=0 extent=7",
+                "  coarse-hash 8+3 agg*1 min=3 max=3 maxAt=0 extent=3"), tree(t));
         assertEquals("count=1 sum=7 min=7 max=7 waits=0 waitSum=0 waitMax=0", t.aggregate(fetch).toString());
         assertEquals(3, t.aggregate(hash).sumNanos());
         assertEquals(0, t.misuses());
@@ -2009,7 +2026,11 @@ class TempoTest {
         clock.add(1);
         p.close();
         t.close();
-        assertEquals(lines("search 0+15", "  load 10+4"), tree(t));
+        assertEquals(lines(
+                "search 0+15",
+                "  agg-parse 0+15 agg*4 min=2 max=5 maxAt=5 extent=15", // no row: one aggregate per anchor
+                "  load 10+4",
+                "    agg-parse 10+4 agg*1 min=4 max=4 maxAt=0 extent=4"), tree(t));
         assertEquals("count=5 sum=19 min=2 max=5 waits=0 waitSum=0 waitMax=0", t.aggregate(parse).toString());
         assertEquals(0, t.misuses());
     }
@@ -2028,7 +2049,7 @@ class TempoTest {
         clock.add(3);
         b.close();
         t.close();
-        assertEquals(lines("search 0+5", "  agg-sort 0+2 detail"), tree(t));
+        assertEquals(lines("search 0+5", "  agg-sort 0+2 detail", "  agg-sort 2+3 agg*1 min=3 max=3 maxAt=0 extent=3"), tree(t));
         assertEquals(List.of(2L, 3L), calls);
     }
 
@@ -2047,7 +2068,7 @@ class TempoTest {
         t.close(); // heals the open aggregate-only span, which still counts
         assertEquals(2, t.misuses());
         assertEquals(4, t.aggregate(merge).sumNanos());
-        assertEquals(lines("search 0+4"), tree(t));
+        assertEquals(lines("search 0+4", "  agg-merge 0+4 agg*1 min=4 max=4 maxAt=0 extent=4"), tree(t));
 
         Trace u = Tempo.start(SEARCH, opts());
         Span x = u.root();
@@ -2358,10 +2379,10 @@ class TempoTest {
                 t.add(heard, 1);
             }
         };
-        calls.run();
+        for (int i = 0; i < 3; i++) calls.run();
         assertEquals(0, allocatedBy(calls));
         t.close();
-        assertEquals(40_000, sum[0]);
+        assertEquals(80_000, sum[0]);
     }
 
     // ---- release and memory ---------------------------------------------------------------------------
@@ -2416,13 +2437,13 @@ class TempoTest {
     void recordedSpansAllocateNothingOnceWarm() {
         int spans = 8_000;
         for (int round = 0; round < 3; round++) { // fills the chunk pool and loads every class on the path
-            Trace warm = Tempo.start(SEARCH, opts().level(DETAIL));
+            Trace warm = Tempo.start(SEARCH, opts().level(DETAIL).budget(Integer.MAX_VALUE));
             record(warm.root(), spans);
             warm.close();
             warm.release();
         }
 
-        Trace t = Tempo.start(SEARCH, opts().level(DETAIL));
+        Trace t = Tempo.start(SEARCH, opts().level(DETAIL).budget(Integer.MAX_VALUE));
         record(t.root(), 1); // creates the depth-1 handle and the event table
         assertEquals(0, allocatedBy(() -> record(t.root(), spans)), "bytes allocated by " + spans + " spans");
         t.close();
