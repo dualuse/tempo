@@ -248,4 +248,39 @@ class SetupTimeTest {
             assertEquals(List.of(3L), cpus);
         }
     }
+
+    /**
+     * The queue wait ends as the task wins its handoff, before Tempo looks up or sets up the worker's lane:
+     * on a thread's first task in a trace, setting its lane up is the task's run time, not queue wait. The
+     * fake clock makes the setup visible: it runs 1000 ns ahead for every lane registered beyond the root's.
+     */
+    @Test
+    void aTasksQueueWaitEndsBeforeItsLaneIsSetUp() throws Exception {
+        for (int budget : new int[] {512, 0}) { // a recorded handoff, and one folded past the budget
+            Trace[] trace = new Trace[1];
+            AtomicLong base = new AtomicLong(1_000_000_000L);
+            LongSupplier clock = () -> {
+                Trace t = trace[0];
+                return base.get() + (t == null ? 0 : 1000L * (t.ctx.lanesById().length - 1));
+            };
+            Trace t = trace[0] = Tempo.start(SEARCH, new Options().clock(clock).cpu(false).level(DETAIL).budget(budget));
+            base.addAndGet(10);
+            Handoff h = t.root().handoff(MATCH); // submitted at 10
+            base.addAndGet(30);
+            assertNull(onThread("worker", () -> {
+                Span m = h.begin();              // wins the handoff at 40, then sets the worker's lane up: 1040
+                base.addAndGet(5);
+                m.close();                       // 1045
+            }));
+            t.close();
+            Tempo.Aggregate a = t.aggregate(MATCH);
+            assertEquals(30, a.waitSumNanos(), "budget " + budget + ": the wait is the time in the queue, no lane setup in it");
+            assertEquals(1005, a.sumNanos(), "budget " + budget + ": the lane setup is the task's run time");
+            if (budget > 0) {
+                assertEquals(lines(
+                        "search 0+1045",
+                        "  match 10+1005 handoff~30 @worker"), tree(t));
+            }
+        }
+    }
 }

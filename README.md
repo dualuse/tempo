@@ -202,7 +202,8 @@ thread) from `DETAIL` up, or as `Options.cpu(true|false)` says; `span.cpu()` ask
 one more span. The first CPU read in a JVM sets the clock up, which takes milliseconds: a
 trace pays it on the thread that starts it at such a level, or raises it there, so the first
 such trace of a JVM shows it in its root's time, never in a task's queue wait. A task reads
-its start before its CPU time, so its queue wait is time in the queue only.
+its start as soon as it wins its handoff, before it sets up its thread's lane or reads its CPU
+time, so its queue wait is time in the queue only.
 
 ### Budget and folding
 

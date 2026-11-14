@@ -316,8 +316,9 @@ public final class Tempo {
          * {@link #COARSE}. {@code true} measures at every level, {@code false} never. The first read in a
          * JVM sets the clock up (it loads the management bean: milliseconds); a trace that measures CPU pays
          * it on the thread that starts it, or raises it to measuring ({@link Trace#raise}), in the root's
-         * time, so no task's queue wait or run time ever includes it. A task reads the clock before its CPU
-         * time: the read is run time, not queue wait.
+         * time, so no task's queue wait or run time ever includes it. A task reads the clock as soon as it
+         * wins its handoff, before it sets up its thread's lane or reads its CPU time: both are run time,
+         * not queue wait.
          */
         public Options cpu(boolean on) {
             this.cpu = on ? CPU_ON : CPU_OFF;
@@ -1120,13 +1121,14 @@ public final class Tempo {
         /**
          * Records the task of handoff {@code h} on this, the calling thread's lane: a lane root, or, while
          * the thread is inside the trace already (inline), a child of the innermost open span. The row is
-         * linked to the handoff row and carries the queue wait. A cancelled task ({@code run} false) is a
-         * closed zero-length row. Returns the task's span ({@link #NOOP} if cancelled or retired), or
-         * null when a cap leaves no room.
+         * linked to the handoff row and carries the queue wait, which ends at {@code now}: the clock read
+         * right after the begin or cancel won the handoff, before this lane was looked up or set up. A
+         * cancelled task ({@code run} false) is a closed zero-length row. Returns the task's span ({@link
+         * #NOOP} if cancelled or retired), or null when a cap leaves no room.
          */
-        Span task(Handoff h, boolean run) {
+        Span task(Handoff h, boolean run, long now) {
             int hr = h.row();
-            if (hr < 0) return foldedTask(h, run);
+            if (hr < 0) return foldedTask(h, run, now);
             boolean root = depth == 0;
             if (root && !activate()) return NOOP;
             int id = h.lane.nameAt(hr);
@@ -1149,7 +1151,6 @@ public final class Tempo {
                 if (root) idle();
                 return null;
             }
-            long now = ctx.now(); // the queue wait ends here: what follows is the task's own time
             if (run && root && ctx.cpu()) sampleCpu(0); // after the start: the read is run time, not queue wait
             Rows c = rows[r >>> CHUNK_BITS];
             c.start[r & MASK] = now;
@@ -1171,8 +1172,9 @@ public final class Tempo {
          * no row: begun, it is a frame whose occurrence (with its queue wait) ends into this lane's RAN entry
          * of that TASKS entry; cancelled, a zero-length UNRUN occurrence. Only the owner writes either, and a
          * render merges them into the TASKS entry. {@link #NOOP} when cancelled or retired, null at a cap.
+         * The queue wait ends at {@code now}, as in {@link #task}.
          */
-        private Span foldedTask(Handoff h, boolean run) {
+        private Span foldedTask(Handoff h, boolean run, long now) {
             int d = depth, target = ~h.row();
             if (d == MAX_DEPTH) {
                 dropped++;
@@ -1186,7 +1188,7 @@ public final class Tempo {
                 if (root) idle();
                 return id < 0 ? NOOP : null; // released, or past the aggregate cap (counted)
             }
-            long now = ctx.now(), wait = Math.max(0, now - h.submit); // as in task(): the clock first
+            long wait = Math.max(0, now - h.submit);
             if (run && root && ctx.cpu()) sampleCpu(0);
             aggs.submit(e, h.submit);
             if (!run) {
@@ -4764,10 +4766,12 @@ public final class Tempo {
             return (state & STATES) == NEW;
         }
 
+        /** Called right after a begin or cancel won the handoff: the clock read first ends the queue wait. */
         private Span task(boolean run) {
             Context ctx = lane.ctx;
+            long now = ctx.now(); // before the lane lookup: a thread's first task sets its lane up, which is run time
             Lane l = laneHere(ctx);
-            Span s = l == null ? null : l.task(this, run);
+            Span s = l == null ? null : l.task(this, run, now);
             if (s == null) ctx.lost(this, l == null);
             return s == null ? Tempo.NOOP : s;
         }
