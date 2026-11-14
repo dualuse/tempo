@@ -427,6 +427,90 @@ class BudgetTest {
     }
 
     /**
+     * A group that mixes tasks that ran with tasks still queued at the render: the longest wait is that of
+     * the earliest task still queued, not of the group's first submit, also when tasks began out of order.
+     */
+    @Test
+    void foldedHandoffsStillQueuedWaitFromTheirOwnSubmit() throws Exception {
+        Trace t = Tempo.start(SEARCH, opts(0).cpu(false));
+        Span root = t.root();
+        Handoff a = root.handoff(LOAD);                    // at 0
+        clock.add(10_000);
+        root.handoff(LOAD);                                // at 10: never starts, waits 90
+        clock.add(10_000);
+        Handoff c = root.handoff(LOAD);                    // at 20
+        clock.add(10_000);
+        root.handoff(LOAD);                                // at 30: never starts, waits 70
+        clock.add(10_000);
+        assertNull(onThread("w1", () -> {
+            Span x = c.begin();                            // at 40: waited 20, ran 10
+            clock.add(10_000);
+            x.close();
+        }));
+        clock.add(10_000);
+        Span x = a.begin();                                // at 60, inline: waited 60, ran 5
+        clock.add(5_000);
+        x.close();
+        clock.add(35_000);
+        t.close();
+        assertEquals(lines(
+                "search 0+100000",
+                "  load 0+15000 agg*4 min=0 max=10000 maxAt=20000 extent=100000 handoff~240000/90000 @_"), tree(t));
+        String h = t.toHeader();
+        assertTrue(h.endsWith(";S=00.0.2s/11.0.f@_~6o.2i+4.0.a.2s.k;e=2"), h);
+        assertEquals(4, t.folded());
+    }
+
+    /** The two probes of the review: a caller-runs task, or one begun late, beside one still queued. */
+    @Test
+    void foldedHandoffStillQueuedBesideOneThatRan() throws Exception {
+        Trace t = Tempo.start(SEARCH, opts(0).cpu(false));
+        Handoff a = t.root().handoff(LOAD);                // at 0
+        clock.add(1_000);
+        a.begin().close();                                 // caller-runs: waited 1, ran 0
+        clock.add(89_000);
+        t.root().handoff(LOAD);                            // at 90: never starts, waits 10
+        clock.add(10_000);
+        t.close();
+        assertEquals(lines(
+                "search 0+100000",
+                "  load 0+0 agg*2 min=0 max=0 maxAt=0 extent=100000 handoff~11000/10000"), tree(t));
+
+        Trace u = Tempo.start(SEARCH, opts(0).cpu(false));
+        Handoff b = u.root().handoff(LOAD);                // at 0
+        clock.add(50_000);
+        u.root().handoff(LOAD);                            // at 50: never starts, waits 50
+        clock.add(10_000);
+        b.begin().close();                                 // at 60: waited 60
+        clock.add(40_000);
+        u.close();
+        assertEquals(lines(
+                "search 0+100000",
+                "  load 0+0 agg*2 min=0 max=0 maxAt=0 extent=100000 handoff~110000/60000"), tree(u));
+    }
+
+    /**
+     * The submitting lane keeps its folded handoffs that may still wait in a list, which it prunes of
+     * those that began before the list doubles: a long loop of tasks that run keeps it short.
+     */
+    @Test
+    void foldedHandoffsKeptForTheRenderArePrunedOnceTheyBegin() throws Exception {
+        Trace t = Tempo.start(SEARCH, opts(0).cpu(false));
+        Handoff first = t.root().handoff(LOAD);            // never starts
+        for (int i = 0; i < 10_000; i++) t.root().handoff(LOAD).begin().close();
+        java.lang.reflect.Field head = Tempo.Lane.class.getDeclaredField("waiting");
+        head.setAccessible(true);
+        int kept = 0;
+        for (Handoff h = (Handoff) head.get(first.lane); h != null; h = h.next) kept++;
+        assertTrue(kept <= 16, "handoffs kept: " + kept);
+        clock.add(10_000);
+        t.close();
+        assertEquals(lines(
+                "search 0+10000",
+                "  load 0+0 agg*10001 min=0 max=0 maxAt=0 extent=10000 handoff~10000/10000"), tree(t));
+    }
+
+    /**
      * A folded task begun on a thread outside the trace has no recorded span to hang its spans from: they
      * are aggregate-only, its handoffs fold, and their aggregates are top-level nodes of the lane, which
      * the header leaves out as dropped.

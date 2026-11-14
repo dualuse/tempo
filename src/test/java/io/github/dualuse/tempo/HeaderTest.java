@@ -433,7 +433,7 @@ class HeaderTest {
                         Span b = s.at(k, () -> {
                             boolean caller = callerRuns(h);
                             Span x = h.begin();
-                            if (caller && x != NOOP) inline.add((long) h.lane.id << 32 | h.row);
+                            if (caller && x != NOOP) inline.add((long) h.lane.id << 32 | h.row());
                             return x;
                         });
                         if (b != NOOP) stack.add(b);
@@ -515,8 +515,9 @@ class HeaderTest {
      */
     private static boolean callerRuns(Handoff h) {
         Tempo.Lane l = h.lane;
-        if (l == null || Thread.currentThread() != l.owner || l.depth == 0 || l.rowCount != h.row + 1) return false;
-        return l.rowAt[l.depth - 1] == l.rows[h.row >>> Tempo.Lane.CHUNK_BITS].parent[h.row & Tempo.Lane.MASK];
+        int r = h.row();
+        if (l == null || Thread.currentThread() != l.owner || l.depth == 0 || l.rowCount != r + 1) return false;
+        return l.rowAt[l.depth - 1] == l.rows[r >>> Tempo.Lane.CHUNK_BITS].parent[r & Tempo.Lane.MASK];
     }
 
     private static void count(Map<String, Object> doc, Map<String, Integer> seen) {

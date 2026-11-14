@@ -1,11 +1,15 @@
 package io.github.dualuse.tempo;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.lang.ref.WeakReference;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Objects;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
@@ -16,6 +20,7 @@ import java.util.function.DoubleConsumer;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
+import java.util.zip.Deflater;
 
 /**
  * Phase profiling for request-shaped work.
@@ -272,6 +277,7 @@ public final class Tempo {
         boolean strict;
         LongSupplier clock = SYSTEM_CLOCK, cpuClock; // cpuClock: tests only; null reads the thread's CPU time
         LongSupplier wallClock = System::currentTimeMillis; // tests only
+        String linkBase; // null: Link.base()
 
         /** {@link #COARSE} (default), {@link #DETAIL} or {@link #DEEP}; out-of-range values are clamped. */
         public Options level(int level) {
@@ -316,6 +322,21 @@ public final class Tempo {
         /** Byte limit of the detailed header ({@link Trace#toHeader()}); default 3000. */
         public Options headerBytes(int max) {
             this.headerBytes = Math.max(0, max);
+            return this;
+        }
+
+        /**
+         * The viewer that {@link Trace#toLink()} points at. By default the system property {@code
+         * tempo.linkBase}, else the base the library was built with: the GitHub Pages site of the
+         * repository it was built from, {@code https://dualuse.github.io/tempo/} for this one. Null
+         * restores the default.
+         *
+         * @throws IllegalArgumentException if {@code base} is not an absolute URL, or has a {@code #},
+         *                                  a {@code ,}, whitespace or a non-ASCII character
+         */
+        public Options linkBase(String base) {
+            if (base != null && !Link.valid(base)) throw new IllegalArgumentException("not a Tempo-Link base: " + base);
+            this.linkBase = base;
             return this;
         }
 
@@ -371,6 +392,7 @@ public final class Tempo {
         final LongSupplier clock, cpuClock;
         final boolean strict;
         final int budget, block, headerBytes, maxLanes, cpu;
+        final String linkBase; // null: Link.base()
         final AtomicInteger misuses = new AtomicInteger();
         volatile int level;
         volatile boolean detailSeen, released;
@@ -394,6 +416,7 @@ public final class Tempo {
             cpuClock = null;
             strict = false;
             budget = block = headerBytes = maxLanes = 0;
+            linkBase = null;
             cpu = CPU_OFF;
             level = -1; // below COARSE, so NOOP.detail() returns at the level check
         }
@@ -407,6 +430,7 @@ public final class Tempo {
             budget = credits = o.budget;
             block = Math.max(1, budget / 64);
             headerBytes = o.headerBytes;
+            linkBase = o.linkBase;
             maxLanes = o.lanes;
             level = o.level;
             listening = Name.anySink;
@@ -631,13 +655,13 @@ public final class Tempo {
          */
         void lost(Handoff h, boolean count) {
             if (count) DROPPED.getAndAdd(this, 1);
-            int name = h.row < 0 ? h.lane.taskName(~h.row) : h.lane.nameAt(h.row);
+            int row = h.row(), name = row < 0 ? h.lane.taskName(~row) : h.lane.nameAt(row);
             if (name < 0 || released) return;
             totals().add(name, true, Math.max(0, now() - h.submit));
             synchronized (this) {
                 if (lost == null) lost = new long[8];
                 else if (lostCount == lost.length) lost = Arrays.copyOf(lost, 2 * lostCount);
-                lost[lostCount++] = (long) h.lane.id << 32 | h.row & 0xFFFF_FFFFL;
+                lost[lostCount++] = (long) h.lane.id << 32 | row & 0xFFFF_FFFFL;
                 lost[lostCount++] = h.submit;
             }
         }
@@ -914,7 +938,7 @@ public final class Tempo {
         static final int IDLE = 0, ACTIVE = 1, RETIRED = 2, KIND = 3, EPOCH = 4, FRAME = -1;
         static final long OPEN = Long.MIN_VALUE;
 
-        private static final VarHandle COMMIT, STATE, LABELS, AGGS, DUR = MethodHandles.arrayElementVarHandle(long[].class);
+        private static final VarHandle COMMIT, STATE, LABELS, AGGS, WAITING, DUR = MethodHandles.arrayElementVarHandle(long[].class);
 
         static {
             try {
@@ -923,6 +947,7 @@ public final class Tempo {
                 STATE = l.findVarHandle(Lane.class, "state", int.class);
                 LABELS = l.findVarHandle(Lane.class, "labels", String[].class);
                 AGGS = l.findVarHandle(Lane.class, "aggs", Aggs.class);
+                WAITING = l.findVarHandle(Lane.class, "waiting", Handoff.class);
             } catch (ReflectiveOperationException e) {
                 throw new ExceptionInInitializerError(e);
             }
@@ -950,6 +975,13 @@ public final class Tempo {
 
         // Folded and aggregate-only spans; replaced by a grown copy via AGGS.setRelease, like labels.
         private Aggs aggs;
+
+        // The folded handoffs submitted here whose task may not have begun, newest first and linked by
+        // Handoff.next, so a render knows when those that never started were submitted (Shape#settle).
+        // The owner pushes via WAITING.setRelease and, once the list has doubled, unlinks the begun and
+        // cancelled ones; an unlinked handoff still points down the list, so a reader walking it is not lost.
+        private Handoff waiting;
+        private int waitingRoom; // pushes until the list has doubled
 
         // CPU time at open of the rows at the depths whose bit is set in cpuMask; created on first use.
         long cpuMask;
@@ -1009,7 +1041,9 @@ public final class Tempo {
                 long now = ctx.now();
                 aggs.submit(e, now);
                 folded++;
-                return new Handoff(this, ~e, now);
+                Handoff h = new Handoff(this, ~e, now);
+                queue(h);
+                return h;
             }
             int r = row(n, flags | HANDOFF, rowAt[depth - 1]);
             if (r < 0) return Handoff.NOOP;
@@ -1020,6 +1054,39 @@ public final class Tempo {
             return new Handoff(this, r, now);
         }
 
+        /** Pushes folded handoff {@code h} on the waiting list, first unlinking those that left it if it has doubled. */
+        private void queue(Handoff h) {
+            if (--waitingRoom < 0) {
+                int n = 0;
+                for (Handoff x = waiting, prev = null; x != null; x = x.next) {
+                    if (x.waiting()) {
+                        n++;
+                        prev = x;
+                    } else if (prev == null) {
+                        waiting = x.next;
+                    } else {
+                        prev.next = x.next;
+                    }
+                }
+                waitingRoom = Math.max(16, 2 * n) - n - 1;
+            }
+            h.next = waiting;
+            WAITING.setRelease(this, h);
+        }
+
+        /** The earliest submit by TASKS entry of the folded handoffs submitted here that still wait, or null. */
+        long[] waitingSince(int entries) {
+            Handoff h = (Handoff) WAITING.getAcquire(this);
+            if (h == null) return null;
+            long[] since = new long[entries];
+            Arrays.fill(since, Long.MAX_VALUE);
+            for (; h != null; h = h.next) {
+                int e = ~h.row();
+                if (e < entries && h.waiting() && h.submit < since[e]) since[e] = h.submit;
+            }
+            return since;
+        }
+
         /**
          * Records the task of handoff {@code h} on this, the calling thread's lane: a lane root, or, while
          * the thread is inside the trace already (inline), a child of the innermost open span. The row is
@@ -1028,10 +1095,11 @@ public final class Tempo {
          * null when a cap leaves no room.
          */
         Span task(Handoff h, boolean run) {
-            if (h.row < 0) return foldedTask(h, run);
+            int hr = h.row();
+            if (hr < 0) return foldedTask(h, run);
             boolean root = depth == 0;
             if (root && !activate()) return NOOP;
-            int id = h.lane.nameAt(h.row);
+            int id = h.lane.nameAt(hr);
             if (id < 0) { // the submitter's lane is retired: the trace was released
                 if (root) idle();
                 return NOOP;
@@ -1056,7 +1124,7 @@ public final class Tempo {
             long now = ctx.now();
             c.start[r & MASK] = now;
             if (!run) DUR.setOpaque(c.dur, r & MASK, 0L);
-            append(r, XPARENT, (long) h.lane.id << 32 | h.row);
+            append(r, XPARENT, (long) h.lane.id << 32 | hr);
             append(r, QWAIT, Math.max(0, now - h.submit));
             publish();
             if (run && root) {
@@ -1069,13 +1137,13 @@ public final class Tempo {
         }
 
         /**
-         * The task of a folded handoff, whose TASKS entry is {@code ~h.row} in the submitter's lane. It writes
+         * The task of a folded handoff, whose TASKS entry is {@code ~h.row()} in the submitter's lane. It writes
          * no row: begun, it is a frame whose occurrence (with its queue wait) ends into this lane's RAN entry
          * of that TASKS entry; cancelled, a zero-length UNRUN occurrence. Only the owner writes either, and a
          * render merges them into the TASKS entry. {@link #NOOP} when cancelled or retired, null at a cap.
          */
         private Span foldedTask(Handoff h, boolean run) {
-            int d = depth, target = ~h.row;
+            int d = depth, target = ~h.row();
             if (d == MAX_DEPTH) {
                 dropped++;
                 return null;
@@ -1602,6 +1670,7 @@ public final class Tempo {
                 EVENT_POOL.give(c);
             }
             aggs = null;
+            waiting = null;
             labels = null;
         }
 
@@ -1845,6 +1914,7 @@ public final class Tempo {
         final int[] aggKey;         // Aggs.KEY ints per aggregate entry of the lane
         final long[] aggCell;       // Aggs.CELLS longs per entry; a TASKS entry's with its occurrences merged
         int[] aggThread;            // by TASKS entry: the lane that ran its occurrences, NONE or MIXED; null if none ran
+        final long[] waitingSince;  // by TASKS entry: the earliest submit of a task not begun nor cancelled; null if none
         int[] bodyLane, bodyRow;    // by handoff row: the task row linked to it, or -1
         boolean[] hidden;           // not in its parent's child list: a task drawn at its handoff, or a lost handoff
         int[] first, next;          // child lists over the nodes: rows, a virtual parent of the lane roots, aggregates
@@ -1931,6 +2001,7 @@ public final class Tempo {
                 System.arraycopy(a.keys, 0, aggKey, 0, aggKey.length);
                 System.arraycopy(a.cells, 0, aggCell, 0, aggCell.length);
             }
+            waitingSince = aggs > 0 ? l.waitingSince(aggs) : null;
         }
 
         /**
@@ -1968,16 +2039,19 @@ public final class Tempo {
 
         /**
          * Adds the handoffs of each TASKS entry that never started: no duration, waiting from their submit
-         * until {@code now}. Their submit times are known as a sum only, so the longest wait, and the start
-         * if it is the aggregate's, are those of the first submit of the entry: exact when none of its
-         * handoffs started, at most that otherwise.
+         * until {@code now}. Their count and submit sum are what the merge left of the entry's; the first of
+         * them comes from the lane's waiting list. A render racing a begin can find the two
+         * apart; the longest wait is then kept within the wait sum, and the first submit falls back to the
+         * entry's.
          */
         void settle(long now) {
             for (int t = 0; t < aggs; t++) {
                 int b = t * Aggs.CELLS;
                 long[] c = aggCell;
-                long n = c[b + Aggs.SUBMITS], first = c[b + Aggs.SUBMIT_FIRST];
+                long n = c[b + Aggs.SUBMITS];
                 if (aggKey[t * Aggs.KEY + Aggs.KIND] != Aggs.TASKS || n <= 0) continue;
+                long first = waitingSince == null || waitingSince[t] == Long.MAX_VALUE ? c[b + Aggs.SUBMIT_FIRST] : waitingSince[t];
+                long waits = n * now - c[b + Aggs.SUBMIT_SUM];
                 c[b + Aggs.FLAGS] = c[b + Aggs.COUNT] == 0 ? UNRUN | NEVER : c[b + Aggs.FLAGS] & (UNRUN | NEVER);
                 c[b + Aggs.COUNT] += n;
                 c[b + Aggs.FOLDED] += n;
@@ -1988,8 +2062,8 @@ public final class Tempo {
                 }
                 c[b + Aggs.FIRST] = Math.min(c[b + Aggs.FIRST], first);
                 c[b + Aggs.LAST] = Math.max(c[b + Aggs.LAST], now);
-                c[b + Aggs.WAIT_SUM] += n * now - c[b + Aggs.SUBMIT_SUM];
-                c[b + Aggs.WAIT_MAX] = Math.max(c[b + Aggs.WAIT_MAX], now - first);
+                c[b + Aggs.WAIT_SUM] += waits;
+                c[b + Aggs.WAIT_MAX] = Math.max(c[b + Aggs.WAIT_MAX], Math.min(now - first, waits));
             }
         }
 
@@ -2114,6 +2188,7 @@ public final class Tempo {
         private final long now;
         final long wall;
         final int headerBytes;
+        private final String linkBase;
         private final int misuses, dropped, folded;
 
         private Snapshot() {
@@ -2121,6 +2196,7 @@ public final class Tempo {
             totals = null;
             now = wall = 0;
             misuses = dropped = folded = headerBytes = 0;
+            linkBase = null;
         }
 
         /**
@@ -2144,6 +2220,7 @@ public final class Tempo {
             now = ctx.now();
             wall = ctx.wall;
             headerBytes = ctx.headerBytes;
+            linkBase = ctx.linkBase;
             Lane[] lanes = ctx.lanesById();
             shapes = new Shape[lanes.length];
             for (int i = 0; i < lanes.length; i++) if (lanes[i] != null) shapes[i] = Shape.of(lanes[i]);
@@ -2378,6 +2455,14 @@ public final class Tempo {
          */
         public String toHeader() {
             return Header.of(this, headerBytes);
+        }
+
+        /**
+         * The {@code Tempo-Link} header value (see {@link Trace#toLink()}), carrying {@link #toHeader()};
+         * empty if taken after release.
+         */
+        public String toLink() {
+            return Link.of(linkBase != null ? linkBase : Link.base(), toHeader());
         }
 
         /** Like {@link Trace#forEachTop}, as the snapshot was taken. */
@@ -3022,6 +3107,15 @@ public final class Tempo {
         }
 
         /**
+         * The {@code Tempo-Link} header value, as specified in {@code FORMAT.md} section 9: a URL of the web
+         * viewer (see {@link Options#linkBase}) whose fragment carries {@link #toHeader()} compressed, so
+         * one click opens the trace and the trace never reaches the viewer's server. Empty after release.
+         */
+        public String toLink() {
+            return snapshot().toLink();
+        }
+
+        /**
          * Visits every recorded span in pre-order with a reused, read-only view, from a {@link #snapshot()}.
          * Spans still open are clamped to one {@code now} taken for the whole walk. A handoff is one span on
          * the thread that ran its task, see {@link SpanView#handoff()}. Nothing is visited after release.
@@ -3591,10 +3685,7 @@ public final class Tempo {
      * record into another request.
      */
     public static final class Handoff {
-        /** The handoff of {@link Tempo#NOOP}: begins {@link Tempo#NOOP} and wraps nothing. */
-        public static final Handoff NOOP = new Handoff(null, -1, 0);
-
-        private static final int NEW = 0, BEGUN = 1, ENDED = 2; // ENDED: cancelled or rejected
+        private static final int NEW = 0, BEGUN = 1, ENDED = 2, STATES = 3, ROW = 2; // ENDED: cancelled or rejected
         private static final VarHandle STATE;
 
         static {
@@ -3605,16 +3696,24 @@ public final class Tempo {
             }
         }
 
+        /** The handoff of {@link Tempo#NOOP}: begins {@link Tempo#NOOP} and wraps nothing. */
+        public static final Handoff NOOP = new Handoff(null, -1, 0);
+
         // Header plus these four fields is 32 B with compressed oops.
-        final Lane lane; // the submitter's
-        final int row;   // its handoff row
+        final Lane lane;            // the submitter's
         final long submit;
-        private volatile int state;
+        private volatile int state; // row << ROW | NEW, BEGUN or ENDED
+        Handoff next;               // folded: the next older one in the submitter's lane's waiting list
 
         Handoff(Lane lane, int row, long submit) {
             this.lane = lane;
-            this.row = row;
             this.submit = submit;
+            STATE.set(this, row << ROW); // published with the handoff itself, so no fence
+        }
+
+        /** Its handoff row in the submitter's lane, or {@code ~entry} of its TASKS aggregate when folded. */
+        int row() {
+            return state >> ROW;
         }
 
         /**
@@ -3644,6 +3743,7 @@ public final class Tempo {
 
         /** Attaches a number to the handoff at submit, e.g. the executor's queue length. Submitting thread only. */
         public Handoff set(Name key, long value) {
+            int row = row();
             if (lane == null || row < 0) return this; // folded: no entry to attach it to
             if (Thread.currentThread() == lane.owner) lane.event(row, lane.ctx.key(key) << KIND_BITS | ATTR_LONG, value);
             else lane.ctx.misuse("handoff set on a foreign thread");
@@ -3698,10 +3798,16 @@ public final class Tempo {
             };
         }
 
+        /** Neither begun nor cancelled (nor rejected) yet; any thread. */
+        boolean waiting() {
+            return (state & STATES) == NEW;
+        }
+
         private boolean claim(int to) {
             if (lane == null || lane.ctx.released) return false;
-            if (STATE.compareAndSet(this, NEW, to)) return true;
-            if (to == BEGUN) lane.ctx.misuse(state == BEGUN ? "handoff begun twice" : "handoff begun after cancel");
+            int s = state;
+            if ((s & STATES) == NEW && STATE.compareAndSet(this, s, s | to)) return true;
+            if (to == BEGUN) lane.ctx.misuse((state & STATES) == BEGUN ? "handoff begun twice" : "handoff begun after cancel");
             return false;
         }
 
@@ -3724,6 +3830,66 @@ public final class Tempo {
             if (cur != null && cur.ctx == ctx) return cur;
             if (lane.owner == Thread.currentThread() && lane.depth == 0 && lane.id != 0) return lane;
             return slot.lane(ctx);
+        }
+    }
+
+    /**
+     * Tempo-Link (FORMAT.md section 9): {@code <base>#t=z.<base64url(raw DEFLATE(value))>}. The default base
+     * is baked into the jar at build time as a resource, from the repository the build runs in, so a
+     * fork's jar points at the fork's viewer; a copy of this file without the resource uses {@link #UPSTREAM}.
+     */
+    static final class Link {
+        static final String UPSTREAM = "https://dualuse.github.io/tempo/", RESOURCE = "link-base.txt";
+        static final String BUILT = built();
+
+        /** {@code -Dtempo.linkBase} when it is a valid base, else the base the library was built with. */
+        static String base() {
+            String p = System.getProperty("tempo.linkBase");
+            return p != null && valid(p) ? p : BUILT;
+        }
+
+        private static String built() {
+            try (InputStream in = Tempo.class.getResourceAsStream(RESOURCE)) {
+                String b = in == null ? "" : new String(in.readAllBytes(), StandardCharsets.UTF_8).trim();
+                return valid(b) ? b : UPSTREAM;
+            } catch (IOException | RuntimeException e) {
+                return UPSTREAM;
+            }
+        }
+
+        /** An absolute URL of printable ASCII without {@code #} or {@code ,}. */
+        static boolean valid(String base) {
+            int colon = base.indexOf(':');
+            if (colon < 1 || !isAsciiLetter(base.charAt(0))) return false;
+            for (int i = 0; i < base.length(); i++) {
+                char c = base.charAt(i);
+                if (c <= ' ' || c >= 0x7F || c == '#' || c == ',') return false;
+                if (i < colon && !isAsciiLetter(c) && !(c >= '0' && c <= '9') && c != '+' && c != '-' && c != '.') return false;
+            }
+            return true;
+        }
+
+        private static boolean isAsciiLetter(char c) {
+            return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z';
+        }
+
+        /** The link to {@code value} at {@code base}; empty for an empty value. */
+        static String of(String base, String value) {
+            if (value.isEmpty()) return "";
+            byte[] in = value.getBytes(StandardCharsets.US_ASCII), out = new byte[in.length + 64];
+            Deflater d = new Deflater(Deflater.BEST_COMPRESSION, true);
+            try {
+                d.setInput(in);
+                d.finish();
+                int n = 0;
+                while (!d.finished()) {
+                    if (n == out.length) out = Arrays.copyOf(out, 2 * n);
+                    n += d.deflate(out, n, out.length - n);
+                }
+                return base + "#t=z." + Base64.getUrlEncoder().withoutPadding().encodeToString(Arrays.copyOf(out, n));
+            } finally {
+                d.end();
+            }
         }
     }
 

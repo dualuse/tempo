@@ -40,3 +40,12 @@ jobs:
           -PtestJdk=${{ matrix.java }}
           -Porg.gradle.java.installations.auto-download=false
           -Porg.gradle.java.installations.fromEnv=JAVA_HOME_${{ matrix.java }}_X64
+      # The jar links to the GitHub Pages viewer of the repository it is built in (GITHUB_REPOSITORY),
+      # so a fork's jar opens the fork's viewer; the second build checks that rule for a made-up fork.
+      - name: Library jar with this repository's Tempo-Link base
+        if: matrix.java == 21
+        run: |
+          ./gradlew jar checkLinkBase
+          unzip -p build/libs/tempo-*.jar io/github/dualuse/tempo/link-base.txt
+          GITHUB_REPOSITORY=Some-Owner/tempo-fork ./gradlew test --tests '*LinkTest*' jar
+          test "$(unzip -p build/libs/tempo-*.jar io/github/dualuse/tempo/link-base.txt)" = "https://some-owner.github.io/tempo-fork/"

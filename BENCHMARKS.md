@@ -18,20 +18,20 @@ reports the per-trace setup apart.
 
 | Benchmark | Measured | Gate |
 |---|---|---|
-| `span`, `spanNotInlined` | 0.0002 B/op (1,008 B per trace) | 0.01 B/op |
-| `phase` | 0.0001 B/op (1,784 B per trace) | 0.01 B/op |
-| `done` | 0.0001 B/op (1,720 B per trace) | 0.01 B/op |
-| `setLong` | 0.0000 B/op (1,216 B per trace) | 0.01 B/op |
+| `span`, `spanNotInlined` | 0.0002 B/op (1,024 B per trace) | 0.01 B/op |
+| `phase` | 0.0001 B/op (1,800 B per trace) | 0.01 B/op |
+| `done` | 0.0001 B/op (1,736 B per trace) | 0.01 B/op |
+| `setLong` | 0.0000 B/op (1,232 B per trace) | 0.01 B/op |
 | `detailDisabled`, `currentDetailNoTrace`, `currentDetailCoarse` | 0.0000 B/op | 0.01 B/op |
 | `alwaysOn` | 0.0002 B/op | 0.01 B/op |
 | `folded` | 0.0003 B/op | 0.01 B/op |
 | `waited` | 0.0002 B/op | 0.01 B/op |
-| `handoff` | 32.0001 B/op (944 B per trace) | 32.01 B/op: the one `Handoff` |
-| `handoffInline` | 32.0004 B/op (1,280 B per trace) | 32.01 B/op |
+| `handoff` | 32.0001 B/op (960 B per trace) | 32.01 B/op: the one `Handoff` |
+| `handoffInline` | 32.0004 B/op (1,296 B per trace) | 32.01 B/op |
 | `handoffFolded` | 32.0005 B/op | 32.01 B/op |
-| `traceLifecycle` | 944 B per trace | 1,024 B |
+| `traceLifecycle` | 960 B per trace | 1,024 B |
 | `snapshotToHeader` (300 spans) | 5,232 B per render | 6,144 B |
-| `toHeader` (300 spans) | 22,568 B per render | 24,576 B |
+| `toHeader` (300 spans) | 22,576 B per render | 24,576 B |
 
 The 300-span render writes a 3,440-character value. The encoder alone
 (`snapshotToHeader`) allocates the output `String` (about 3.5 KB) and about 1.7 KB of

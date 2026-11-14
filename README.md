@@ -55,7 +55,13 @@ t.release();                                    // optional: buffers go back to 
   decimals, or with `-1` as `Double.toString` prints seconds; `toServerTiming()` gives a W3C
   `Server-Timing` value in milliseconds; `forEachTop` visits the legacy steps and `forEachSpan`
   the whole tree; `printOnClose(out, label)` prints the `Runtime` line when the trace closes.
+  `toHeader()` gives the `Tempo-Timing` value and `toLink()` the `Tempo-Link` URL.
   `snapshot()` keeps a copy that stays readable after `release()`.
+- **Link base:** `toLink()` points at the viewer the jar was built for: the GitHub Pages site of the
+  repository it was built in (`https://<owner>.github.io/<repo>/`, from `GITHUB_REPOSITORY` in
+  GitHub Actions), so a fork's jar opens the fork's viewer; any other build uses
+  `https://dualuse.github.io/tempo/`. `-Dtempo.linkBase=URL` overrides it for a JVM,
+  `Options.linkBase(url)` for one trace, for instance for a self-hosted copy of `site/index.html`.
 
 ## Command-line viewer: `tools/tempo`
 
@@ -139,8 +145,8 @@ time is duration minus CPU time, where CPU was measured.
 Python's `webbrowser` module, that is, in the local browser. With `--diff` (or an
 input link with `&c=`) the link holds both traces; with `--tree`, `--agg`, `--pools`, `--critical` or `--diff` it opens
 on that tab. `--base URL` (or `$TEMPO_LINK_BASE`) points `--to link` and `--open` at
-another copy of the viewer, such as a self-hosted one; the default is
-`https://dualuse.github.io/tempo/`. The trace travels in the URL fragment, which the browser
+another copy of the viewer, such as a self-hosted one or a fork's; the default is
+`https://dualuse.github.io/tempo/` (the CLI is not built, so a fork sets `TEMPO_LINK_BASE`). The trace travels in the URL fragment, which the browser
 keeps to itself: nothing is uploaded, and the CLI sends nothing anywhere. The link
 does end up in the browser history.
 
@@ -192,6 +198,7 @@ output change, rerun with `TEMPO_UPDATE_SNAPSHOTS=1` and review the diff) and
 ./gradlew jmh -Pjmh.args="Tempo -f 1 -prof gc"   # explicit JMH command line
 ./gradlew jmhGate                                # the allocation gate CI runs
 ./gradlew jcstress                               # concurrency tests (jcstress, quick mode)
+GITHUB_REPOSITORY=owner/repo ./gradlew jar       # a jar whose Tempo-Link base is https://owner.github.io/repo/
 ```
 
 Gradle itself needs JDK 17 or newer; the library is compiled with `--release 11`.
