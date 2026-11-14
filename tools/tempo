@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """tempo - read Tempo-Timing values in the terminal.
 
-Reads a trace from files or stdin: `curl -i` output (the Tempo-Timing header line,
-also folded or wrapped over several lines), a bare header value starting with
-`v1;`, or a JSON document holding a tempo object anywhere (for example under
+Reads a trace from files or stdin: `curl -i` output (the Tempo-Timing or Tempo-Link
+header line, also folded or wrapped over several lines), a bare header value
+starting with `v1;`, a Tempo-Link URL (`...#t=z....`, also inside a log line or as
+an argument), or a JSON document holding a tempo object anywhere (for example under
 "info"). The format is specified in FORMAT.md.
 
 Python 3.8+, standard library only, one file.
 """
 
 import argparse
+import base64
 import datetime
 import json
 import math
@@ -18,6 +20,8 @@ import re
 import shutil
 import sys
 import textwrap
+import webbrowser
+import zlib
 
 VERSION = "1.0"
 MIN_WIDTH = 40    # narrowest output: the lanes need a label column and a time axis
@@ -271,6 +275,193 @@ def dump_json(doc):
 
 
 # ======================================================================
+# Encoder (FORMAT.md section 7, canonical form; mirrors tools/tempo_ref.py).
+# Only needed to write a link for a trace that arrived as JSON.
+# ======================================================================
+
+def to_b36(n):
+    if n < 0:
+        raise ValueError("negative value cannot be encoded: %r" % n)
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out = []
+    while True:
+        n, r = divmod(n, 36)
+        out.append(digits[r])
+        if not n:
+            return "".join(reversed(out))
+
+
+def encode_name(name):
+    out = []
+    for byte in (name or "?").encode("utf-8"):
+        if (0x30 <= byte <= 0x39 or 0x41 <= byte <= 0x5A or 0x61 <= byte <= 0x7A
+                or byte == 0x2E or byte == 0x2D):
+            out.append(chr(byte))
+        elif byte == 0x20:
+            out.append("_")
+        else:
+            out.append("%%%02X" % byte)
+    return "".join(out)
+
+
+def encode_number(v):
+    if isinstance(v, int):
+        return str(v)
+    if v != v or v in (float("inf"), float("-inf")):
+        return None
+    s = ("%.6f" % v).rstrip("0").rstrip(".")
+    return "0" if s in ("-0", "") else s
+
+
+def encode(doc):
+    """The JSON form (as normalize_doc returns it) -> canonical header value. ValueError if impossible."""
+    spans = doc["spans"]
+    if not spans:
+        raise ValueError("a trace without spans has no header value")
+    depth, stack = [], []
+    for i, s in enumerate(spans):
+        if i == 0:
+            if s["thread"] != 0 or s["start"] != 0:
+                raise ValueError("the root must start at 0 on thread 0")
+            depth.append(0)
+        else:
+            while stack and stack[-1] != s["parent"]:
+                stack.pop()
+            if not stack:
+                raise ValueError("span %d is not in pre-order" % i)
+            depth.append(depth[s["parent"]] + 1)
+            if depth[i] > MAX_DEPTH:
+                raise ValueError("span %d is deeper than %d" % (i, MAX_DEPTH))
+        stack.append(i)
+    names = {}
+    for s in spans:
+        names.setdefault(s["name"] or "?", len(names))
+    for s in spans:
+        for k in s.get("attrs", {}):
+            names.setdefault(k or "?", len(names))
+    dropped = doc.get("dropped", 0)
+    recs = []
+    cur = [0] * (MAX_DEPTH + 2)
+    for i, s in enumerate(spans):
+        d = depth[i]
+        delta = s["start"] - cur[d]
+        if delta < 0:
+            raise ValueError("span %d starts before its previous sibling or parent" % i)
+        cur[d] = cur[d + 1] = s["start"]
+        r = [to_b36(d), to_b36(names[s["name"] or "?"]), ".", to_b36(delta), ".", to_b36(s["dur"])]
+        agg = s.get("agg")
+        if i > 0 and s["thread"] != spans[s["parent"]]["thread"]:
+            r.append("@_" if s["thread"] == -1 else "@" + to_b36(s["thread"]))
+        if agg is not None:
+            if "waitSum" in agg:
+                r.append("~%s.%s" % (to_b36(agg["waitSum"]), to_b36(agg["waitMax"])))
+        elif "wait" in s:
+            r.append("~" + to_b36(s["wait"]))
+        if "cpu" in s:
+            r.append("*" + to_b36(s["cpu"]))
+        if agg is not None:
+            r.append("+" + ".".join(to_b36(agg[k]) for k in ("count", "min", "max", "extent", "maxAt")))
+        if s.get("flags"):
+            r.append("^" + "".join(f for f in FLAG_ORDER if f in s["flags"]))
+        for k, val in s.get("attrs", {}).items():
+            num = encode_number(val)
+            if num is None:
+                dropped += 1
+            else:
+                r.append(":%s=%s" % (to_b36(names[k or "?"]), num))
+        recs.append("".join(r))
+    out = ["v1"]
+    if doc.get("wall") is not None:
+        out.append("w=" + to_b36(doc["wall"]))
+    if doc.get("folded", 0) or dropped:
+        out.append("x=%s.%s" % (to_b36(doc.get("folded", 0)), to_b36(dropped)))
+    if doc.get("live"):
+        out.append("l=" + ".".join(to_b36(t) for t in doc["live"]))
+    out.append("T=" + ":".join(encode_name(t) for t in doc["threads"]))
+    out.append("N=" + ":".join(encode_name(n) for n in names))
+    out.append("S=" + "/".join(recs))
+    out.append("e=" + to_b36(len(recs)))
+    return ";".join(out)
+
+
+# ======================================================================
+# Tempo-Link (FORMAT.md section 9; mirrors tools/tempo_ref.py)
+# ======================================================================
+
+DEFAULT_BASE = "https://dualuse.de/tempo/"
+B64URL_RE = re.compile(r"^[A-Za-z0-9_-]*$")
+MAX_INFLATED = 16 * 1024 * 1024
+
+
+def pack_value(value, level=9):
+    """A fragment parameter in the z. form: 'z.' + base64url(raw DEFLATE). Always this form, even
+    where the plain one would be shorter, because terminals detect it as part of the URL."""
+    co = zlib.compressobj(level, zlib.DEFLATED, -15)
+    return "z." + base64.urlsafe_b64encode(co.compress(value.encode("utf-8")) + co.flush()).decode("ascii").rstrip("=")
+
+
+def unpack_value(packed):
+    """A fragment parameter -> the Tempo-Timing value it carries (not yet validated)."""
+    p = strip_ws(packed)
+    if not p:
+        raise TempoFormatError("E_LINK", "empty trace parameter")
+    if not p.startswith("z."):
+        return re.sub(r"%([0-9A-Fa-f]{2})", lambda m: chr(int(m.group(1), 16)), p)
+    s = p[2:]
+    s = s[:-2] if s.endswith("==") else s[:-1] if s.endswith("=") else s
+    if not B64URL_RE.match(s):
+        bad = next(ch for ch in s if not B64URL_RE.match(ch))
+        raise TempoFormatError("E_LINK", "character %r is not base64url" % bad)
+    if len(s) % 4 == 1:
+        raise TempoFormatError("E_LINK", "base64url length %d is impossible" % len(s))
+    d = zlib.decompressobj(-15)
+    try:
+        out = d.decompress(base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)), MAX_INFLATED + 1)
+    except zlib.error as e:
+        raise TempoFormatError("E_LINK", "payload is not raw DEFLATE (%s)" % e)
+    if len(out) > MAX_INFLATED:
+        raise TempoFormatError("E_LINK", "payload inflates to more than %d bytes" % MAX_INFLATED)
+    if not d.eof:
+        raise TempoFormatError("E_LINK", "DEFLATE stream is incomplete (link cut?)")
+    if d.unused_data:
+        raise TempoFormatError("E_LINK", "%d bytes follow the DEFLATE stream" % len(d.unused_data))
+    return out.decode("utf-8", "replace")
+
+
+def _params(text):
+    out = {}
+    for part in text.split("&"):
+        k, eq, v = part.partition("=")
+        if k and eq:
+            out[k] = v                     # a repeated parameter: the last one wins
+    return out
+
+
+def link_params(url):
+    """The parameters of a link: from the fragment when it carries t=, else from the query."""
+    u, _, frag = strip_ws(url).partition("#")
+    for params in (_params(frag), _params(u.partition("?")[2])):
+        if params.get("t"):
+            return params
+    raise TempoFormatError("E_LINK", "link has no t= parameter in the fragment or the query")
+
+
+def check_base(base):
+    if not base or "#" in base or any(ch in WHITESPACE or ch == "," for ch in base):
+        raise ValueError("--base must be a URL without '#', ',' or whitespace: %r" % base)
+    return base
+
+
+def encode_link(value, base=DEFAULT_BASE, compare=None, tab=None):
+    url = check_base(base) + "#t=" + pack_value(strip_ws(value))
+    if compare is not None:
+        url += "&c=" + pack_value(strip_ws(compare))
+    if tab:
+        url += "&tab=" + tab
+    return url
+
+
+# ======================================================================
 # JSON input: validation of the JSON form
 # ======================================================================
 
@@ -373,11 +564,17 @@ def normalize_doc(obj):
 # ======================================================================
 
 VALUE_CHARS = frozenset(ALPHABET | frozenset(WHITESPACE))
-HEADER_RE = re.compile(r"^[ \t]*tempo-timing[ \t]*:(.*)$", re.I)
+# what a link may consist of: printable ASCII except the characters a URL never holds unescaped
+LINK_CHARS = frozenset(chr(c) for c in range(0x21, 0x7F)) - frozenset('"<>\\`{|},') | frozenset(WHITESPACE)
+HEADER_RE = re.compile(r"^[ \t]*(tempo-timing|tempo-link)[ \t]*:(.*)$", re.I)
 FIELD_LINE_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+:[ \t]+\S")
 COMPLETE_RE = re.compile(r";e=[0-9a-z]+$")
 VALUE_START_RE = re.compile(r"(?m)^[ \t]*(?=v1;)")
 BARE_RE = re.compile(r"(?:^|(?<=[^0-9A-Za-z./:;=@~*+^_%-]))v1;")
+# a URL (or a bare fragment) whose fragment or query has a t= parameter: a Tempo-Link
+# (the fragment form; the query form only with a t= that starts like a packed value)
+LINK_TOKEN_RE = re.compile(r"[^\s\"'<>`{|}\\,]*(?:#(?:[^\s\"'<>`{|}\\,#&]*&)*t="
+                           r"|\?(?:[^\s\"'<>`{|}\\,#&]*&)*t=(?=z\.|v1))[^\s\"'<>`{|}\\,]*")
 
 
 class InputError(Exception):
@@ -386,31 +583,74 @@ class InputError(Exception):
         self.code = code
 
 
+def link_complete(url):
+    """True when a link (or what a wrapped line left of it) decodes to complete values."""
+    try:
+        p = link_params(url)
+        return all(COMPLETE_RE.search(strip_ws(unpack_value(p[k]))) for k in ("t", "c") if p.get(k))
+    except TempoFormatError:
+        return False
+
+
 def _header_values(lines):
-    """Values of Tempo-Timing header lines, with folded or wrapped continuation lines."""
-    out = []
+    """Tempo-Timing and Tempo-Link header lines, with folded or wrapped continuation lines.
+
+    Returns (kind, payload, alt) triples: kind "header" or "link". Within one response
+    (a block that starts at an HTTP/ status line) Tempo-Timing wins; the i-th Tempo-Link
+    then becomes `alt` of the i-th Tempo-Timing value, to be checked for agreement.
+    """
+    blocks = [([], [])]                      # per response: (timing values, links)
     i = 0
     while i < len(lines):
+        if lines[i].startswith("HTTP/"):
+            blocks.append(([], []))
         m = HEADER_RE.match(lines[i])
         i += 1
         if not m:
             continue
-        value = m.group(1)
+        is_link = m.group(1).lower() == "tempo-link"
+        chars = LINK_CHARS if is_link else VALUE_CHARS
+        value = m.group(2)
         while i < len(lines):
             nxt = lines[i]
             if not nxt.strip():
                 break
             folded = nxt[:1] in (" ", "\t")
             if not folded:
-                if COMPLETE_RE.search(strip_ws(value)):
+                if link_complete(value) if is_link else COMPLETE_RE.search(strip_ws(value)):
                     break
                 if FIELD_LINE_RE.match(nxt) or nxt.startswith("HTTP/") or nxt.lstrip().startswith("v1;"):
                     break
-            if any(ch not in VALUE_CHARS for ch in nxt):
+            if any(ch not in chars for ch in nxt):
                 break
             value += nxt
             i += 1
-        out.append(value)
+        blocks[-1][1 if is_link else 0].append(value)
+    out = []
+    for timing, links in blocks:
+        if timing:
+            out.extend(("header", v, links[k] if k < len(links) else None) for k, v in enumerate(timing))
+        else:
+            out.extend(("link", v, None) for v in links)
+    return out
+
+
+def _bare_links(lines):
+    """Links anywhere in the text (a log line, a pasted URL); a link that ends its line
+    and is not complete yet continues on the next lines, as a terminal wraps it."""
+    out = []
+    for li, line in enumerate(lines):
+        for m in LINK_TOKEN_RE.finditer(line):
+            url = m.group(0).rstrip(".)]!?")
+            j = li + 1
+            while m.end() == len(line.rstrip()) and j < len(lines) and not link_complete(url):
+                nxt = lines[j].strip()
+                if (not nxt or any(ch in WHITESPACE or ch not in LINK_CHARS for ch in nxt)
+                        or "#" in nxt or "://" in nxt or FIELD_LINE_RE.match(nxt)):
+                    break
+                url += nxt
+                j += 1
+            out.append(url.rstrip(".)]!?"))
     return out
 
 
@@ -457,25 +697,28 @@ def _json_candidates(text):
 
 
 def extract(text):
-    """Find the traces in an input text: list of ("header", str) or ("json", dict)."""
-    if text.startswith("﻿"):
+    """Find the traces in an input text: a list of (kind, payload, alt) with kind "header"
+    (a Tempo-Timing value), "link" (a Tempo-Link URL) or "json" (a dict); alt is a
+    Tempo-Link that came with a Tempo-Timing value in the same response, or None."""
+    if text.startswith("\ufeff"):
         text = text[1:]
     found = _json_candidates(text)
     if found:
-        return found
+        return [(kind, payload, None) for kind, payload in found]
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     values = _header_values(lines)
     if values:
-        return [("header", v) for v in values]
+        return values
+    links = [("link", u, None) for u in _bare_links(lines)]
     stripped = text.strip(WHITESPACE)
-    if stripped.startswith("v1;") or not BARE_RE.search(text):
+    if not links and (stripped.startswith("v1;") or not BARE_RE.search(text)):
         if stripped[:1] in ("{", "["):
             return []
         # the input is the value itself: decode all of it strictly; several values
         # may follow each other, one per line (continuation lines are joined)
-        return [("header", c) for c in VALUE_START_RE.split(text) if c.strip(WHITESPACE)] \
-            or [("header", text)]
-    out = []
+        return [("header", c, None) for c in VALUE_START_RE.split(text) if c.strip(WHITESPACE)] \
+            or [("header", text, None)]
+    out = links
     starts = [m.start() for m in BARE_RE.finditer(text)]
     for k, st in enumerate(starts):
         e = starts[k + 1] if k + 1 < len(starts) else len(text)
@@ -484,23 +727,61 @@ def extract(text):
             if text[j] in WHITESPACE and COMPLETE_RE.search(strip_ws(text[st:j])):
                 break
             j += 1
-        out.append(("header", text[st:j]))
+        out.append(("header", text[st:j], None))
     return out
 
 
-def load_text(text, label):
-    """All traces of one input as a list of (label, Trace or TempoFormatError)."""
+def _decode_candidate(kind, payload):
+    """(doc, value, packed c= or None) of one candidate; value is None for JSON."""
+    if kind == "json":
+        return normalize_doc(payload), None, None
+    if kind == "link":
+        params = link_params(payload)
+        value = strip_ws(unpack_value(params["t"]))
+        return decode(value), value, params.get("c") or None
+    value = strip_ws(payload)
+    return decode(value), value, None
+
+
+def load_text(text, label, warn=None):
+    """All traces of one input as a list of (label, Trace or TempoFormatError).
+
+    A Tempo-Link next to a Tempo-Timing value is only checked: the value wins, and
+    `warn` (a function taking a message) hears about a link that disagrees with it.
+    """
     cands = extract(text)
     if not cands:
-        return [(label, InputError("E_INPUT", "no Tempo-Timing value or tempo JSON found"))]
+        return [(label, InputError("E_INPUT", "no Tempo-Timing value, Tempo-Link or tempo JSON found"))]
     out = []
-    for k, (kind, payload) in enumerate(cands):
+    for k, (kind, payload, alt) in enumerate(cands):
         lab = label if len(cands) == 1 else "%s#%d" % (label, k + 1)
         try:
-            doc = decode(payload) if kind == "header" else normalize_doc(payload)
-            out.append((lab, Trace(doc, lab)))
+            doc, value, compare = _decode_candidate(kind, payload)
+        except TempoFormatError as e:
+            if alt is None:
+                out.append((lab, e))
+                continue
+            try:     # Tempo-Timing rejected: fall back to the link of the same response
+                doc, value, compare = _decode_candidate("link", alt)
+            except TempoFormatError:
+                out.append((lab, e))
+                continue
+            if warn:
+                warn("%s: Tempo-Timing rejected (%s); using Tempo-Link" % (lab, e))
+            alt = None
+        if alt is not None and warn:
+            try:
+                if _decode_candidate("link", alt)[0] != doc:
+                    warn("%s: Tempo-Link and Tempo-Timing disagree; using Tempo-Timing" % lab)
+            except TempoFormatError as e:
+                warn("%s: Tempo-Link ignored (%s); using Tempo-Timing" % (lab, e))
+        try:
+            t = Trace(doc, lab)
         except TempoFormatError as e:
             out.append((lab, e))
+            continue
+        t.value, t.link_compare = value, compare
+        out.append((lab, t))
     return out
 
 
@@ -2165,13 +2446,27 @@ class UsageError(Exception):
 
 EPILOG = """\
 input:
-  curl -si "$URL" | tempo            the Tempo-Timing line of curl -i output
+  curl -si "$URL" | tempo            the Tempo-Timing (or Tempo-Link) line of curl -i
   pbpaste | tempo --tree             a bare value (v1;...), wrapped lines are fine
+  tempo 'https://.../tempo/#t=z...'  a Tempo-Link URL (argument, file, stdin, log
+                                     line); ?t=z... in the query is read too
   tempo response.json                JSON with a tempo object anywhere
-  Quote a value on the command line or pipe it: ; * ~ ^ are shell syntax.
+  Quote a value or link on the command line or pipe it: ; * ~ ^ & are shell syntax.
+  With both headers in one response, Tempo-Timing wins (a warning if they
+  disagree). A link's &c= trace is what --diff compares with when no OTHER is given.
+
+web viewer (Tempo Timeline):
+  --to link                          print the Tempo-Link URL of the trace
+  --open                             open the trace in the browser; with --diff,
+                                     both traces; with --tree, --agg, --pools,
+                                     --critical or --diff, on that tab
+  --base URL                         another viewer copy (default $TEMPO_LINK_BASE
+                                     or https://dualuse.de/tempo/)
+  The trace travels in the #fragment, which the browser never sends to the
+  server; --open only starts the local browser. Nothing else is sent anywhere.
 
 views (default: lanes per thread, grouped into pools):
-  --tree, --agg, --pools, --findings, --critical, --diff OTHER, --stats FILES...
+  --tree, --agg, --pools, --findings, --critical, --diff [OTHER], --stats FILES...
 
 layout:
   Lanes and charts fit --width down to 40 columns (a smaller width is
@@ -2190,7 +2485,7 @@ def build_parser():
         description="Read Tempo-Timing values in the terminal (format: FORMAT.md).",
         epilog=EPILOG)
     ap.add_argument("inputs", nargs="*", metavar="FILE",
-                    help="input files; none or '-' reads stdin")
+                    help="input files or Tempo-Link URLs; none or '-' reads stdin")
     v = ap.add_argument_group("views").add_mutually_exclusive_group()
     v.add_argument("--tree", action="store_true",
                    help="indented tree: start, wait, duration, self, cpu, off-cpu, attributes")
@@ -2202,12 +2497,14 @@ def build_parser():
                    help="stragglers, never started, open, failed, queue waits, off-CPU")
     v.add_argument("--critical", action="store_true",
                    help="critical path across handoffs, wait vs run per hop")
-    v.add_argument("--diff", metavar="OTHER",
-                   help="per-path change from the input (A) to OTHER (B)")
+    v.add_argument("--diff", metavar="OTHER", nargs="?", const="",
+                   help="per-path change from the input (A) to OTHER (B), a file or link; "
+                        "without OTHER, to the &c= trace of the input link")
     v.add_argument("--stats", nargs="*", metavar="FILE",
                    help="per-path count and p50/p95/max of sum, self, wait over many traces")
-    v.add_argument("--to", choices=["json", "chrome", "folded"],
-                   help="convert: JSON form, Chrome trace events (Perfetto), collapsed stacks")
+    v.add_argument("--to", choices=["json", "chrome", "folded", "link"],
+                   help="convert: JSON form, Chrome trace events (Perfetto), collapsed stacks, "
+                        "Tempo-Link URL")
     v.add_argument("--check", action="store_true",
                    help="validate only; exit 1 on a malformed or truncated value")
     f = ap.add_argument_group("filters")
@@ -2217,6 +2514,13 @@ def build_parser():
     f.add_argument("--depth", type=int, metavar="N", help="at most N levels below the root/focus")
     f.add_argument("--min-ms", type=float, metavar="X",
                    help="hide spans (and their subtrees) shorter than X ms")
+    w = ap.add_argument_group("web viewer")
+    w.add_argument("--open", action="store_true",
+                   help="open the trace in the web viewer (the local browser; the trace stays "
+                        "in the link fragment)")
+    w.add_argument("--base", metavar="URL",
+                   help="viewer URL for --to link and --open (default: $TEMPO_LINK_BASE or %s)"
+                        % DEFAULT_BASE)
     o = ap.add_argument_group("layout")
     o.add_argument("--width", type=int, metavar="N",
                    help="output width (default: terminal; at least %d)" % MIN_WIDTH)
@@ -2235,6 +2539,16 @@ def _read(name, stdin):
         return data
     with open(name, "rb") as fh:
         return fh.read().decode("utf-8", "replace")
+
+
+def _read_arg(name, stdin):
+    """A file, '-' for stdin, or a Tempo-Link given as the argument itself."""
+    if name != "-" and not os.path.exists(name) and LINK_TOKEN_RE.search(name):
+        return name
+    return _read(name, stdin)
+
+
+OPEN_TABS = (("tree", "tree"), ("agg", "agg"), ("pools", "pools"), ("critical", "critical"), ("diff", "diff"))
 
 
 def run(argv, stdin=None, stdout=None, stderr=None, env=None, isatty=None):
@@ -2280,6 +2594,15 @@ def run(argv, stdin=None, stdout=None, stderr=None, env=None, isatty=None):
         err("bad --threads expression: %s" % e)
         return 2
 
+    if args.open and (args.to or args.check or args.stats is not None):
+        err("--open cannot be combined with --to, --check or --stats")
+        return 2
+    try:
+        base = check_base(args.base if args.base is not None else env.get("TEMPO_LINK_BASE") or DEFAULT_BASE)
+    except ValueError as e:
+        err(str(e))
+        return 2
+
     names = list(args.inputs)
     if args.stats is not None:
         names.extend(args.stats)
@@ -2292,11 +2615,12 @@ def run(argv, stdin=None, stdout=None, stderr=None, env=None, isatty=None):
     loaded = []
     for name in names:
         try:
-            text = _read(name, stdin)
+            text = _read_arg(name, stdin)
         except (IOError, OSError) as e:
             err("%s: %s" % (name, e.strerror or e))
             return 1
-        loaded.extend(load_text(text, "stdin" if name == "-" else name))
+        label = "stdin" if name == "-" else "link" if text is name else name
+        loaded.extend(load_text(text, label, err))
 
     if args.check:
         status = 0
@@ -2335,6 +2659,54 @@ def run(argv, stdin=None, stdout=None, stderr=None, env=None, isatty=None):
         return 1
     if len(loaded) > 1:
         err("%s: %d traces found, showing the first (--stats reads all)" % (label, len(loaded)))
+    other = None
+    if args.diff is not None:
+        if args.diff:
+            try:
+                otext = _read_arg(args.diff, stdin)
+            except (IOError, OSError) as e:
+                err("%s: %s" % (args.diff, e.strerror or e))
+                return 1
+            olabel, other = load_text(otext, "link" if otext is args.diff else args.diff, err)[0]
+        elif trace.link_compare:
+            olabel = label + " (c=)"
+            try:
+                other = Trace(decode(unpack_value(trace.link_compare)), olabel)
+                other.value, other.link_compare = strip_ws(unpack_value(trace.link_compare)), None
+            except TempoFormatError as e:
+                other = e
+        else:
+            err("--diff needs OTHER, or an input link that carries a second trace (&c=)")
+            return 2
+        if isinstance(other, Exception):
+            err("%s: %s" % (olabel, other))
+            return 1
+
+    if args.to == "link" or args.open:
+        try:
+            value = trace.value or encode(trace.doc)
+            if other is not None:
+                compare = other.value or encode(other.doc)
+            elif trace.link_compare:
+                compare = unpack_value(trace.link_compare)    # keep the pair of the input link
+            else:
+                compare = None
+        except TempoFormatError as e:
+            err("%s: %s" % (label, e))
+            return 1
+        except ValueError as e:
+            err("%s: cannot be written as a header value: %s" % (label, e))
+            return 1
+        tab = next((t for opt, t in OPEN_TABS if getattr(args, opt)), None) if args.open else None
+        if args.diff is not None:
+            tab = "diff"
+        url = encode_link(value, base, compare, tab)
+        stdout.write(url + "\n")
+        if args.open and not webbrowser.open(url):
+            err("could not start a web browser; open the link above yourself")
+            return 1
+        return 0
+
     try:
         if args.to == "json":
             stdout.write(dump_json(trace.doc))
@@ -2345,17 +2717,8 @@ def run(argv, stdin=None, stdout=None, stderr=None, env=None, isatty=None):
         if args.to == "folded":
             stdout.write(to_folded(trace))
             return 0
-        if args.diff:
-            try:
-                other = load_text(_read(args.diff, stdin), args.diff)
-            except (IOError, OSError) as e:
-                err("%s: %s" % (args.diff, e.strerror or e))
-                return 1
-            olabel, otrace = other[0]
-            if isinstance(otrace, Exception):
-                err("%s: %s" % (olabel, otrace))
-                return 1
-            lines = view_diff(trace, otrace, flt, p, width)
+        if other is not None:
+            lines = view_diff(trace, other, flt, p, width)
         elif args.tree:
             lines = view_tree(trace, flt, p, width)
         elif args.agg:

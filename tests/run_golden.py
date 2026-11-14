@@ -9,8 +9,13 @@
     but encoders never write).
   * Every prefix of every canonical vector either is rejected as cut
     (E_VERSION/E_CUT) or decodes to a prefix of the full span list.
-  * testdata/invalid/*.header must be rejected with the code listed in
-    testdata/invalid/README.md.
+  * testdata/golden/NAME.link (every canonical vector has one) must decode to
+    the header value of NAME.header. Decoding must not depend on the exact
+    compressed bytes: the value re-packed at DEFLATE levels 0, 1 and 6, in the
+    plain form, padded and line-wrapped must decode to the same value; so must
+    the query-string form, and a fragment t= must win over a query t=.
+  * testdata/invalid/*.header and *.link must be rejected with the code listed
+    in testdata/invalid/README.md.
   * samples/**/*.header (if present) must decode to the matching .json, and
     tools/gen_traces.py must regenerate the samples byte for byte.
 
@@ -101,6 +106,55 @@ def run_golden(res):
     return len(names)
 
 
+def link_variants(value):
+    """The same value as links that differ in their bytes but not in what they carry."""
+    out = [("level %d" % lv, tempo_ref.encode_link(value, level=lv)) for lv in (0, 1, 6)]
+    out.append(("plain", tempo_ref.encode_link(value, form="plain")))
+    out.append(("auto", tempo_ref.encode_link(value, form="auto", base="http://localhost:8000/viewer.html?x=1")))
+    z = tempo_ref.pack_value(value)
+    out.append(("padded", "#t=" + z + "=" * (-(len(z) - 2) % 4)))
+    out.append(("wrapped", "\r\n ".join(z[i:i + 60] for i in range(0, len(z), 60)).join(["#tab=tree&t=", "\n"])))
+    out.append(("with compare", tempo_ref.encode_link(value, compare=value, tab="diff", level=1)))
+    # the query form is read too (encoders never write it); the fragment wins over the query
+    out.append(("query", tempo_ref.DEFAULT_BASE + "?tab=tree&t=" + z))
+    out.append(("query plain", "http://localhost/v.html?t=" + tempo_ref.pack_value(value, form="plain")))
+    out.append(("fragment wins", tempo_ref.DEFAULT_BASE + "?t=z.not-even-deflate#t=" + z))
+    return out
+
+
+def run_links(res):
+    """Every canonical golden vector has a NAME.link carrying the same value."""
+    n = differ = 0
+    for name in sorted(os.path.basename(p)[:-7] for p in glob.glob(os.path.join(ROOT, "testdata", "golden", "*.header"))):
+        base = os.path.join(ROOT, "testdata", "golden", name)
+        has = os.path.exists(base + ".link")
+        res.check("link     " + name, has == (name not in NON_CANONICAL),
+                  "canonical vectors need a .link file, the others none")
+        if not has:
+            continue
+        n += 1
+        value = tempo_ref.strip_ws(read(base + ".header"))
+        want = json.loads(read(base + ".json"))
+        try:
+            link = tempo_ref.decode_link(read(base + ".link"))
+            ok = link.value == value and link.compare is None and tempo_ref.decode(link.value) == want
+            res.check("link     " + name, ok, "decodes to %r" % (link,))
+        except tempo_ref.TempoFormatError as e:
+            res.check("link     " + name, False, str(e))
+        for label, url in link_variants(value):
+            differ += label.startswith("level") and url != tempo_ref.strip_ws(read(base + ".link"))
+            try:
+                link = tempo_ref.decode_link(url)
+                ok = link.value == value and tempo_ref.decode(link.value) == want
+                if label == "with compare":
+                    ok = ok and link.compare == value and link.tab == "diff"
+                res.check("link %-12s %s" % (label, name), ok, "decodes to %r" % (link,))
+            except tempo_ref.TempoFormatError as e:
+                res.check("link %-12s %s" % (label, name), False, str(e))
+    res.check("link     other levels give other bytes", differ > n, "the level checks are vacuous")
+    return n
+
+
 def check_prefixes(value, full):
     """A cut value must never yield a record the full value does not have."""
     for k in range(len(value)):
@@ -116,15 +170,26 @@ def check_prefixes(value, full):
     return True, ""
 
 
+def decode_invalid(name, text):
+    if name.endswith(".link"):
+        link = tempo_ref.decode_link(text)
+        tempo_ref.decode(link.value)
+        if link.compare is not None:
+            tempo_ref.decode(link.compare)
+    else:
+        tempo_ref.decode(text)
+
+
 def run_invalid(res):
     readme = read(os.path.join(ROOT, "testdata", "invalid", "README.md"))
-    expected = dict(re.findall(r"^\| `([^`]+\.header)` \| `(E_[A-Z]+)` \|", readme, re.M))
-    files = sorted(os.path.basename(p) for p in glob.glob(os.path.join(ROOT, "testdata", "invalid", "*.header")))
+    expected = dict(re.findall(r"^\| `([^`]+\.(?:header|link))` \| `(E_[A-Z]+)` \|", readme, re.M))
+    files = sorted(os.path.basename(p) for p in glob.glob(os.path.join(ROOT, "testdata", "invalid", "*.header"))
+                   + glob.glob(os.path.join(ROOT, "testdata", "invalid", "*.link")))
     res.check("invalid  README lists every file", set(files) == set(expected),
               "files %s vs README %s" % (sorted(set(files) ^ set(expected)), ""))
     for f in files:
         try:
-            tempo_ref.decode(read(os.path.join(ROOT, "testdata", "invalid", f)))
+            decode_invalid(f, read(os.path.join(ROOT, "testdata", "invalid", f)))
             res.check("invalid  " + f, False, "was accepted")
         except tempo_ref.TempoFormatError as e:
             res.check("invalid  " + f, e.code == expected.get(f), "got %s, want %s" % (e.code, expected.get(f)))
@@ -175,12 +240,14 @@ def run_regenerate(res):
 def main():
     res = Result()
     g = run_golden(res)
+    k = run_links(res)
     i = run_invalid(res)
     s = run_samples(res)
     r = run_regenerate(res)
     for f in res.failed:
         print("FAIL " + f)
-    print("golden vectors: %d, invalid vectors: %d, samples: %d, regenerated files: %d" % (g, i, s, r))
+    print("golden vectors: %d, links: %d, invalid vectors: %d, samples: %d, regenerated files: %d"
+          % (g, k, i, s, r))
     print("checks passed: %d, failed: %d" % (res.passed, len(res.failed)))
     return 1 if res.failed else 0
 

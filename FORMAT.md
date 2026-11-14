@@ -7,6 +7,9 @@ This document specifies the two wire forms of a Tempo trace:
 - the **JSON form**, which is what a header value decodes to and what a response body
   can carry directly when there is no size limit.
 
+A header value can also travel inside a URL, in the `Tempo-Link` response header, so
+that a click in the terminal opens the trace in a web viewer (§9).
+
 Every parser and encoder of the project is tested against the vectors in
 [`testdata/`](testdata/). The key words MUST, MUST NOT, SHOULD and MAY are used as in
 RFC 2119.
@@ -374,7 +377,161 @@ Conformance is **structural**: two JSON documents match when they parse to equal
 (object key order does not matter; numbers compare by value). Absent optional keys are
 absent, never `null`. The JSON form carries no size limit and no ladder.
 
-## 9. Worked example
+## 9. Tempo-Link
+
+A service MAY send a second response header, `Tempo-Link`, whose value is a URL that
+opens the same trace in a web viewer. Terminals turn URLs into links, so one click
+shows the trace in the browser. The URL carries the whole `v1` value in its fragment,
+so the trace does not need to be stored anywhere.
+
+```
+Tempo-Link: https://dualuse.de/tempo/#t=z.HU67coMwEPyaNGR86IR4WIxmaJJ0aeI6HhB…
+```
+
+(The whole link of the worked example, §10, is `testdata/golden/search-example.link`:
+440 characters for the 415-character value.)
+
+The default viewer is the Tempo Timeline at `https://dualuse.de/tempo/`; the base is
+configurable, and a copy of the viewer hosted elsewhere, or opened from a `file:` URL,
+reads the same links. A service MAY send `Tempo-Link` together with `Tempo-Timing` or
+instead of it.
+
+### 9.1 Grammar
+
+```
+link     = base "#" params            ; what encoders write
+         / base "?" params            ; also read (see below), never written
+base     = absolute-URI               ; RFC 3986 §4.3; no "#", "," or whitespace
+params   = param *("&" param)
+param    = "t=" packed                ; the trace (required)
+         / "c=" packed                ; a second trace to compare with (optional)
+         / "tab=" tab                 ; the view to open (optional)
+         / pname "=" *pchar           ; anything else: ignored
+packed   = "z." b64url / plain
+b64url   = 1*(ALPHA / DIGIT / "-" / "_")    ; base64url (RFC 4648 §5) without "=" padding
+plain    = the value with every "%" written as "%25"
+tab      = "lanes" / "tree" / "agg" / "pools" / "critical" / "diff" / "stats"
+pname    = 1*(ALPHA / DIGIT / "-" / "_" / ".")
+```
+
+The value packed into `t=` and `c=` is a header value as specified in §2–§7, with its
+whitespace removed. Parameters are split at `&`, each at its first `=`. Unknown
+parameters are ignored, an unknown `tab` too; a repeated parameter takes its last
+value.
+
+**Fragment, not query.** Encoders MUST put the parameters in the fragment (`#t=…`).
+A browser never sends the fragment to a server (RFC 3986 §3.5; it is not part of the
+request line, and it is not part of `Referer`), so the trace stays in the browser even
+though the viewer page itself is fetched from a server. Readers MUST also accept the
+same parameters in the query string (`<base>?t=z.…&tab=tree`), because people build
+such links by hand. If the fragment carries `t=`, the parameters are taken from the
+fragment only; otherwise from the query. A query never undergoes form decoding: `+`
+stays `+` (a `z.` payload has none).
+
+### 9.2 Packing
+
+**`z.` form.** Take the UTF-8 bytes of the value (ASCII, §2), compress them with raw
+DEFLATE (RFC 1951: no zlib header or checksum as in RFC 1950, no gzip wrapper as in
+RFC 1952), encode the result as base64url without padding and prefix `z.`.
+
+- Any compression level, strategy or block type is allowed. Two encoders, or two
+  levels of the same encoder, give different links for the same value. Decoders MUST
+  NOT depend on the exact compressed bytes, only on what they inflate to.
+- The DEFLATE stream MUST be complete and MUST end the payload: an incomplete stream
+  or bytes after its end are rejected (`E_LINK`). Unlike a cut header value (§6.2), a
+  cut `z.` payload cannot be decoded in part.
+- Encoders MUST NOT write `=` padding; decoders SHOULD accept it.
+- Decoders MUST accept a payload that inflates to 1 MiB and MAY reject a larger one
+  (`E_LINK`), as protection against compression bombs. The reference decoder stops
+  at 16 MiB.
+
+**Plain form.** The value itself, with every `%` written `%25`, so that the name
+escapes of §4 survive the URL. Decoders replace every `%XX` escape by its byte; for a
+link written by this grammar that only turns `%25` back into `%`, and it also undoes a
+tool on the way that escaped, say, `^` as `%5E`.
+
+**Which form.** Values of up to a few hundred characters come out about as long or
+longer in the `z.` form; from about 500 characters on it is clearly shorter (§9.4). Encoders MAY use the plain form when it is shorter; the
+viewer's share button picks the shorter of the two. A `Tempo-Link` header SHOULD use
+the `z.` form anyway: base64url never ends a URL in a terminal's link detection or a
+chat tool, whereas the plain form contains `;`, `*`, `~` and `^`, which some of them
+treat as the end of a URL or as shell syntax (`^` is not even a URI character in
+RFC 3986, although browsers accept it).
+
+**Whitespace.** Decoders remove all whitespace from a link before parsing it, like
+from a value (§6.1), because terminals wrap long URLs too.
+
+### 9.3 Decoding
+
+```
+decode_link(url):
+    url = url with all whitespace removed
+    params = fragment parameters if they have a non-empty t=, else query parameters
+    if neither has a non-empty t=:              error E_LINK
+    for t (and c, when it is used):
+        if it starts with "z.":
+            base64url-decode the rest           error E_LINK (bad character, impossible length)
+            inflate as raw DEFLATE              error E_LINK (not DEFLATE, incomplete,
+                                                trailing bytes, too large)
+            value = the bytes as UTF-8
+        else:
+            value = the parameter with every %XX replaced by its byte
+        decode(value) as in §6                  its own error codes, truncation as in §6.2
+```
+
+A link only transports a value: a defect in the link is `E_LINK`, a defect in the value
+it carries keeps the code of §11 (a link carrying a value with a depth jump is
+`E_DEPTH`). `c=` is decoded the same way when a reader uses it, for example to open
+the diff of the two traces; a reader that ignores `c=` need not decode it.
+
+### 9.4 Size
+
+A link carries the same `v1` value as `Tempo-Timing`, so the same byte budget and
+ladder (§7.1) apply to the value **before** compression: `headerBytes` limits the
+value, and the link comes out shorter. On the bundled samples the `z.` payload is
+0.69–0.80 of the value's length (raw DEFLATE level 9):
+
+| Sample | Value | `z.` payload | Ratio |
+|---|---|---|---|
+| `small` | 895 | 717 | 0.80 |
+| `pipeline` | 1140 | 873 | 0.77 |
+| `diff/before` | 1990 | 1409 | 0.71 |
+| `diff/after` | 2067 | 1492 | 0.72 |
+| `find-healthy` | 2218 | 1532 | 0.69 |
+| `find-saturated` | 2226 | 1580 | 0.71 |
+| `batch/find-01` … `30` | | | 0.69–0.80 |
+
+The link adds the base and `#t=` (28 characters with the default base). Small values
+do not compress: on the golden vectors, values of 27–415 characters give `z.` payloads
+from 1 % shorter to 52 % longer; a deep but repetitive one (785) gives 0.60.
+
+A response with both headers carries the trace twice, about 1.7–1.8 times the value
+plus the base. A service with a limit on the total header size budgets both or sends
+one. Browsers take URLs far longer than these; terminals, chat tools and log
+pipelines that cut long lines are the practical limit, and a cut link fails as a
+whole (`E_LINK`) where a cut header value still yields a truncated trace.
+
+### 9.5 Both headers in one response
+
+A response that carries both headers SHOULD carry the same value in both. Decoders
+SHOULD use `Tempo-Timing` and MAY warn when the link decodes to a different trace
+(compare the decoded JSON forms, not the bytes). If `Tempo-Timing` is rejected, a
+decoder MAY fall back to the link. When several responses follow each other (`curl
+-iL`), the headers are paired per response. A JSON form in the body still wins over
+both, as it is not size-limited.
+
+### 9.6 Privacy
+
+The fragment stays on the client: the server that hosts the viewer sees a request for
+the page and nothing of the trace, and the viewer decodes it locally. But the link
+**is** the trace. It ends up in the browser history (and whatever syncs it), in
+bookmarks, and in every chat, ticket or log it is pasted into or that records response
+headers; anyone who has the link can read every span and thread name in it. Treat
+`Tempo-Link` like `Tempo-Timing`: a service that only sends traces to some callers
+sends the link only to them. A query-string link (§9.1) gives up the first protection,
+since the query is sent to the viewer's server.
+
+## 10. Worked example
 
 A search request, 415 bytes (all names invented):
 
@@ -405,7 +562,7 @@ v1;w=mwevdy2z;x=20.0;T=http-7:cpu-1:cpu-2:io-1;N=GET_%2Fsearch:decode:describe:f
 `x=20.0` is 72 folded (the two aggregates of 36), none dropped; `e=d` is 13 records.
 The full decoded JSON is `testdata/golden/search-example.json`.
 
-## 10. Errors
+## 11. Errors
 
 | Code | Meaning |
 |---|---|
@@ -421,18 +578,24 @@ The full decoded JSON is `testdata/golden/search-example.json`.
 | `E_DEPTH` | Depth grows by more than one. |
 | `E_FLAG` | Unknown flag. |
 | `E_AGG` | Aggregate rules broken: `@_` or `~sum.max` on a plain record, single `~` on an aggregate, count 0, or a child under an aggregate. |
+| `E_LINK` | Bad `Tempo-Link` (§9): no `t=` in the fragment or the query, a `z.` payload that is not base64url or not raw DEFLATE, an incomplete stream, bytes after it, or too large. The value inside a good link reports the codes above. |
 
-## 11. Test vectors
+## 12. Test vectors
 
 ```
 testdata/golden/NAME.header   one header value (may contain whitespace if that is the point)
 testdata/golden/NAME.json     the expected JSON form
+testdata/golden/NAME.link     the value as a Tempo-Link (canonical vectors; zlib level 9)
 testdata/invalid/NAME.header  values that must be rejected; README.md lists the code per file
+testdata/invalid/NAME.link    links that must be rejected; listed in the same README
 ```
 
 `python3 tests/run_golden.py` decodes every golden vector and compares it with its JSON,
 round-trips each JSON through the encoder, checks that canonical vectors re-encode byte
 for byte, checks every invalid vector's error code, and validates the synthetic traces in
-`samples/`. Other implementations SHOULD run the same checks: decode equality for every
-golden vector and the listed error code for every invalid one. See
+`samples/`. For links it checks that every `.link` yields its vector's value, and that
+the value re-packed at other DEFLATE levels, in the plain form, in the query string,
+padded or wrapped yields it too. Other implementations SHOULD run the same checks:
+decode equality for every golden vector and link, and the listed error code for every
+invalid one. See
 [`testdata/README.md`](testdata/README.md) for what each vector covers.

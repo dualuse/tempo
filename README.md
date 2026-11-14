@@ -9,7 +9,10 @@ It is a single source file with no runtime dependencies and targets Java 11.
 
 A trace travels in the `Tempo-Timing` response header or as JSON in a response body;
 the format is specified in [FORMAT.md](FORMAT.md). The web viewer, Tempo Timeline, runs at
-<https://dualuse.de/tempo/>: paste a header or `curl -i` output, nothing is uploaded.
+<https://dualuse.de/tempo/>: paste a header or `curl -i` output, nothing is uploaded. A service
+can also send a `Tempo-Link` header: a URL to the viewer that carries the compressed trace in
+its `#fragment`, so a click in the terminal opens it in the browser without the trace being
+sent to any server ([FORMAT.md §9](FORMAT.md#9-tempo-link)).
 
 ## Status
 
@@ -66,20 +69,30 @@ pbpaste | tempo --tree                   # a value copied from a log or a termin
 tempo response.json                      # JSON with a tempo object anywhere (e.g. under "info")
 tempo before.header --diff after.header  # what changed between two requests
 tempo --stats traces/*.header            # p50/p95/max per path over many requests
+tempo 'https://dualuse.de/tempo/#t=z.…'  # a Tempo-Link, as an argument
+tempo --open --critical trace.header     # the same trace in the web viewer
 ```
 
-**Input.** Files or stdin, in any of three forms:
+**Input.** Files, stdin or link arguments, in any of these forms:
 
-- `curl -i` output. The `Tempo-Timing:` line is found case-insensitively, and a value
-  that a proxy folded or a terminal wrapped over several lines is joined again.
+- `curl -i` output. The `Tempo-Timing:` or `Tempo-Link:` line is found
+  case-insensitively, and a value that a proxy folded or a terminal wrapped over
+  several lines is joined again. When one response has both headers, `Tempo-Timing`
+  wins; a warning on stderr says when the link carries a different trace (and the link
+  is used when `Tempo-Timing` is rejected).
 - A bare header value starting with `v1;`, also embedded in a log line. Whitespace
   and line breaks inside the value are ignored.
+- A Tempo-Link URL (anything with `#t=`, or `?t=z.…` in the query), also embedded in a
+  log line or wrapped over several lines, or given directly as an argument instead of
+  a file name. Several values or links in one input are several traces, as for
+  `--stats`. A link may carry a second trace (`&c=`); `--diff` without `OTHER`
+  compares with it.
 - A JSON document holding a tempo object (`"v": 1` and `"spans"`) at any depth. When a
   response has both the header and such a body, the body wins, because it is not
   size-limited.
 
-Quote a value you type on the command line, or pipe it: `;`, `*`, `~` and `^` are
-shell syntax.
+Quote a value or link you type on the command line, or pipe it: `;`, `*`, `~`, `^` and
+`&` are shell syntax.
 
 **Default view: lanes.** One row group per thread, grouped into pools by stripping a
 trailing `-<digits>` from the thread name (`cpu-1`, `cpu-2` form the pool `cpu`;
@@ -110,16 +123,26 @@ folded or dropped spans (`x=`), live lanes (`l=`) and cut values.
 | `--pools` | Per pool, over time: this request's running and queued tasks, and the `queued`/`active` gauges recorded at submit (the pool-wide signal). A table gives tasks, threads seen, run, wait, CPU, off-CPU and peaks. |
 | `--findings` | Stragglers (ending after their parent), never-started and open handoffs, failures, cancellations, the longest queue waits, and off-CPU time on compute pools. |
 | `--critical` | The chain that determined the end time. It walks back from the root's end, always into the child that finished last, and follows handoffs to other threads instead of the blocking wait on them. On an early exit, where the wait ends while the work still runs (an aggregate, or a straggler with nothing else ending within 1 ms of the wake-up), it follows the work running at the wake-up. Each hop shows its queue wait and run time; totals per pool follow. |
-| `--diff OTHER` | Per path, B (OTHER) minus A (the input): Δcount, Δsum, Δself, Δwait, ΔCPU, sorted by the largest absolute change. |
+| `--diff [OTHER]` | Per path, B (OTHER, a file or link) minus A (the input): Δcount, Δsum, Δself, Δwait, ΔCPU, sorted by the largest absolute change. Without OTHER, B is the `&c=` trace of the input link. |
 | `--stats FILES...` | Over many traces (also several per file, such as a log): per path, the number of traces containing it, the median count, and p50/p95/max of sum, self and wait (nearest rank). |
 | `--to json` | The JSON form of FORMAT.md. |
 | `--to chrome` | Chrome trace events for [Perfetto](https://ui.perfetto.dev) or `chrome://tracing`: one track per thread, queue waits as async slices, handoffs as flow arrows. |
 | `--to folded` | Collapsed stacks (`a;b;c <µs>`) for flame-graph tools. Values are self times; queue waits are left out. |
+| `--to link` | The Tempo-Link URL of the trace (`z.` form; an input link's `&c=` is kept). JSON input is encoded into a header value first. |
 | `--check` | Validate only. Exit status 1 on a malformed or cut value, with the error code of FORMAT.md. |
 
 Self time is the duration minus the children that ran nested on the same thread,
 blocking waits included. Children on other threads are never subtracted. Off-CPU
 time is duration minus CPU time, where CPU was measured.
+
+**Web viewer.** `--open` writes the trace's Tempo-Link to stdout and opens it with
+Python's `webbrowser` module, that is, in the local browser. With `--diff` (or an
+input link with `&c=`) the link holds both traces; with `--tree`, `--agg`, `--pools`, `--critical` or `--diff` it opens
+on that tab. `--base URL` (or `$TEMPO_LINK_BASE`) points `--to link` and `--open` at
+another copy of the viewer, such as a self-hosted one; the default is
+`https://dualuse.de/tempo/`. The trace travels in the URL fragment, which the browser
+keeps to itself: nothing is uploaded, and the CLI sends nothing anywhere. The link
+does end up in the browser history.
 
 **Filters**, for every view except the converters and `--critical`:
 

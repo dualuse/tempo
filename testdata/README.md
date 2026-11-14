@@ -9,9 +9,18 @@ The contract for every Tempo-Timing parser and encoder; the format is specified 
 A decoder passes a vector when its output parses to the same JSON value (key order and
 number formatting do not matter).
 
+Every canonical vector also has `NAME.link`: the same value as a `Tempo-Link` URL
+(FORMAT.md §9) with the default base, packed with raw DEFLATE at zlib level 9. A link
+decoder passes when the link yields exactly the value of `NAME.header`. Another
+DEFLATE implementation or level gives other bytes; that is fine, which is why
+`run_golden.py` also re-packs every value at levels 0, 1 and 6, in the plain form,
+padded, line-wrapped and in the query string (`?t=`, which readers accept and encoders
+never write), and checks that each decodes to the same value and that a `t=` in the
+fragment wins over one in the query.
+
 | Vector | Covers |
 |---|---|
-| `search-example` | The 415-byte worked example of FORMAT.md §9: handoffs with wait and CPU, a failed handoff, long and fractional attributes, two aggregates (one on mixed threads), `w=`, `x=`. |
+| `search-example` | The 415-byte worked example of FORMAT.md §10: handoffs with wait and CPU, a failed handoff, long and fractional attributes, two aggregates (one on mixed threads), `w=`, `x=`. |
 | `fallback` | The fixed last-resort value `v1;x=0.<n>;T=%3F;N=%3F;S=00.0.<dur>;e=1`. |
 | `single-root` | One record, nothing else. |
 | `deep-nesting` | A chain down to depth 35 (`z`), then back up to depth 3 and 1: the `cur[d+1]` reset makes first children count from their new parent. |
@@ -35,5 +44,5 @@ the reference encoder reproduces them byte for byte from their JSON.
 
 ## `invalid/`
 
-Values that must be rejected, one defect each; [`invalid/README.md`](invalid/README.md)
-lists the expected error code per file.
+Values (`*.header`) and links (`*.link`) that must be rejected, one defect each;
+[`invalid/README.md`](invalid/README.md) lists the expected error code per file.
