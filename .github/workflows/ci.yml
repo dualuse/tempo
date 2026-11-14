@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -47,20 +50,69 @@ jobs:
       # The jar links to the GitHub Pages viewer of the repository it is built in (GITHUB_REPOSITORY,
       # which Actions always sets), so a fork's jar opens the fork's viewer (deployed by pages.yml once
       # the fork turns on Pages); the next builds check that rule for a made-up fork and -PlinkBase.
+      # The manifest wraps lines at 72 bytes, so continuation lines are joined before the grep.
       - name: Library jar with this repository's Tempo-Link base
         if: matrix.java == 21
         run: |
           ./gradlew jar checkLinkBase
           unzip -p build/libs/tempo-*.jar io/github/dualuse/tempo/link-base.txt
-          unzip -p build/libs/tempo-*.jar META-INF/MANIFEST.MF | grep "^Tempo-Link-Base: https://${GITHUB_REPOSITORY_OWNER,,}.github.io/"
+          unzip -p build/libs/tempo-*.jar META-INF/MANIFEST.MF | tr -d '\r' \
+            | awk '/^ / { line = line substr($0, 2); next } { if (NR > 1) print line; line = $0 } END { print line }' \
+            | grep "^Tempo-Link-Base: https://${GITHUB_REPOSITORY_OWNER,,}.github.io/"
           GITHUB_REPOSITORY=Some-Owner/tempo-fork ./gradlew test --tests '*LinkTest*' jar
           test "$(unzip -p build/libs/tempo-*.jar io/github/dualuse/tempo/link-base.txt)" = "https://some-owner.github.io/tempo-fork/"
           ./gradlew test --tests '*LinkTest*' jar -PlinkBase=https://tempo.example.org/viewer/
           test "$(unzip -p build/libs/tempo-*.jar io/github/dualuse/tempo/link-base.txt)" = "https://tempo.example.org/viewer/"
-      # The format's shared tests: the vectors and the ladder against the reference, the CLI, the viewer's parser.
-      - name: Format tests (Python, Node)
-        if: matrix.java == 21
+
+  # The format's shared tests: the vectors and the ladder against the reference, the CLI (Python 3.8+,
+  # stdlib only), the viewer's parser and analysis (Node).
+  format:
+    name: Format tests (Python ${{ matrix.python }}, Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.8"
+            node: 20
+          - python: "3.x"
+            node: 22
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Golden vectors and samples
+        run: python tests/run_golden.py
+      - name: Command-line viewer
+        run: python -m unittest tests.test_cli
+      - name: Web viewer parser
         run: |
-          python3 tests/run_golden.py
-          python3 -m unittest tests.test_cli
-          for t in tests/test_*.mjs tests/check_spa_parser_sync.mjs; do node "$t"; done
+          node tests/test_parser.mjs
+          node tests/test_analysis.mjs
+          node tests/check_spa_parser_sync.mjs
+
+  # Greps the tree and the full history for the deny-list in the TEMPO_DENYLIST secret (one extended
+  # regular expression per line), see tools/check-private.sh. Only on pushes to master: secrets are
+  # not given to pull requests from forks, and a fork without the secret skips the check.
+  private-terms:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Private terms in the tree and the history
+        env:
+          DENYLIST: ${{ secrets.TEMPO_DENYLIST }}
+        run: |
+          if [ -z "$DENYLIST" ]; then
+            echo "::notice::Private-term check skipped: no TEMPO_DENYLIST secret"
+            exit 0
+          fi
+          list=$(mktemp)
+          printf '%s\n' "$DENYLIST" > "$list"
+          TEMPO_DENYLIST="$list" tools/check-private.sh --names-only
