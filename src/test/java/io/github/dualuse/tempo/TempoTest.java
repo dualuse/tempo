@@ -1,5 +1,6 @@
 package io.github.dualuse.tempo;
 
+import io.github.dualuse.tempo.Tempo.Handoff;
 import io.github.dualuse.tempo.Tempo.Name;
 import io.github.dualuse.tempo.Tempo.Options;
 import io.github.dualuse.tempo.Tempo.Span;
@@ -11,8 +12,16 @@ import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 
 import static io.github.dualuse.tempo.Tempo.COARSE;
 import static io.github.dualuse.tempo.Tempo.DEEP;
@@ -29,7 +38,7 @@ class TempoTest {
 
     /** Manually advanced clock; starts away from zero so the epoch subtraction is exercised. */
     static final class Clock implements LongSupplier {
-        long t = 1_000_000_000L;
+        volatile long t = 1_000_000_000L; // tasks on other threads read it; latches and futures order the writes
 
         @Override
         public long getAsLong() {
@@ -59,10 +68,15 @@ class TempoTest {
         assertSame(NOOP, Tempo.current(), "a test left a span open on the test thread");
     }
 
-    /** One line per span: indent, name, start+duration and the flags/attributes that are set. */
+    /**
+     * One line per span: indent, name, start+duration, the flags that are set, for a handoff its queue
+     * wait, the thread where it differs from the root's, and the attributes.
+     */
     static String tree(Trace t) {
         StringBuilder b = new StringBuilder();
+        String[] rootThread = {null};
         t.forEachSpan(s -> {
+            if (rootThread[0] == null) rootThread[0] = s.thread();
             b.append("  ".repeat(s.depth())).append(s.name()).append(' ').append(s.startNanos()).append('+').append(s.durationNanos());
             if (s.level() == DETAIL) b.append(" detail");
             if (s.level() == DEEP) b.append(" deep");
@@ -75,6 +89,9 @@ class TempoTest {
             if (s.waiting()) b.append(" waiting");
             if (s.healed()) b.append(" healed");
             if (s.misuse()) b.append(" misuse");
+            if (s.handoff()) b.append(" handoff~").append(s.waitNanos());
+            if (s.neverStarted()) b.append(" unstarted");
+            if (!s.thread().equals(rootThread[0])) b.append(" @").append(s.thread());
             for (int i = 0; i < s.attributes(); i++) {
                 b.append(' ').append(s.attributeKey(i)).append('=');
                 if (s.attributeIsDouble(i)) b.append(s.doubleAttribute(i));
@@ -90,6 +107,10 @@ class TempoTest {
     }
 
     static Throwable onOtherThread(Runnable r) throws InterruptedException {
+        return onThread("other", r);
+    }
+
+    static Throwable onThread(String name, Runnable r) throws InterruptedException {
         AtomicReference<Throwable> thrown = new AtomicReference<>();
         Thread t = new Thread(() -> {
             try {
@@ -97,7 +118,7 @@ class TempoTest {
             } catch (Throwable e) {
                 thrown.set(e);
             }
-        });
+        }, name);
         t.start();
         t.join();
         return thrown.get();
@@ -1118,6 +1139,639 @@ class TempoTest {
             onOtherThread(() -> seen.set(Tempo.current()));
             assertSame(NOOP, seen.get());
         }
+    }
+
+    // ---- handoffs -------------------------------------------------------------------------------------
+
+    static final Name QUEUED = Tempo.name("queued"), POOL_WAIT = Tempo.name("pool-wait");
+
+    /** One named thread; tasks run one after another in submit order. */
+    static ExecutorService worker(String name) {
+        return Executors.newSingleThreadExecutor(r -> new Thread(r, name));
+    }
+
+    @Test
+    void handoffRecordsQueueWaitAndRunOnTheWorker() throws Exception {
+        ExecutorService pool = worker("worker-1");
+        try {
+            Trace t = Tempo.start(SEARCH, opts());
+            Span root = t.root();
+            clock.add(10);
+            Handoff h = root.handoff(MATCH).set(QUEUED, 3);
+            clock.add(30);
+            pool.submit(() -> {
+                assertSame(NOOP, Tempo.current());
+                try (Span m = h.begin()) {
+                    assertSame(m, Tempo.current());
+                    clock.add(5);
+                    try (Span l = m.span(LOAD)) {
+                        l.set(BYTES, 7);
+                        clock.add(20);
+                    }
+                    m.set(SCORE, 0.5);
+                }
+                assertSame(NOOP, Tempo.current());
+            }).get();
+            clock.add(15);
+            t.close();
+            assertEquals(lines(
+                    "search 0+80",
+                    "  match 10+25 handoff~30 @worker-1 queued=3 score=0.5",
+                    "    load 45+20 @worker-1 bytes=7"), tree(t));
+            List<String> ids = new ArrayList<>();
+            t.forEachSpan(v -> ids.add(v.id() + "<" + v.parent() + "@" + v.depth()));
+            assertEquals(List.of("0<-1@0", "1<0@1", "2<1@2"), ids);
+            assertEquals(0, t.misuses());
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    @Test
+    void wrappersMarkFailuresAndRethrow() throws Exception {
+        ExecutorService pool = worker("worker-1");
+        try {
+            Trace t = Tempo.start(SEARCH, opts());
+            Span root = t.root();
+            IOException io = new IOException("gone");
+            Future<Object> c = pool.submit(root.handoff(LOAD).callable(() -> {
+                clock.add(4);
+                throw io;
+            }));
+            assertSame(io, assertThrows(ExecutionException.class, c::get).getCause());
+            RuntimeException boom = new IllegalStateException("boom");
+            Future<?> r = pool.submit(root.handoff(MATCH).runnable(() -> {
+                throw boom;
+            }));
+            assertSame(boom, assertThrows(ExecutionException.class, r::get).getCause());
+            Supplier<Integer> s = root.handoff(DECODE).supplier(() -> {
+                clock.add(2);
+                return 42;
+            });
+            assertEquals(42, CompletableFuture.supplyAsync(s, pool).get());
+            t.close();
+            assertEquals(lines(
+                    "search 0+6",
+                    "  load 0+4 failed handoff~0 @worker-1",
+                    "  match 4+0 failed handoff~0 @worker-1",
+                    "  decode 4+2 handoff~0 @worker-1"), tree(t));
+            assertEquals(0, t.misuses());
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    @Test
+    void inlineHandoffIsAChildOnTheSubmittingThread() {
+        Trace t = Tempo.start(SEARCH, opts());
+        try (Span r = t.root().span(RERANK)) {
+            Handoff h = r.handoff(MATCH);
+            clock.add(3);
+            h.runnable(() -> { // caller runs
+                try (Span l = Tempo.current().span(LOAD)) {
+                    clock.add(4);
+                }
+            }).run();
+            assertSame(r, Tempo.current());
+        }
+        t.close();
+        assertEquals(lines(
+                "search 0+7",
+                "  rerank 0+7",
+                "    match 0+4 handoff~3",
+                "      load 3+4"), tree(t));
+        assertEquals(0, t.misuses());
+    }
+
+    @Test
+    void cancelledRejectedAndNeverStartedHandoffs() {
+        Trace t = Tempo.start(SEARCH, opts());
+        Span root = t.root();
+        Handoff a = root.handoff(MATCH), b = root.handoff(LOAD), c = root.handoff(DECODE);
+        clock.add(5);
+        a.cancel();
+        clock.add(2);
+        b.reject();
+        a.cancel(); // once is enough
+        assertEquals(0, t.misuses());
+        assertSame(NOOP, a.begin());
+        assertEquals(1, t.misuses());
+        clock.add(3);
+        t.close();
+        assertEquals(lines(
+                "search 0+10",
+                "  match 0+0 cancelled handoff~5",
+                "  load 0+0 cancelled handoff~7",
+                "  decode 0+0 handoff~10 unstarted"), tree(t));
+        clock.add(4);
+        assertEquals(lines( // an unstarted handoff keeps waiting
+                "search 0+10",
+                "  match 0+0 cancelled handoff~5",
+                "  load 0+0 cancelled handoff~7",
+                "  decode 0+0 handoff~14 unstarted"), tree(t));
+        assertEquals(1, t.misuses());
+    }
+
+    @Test
+    void cancelOnAnotherThreadIsRecordedThere() throws Exception {
+        Trace t = Tempo.start(SEARCH, opts());
+        Handoff h = t.root().handoff(MATCH);
+        clock.add(6);
+        assertNull(onThread("canceller", h::cancel));
+        Span s = h.begin();
+        assertSame(NOOP, s);
+        t.close();
+        assertEquals(lines("search 0+6", "  match 0+0 cancelled handoff~6 @canceller"), tree(t));
+        assertEquals(1, t.misuses());
+    }
+
+    @Test
+    void beginTwiceIsMisuseAndCancelAfterBeginIsNot() throws Exception {
+        Trace t = Tempo.start(SEARCH, opts());
+        Handoff h = t.root().handoff(MATCH);
+        Span s = h.begin();
+        assertTrue(s.recording());
+        assertSame(NOOP, h.begin());
+        assertEquals(1, t.misuses());
+        s.close();
+        h.cancel();
+        assertEquals(1, t.misuses());
+        assertNull(onOtherThread(() -> h.set(QUEUED, 1)));
+        assertEquals(2, t.misuses());
+        t.close();
+        assertEquals(lines("search 0+0", "  match 0+0 handoff~0"), tree(t));
+
+        Trace u = Tempo.start(SEARCH, strict());
+        Handoff g = u.root().handoff(MATCH);
+        g.begin().close();
+        AssertionError e = assertThrows(AssertionError.class, g::begin);
+        assertEquals("Tempo misuse: handoff begun twice", e.getMessage());
+        Handoff k = u.root().handoff(LOAD);
+        k.cancel();
+        assertEquals("Tempo misuse: handoff begun after cancel", assertThrows(AssertionError.class, k::begin).getMessage());
+        Throwable foreign = onOtherThread(() -> g.set(QUEUED, 1));
+        assertEquals("Tempo misuse: handoff set on a foreign thread", foreign.getMessage());
+        u.close();
+    }
+
+    @Test
+    void handoffsOnNoopOrAForeignThreadRecordNothing() throws Exception {
+        assertSame(Handoff.NOOP, NOOP.handoff(MATCH));
+        Runnable r = () -> { };
+        Callable<Integer> c = () -> 1;
+        Supplier<Integer> s = () -> 2;
+        assertSame(r, Handoff.NOOP.runnable(r));
+        assertSame(c, Handoff.NOOP.callable(c));
+        assertSame(s, Handoff.NOOP.supplier(s));
+        assertSame(NOOP, Handoff.NOOP.begin());
+        Handoff.NOOP.set(QUEUED, 1).cancel();
+        Handoff.NOOP.reject();
+
+        Trace t = Tempo.start(SEARCH, opts());
+        AtomicReference<Handoff> h = new AtomicReference<>();
+        assertNull(onOtherThread(() -> h.set(t.root().handoff(MATCH))));
+        assertSame(Handoff.NOOP, h.get());
+        assertEquals(1, t.misuses());
+        t.root().handoff(null).begin().close();
+        assertEquals(2, t.misuses());
+        t.close();
+        assertEquals(lines("search 0+0", "  ? 0+0 misuse handoff~0"), tree(t));
+    }
+
+    @Test
+    void handoffsChainAcrossWorkers() throws Exception {
+        ExecutorService one = worker("worker-1"), two = worker("worker-2");
+        try {
+            Trace t = Tempo.start(SEARCH, opts().level(DETAIL));
+            Handoff h = t.root().handoff(MATCH);
+            one.submit(h.runnable(() -> {
+                clock.add(2);
+                Handoff g = Tempo.current().handoff(LOAD);
+                clock.add(1);
+                try {
+                    two.submit(g.runnable(() -> {
+                        try (Span d = Tempo.current().detail(DECODE)) {
+                            clock.add(5);
+                        }
+                    })).get();
+                } catch (Exception e) {
+                    throw new AssertionError(e);
+                }
+            })).get();
+            t.close();
+            assertEquals(lines(
+                    "search 0+8",
+                    "  match 0+8 handoff~0 @worker-1",
+                    "    load 2+5 handoff~1 @worker-2",
+                    "      decode 3+5 detail @worker-2"), tree(t));
+        } finally {
+            one.shutdown();
+            two.shutdown();
+        }
+    }
+
+    @Test
+    void aTaskOfTheSameTraceInsideAnotherRunsInlineButIsDrawnAtItsHandoff() throws Exception {
+        ExecutorService pool = worker("worker-1");
+        try {
+            Trace t = Tempo.start(SEARCH, opts());
+            Handoff first = t.root().handoff(MATCH), second = t.root().handoff(LOAD);
+            pool.submit(() -> {
+                try (Span m = first.begin()) {
+                    clock.add(2);
+                    second.runnable(() -> clock.add(3)).run(); // e.g. a pool that helps while it joins
+                    assertSame(m, Tempo.current());
+                }
+            }).get();
+            t.close();
+            assertEquals(lines(
+                    "search 0+5",
+                    "  match 0+5 handoff~0 @worker-1",
+                    "  load 0+3 handoff~2 @worker-1"), tree(t));
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    @Test
+    void interleavedTracesShareOnePoolThread() throws Exception {
+        ExecutorService pool = worker("worker-1");
+        try {
+            Trace a = Tempo.start(SEARCH, opts());
+            Trace b = Tempo.start(RERANK, opts()); // two requests alive at once
+            for (int i = 0; i < 2; i++) {
+                for (Trace t : List.of(a, b)) {
+                    Handoff h = t.root().handoff(MATCH).set(QUEUED, i);
+                    pool.submit(() -> {
+                        try (Span m = h.begin()) {
+                            assertSame(m, Tempo.current());
+                            m.span(LOAD).close();
+                            clock.add(1);
+                        }
+                        assertSame(NOOP, Tempo.current());
+                    }).get();
+                }
+            }
+            b.close();
+            a.close();
+            assertEquals(lines(
+                    "search 0+4",
+                    "  match 0+1 handoff~0 @worker-1 queued=0",
+                    "    load 0+0 @worker-1",
+                    "  match 2+1 handoff~0 @worker-1 queued=1",
+                    "    load 2+0 @worker-1"), tree(a));
+            assertEquals(lines(
+                    "rerank 0+4",
+                    "  match 1+1 handoff~0 @worker-1 queued=0",
+                    "    load 1+0 @worker-1",
+                    "  match 3+1 handoff~0 @worker-1 queued=1",
+                    "    load 3+0 @worker-1"), tree(b));
+            assertEquals(2, pool.submit(TempoTest::cachedLanes).get()); // one lane per trace, reused
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    static int cachedLanes() {
+        int n = 0;
+        for (Tempo.Lane l : Tempo.SLOT.get().lanes) {
+            assertFalse(l != null && l.retired(), "a retired lane stayed cached");
+            if (l != null) n++;
+        }
+        return n;
+    }
+
+    @Test
+    void aPoolThreadMovesOnAfterItsTraceEnds() throws Exception {
+        ExecutorService pool = worker("worker-1");
+        try {
+            Trace a = Tempo.start(SEARCH, opts());
+            Handoff early = a.root().handoff(LOAD), late = a.root().handoff(MATCH);
+            pool.submit(() -> early.begin().close()).get();
+            a.close();
+            a.release();
+
+            Trace b = Tempo.start(RERANK, opts());
+            Handoff h = b.root().handoff(DECODE);
+            pool.submit(() -> {
+                h.begin().close();
+                assertSame(NOOP, Tempo.current());
+            }).get();
+            assertEquals(1, pool.submit(TempoTest::cachedLanes).get()); // the released trace's lane is gone
+
+            int[] ran = {0};
+            pool.submit(() -> {
+                assertSame(NOOP, late.begin()); // a straggler of the released trace records nothing
+                late.runnable(() -> ran[0]++).run();
+                assertSame(NOOP, Tempo.current());
+            }).get();
+            assertEquals(1, ran[0]);
+            b.close();
+            assertEquals(lines("rerank 0+0", "  decode 0+0 handoff~0 @worker-1"), tree(b));
+            assertEquals("", tree(a));
+            assertEquals(0, a.misuses() + b.misuses());
+            b.release();
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    @Test
+    void aTaskOfAnotherTraceRestoresTheCurrentSpan() throws Exception {
+        AtomicReference<Trace> other = new AtomicReference<>();
+        AtomicReference<Handoff> handoff = new AtomicReference<>();
+        assertNull(onThread("request-2", () -> {
+            Trace b = Tempo.start(RERANK, opts());
+            handoff.set(b.root().handoff(MATCH));
+            other.set(b);
+            b.close();
+        }));
+        Trace a = Tempo.start(SEARCH, opts());
+        try (Span d = a.root().span(DECODE)) {
+            handoff.get().runnable(() -> {
+                assertNotSame(d, Tempo.current());
+                Tempo.current().span(LOAD).close();
+                clock.add(2);
+            }).run();
+            assertSame(d, Tempo.current());
+        }
+        a.close();
+        assertSame(NOOP, Tempo.current());
+        String here = Thread.currentThread().getName();
+        assertEquals(lines("search 0+2", "  decode 0+2"), tree(a));
+        assertEquals(lines(
+                "rerank 0+0",
+                "  match 0+2 handoff~0 @" + here,
+                "    load 0+0 @" + here), tree(other.get()));
+    }
+
+    @Test
+    void aStragglerOnTheRequestThreadLeavesTheRootAlone() {
+        Trace t = Tempo.start(SEARCH, opts());
+        Handoff h = t.root().handoff(MATCH);
+        clock.add(1);
+        t.close();
+        clock.add(2);
+        h.runnable(() -> clock.add(3)).run();
+        assertEquals(1, t.elapsedNanos());
+        t.root().set(BYTES, 9);
+        assertEquals(lines("search 0+1 bytes=9", "  match 0+3 handoff~3"), tree(t));
+        assertSame(NOOP, Tempo.current());
+    }
+
+    @Test
+    void tasksPastTheLaneCapFoldTheirWaitAndCountAsDropped() throws Exception {
+        Trace t = Tempo.start(SEARCH, opts().lanes(2));
+        Span root = t.root();
+        Handoff a = root.handoff(MATCH), b = root.handoff(MATCH), c = root.handoff(MATCH);
+        clock.add(4);
+        assertNull(onThread("w1", () -> a.begin().close()));
+        clock.add(3);
+        assertNull(onThread("w2", () -> assertSame(NOOP, b.begin())));
+        c.begin().close(); // inline on a lane the trace has
+        t.close();
+        assertEquals(1, t.dropped());
+        assertEquals(0, t.misuses());
+        assertEquals("count=0 sum=0 min=0 max=0 waits=1 waitSum=7 waitMax=7", t.aggregate(MATCH).toString());
+        assertEquals(lines(
+                "search 0+7",
+                "  match 0+0 handoff~4 @w1",
+                "  match 0+0 handoff~7"), tree(t));
+    }
+
+    @Test
+    void tasksPastALanesCapAreLeftOutButNotNeverStarted() throws Exception {
+        ExecutorService pool = worker("worker-1");
+        try {
+            Trace t = Tempo.start(SEARCH, opts());
+            int n = Tempo.Lane.MAX_EVENTS / 2 + 1; // a task takes two events (link and queue wait)
+            Handoff[] hs = handoffs(t.root(), n);
+            clock.add(3);
+            pool.submit(() -> {
+                Span outer = hs[0].begin();
+                for (int i = 1; i < n; i++) hs[i].begin().close(); // inline in outer, until the worker's lane is full
+                outer.close();
+            }).get();
+            t.close();
+            int[] handoffs = {0}, unstarted = {0};
+            t.forEachSpan(v -> {
+                if (v.handoff()) handoffs[0]++;
+                if (v.neverStarted()) unstarted[0]++;
+            });
+            assertEquals(n - 1, handoffs[0]);
+            assertEquals(0, unstarted[0]);
+            assertEquals(1, t.dropped());
+            assertEquals("count=0 sum=0 min=0 max=0 waits=1 waitSum=3 waitMax=3", t.aggregate(MATCH).toString());
+            assertEquals(0, t.misuses());
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    /** Pool threads interleave tasks of concurrent traces; every span lands in its own trace (real threads and clock). */
+    @Test
+    void concurrentTracesKeepTheirTasksApart() throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        int traces = 8, tasks = 200;
+        List<Trace> done = new ArrayList<>();
+        try {
+            List<Callable<Trace>> requests = new ArrayList<>();
+            for (int k = 0; k < traces; k++) {
+                long stamp = k;
+                requests.add(() -> {
+                    Trace t = Tempo.start(SEARCH);
+                    List<Future<?>> fs = new ArrayList<>();
+                    for (int i = 0; i < tasks; i++) {
+                        Handoff h = t.root().handoff(MATCH).set(QUEUED, stamp);
+                        fs.add(pool.submit(h.runnable(() -> {
+                            Tempo.current().set(BYTES, stamp);
+                            Tempo.current().span(LOAD).set(BYTES, stamp).close();
+                        })));
+                    }
+                    for (Future<?> f : fs) f.get();
+                    t.close();
+                    return t;
+                });
+            }
+            ExecutorService requestThreads = Executors.newFixedThreadPool(traces);
+            try {
+                for (Future<Trace> f : requestThreads.invokeAll(requests)) done.add(f.get());
+            } finally {
+                requestThreads.shutdown();
+            }
+            for (int k = 0; k < traces; k++) {
+                Trace t = done.get(k);
+                long stamp = k;
+                int[] handoffs = {0}, spans = {0};
+                t.forEachSpan(v -> {
+                    spans[0]++;
+                    if (v.handoff()) {
+                        handoffs[0]++;
+                        assertFalse(v.neverStarted());
+                        assertEquals(2, v.attributes());
+                    }
+                    for (int i = 0; i < v.attributes(); i++) assertEquals(stamp, v.longAttribute(i));
+                    if (v.depth() == 2) assertEquals(LOAD, v.name());
+                });
+                assertEquals(tasks, handoffs[0]);
+                assertEquals(1 + 2 * tasks, spans[0]);
+                assertEquals(0, t.misuses() + t.dropped());
+                t.release();
+            }
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    @Test
+    void handoffAllocatesOneSmallObjectAndTheTaskNothing() throws Exception {
+        ExecutorService pool = worker("worker-1");
+        int n = 2_000;
+        try {
+            for (int round = 0; round < 3; round++) { // fills the chunk pool and loads every class on the path
+                Trace warm = Tempo.start(SEARCH, opts());
+                Handoff[] hs = handoffs(warm.root(), 2 * n);
+                pool.submit(() -> run(hs)).get();
+                warm.close();
+                warm.release();
+            }
+            Trace t = Tempo.start(SEARCH, opts());
+            try (t) {
+                Handoff[] first = handoffs(t.root(), 1);
+                pool.submit(() -> run(first)).get(); // creates the worker's lane for the trace
+                Handoff[] hs = new Handoff[n];
+                long submit = allocatedBy(() -> {
+                    for (int i = 0; i < n; i++) hs[i] = t.root().handoff(MATCH);
+                });
+                assertTrue(submit > 0 && submit % n == 0 && submit / n <= 32, "handoff() allocated " + submit + " B for " + n);
+                assertEquals(0, pool.submit(() -> allocatedBy(() -> run(hs))).get(), "bytes the tasks allocated");
+            }
+            assertEquals(0, t.misuses() + t.dropped());
+            t.release();
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    private static Handoff[] handoffs(Span s, int n) {
+        Handoff[] hs = new Handoff[n];
+        for (int i = 0; i < n; i++) hs[i] = s.handoff(MATCH);
+        return hs;
+    }
+
+    private static void run(Handoff[] hs) {
+        for (Handoff h : hs) {
+            Span s = h.begin();
+            s.span(LOAD).close();
+            s.close();
+        }
+    }
+
+    // ---- lane-less aggregates -------------------------------------------------------------------------
+
+    @Test
+    void lanelessAggregatesAreExactAtCoarse() throws Exception {
+        Trace t = Tempo.start(SEARCH, opts());
+        t.add(MATCH, 5);
+        t.add(MATCH, 3);
+        t.add(MATCH, 9);
+        t.add(MATCH, -4); // clamped
+        long token = t.submitted();
+        clock.add(7);
+        assertEquals(7, t.waited(POOL_WAIT, token));
+        t.addWait(POOL_WAIT, 2);
+        assertNull(onOtherThread(() -> t.addWait(POOL_WAIT, 11)));
+        assertEquals("count=4 sum=17 min=0 max=9 waits=0 waitSum=0 waitMax=0", t.aggregate(MATCH).toString());
+        assertEquals("count=0 sum=0 min=0 max=0 waits=3 waitSum=20 waitMax=11", t.aggregate(POOL_WAIT).toString());
+        assertEquals("count=0 sum=0 min=0 max=0 waits=0 waitSum=0 waitMax=0", t.aggregate(DECODE).toString());
+        assertEquals(0, t.aggregate(null).count());
+        t.close();
+        assertEquals(lines("search 0+7"), tree(t)); // no span, no lane
+        assertEquals(1, t.ctx.lanesById().length);
+        t.add(MATCH, 1); // after close: still counted
+        assertEquals(5, t.aggregate(MATCH).count());
+        t.release();
+        t.add(MATCH, 1);
+        assertEquals(0, t.aggregate(MATCH).count());
+    }
+
+    @Test
+    void lanelessAggregatesGrowPastTheirFirstTable() {
+        Trace t = Tempo.start(SEARCH, opts());
+        Name[] names = new Name[40];
+        for (int i = 0; i < names.length; i++) names[i] = Tempo.name("aggregate-" + i);
+        for (int round = 1; round <= 3; round++)
+            for (int i = 0; i < names.length; i++) t.add(names[i], i * round);
+        for (int i = 0; i < names.length; i++) {
+            Tempo.Aggregate a = t.aggregate(names[i]);
+            assertEquals(3, a.count());
+            assertEquals(6L * i, a.sumNanos());
+            assertEquals(i, a.minNanos());
+            assertEquals(3L * i, a.maxNanos());
+        }
+        t.close();
+    }
+
+    @Test
+    void lanelessAggregatesAreExactUnderContention() throws Exception {
+        Trace t = Tempo.start(SEARCH, opts());
+        int threads = 8, adds = 20_000;
+        Name[] names = {MATCH, LOAD, DECODE};
+        CountDownLatch go = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        try {
+            List<Future<?>> fs = new ArrayList<>();
+            for (int k = 0; k < threads; k++) {
+                fs.add(pool.submit(() -> {
+                    go.await();
+                    for (int i = 0; i < adds; i++) {
+                        t.add(names[i % 3], i % 100);
+                        t.addWait(names[i % 3], 1 + i % 50);
+                    }
+                    return null;
+                }));
+            }
+            go.countDown();
+            for (Future<?> f : fs) f.get();
+        } finally {
+            pool.shutdown();
+        }
+        long count = 0, sum = 0, waits = 0, waitSum = 0;
+        for (Name n : names) {
+            Tempo.Aggregate a = t.aggregate(n);
+            count += a.count();
+            sum += a.sumNanos();
+            waits += a.waitCount();
+            waitSum += a.waitSumNanos();
+            assertEquals(0, a.minNanos());
+            assertEquals(99, a.maxNanos());
+            assertEquals(50, a.waitMaxNanos());
+        }
+        long perThreadSum = 0, perThreadWait = 0;
+        for (int i = 0; i < adds; i++) {
+            perThreadSum += i % 100;
+            perThreadWait += 1 + i % 50;
+        }
+        assertEquals((long) threads * adds, count);
+        assertEquals(threads * perThreadSum, sum);
+        assertEquals((long) threads * adds, waits);
+        assertEquals(threads * perThreadWait, waitSum);
+        assertEquals(1, t.ctx.lanesById().length);
+        t.close();
+    }
+
+    @Test
+    void lanelessAggregatesAllocateNothingOnceWarm() {
+        Trace t = Tempo.start(SEARCH, opts());
+        Runnable calls = () -> {
+            for (int i = 0; i < 10_000; i++) {
+                t.add(MATCH, i);
+                t.waited(POOL_WAIT, t.submitted());
+            }
+        };
+        calls.run();
+        assertEquals(0, allocatedBy(calls));
+        t.close();
     }
 
     // ---- release and memory ---------------------------------------------------------------------------

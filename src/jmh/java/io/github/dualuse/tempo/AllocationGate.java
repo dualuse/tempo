@@ -9,6 +9,7 @@ import org.openjdk.jmh.runner.RunnerException;
 import org.openjdk.jmh.runner.options.OptionsBuilder;
 import org.openjdk.jmh.runner.options.TimeValue;
 
+import java.util.Collections;
 import java.util.Map;
 import java.util.TreeMap;
 
@@ -18,16 +19,20 @@ import java.util.TreeMap;
  *
  * <p>A cycling benchmark pays a fixed per-trace setup every {@code cycle} operations, so its B/op is
  * {@code perOp + setup / cycle}. The gate applies to {@code perOp}, solved from the two cycle lengths;
- * the setup is reported, and {@code traceLifecycle} is held to a ceiling of its own.
+ * the setup is reported, and {@code traceLifecycle} is held to a ceiling of its own. A handoff allocates
+ * exactly one small object, so the handoff benchmarks are gated at its size instead of zero.
  */
 public final class AllocationGate {
 
     static final double PER_OP = 0.01;   // B/op
     static final double SETUP = 1024;    // B per trace start + close + release
+    static final double HANDOFF = 32;    // B per handoff: exactly one small object
+    static final String GATED = "span|spanNotInlined|phase|done|setLong|detailDisabled|traceLifecycle"
+            + "|handoff|handoffInline|currentDetailNoTrace|currentDetailCoarse|waited";
 
     public static void main(String[] args) throws RunnerException {
         Iterable<RunResult> results = new Runner(new OptionsBuilder()
-                .include(TempoBenchmark.class.getName() + "\\.(span|spanNotInlined|phase|done|setLong|detailDisabled|traceLifecycle)$")
+                .include(TempoBenchmark.class.getName() + "\\.(" + GATED + ")$")
                 .addProfiler(GCProfiler.class)
                 .forks(1)
                 .warmupIterations(3).warmupTime(TimeValue.seconds(1))
@@ -47,18 +52,20 @@ public final class AllocationGate {
         for (Map.Entry<String, Map<Integer, Double>> e : norm.entrySet()) {
             Map<Integer, Double> byCycle = e.getValue();
             if (byCycle.size() == 2) {
-                int c1 = 1000, c2 = 16000;
+                int c1 = Collections.min(byCycle.keySet()), c2 = Collections.max(byCycle.keySet());
                 double b1 = byCycle.get(c1), b2 = byCycle.get(c2);
                 double perOp = (b2 * c2 - b1 * c1) / (c2 - c1), setup = (b1 - perOp) * c1;
-                ok &= check(e.getKey(), perOp, PER_OP, String.format(" B/op net of %.0f B per trace", setup));
+                double gate = e.getKey().startsWith("handoff") ? HANDOFF + PER_OP : PER_OP;
+                ok &= check(e.getKey(), perOp, gate, String.format(" B/op net of %.0f B per trace", setup));
             } else if (e.getKey().equals("traceLifecycle")) {
                 ok &= check(e.getKey(), byCycle.get(0), SETUP, " B/trace");
             } else {
                 ok &= check(e.getKey(), byCycle.get(0), PER_OP, " B/op");
             }
         }
-        if (norm.size() != 7) {
-            System.out.println("FAIL  expected 7 gated benchmarks, ran " + norm.keySet());
+        int expected = GATED.split("\\|").length;
+        if (norm.size() != expected) {
+            System.out.println("FAIL  expected " + expected + " gated benchmarks, ran " + norm.keySet());
             ok = false;
         }
         System.exit(ok ? 0 : 1);

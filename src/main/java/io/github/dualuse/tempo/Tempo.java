@@ -3,6 +3,7 @@ package io.github.dualuse.tempo;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.Arrays;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -29,6 +30,8 @@ import java.util.function.Supplier;
  *
  * <p>A {@link Span} is a handle that only its lane's owner thread may use; the handle object is
  * reused for the next span opened at the same depth, so it must not be used after it is closed.
+ * Work for another thread goes through a {@link Handoff}: {@code s.handoff(n)} where the task is
+ * submitted, {@code h.begin()} (or {@code h.runnable(r)}) where it runs, which records its queue wait.
  */
 public final class Tempo {
 
@@ -137,7 +140,7 @@ public final class Tempo {
     public static final class Options {
         static final Options DEFAULTS = new Options(); // never handed out, so never mutated
 
-        int level = COARSE, budget = 512, headerBytes = 3000;
+        int level = COARSE, budget = 512, headerBytes = 3000, lanes = 256;
         boolean cpu, strict;
         LongSupplier clock = SYSTEM_CLOCK;
 
@@ -171,6 +174,17 @@ public final class Tempo {
             return this;
         }
 
+        /**
+         * Threads that may record into one trace, the starting thread included; default 256, at least 1.
+         * Meant for pools of platform threads: with a thread per task (virtual threads) the tasks begun
+         * past the cap are not recorded. Such a task's handoff is left out of the tree, its queue wait is
+         * added to {@link Trace#aggregate(Name)} of the handoff's name, and it counts as dropped.
+         */
+        public Options lanes(int max) {
+            this.lanes = Math.max(1, max);
+            return this;
+        }
+
         /** Throws {@link AssertionError} at the offending call on misuse instead of healing silently. */
         public Options strict(boolean on) {
             this.strict = on;
@@ -178,26 +192,47 @@ public final class Tempo {
         }
     }
 
-    /** Per-trace settings and counters. Lanes reference this instead of the {@link Trace}, so a lane retains no other lane. */
+    /**
+     * Per-trace settings, counters, the lane registry and the lane-less aggregates. Lanes and handoffs
+     * reference this instead of the {@link Trace}.
+     */
     static final class Context {
         private static final AtomicLong IDS = new AtomicLong();
+        private static final VarHandle LANES, TOTALS, DROPPED;
+
+        static {
+            try {
+                MethodHandles.Lookup l = MethodHandles.lookup();
+                LANES = l.findVarHandle(Context.class, "lanes", Lane.class);
+                TOTALS = l.findVarHandle(Context.class, "totals", Totals.class);
+                DROPPED = l.findVarHandle(Context.class, "dropped", int.class);
+            } catch (ReflectiveOperationException e) {
+                throw new ExceptionInInitializerError(e);
+            }
+        }
+
         static final Context NONE = new Context();
 
         final long id, epoch;
         final LongSupplier clock;
         final boolean strict, cpu;
-        final int budget, headerBytes;
+        final int budget, headerBytes, maxLanes;
         final AtomicInteger misuses = new AtomicInteger();
         volatile int level;
         volatile boolean detailSeen, released;
         boolean raised; // guarded by this
+        private volatile Lane lanes;    // CAS-linked registry, newest first
+        private volatile Totals totals; // created with the first lane-less record
+        private volatile int dropped;   // tasks left unrecorded at the lane cap
+        private long[] lost;            // guarded by this: (laneId << 32 | row) of handoffs whose task has no record
+        private int lostCount;
 
         private Context() {
             id = -1;
             epoch = 0;
             clock = SYSTEM_CLOCK;
             strict = cpu = false;
-            budget = headerBytes = 0;
+            budget = headerBytes = maxLanes = 0;
             level = -1; // below COARSE, so NOOP.detail() returns at the level check
         }
 
@@ -208,6 +243,7 @@ public final class Tempo {
             cpu = o.cpu;
             budget = o.budget;
             headerBytes = o.headerBytes;
+            maxLanes = o.lanes;
             level = o.level;
             epoch = clock.getAsLong();
         }
@@ -220,11 +256,187 @@ public final class Tempo {
             misuses.incrementAndGet();
             if (strict) throw new AssertionError("Tempo misuse: " + what);
         }
+
+        int key(Name key) {
+            if (key != null) return key.id;
+            misuse("null attribute key");
+            return Name.UNKNOWN.id;
+        }
+
+        boolean full() {
+            Lane head = lanes;
+            return head != null && head.id + 1 >= maxLanes;
+        }
+
+        /** Adds a lane to the registry; null when the trace has its maximum of lanes. */
+        Lane register(Lane lane) {
+            Lane head;
+            do {
+                head = lanes;
+                if (head != null && head.id + 1 >= maxLanes) return null;
+                lane.next = head;
+                lane.id = head == null ? 0 : head.id + 1;
+            } while (!LANES.compareAndSet(this, head, lane));
+            // release() stores released, then walks the registry; this CASed the registry, then reads released
+            if (released) lane.requestRetire();
+            return lane;
+        }
+
+        Lane[] lanesById() {
+            Lane head = lanes;
+            Lane[] out = new Lane[head.id + 1];
+            for (Lane l = head; l != null; l = l.next) out[l.id] = l;
+            return out;
+        }
+
+        void release() {
+            if (released) return;
+            released = true;
+            for (Lane l = lanes; l != null; l = l.next) l.requestRetire();
+        }
+
+        int dropped() {
+            int n = dropped;
+            for (Lane l = lanes; l != null; l = l.next) n += l.dropped;
+            return n;
+        }
+
+        Totals totals() {
+            Totals t = totals;
+            if (t == null && !TOTALS.compareAndSet(this, null, t = new Totals(8))) t = totals;
+            return t;
+        }
+
+        /**
+         * A handoff whose task gets no record: at the lane cap ({@code count}), or at a lane's row, depth or
+         * event cap (counted there). Its row is left out of the tree and its queue wait goes to the aggregate.
+         */
+        void lost(Handoff h, boolean count) {
+            if (count) DROPPED.getAndAdd(this, 1);
+            totals().add(h.lane.nameOf(h.row), true, Math.max(0, now() - h.submit));
+            synchronized (this) {
+                if (lost == null) lost = new long[8];
+                else if (lostCount == lost.length) lost = Arrays.copyOf(lost, 2 * lostCount);
+                lost[lostCount++] = (long) h.lane.id << 32 | h.row;
+            }
+        }
+
+        synchronized long[] lost() {
+            return lost == null ? new long[0] : Arrays.copyOf(lost, lostCount);
+        }
     }
 
-    /** Per-thread state. Holds no {@link Trace}; only lane-root opens and closes touch it. */
+    /**
+     * Lane-less aggregates of one trace, keyed by name: thread-safe, lock-free, allocation-free once a
+     * name has a slot. Open addressing whose slots are claimed once and never move; a full table chains
+     * a larger one, so a name lives in exactly one table of the chain.
+     */
+    static final class Totals {
+        static final int COUNT = 0, SUM = 1, MIN = 2, MAX = 3, WAITS = 4, WAIT_SUM = 5, WAIT_MAX = 6, CELLS = 7;
+        private static final VarHandle KEY = MethodHandles.arrayElementVarHandle(int[].class),
+                CELL = MethodHandles.arrayElementVarHandle(long[].class), NEXT;
+
+        static {
+            try {
+                NEXT = MethodHandles.lookup().findVarHandle(Totals.class, "next", Totals.class);
+            } catch (ReflectiveOperationException e) {
+                throw new ExceptionInInitializerError(e);
+            }
+        }
+
+        private final int[] keys;   // name id + 1; 0 is a free slot
+        private final long[] cells; // CELLS per slot; MIN holds Long.MAX_VALUE - min, so every extreme is a max from 0
+        private volatile Totals next;
+
+        Totals(int capacity) {
+            keys = new int[capacity];
+            cells = new long[capacity * CELLS];
+        }
+
+        void add(int id, boolean wait, long nanos) {
+            Totals t = this;
+            int s;
+            while ((s = t.slot(id, true)) < 0) {
+                Totals n = t.next;
+                if (n == null && !NEXT.compareAndSet(t, null, n = new Totals(2 * t.keys.length))) n = t.next;
+                t = n;
+            }
+            long[] c = t.cells;
+            int b = s * CELLS;
+            if (wait) {
+                CELL.getAndAdd(c, b + WAITS, 1L);
+                CELL.getAndAdd(c, b + WAIT_SUM, nanos);
+                max(c, b + WAIT_MAX, nanos);
+            } else {
+                CELL.getAndAdd(c, b + COUNT, 1L);
+                CELL.getAndAdd(c, b + SUM, nanos);
+                max(c, b + MAX, nanos);
+                max(c, b + MIN, Long.MAX_VALUE - nanos);
+            }
+        }
+
+        Aggregate get(int id) {
+            for (Totals t = this; t != null; t = t.next) {
+                int s = t.slot(id, false);
+                if (s < 0) continue;
+                long[] c = t.cells;
+                int b = s * CELLS;
+                long count = cell(c, b + COUNT);
+                return new Aggregate(count, cell(c, b + SUM), count == 0 ? 0 : Long.MAX_VALUE - cell(c, b + MIN),
+                        cell(c, b + MAX), cell(c, b + WAITS), cell(c, b + WAIT_SUM), cell(c, b + WAIT_MAX));
+            }
+            return Aggregate.EMPTY;
+        }
+
+        /** The slot of {@code id}, claiming a free one if {@code claim}; -1 if absent (and, claiming, the table is full). */
+        private int slot(int id, boolean claim) {
+            int mask = keys.length - 1, key = id + 1;
+            for (int i = id & mask, k = 0; k <= mask; k++, i = (i + 1) & mask) {
+                int s = (int) KEY.getAcquire(keys, i);
+                if (s == 0 && claim) s = (int) KEY.compareAndExchange(keys, i, 0, key);
+                if (s == 0 && claim || s == key) return i;
+                if (s == 0) return -1;
+            }
+            return -1;
+        }
+
+        private static long cell(long[] c, int i) {
+            return (long) CELL.getVolatile(c, i);
+        }
+
+        private static void max(long[] c, int i, long v) {
+            long cur;
+            while ((cur = cell(c, i)) < v && !CELL.compareAndSet(c, i, cur, v)) { }
+        }
+    }
+
+    /**
+     * Per-thread state. Holds no {@link Trace}; only lane-root opens and closes touch {@code current}.
+     * Pool threads interleave tasks of concurrent traces, so the slot remembers its lanes of the last
+     * four traces; a lane found retired is dropped at the next lookup.
+     */
     static final class ThreadSlot {
         Lane current;
+        final Lane[] lanes = new Lane[4];
+        private int victim;
+
+        /** An idle lane of this thread for the trace, from the cache or new; null at the trace's lane cap. */
+        Lane lane(Context ctx) {
+            int free = -1;
+            for (int i = 0; i < lanes.length; i++) {
+                Lane l = lanes[i];
+                if (l != null && l.retired()) lanes[i] = l = null;
+                if (l == null) {
+                    if (free < 0) free = i;
+                } else if (l.ctx == ctx && l.depth == 0) {
+                    return l;
+                }
+            }
+            if (ctx.full()) return null;
+            Lane l = ctx.register(new Lane(ctx, this));
+            if (l != null) lanes[free >= 0 ? free : victim++ & 3] = l;
+            return l;
+        }
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -331,10 +543,65 @@ public final class Tempo {
         private volatile boolean retireRequested;
         private Lane saved; // slot.current when the lane root opened
 
-        Lane(Context ctx) {
+        Lane(Context ctx, ThreadSlot slot) {
             this.ctx = ctx;
             this.owner = Thread.currentThread();
-            this.slot = SLOT.get();
+            this.slot = slot;
+        }
+
+        boolean retired() {
+            return state == RETIRED;
+        }
+
+        /** Writes a closed handoff row under the innermost open span at the submit time. */
+        Handoff handoff(Name n, int flags) {
+            int r = row(n, flags | HANDOFF, rowAt[depth - 1]);
+            if (r < 0) return Handoff.NOOP;
+            long now = ctx.now();
+            closed(r, now, 0);
+            publish();
+            return new Handoff(this, r, now);
+        }
+
+        /**
+         * Records the task of handoff {@code h} on this, the calling thread's lane: a lane root, or, while
+         * the thread is inside the trace already (inline), a child of the innermost open span. The row is
+         * linked to the handoff row and carries the queue wait. A cancelled task ({@code run} false) is a
+         * closed zero-length row. Returns the task's span ({@link #NOOP} if cancelled or retired), or
+         * null when a cap leaves no room.
+         */
+        Span task(Handoff h, boolean run) {
+            boolean root = depth == 0;
+            if (root && !STATE.compareAndSet(this, IDLE, ACTIVE)) return NOOP;
+            Name n = Name.byId(h.lane.nameOf(h.row));
+            Span s = NOOP;
+            int r = -1;
+            if (eventCount > MAX_EVENTS - 2) {
+                dropped++;
+            } else if (run) {
+                s = stack(n, 0);
+                r = s == NOOP ? -1 : s.row;
+            } else {
+                r = row(n, CANCELLED, root ? -1 : rowAt[depth - 1]);
+            }
+            if (r < 0) {
+                if (root) idle();
+                return null;
+            }
+            Rows c = rows[r >>> CHUNK_BITS];
+            long now = ctx.now();
+            c.start[r & MASK] = now;
+            if (!run) DUR.setOpaque(c.dur, r & MASK, 0L);
+            append(r, XPARENT, (long) h.lane.id << 32 | h.row);
+            append(r, QWAIT, Math.max(0, now - h.submit));
+            publish();
+            if (run && root) {
+                saved = slot.current;
+                slot.current = this;
+            } else if (root) {
+                idle();
+            }
+            return s;
         }
 
         Span openRoot(Name n, int flags) {
@@ -526,7 +793,7 @@ public final class Tempo {
             return lapOrdinal == null ? 0 : lapOrdinal[d];
         }
 
-        private int nameOf(int r) {
+        int nameOf(int r) {
             return rows[r >>> CHUNK_BITS].name[r & MASK];
         }
 
@@ -630,52 +897,125 @@ public final class Tempo {
             long dur = (long) DUR.getOpaque(k.dur, i);
             return dur != OPEN ? dur : Math.max(0, ctx.now() - k.start[i]);
         }
+    }
 
-        /**
-         * Visits the committed rows as a tree in pre-order. Returns the next free id.
-         * Reading {@code state} first matters: the owner stores {@code IDLE} after its last write, so a lane
-         * read as {@code IDLE} is seen complete (final durations and flags included). A lane read as
-         * {@code ACTIVE} is best effort and its spans are marked {@link SpanView#live}.
-         */
-        int visit(int base, long now, SpanView v, SpanVisitor visitor) {
-            int s = state;
-            if (s == RETIRED || ctx.released) return base;
-            long c = committed();
-            int nRows = (int) (c >>> 32), nEvents = (int) c;
+    /**
+     * One lane's committed rows as one render reads them: attribute events grouped by row, labels, task
+     * links and child lists. Reading {@code state} before the commit matters: the owner stores
+     * {@code IDLE} after its last write, so a lane read as {@code IDLE} is seen complete (final durations
+     * and flags included). A lane read as {@code ACTIVE} is best effort and its spans are marked
+     * {@link SpanView#live}.
+     */
+    static final class Shape {
+        final Lane lane;
+        final int rows;
+        final boolean live;
+        final int[] from, order;  // attribute events of row r: order[from[r] .. from[r + 1]), in append order
+        int[] labelOf;
+        String[] text;
+        long[] link, wait;        // XPARENT and QWAIT by row; null in a lane without tasks
+        int[] bodyLane, bodyRow;  // by handoff row: the task row linked to it, or -1
+        boolean[] hidden;         // not in its parent's child list: a task drawn at its handoff, or a lost handoff
+        int[] first, next;        // child lists; index rows is a virtual parent of the lane roots
 
-            // Attribute events grouped by row (counting sort), keeping append order within a row.
-            int[] from = new int[nRows + 1], labelOf = null;
+        /** Null for a lane that is retired or whose trace is released. */
+        static Shape of(Lane l) {
+            int s = l.state;
+            if (s == Lane.RETIRED || l.ctx.released) return null;
+            return new Shape(l, s == Lane.ACTIVE, l.committed());
+        }
+
+        private Shape(Lane l, boolean live, long commit) {
+            lane = l;
+            this.live = live;
+            rows = (int) (commit >>> 32);
+            int nEvents = (int) commit;
+            Events[] events = l.events;
+            from = new int[rows + 1];
             for (int e = 0; e < nEvents; e++) {
-                Events k = events[e >>> CHUNK_BITS];
-                int kind = k.key[e & MASK] & KIND_MASK, r = k.row[e & MASK];
+                Events k = events[e >>> Lane.CHUNK_BITS];
+                int i = e & Lane.MASK, kind = k.key[i] & KIND_MASK, r = k.row[i];
                 if (kind == ATTR_LONG || kind == ATTR_DOUBLE) {
                     from[r + 1]++;
                 } else if (kind == LABEL) {
-                    if (labelOf == null) Arrays.fill(labelOf = new int[nRows], -1);
-                    labelOf[r] = (int) k.value[e & MASK];
+                    if (labelOf == null) Arrays.fill(labelOf = new int[rows], -1);
+                    labelOf[r] = (int) k.value[i];
+                } else if (kind == XPARENT) {
+                    if (link == null) Arrays.fill(link = new long[rows], -1);
+                    link[r] = k.value[i];
+                } else if (kind == QWAIT) {
+                    if (wait == null) wait = new long[rows];
+                    wait[r] = k.value[i];
                 }
             }
-            for (int r = 0; r < nRows; r++) from[r + 1] += from[r];
-            int[] order = new int[from[nRows]], fill = Arrays.copyOf(from, nRows);
-            for (int e = 0; e < nEvents; e++)
-                if (isAttribute(e)) order[fill[events[e >>> CHUNK_BITS].row[e & MASK]]++] = e;
-            String[] text = labelOf == null ? null : (String[]) LABELS.getAcquire(this);
+            for (int r = 0; r < rows; r++) from[r + 1] += from[r];
+            order = new int[from[rows]];
+            int[] fill = Arrays.copyOf(from, rows);
+            for (int e = 0; e < nEvents; e++) {
+                Events k = events[e >>> Lane.CHUNK_BITS];
+                int i = e & Lane.MASK, kind = k.key[i] & KIND_MASK;
+                if (kind == ATTR_LONG || kind == ATTR_DOUBLE) order[fill[k.row[i]]++] = e;
+            }
+            if (labelOf != null) text = (String[]) Lane.LABELS.getAcquire(l);
+        }
 
-            // Child lists, row order within a parent; index nRows is a virtual parent of the lane roots.
-            // A RETRO lap adopts the run of preceding siblings that started at or after it, back to the
-            // previous phase row, and takes the place of the first of them.
-            int top = nRows;
-            int[] parent = new int[nRows + 1], first = new int[nRows + 1], last = new int[nRows + 1],
-                    next = new int[nRows + 1], prev = new int[nRows + 1];
+        int flags(int r) {
+            return lane.rows[r >>> Lane.CHUNK_BITS].flags[r & Lane.MASK];
+        }
+
+        long start(int r) {
+            return lane.rows[r >>> Lane.CHUNK_BITS].start[r & Lane.MASK];
+        }
+
+        long dur(int r) {
+            return (long) Lane.DUR.getOpaque(lane.rows[r >>> Lane.CHUNK_BITS].dur, r & Lane.MASK);
+        }
+
+        int name(int r) {
+            return lane.rows[r >>> Lane.CHUNK_BITS].name[r & Lane.MASK];
+        }
+
+        String label(int r) {
+            return labelOf == null || labelOf[r] < 0 ? null : text[labelOf[r]];
+        }
+
+        void hide(int r) {
+            if (hidden == null) hidden = new boolean[rows];
+            hidden[r] = true;
+        }
+
+        void link(int handoffRow, int laneId, int row) {
+            if (bodyLane == null) {
+                Arrays.fill(bodyLane = new int[rows], -1);
+                bodyRow = new int[rows];
+            }
+            bodyLane[handoffRow] = laneId;
+            bodyRow[handoffRow] = row;
+        }
+
+        boolean begun(int r) {
+            return bodyLane != null && bodyLane[r] >= 0;
+        }
+
+        /**
+         * Child lists in row order. A RETRO lap adopts the run of preceding siblings that started at or
+         * after it, back to the previous phase row, and takes the place of the first of them.
+         */
+        void tree() {
+            int top = rows;
+            int[] parent = new int[rows + 1], last = new int[rows + 1], prev = new int[rows + 1];
+            first = new int[rows + 1];
+            next = new int[rows + 1];
             Arrays.fill(first, -1);
             Arrays.fill(last, -1);
-            for (int r = 0; r < nRows; r++) {
-                Rows k = rows[r >>> CHUNK_BITS];
-                int i = r & MASK, p = k.parent[i] < 0 ? top : k.parent[i];
+            for (int r = 0; r < rows; r++) {
+                if (hidden != null && hidden[r]) continue;
+                Rows k = lane.rows[r >>> Lane.CHUNK_BITS];
+                int i = r & Lane.MASK, p = k.parent[i] < 0 ? top : k.parent[i];
                 parent[r] = p;
                 if ((k.flags[i] & RETRO) != 0) {
                     int a = last[p], b = -1;
-                    while (a >= 0 && (flagsOf(a) & PHASE) == 0 && startOf(a) >= k.start[i]) {
+                    while (a >= 0 && (flags(a) & PHASE) == 0 && start(a) >= k.start[i]) {
                         parent[a] = r;
                         b = a;
                         a = prev[a];
@@ -695,52 +1035,117 @@ public final class Tempo {
                 else first[p] = r;
                 last[p] = r;
             }
+        }
+    }
 
-            int[] id = new int[nRows], depthOf = new int[nRows];
-            v.lane = this;
-            v.order = order;
-            v.live = s == ACTIVE;
-            int n = base;
-            for (int r = first[top]; r >= 0; ) {
-                Rows k = rows[r >>> CHUNK_BITS];
-                int i = r & MASK, p = parent[r];
-                long start = k.start[i], dur = (long) DUR.getOpaque(k.dur, i);
-                id[r] = n++;
-                depthOf[r] = p == top ? 0 : depthOf[p] + 1;
-                v.id = id[r];
-                v.parent = p == top ? -1 : id[p];
-                v.depth = depthOf[r];
-                v.name = Name.byId(k.name[i]);
-                v.start = start;
-                v.open = dur == OPEN;
-                v.duration = v.open ? Math.max(0, now - start) : dur;
-                v.flags = k.flags[i];
-                v.label = labelOf == null || labelOf[r] < 0 ? null : text[labelOf[r]];
-                v.attrFrom = from[r];
-                v.attrTo = from[r + 1];
-                visitor.visit(v);
+    /**
+     * The lanes of one trace stitched into one tree. A handoff row is drawn as one record with the task
+     * linked to it (submit time, queue wait, the task's duration, thread and children); a handoff without
+     * a task is drawn never started.
+     */
+    static final class Stitch {
+        private final Shape[] shapes; // by lane id
+        private final long now;
 
-                if (first[r] >= 0) {
-                    r = first[r];
-                } else {
-                    while (r != top && next[r] < 0) r = parent[r];
-                    r = r == top ? -1 : next[r];
+        Stitch(Context ctx, long now) {
+            this.now = now;
+            Lane[] lanes = ctx.lanesById();
+            shapes = new Shape[lanes.length];
+            for (int i = 0; i < lanes.length; i++) if (lanes[i] != null) shapes[i] = Shape.of(lanes[i]);
+            for (long x : ctx.lost()) {
+                Shape s = shapes[(int) (x >>> 32)];
+                if (s != null && (int) x < s.rows) s.hide((int) x);
+            }
+            // A task whose handoff row is not visible (a live render racing the submit) is left out.
+            for (Shape s : shapes) {
+                if (s == null || s.link == null) continue;
+                for (int r = 0; r < s.rows; r++) {
+                    long x = s.link[r];
+                    if (x < 0) continue;
+                    s.hide(r);
+                    Shape t = shapes[(int) (x >>> 32)];
+                    int h = (int) x;
+                    if (t != null && h < t.rows && (t.flags(h) & HANDOFF) != 0) t.link(h, s.lane.id, r);
                 }
             }
-            return n;
+            for (Shape s : shapes) if (s != null) s.tree();
         }
 
-        private long startOf(int r) {
-            return rows[r >>> CHUNK_BITS].start[r & MASK];
+        /** Visits the records in pre-order; the lane roots of each lane, by lane id, are the top level. */
+        void walk(SpanVisitor visitor) {
+            SpanView v = new SpanView();
+            int limit = 0; // a record per row at most, whatever the links say
+            for (Shape s : shapes) if (s != null) limit += s.rows;
+            int[] lane = new int[16], row = new int[16], id = new int[16]; // the path to the current record
+            int n = 0;
+            for (Shape top : shapes) {
+                if (top == null) continue;
+                for (int r = top.first[top.rows]; r >= 0 && n < limit; r = top.next[r]) {
+                    int d = 0;
+                    lane[0] = top.lane.id;
+                    row[0] = r;
+                    id[0] = n;
+                    emit(v, top, r, -1, 0, n++, visitor);
+                    while (true) {
+                        Shape s = shapes[lane[d]];
+                        int p = row[d];
+                        if (s.begun(p)) { // a handoff's children are its task's
+                            int b = s.bodyLane[p];
+                            p = s.bodyRow[p];
+                            s = shapes[b];
+                        }
+                        int c = n < limit ? s.first[p] : -1;
+                        if (c < 0) { // no child: the next sibling of this record or of its nearest ancestor
+                            for (; d > 0; d--) {
+                                s = shapes[lane[d]];
+                                c = n < limit ? s.next[row[d]] : -1;
+                                if (c >= 0) break;
+                            }
+                            if (c < 0) break;
+                            d--;
+                        }
+                        if (++d == lane.length) {
+                            lane = Arrays.copyOf(lane, 2 * d);
+                            row = Arrays.copyOf(row, 2 * d);
+                            id = Arrays.copyOf(id, 2 * d);
+                        }
+                        lane[d] = s.lane.id;
+                        row[d] = c;
+                        id[d] = n;
+                        emit(v, s, c, id[d - 1], d, n++, visitor);
+                    }
+                }
+            }
         }
 
-        private int flagsOf(int r) {
-            return rows[r >>> CHUNK_BITS].flags[r & MASK];
-        }
-
-        private boolean isAttribute(int e) {
-            int kind = events[e >>> CHUNK_BITS].key[e & MASK] & KIND_MASK;
-            return kind == ATTR_LONG || kind == ATTR_DOUBLE;
+        private void emit(SpanView v, Shape s, int r, int parent, int depth, int id, SpanVisitor visitor) {
+            int flags = s.flags(r);
+            boolean handoff = (flags & HANDOFF) != 0, begun = handoff && s.begun(r);
+            Shape b = begun ? shapes[s.bodyLane[r]] : s;
+            int br = begun ? s.bodyRow[r] : r;
+            long dur = b.dur(br);
+            v.id = id;
+            v.parent = parent;
+            v.depth = depth;
+            v.lane = b.lane;
+            v.live = b.live;
+            v.name = Name.byId(b.name(br));
+            v.start = s.start(r);
+            v.open = dur == Lane.OPEN;
+            v.duration = v.open ? Math.max(0, now - b.start(br)) : dur;
+            v.flags = begun ? flags | b.flags(br) : flags;
+            v.handoff = handoff;
+            v.begun = begun;
+            v.wait = begun ? (b.wait == null ? 0 : b.wait[br]) : handoff ? Math.max(0, now - v.start) : 0;
+            v.label = b.label(br);
+            v.order = b.order;
+            v.attrFrom = b.from[br];
+            v.attrTo = b.from[br + 1];
+            v.subLane = s.lane;
+            v.subOrder = s.order;
+            v.subFrom = begun ? s.from[r] : 0;
+            v.subTo = begun ? s.from[r + 1] : 0;
+            visitor.visit(v);
         }
     }
 
@@ -748,20 +1153,9 @@ public final class Tempo {
 
     /** One request's recording. Not pooled. Reads stay valid after {@link #close()} until {@link #release()}. */
     public static final class Trace implements AutoCloseable {
-        private static final VarHandle LANES;
-
-        static {
-            try {
-                LANES = MethodHandles.lookup().findVarHandle(Trace.class, "lanes", Lane.class);
-            } catch (ReflectiveOperationException e) {
-                throw new ExceptionInInitializerError(e);
-            }
-        }
-
         final Context ctx;
         private final Lane rootLane;
         private final Span root;
-        private volatile Lane lanes; // CAS-linked registry, newest first
 
         Trace(Name name, Options options) {
             ctx = new Context(options == null ? Options.DEFAULTS : options);
@@ -771,18 +1165,8 @@ public final class Tempo {
                 name = Name.UNKNOWN;
                 flags = MISUSE;
             }
-            rootLane = register(new Lane(ctx));
+            rootLane = ctx.register(new Lane(ctx, SLOT.get()));
             root = rootLane.openRoot(name, flags);
-        }
-
-        Lane register(Lane lane) {
-            Lane head;
-            do {
-                head = lanes;
-                lane.next = head;
-                lane.id = head == null ? 0 : head.id + 1;
-            } while (!LANES.compareAndSet(this, head, lane));
-            return lane;
         }
 
         /** The root span, opened at {@link Tempo#start}. */
@@ -828,28 +1212,61 @@ public final class Tempo {
 
         /** Returns the trace's buffers to the pool. Optional and idempotent; afterwards every read is empty. */
         public void release() {
+            ctx.release();
+        }
+
+        /**
+         * Adds one occurrence of {@code name} lasting {@code nanos} to {@link #aggregate(Name)}, without a
+         * span or a lane. Thread-safe, at every level, also after close; allocation-free once the trace
+         * has seen the name. Ignored after release.
+         */
+        public void add(Name name, long nanos) {
+            total(name, false, nanos);
+        }
+
+        /** Adds a queue wait of {@code nanos} to {@link #aggregate(Name)}, like {@link #add}. */
+        public void addWait(Name name, long nanos) {
+            total(name, true, nanos);
+        }
+
+        /**
+         * The trace clock now, as a token for {@link #waited}. Take it where a task is submitted and pass
+         * it to the task; one clock read and nothing else.
+         */
+        public long submitted() {
+            return ctx.now();
+        }
+
+        /** Adds the queue wait from {@code submitted}, a token of {@link #submitted()}, to now; returns it. */
+        public long waited(Name name, long submitted) {
+            long wait = Math.max(0, ctx.now() - submitted);
+            total(name, true, wait);
+            return wait;
+        }
+
+        private void total(Name name, boolean wait, long nanos) {
             if (ctx.released) return;
-            ctx.released = true;
-            for (Lane l = lanes; l != null; l = l.next) l.requestRetire();
+            ctx.totals().add(ctx.key(name), wait, Math.max(0, nanos));
+        }
+
+        /**
+         * Count, sum, extremes and queue waits of {@code name} recorded through {@link #add},
+         * {@link #addWait} and {@link #waited}, and the queue waits of tasks left unrecorded at the lane
+         * cap. Exact once the contributing threads are done, best effort while they run; empty after release.
+         */
+        public Aggregate aggregate(Name name) {
+            Totals t = ctx.totals;
+            return name == null || t == null || ctx.released ? Aggregate.EMPTY : t.get(name.id);
         }
 
         /**
          * Visits every recorded span in pre-order with a reused, read-only view. Spans still open are
-         * clamped to one {@code now} taken for the whole walk. Nothing is visited after release.
+         * clamped to one {@code now} taken for the whole walk. A handoff is one span on the thread that
+         * ran its task, see {@link SpanView#handoff()}. Nothing is visited after release.
          */
         public void forEachSpan(SpanVisitor visitor) {
             if (ctx.released) return;
-            long now = ctx.now();
-            SpanView v = new SpanView();
-            int base = 0;
-            for (Lane l : lanesById()) base = l.visit(base, now, v, visitor);
-        }
-
-        private Lane[] lanesById() {
-            Lane head = lanes;
-            Lane[] out = new Lane[head.id + 1];
-            for (Lane l = head; l != null; l = l.next) out[l.id] = l;
-            return out;
+            new Stitch(ctx, ctx.now()).walk(visitor);
         }
 
         int misuses() {
@@ -857,9 +1274,7 @@ public final class Tempo {
         }
 
         int dropped() {
-            int n = 0;
-            for (Lane l = lanes; l != null; l = l.next) n += l.dropped;
-            return n;
+            return ctx.dropped();
         }
     }
 
@@ -1040,9 +1455,17 @@ public final class Tempo {
         }
 
         private int key(Name key) {
-            if (key != null) return key.id;
-            ctx.misuse("null attribute key");
-            return Name.UNKNOWN.id;
+            return ctx.key(key);
+        }
+
+        /**
+         * Records the submit of a task to another thread: a handoff entry under the innermost open span,
+         * and the handle the task {@link Handoff#begin() begins} with. Allocates that one small object.
+         * Always recorded, whatever the level; guard with {@link #detailed()} where handoffs are detail.
+         */
+        public Handoff handoff(Name name) {
+            if (!live()) return Handoff.NOOP;
+            return name != null ? lane.handoff(name, 0) : lane.handoff(nullName(), MISUSE);
         }
 
         /** Marks the span failed. Works after close as well, so a catch block can call it. */
@@ -1114,13 +1537,13 @@ public final class Tempo {
 
     /** Read-only view of one recorded span, reused across {@link SpanVisitor#visit} calls. */
     public static final class SpanView {
-        Lane lane;
-        int[] order;
-        int id, parent, depth, flags, attrFrom, attrTo;
+        Lane lane, subLane; // the span's lane; for a begun handoff the submitter's, whose attributes come first
+        int[] order, subOrder;
+        int id, parent, depth, flags, attrFrom, attrTo, subFrom, subTo;
         Name name;
         String label;
-        long start, duration;
-        boolean open, live;
+        long start, duration, wait;
+        boolean open, live, handoff, begun;
 
         SpanView() {}
 
@@ -1134,11 +1557,24 @@ public final class Tempo {
 
         public Name name() { return name; }
 
-        /** Nanoseconds from the trace start. */
+        /** Nanoseconds from the trace start; for a {@link #handoff()} the submit time. */
         public long startNanos() { return start; }
 
-        /** Duration; for an open span the time up to the walk's {@code now}. */
+        /** Duration; for an open span the time up to the walk's {@code now}. For a handoff its task's run time. */
         public long durationNanos() { return duration; }
+
+        /**
+         * A task handed to another thread ({@link Span#handoff}): it was submitted at {@link #startNanos()},
+         * waited {@link #waitNanos()} and ran for {@link #durationNanos()} on {@link #thread()}; its
+         * children are the task's spans. A task begun on the submitting thread itself is one too.
+         */
+        public boolean handoff() { return handoff; }
+
+        /** A handoff whose task has not begun (yet): no thread ran it, nor cancelled it. */
+        public boolean neverStarted() { return handoff && !begun; }
+
+        /** Queue wait of a handoff, submit to begin (or cancel); still counting if it never started. 0 for other spans. */
+        public long waitNanos() { return wait; }
 
         public boolean open() { return open; }
 
@@ -1147,6 +1583,7 @@ public final class Tempo {
 
         public boolean failed() { return (flags & FAILED) != 0; }
 
+        /** Cancelled, or for a handoff: cancelled or rejected before it began. */
         public boolean cancelled() { return (flags & CANCELLED) != 0; }
 
         public boolean waiting() { return (flags & WAIT) != 0; }
@@ -1174,13 +1611,15 @@ public final class Tempo {
             return (flags & DEEP_ROW) != 0 ? DEEP : (flags & DETAIL_ROW) != 0 ? DETAIL : COARSE;
         }
 
+        /** The thread that ran the span; for a handoff that never started, the submitting thread. */
         public String thread() { return lane.owner.getName(); }
 
-        public int attributes() { return attrTo - attrFrom; }
+        /** Attributes; a handoff has those set at submit ({@link Handoff#set}) first, then its task's. */
+        public int attributes() { return (subTo - subFrom) + (attrTo - attrFrom); }
 
-        public Name attributeKey(int i) { return Name.byId(key(i) >>> KIND_BITS); }
+        public Name attributeKey(int i) { return Name.byId(events(i).key[event(i) & Lane.MASK] >>> KIND_BITS); }
 
-        public boolean attributeIsDouble(int i) { return (key(i) & KIND_MASK) == ATTR_DOUBLE; }
+        public boolean attributeIsDouble(int i) { return (events(i).key[event(i) & Lane.MASK] & KIND_MASK) == ATTR_DOUBLE; }
 
         /** The value of a long attribute, or a double attribute truncated. */
         public long longAttribute(int i) {
@@ -1193,19 +1632,197 @@ public final class Tempo {
             return attributeIsDouble(i) ? Double.longBitsToDouble(v) : v;
         }
 
-        private int key(int i) {
-            int e = event(i);
-            return lane.events[e >>> Lane.CHUNK_BITS].key[e & Lane.MASK];
+        private long value(int i) {
+            return events(i).value[event(i) & Lane.MASK];
         }
 
-        private long value(int i) {
-            int e = event(i);
-            return lane.events[e >>> Lane.CHUNK_BITS].value[e & Lane.MASK];
+        private Events events(int i) {
+            return (i < subTo - subFrom ? subLane : lane).events[event(i) >>> Lane.CHUNK_BITS];
         }
 
         private int event(int i) {
             if (i < 0 || i >= attributes()) throw new IndexOutOfBoundsException("attribute " + i);
-            return order[attrFrom + i];
+            int sub = subTo - subFrom;
+            return i < sub ? subOrder[subFrom + i] : order[attrFrom + i - sub];
+        }
+    }
+
+    /**
+     * A task handed from one thread to another, created by {@link Span#handoff} on the submitting thread.
+     * The task calls {@link #begin()} where it starts to run, or is wrapped with {@link #runnable},
+     * {@link #callable} or {@link #supplier}; a task that will not run is {@link #cancel() cancelled} or
+     * {@link #reject() rejected}. Each handoff is used once and never reused, so a straggler cannot
+     * record into another request.
+     */
+    public static final class Handoff {
+        /** The handoff of {@link Tempo#NOOP}: begins {@link Tempo#NOOP} and wraps nothing. */
+        public static final Handoff NOOP = new Handoff(null, -1, 0);
+
+        private static final int NEW = 0, BEGUN = 1, ENDED = 2; // ENDED: cancelled or rejected
+        private static final VarHandle STATE;
+
+        static {
+            try {
+                STATE = MethodHandles.lookup().findVarHandle(Handoff.class, "state", int.class);
+            } catch (ReflectiveOperationException e) {
+                throw new ExceptionInInitializerError(e);
+            }
+        }
+
+        // Header plus these four fields is 32 B with compressed oops.
+        final Lane lane; // the submitter's
+        final int row;   // its handoff row
+        final long submit;
+        private volatile int state;
+
+        Handoff(Lane lane, int row, long submit) {
+            this.lane = lane;
+            this.row = row;
+            this.submit = submit;
+        }
+
+        /**
+         * Starts the task on the calling thread and returns its span, which the task closes; the queue
+         * wait since the submit is recorded with it. On a thread already inside the trace (the task runs
+         * inline) the span is a child of that thread's innermost open span, otherwise the root of the
+         * thread's lane, and {@link Tempo#current()} returns it until it closes. {@link Tempo#NOOP} after
+         * release, past the lane cap, and on a second begin or a begin after cancel (both misuse).
+         */
+        public Span begin() {
+            if (!claim(BEGUN)) return Tempo.NOOP;
+            return task(true);
+        }
+
+        /** Marks the task cancelled before it began, e.g. by an early exit. A no-op once it has begun. */
+        public void cancel() {
+            if (claim(ENDED)) task(false);
+        }
+
+        /** Marks the task rejected by the executor; recorded like {@link #cancel()}. */
+        public void reject() {
+            cancel();
+        }
+
+        /** Attaches a number to the handoff at submit, e.g. the executor's queue length. Submitting thread only. */
+        public Handoff set(Name key, long value) {
+            if (lane == null) return this;
+            if (Thread.currentThread() == lane.owner) lane.event(row, lane.ctx.key(key) << KIND_BITS | ATTR_LONG, value);
+            else lane.ctx.misuse("handoff set on a foreign thread");
+            return this;
+        }
+
+        /** Wraps {@code task} in {@link #begin()} and close; a throwable marks the span failed and is rethrown. */
+        public Runnable runnable(Runnable task) {
+            if (lane == null) return task;
+            return () -> {
+                Span s = begin();
+                try {
+                    task.run();
+                } catch (Throwable t) {
+                    s.fail();
+                    throw t;
+                } finally {
+                    s.close();
+                }
+            };
+        }
+
+        /** Like {@link #runnable} for a {@link Callable}. */
+        public <V> Callable<V> callable(Callable<V> task) {
+            if (lane == null) return task;
+            return () -> {
+                Span s = begin();
+                try {
+                    return task.call();
+                } catch (Throwable t) {
+                    s.fail();
+                    throw t;
+                } finally {
+                    s.close();
+                }
+            };
+        }
+
+        /** Like {@link #runnable} for a {@link Supplier}. */
+        public <V> Supplier<V> supplier(Supplier<V> task) {
+            if (lane == null) return task;
+            return () -> {
+                Span s = begin();
+                try {
+                    return task.get();
+                } catch (Throwable t) {
+                    s.fail();
+                    throw t;
+                } finally {
+                    s.close();
+                }
+            };
+        }
+
+        private boolean claim(int to) {
+            if (lane == null || lane.ctx.released) return false;
+            if (STATE.compareAndSet(this, NEW, to)) return true;
+            if (to == BEGUN) lane.ctx.misuse(state == BEGUN ? "handoff begun twice" : "handoff begun after cancel");
+            return false;
+        }
+
+        private Span task(boolean run) {
+            Context ctx = lane.ctx;
+            Lane l = laneHere(ctx);
+            Span s = l == null ? null : l.task(this, run);
+            if (s == null) ctx.lost(this, l == null);
+            return s == null ? Tempo.NOOP : s;
+        }
+
+        /**
+         * The calling thread's lane for the task: the current lane if it belongs to this trace (inline),
+         * else an idle lane of this thread for the trace. The trace's root lane is never reopened for a
+         * task, so the root handle stays the root's. Null at the lane cap.
+         */
+        private Lane laneHere(Context ctx) {
+            ThreadSlot slot = SLOT.get();
+            Lane cur = slot.current;
+            if (cur != null && cur.ctx == ctx) return cur;
+            if (lane.owner == Thread.currentThread() && lane.depth == 0 && lane.id != 0) return lane;
+            return slot.lane(ctx);
+        }
+    }
+
+    /** Count, sum and extremes of a name's occurrences, and of their queue waits. Zero when there were none. */
+    public static final class Aggregate {
+        static final Aggregate EMPTY = new Aggregate(0, 0, 0, 0, 0, 0, 0);
+
+        private final long count, sum, min, max, waits, waitSum, waitMax;
+
+        Aggregate(long count, long sum, long min, long max, long waits, long waitSum, long waitMax) {
+            this.count = count;
+            this.sum = sum;
+            this.min = min;
+            this.max = max;
+            this.waits = waits;
+            this.waitSum = waitSum;
+            this.waitMax = waitMax;
+        }
+
+        public long count() { return count; }
+
+        public long sumNanos() { return sum; }
+
+        public long minNanos() { return min; }
+
+        public long maxNanos() { return max; }
+
+        /** Queue waits recorded for the name; independent of {@link #count()}. */
+        public long waitCount() { return waits; }
+
+        public long waitSumNanos() { return waitSum; }
+
+        public long waitMaxNanos() { return waitMax; }
+
+        @Override
+        public String toString() {
+            return "count=" + count + " sum=" + sum + " min=" + min + " max=" + max
+                    + " waits=" + waits + " waitSum=" + waitSum + " waitMax=" + waitMax;
         }
     }
 
