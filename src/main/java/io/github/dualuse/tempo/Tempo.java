@@ -3,12 +3,15 @@ package io.github.dualuse.tempo;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.lang.ref.WeakReference;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import java.util.function.DoubleConsumer;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
@@ -367,6 +370,7 @@ public final class Tempo {
         // handoff, which orders the reads. Listeners is immutable, so even a racy read sees it whole.
         boolean listening; // a global sink existed at start, or a per-trace listener was added
         Listeners on;
+        Consumer<String> printer; // printOnClose; written and read by the starting thread
         private volatile Lane lanes;    // CAS-linked registry, newest first
         private volatile Totals totals; // created with the first lane-less record
         private volatile int dropped;   // tasks left unrecorded at the lane cap
@@ -1199,6 +1203,10 @@ public final class Tempo {
             depth = d;
             publish();
             if (ctx.listening) fire(d, top); // before exitRoot, which may return the rows to the pool
+            if (d == 0 && id == 0 && ctx.printer != null) {
+                Throwable t = print(ctx.printer);
+                if (t != null && ctx.strict && thrown == null) thrown = t;
+            }
             if (d == 0) exitRoot();
             if (thrown != null) rethrow();
             if (healed) ctx.misuse("span closed while a child span was open");
@@ -1252,6 +1260,17 @@ public final class Tempo {
         private void notify(Name n, long nanos) {
             Throwable t = ctx.notify(n, nanos);
             if (t != null && ctx.strict && thrown == null) thrown = t;
+        }
+
+        /** Passes the {@code Runtime} text of this, the root lane, to {@code out}; returns what it threw, counted as misuse. */
+        Throwable print(Consumer<String> out) {
+            try {
+                out.accept(tops(handles[0].row).runtime(-1));
+                return null;
+            } catch (Throwable t) {
+                ctx.misuses.incrementAndGet();
+                return t;
+            }
         }
 
         private void rethrow() {
@@ -1504,6 +1523,42 @@ public final class Tempo {
             VarHandle.acquireFence();
             if (ctx.released) return 0; // the chunk may have been recycled while it was read
             return dur != OPEN ? dur : Math.max(0, ctx.now() - start);
+        }
+
+        /**
+         * The legacy phases under row {@code root} and its wall time, read in place with one {@code now}
+         * for whatever is open; empty once released. Safe from any thread. Legacy rows are phases, which
+         * a RETRO lap never adopts, so row order is their order in the stitched tree.
+         */
+        Tops tops(int root) {
+            if (ctx.released || retired()) return Tops.EMPTY;
+            try {
+                long c = committed();
+                int n = (int) (c >>> 32), nEvents = (int) c;
+                long now = ctx.now();
+                Tops t = new Tops();
+                for (int r = root; r < n; r++) {
+                    Rows k = rows[r >>> CHUNK_BITS];
+                    int i = r & MASK;
+                    if (r != root && (k.parent[i] != root || (k.flags[i] & LEGACY) == 0)) continue;
+                    long d = (long) DUR.getOpaque(k.dur, i), s = k.start[i];
+                    d = d != OPEN ? d : Math.max(0, now - s);
+                    if (r == root) t.total = d;
+                    else t.add(r, k.name[i], null, s, d);
+                }
+                String[] text = t.n == 0 ? null : (String[]) LABELS.getAcquire(this);
+                for (int e = 0; text != null && e < nEvents; e++) {
+                    Events k = events[e >>> CHUNK_BITS];
+                    int i = e & MASK;
+                    if ((k.key[i] & KIND_MASK) == LABEL) t.label(k.row[i], text[(int) k.value[i]]);
+                }
+                VarHandle.acquireFence();
+                return ctx.released ? Tops.EMPTY : t;
+            } catch (RuntimeException e) { // a chunk recycled under a read racing release()
+                VarHandle.acquireFence();
+                if (ctx.released) return Tops.EMPTY;
+                throw e;
+            }
         }
     }
 
@@ -2057,6 +2112,39 @@ public final class Tempo {
             return s.dur[0] != Lane.OPEN ? s.dur[0] : Math.max(0, now - s.start[0]);
         }
 
+        /** Like {@link Trace#forEachTop}, as the snapshot was taken. */
+        public void forEachTop(TopVisitor visitor) {
+            tops().forEach(visitor);
+        }
+
+        /** Like {@link Trace#toRuntime(int)}, as the snapshot was taken. */
+        public String toRuntime(int digits) {
+            return tops().runtime(digits);
+        }
+
+        /** Like {@link Trace#toRuntime(int, long)}. */
+        public String toRuntime(int digits, long totalNanos) {
+            return tops().runtime(digits, totalNanos);
+        }
+
+        /** Like {@link Trace#toServerTiming()}, as the snapshot was taken. */
+        public String toServerTiming() {
+            return tops().serverTiming();
+        }
+
+        private Tops tops() {
+            Shape s = shapes.length == 0 ? null : shapes[0];
+            if (s == null || s.rows == 0) return Tops.EMPTY;
+            Tops t = new Tops();
+            t.total = elapsedNanos();
+            for (int r = 1; r < s.rows; r++) { // row order is tree order for phases, see Lane.tops
+                if (s.parent[r] != 0 || (s.flags[r] & LEGACY) == 0) continue;
+                long d = s.dur[r];
+                t.add(r, s.name[r], s.label == null ? null : s.label[r], s.start[r], d != Lane.OPEN ? d : Math.max(0, now - s.start[r]));
+            }
+            return t;
+        }
+
         int misuses() {
             return misuses;
         }
@@ -2068,6 +2156,120 @@ public final class Tempo {
         /** Detail spans folded into aggregates for want of budget: the wire's {@code x=} folded count. */
         int folded() {
             return folded;
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * The root's legacy phases (name, label, start, duration) and the root's wall time, read once for
+     * the legacy renderers.
+     */
+    static final class Tops {
+        static final Tops EMPTY = new Tops();
+
+        int n;
+        long total;
+        int[] row = new int[0], name = new int[0];
+        String[] label = new String[0];
+        long[] start = new long[0], dur = new long[0];
+
+        void add(int r, int nameId, String text, long startNanos, long durNanos) {
+            if (n == row.length) {
+                int m = Math.max(8, 2 * n);
+                row = Arrays.copyOf(row, m);
+                name = Arrays.copyOf(name, m);
+                label = Arrays.copyOf(label, m);
+                start = Arrays.copyOf(start, m);
+                dur = Arrays.copyOf(dur, m);
+            }
+            row[n] = r;
+            name[n] = nameId;
+            label[n] = text;
+            start[n] = startNanos;
+            dur[n++] = durNanos;
+        }
+
+        /** Sets the label of row {@code r}, if it is one of these; rows are added in ascending order. */
+        void label(int r, String text) {
+            int i = Arrays.binarySearch(row, 0, n, r);
+            if (i >= 0) label[i] = text;
+        }
+
+        void forEach(TopVisitor visitor) {
+            for (int i = 0; i < n; i++) visitor.visit(Name.byId(name[i]), label[i], start[i], dur[i]);
+        }
+
+        String runtime(int digits) {
+            return runtime(digits, total);
+        }
+
+        String runtime(int digits, long totalNanos) {
+            StringBuilder b = new StringBuilder(16 + 32 * n);
+            seconds(b, totalNanos, digits).append('s');
+            for (int i = 0; i < n; i++) {
+                seconds(b.append(i == 0 ? " = " : " + "), dur[i], digits).append("s (");
+                b.append(label[i] != null ? label[i] : Name.byId(name[i]).text).append(')');
+            }
+            return b.toString();
+        }
+
+        String serverTiming() {
+            StringBuilder b = new StringBuilder(16 + 24 * n);
+            for (int i = 0; i < n; i++) {
+                token(b, Name.byId(name[i]).text);
+                fixed(b.append(";dur="), dur[i], 6, 3).append(", ");
+            }
+            return fixed(b.append("total;dur="), total, 6, 3).toString();
+        }
+
+        /**
+         * Seconds as {@code String.format("%.<digits>f", nanos / 1e9)} would print them in a locale with a
+         * decimal point, or for {@code digits < 0} as {@code Double.toString(nanos / 1e9)}. Below 10^15 ns
+         * the shortest repr of that double is the exact decimal of the nanoseconds, so rounding the exact
+         * value half up is what the formatter does; above, the double's own digits are rounded.
+         */
+        static StringBuilder seconds(StringBuilder b, long nanos, int digits) {
+            if (digits < 0) return b.append(nanos / 1e9);
+            if (nanos > -1_000_000_000_000_000L && nanos < 1_000_000_000_000_000L) return fixed(b, nanos, 9, digits);
+            return b.append(new BigDecimal(Double.toString(nanos / 1e9)).setScale(digits, RoundingMode.HALF_UP).toPlainString());
+        }
+
+        private static final long[] POW10 = {1L, 10L, 100L, 1_000L, 10_000L, 100_000L, 1_000_000L,
+                10_000_000L, 100_000_000L, 1_000_000_000L};
+
+        /** {@code value / 10^scale} (scale at most 9) with {@code digits} decimals, rounded half up. */
+        static StringBuilder fixed(StringBuilder b, long value, int scale, int digits) {
+            if (value < 0) {
+                b.append('-');
+                value = value == Long.MIN_VALUE ? Long.MAX_VALUE : -value;
+            }
+            int shown = Math.min(digits, scale);
+            long unit = POW10[scale - shown], q = value / unit;
+            if (2 * (value % unit) >= unit) q++;
+            long p = POW10[shown];
+            b.append(q / p);
+            if (digits == 0) return b;
+            b.append('.');
+            for (long f = q % p, m = p / 10; m > 0; m /= 10) b.append((char) ('0' + f / m % 10));
+            for (int i = shown; i < digits; i++) b.append('0');
+            return b;
+        }
+
+        /** The name lower-cased, each run of characters outside {@code [a-z0-9]} replaced by one {@code -}. */
+        static void token(StringBuilder b, String text) {
+            boolean run = false;
+            for (int i = 0; i < text.length(); i++) {
+                char c = text.charAt(i);
+                if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+                if (c >= 'a' && c <= 'z' || c >= '0' && c <= '9') {
+                    b.append(c);
+                    run = false;
+                } else if (!run) {
+                    b.append('-');
+                    run = true;
+                }
+            }
         }
     }
 
@@ -2226,6 +2428,63 @@ public final class Tempo {
          */
         public Snapshot snapshot() {
             return Snapshot.of(ctx);
+        }
+
+        /**
+         * Visits the legacy phases in start order: the root's children marked by {@link Span#done(Name,
+         * String)} or {@link Span#legacy()}, with their label ({@code null} if none), start from the trace
+         * start and duration; an open phase lasts until now. Reads the root's lane in place.
+         */
+        public void forEachTop(TopVisitor visitor) {
+            rootLane.tops(root.row).forEach(visitor);
+        }
+
+        /**
+         * The legacy {@code Runtime} text {@code <total>s = <d1>s (<label1>) + ... + <dn>s (<labeln>)}, or
+         * {@code <total>s} without legacy phases (see {@link #forEachTop}). The total is the root's wall time,
+         * up to now while it is open. Each phase prints its label, or its name without one. Durations are
+         * seconds with {@code digits} fixed decimals, rounded half up, or with {@code digits = -1} as
+         * {@code Double.toString(nanos / 1e9)} prints them. After release: just the total, {@code 0}.
+         */
+        public String toRuntime(int digits) {
+            return rootLane.tops(root.row).runtime(digits);
+        }
+
+        /** {@link #toRuntime(int)} with the total given, so it can match a total read once for several headers. */
+        public String toRuntime(int digits, long totalNanos) {
+            return rootLane.tops(root.row).runtime(digits, totalNanos);
+        }
+
+        /**
+         * A W3C {@code Server-Timing} value: one {@code <token>;dur=<ms>} per legacy phase (see
+         * {@link #forEachTop}), then {@code total;dur=<ms>}, joined by {@code ", "}. The token is the
+         * phase's name lower-cased with each run of characters outside {@code [a-z0-9]} replaced by
+         * {@code -}; durations are milliseconds with three decimals, rounded half up.
+         */
+        public String toServerTiming() {
+            return rootLane.tops(root.row).serverTiming();
+        }
+
+        /**
+         * Passes {@code <label>: } and the {@link #toRuntime(int) toRuntime(-1)} text to {@code out} as one
+         * line when the root closes, or at once if it has closed; no prefix for a {@code null} label. Only
+         * on the starting thread; a throw from {@code out} is handled like a listener's ({@link #on}).
+         */
+        public Trace printOnClose(Consumer<String> out, String label) {
+            if (out == null) {
+                ctx.misuse("null printer");
+            } else if (Thread.currentThread() != rootLane.owner) {
+                ctx.misuse("printer added on a foreign thread");
+            } else {
+                Consumer<String> p = label == null ? out : line -> out.accept(label + ": " + line);
+                if (rootLane.depth > 0) {
+                    ctx.printer = p;
+                } else {
+                    Throwable t = rootLane.print(p);
+                    if (t != null && ctx.strict) throw Context.listenerThrew(t);
+                }
+            }
+            return this;
         }
 
         int misuses() {
@@ -2535,6 +2794,12 @@ public final class Tempo {
     @FunctionalInterface
     public interface SpanVisitor {
         void visit(SpanView span);
+    }
+
+    /** Receives the legacy phases of a trace, see {@link Trace#forEachTop}. */
+    @FunctionalInterface
+    public interface TopVisitor {
+        void visit(Name name, String label, long startNanos, long durationNanos);
     }
 
     /** Read-only view of one recorded span, reused across {@link SpanVisitor#visit} calls. */
