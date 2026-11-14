@@ -200,7 +200,7 @@ async function codeOfAsync(promise) {
 }
 const zOf = (value) => "z." + deflateRawSync(Buffer.from(value, "utf8")).toString("base64url");
 const plainOf = (value) => value.replace(/%/g, "%25");
-const BASES = ["https://dualuse.de/tempo/", "file:///home/me/tempo/site/index.html", "http://localhost:8080/tools/tempo.html?x=1"];
+const BASES = ["https://dualuse.github.io/tempo/", "file:///home/me/tempo/site/index.html", "http://localhost:8080/tools/tempo.html?x=1"];
 const linkVectors = goldens.map((n) => [join(goldenDir, n + ".header"), join(goldenDir, n + ".json")])
   .concat(samples.map((p) => [p, p.slice(0, -7) + ".json"]));
 let nLinks = 0;
@@ -238,8 +238,8 @@ for (const [hp, jp] of linkVectors) {
 }
 const sv = P.stripWs(read("samples/find-saturated.header")), hv = P.stripWs(read("samples/find-healthy.header"));
 const svDoc = P.decode(sv), hvDoc = P.decode(hv);
-const svUrl = "https://dualuse.de/tempo/#t=" + zOf(sv);
-const hvUrl = "https://dualuse.de/tempo/#t=" + zOf(hv);
+const svUrl = "https://dualuse.github.io/tempo/#t=" + zOf(sv);
+const hvUrl = "https://dualuse.github.io/tempo/#t=" + zOf(hv);
 {
   // several links -> several traces (the page sends them to stats)
   const several = P.extractTraces([svUrl, hvUrl, "see " + svUrl + "."].join("\n"));
@@ -277,13 +277,13 @@ const hvUrl = "https://dualuse.de/tempo/#t=" + zOf(hv);
     ["not UTF-8", "z." + deflateRawSync(Buffer.from([0x76, 0x31, 0x3b, 0xff, 0xfe])).toString("base64url")]
   ];
   for (const [label, packed] of corrupt) {
-    const code = await codeOfAsync(P.loadAsync(P.extractTraces("https://dualuse.de/tempo/#t=" + packed)[0] || { source: "link", link: { t: packed } }));
+    const code = await codeOfAsync(P.loadAsync(P.extractTraces("https://dualuse.github.io/tempo/#t=" + packed)[0] || { source: "link", link: { t: packed } }));
     check("corrupt link: " + label, code === "E_LINK", "got " + code);
   }
-  check("Tempo-Link header without a fragment", (await codeOfAsync(P.loadAsync(P.extractTraces("HTTP/1.1 200 OK\nTempo-Link: https://dualuse.de/tempo/\n\n{}")[0]))) === "E_LINK");
+  check("Tempo-Link header without a fragment", (await codeOfAsync(P.loadAsync(P.extractTraces("HTTP/1.1 200 OK\nTempo-Link: https://dualuse.github.io/tempo/\n\n{}")[0]))) === "E_LINK");
   check("load() refuses a link item", codeOf(() => P.load(P.extractTraces(svUrl)[0])) === "E_LINK");
   // a corrupt Tempo-Link next to a good Tempo-Timing: the header wins, with a note
-  const badBeside = await P.loadAsync(P.extractTraces("HTTP/1.1 200 OK\nTempo-Timing: " + sv + "\nTempo-Link: https://dualuse.de/tempo/#t=z." + flipped + "\n\n{}")[0]);
+  const badBeside = await P.loadAsync(P.extractTraces("HTTP/1.1 200 OK\nTempo-Timing: " + sv + "\nTempo-Link: https://dualuse.github.io/tempo/#t=z." + flipped + "\n\n{}")[0]);
   check("corrupt Tempo-Link beside Tempo-Timing", same(badBeside.doc, svDoc) && /does not decode/.test(badBeside.note || ""), badBeside.note);
   // a cut Tempo-Timing next to a complete Tempo-Link: the link wins, with a note
   const cutBeside = await P.loadAsync(P.extractTraces("HTTP/1.1 200 OK\nTempo-Timing: " + sv.slice(0, 900) + "\nTempo-Link: " + svUrl + "\n\n{}")[0]);

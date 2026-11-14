@@ -394,7 +394,7 @@ def encode(doc):
 
 # ---------------------------------------------------------------- Tempo-Link (FORMAT.md section 9)
 
-DEFAULT_BASE = "https://dualuse.de/tempo/"
+DEFAULT_BASE = "https://dualuse.github.io/tempo/"
 LINK_TABS = ("lanes", "tree", "agg", "pools", "critical", "diff", "stats")
 B64URL_RE = re.compile(r"^[A-Za-z0-9_-]*$")
 MAX_INFLATED = 16 * 1024 * 1024   # FORMAT.md 9.2: decoders accept at least 1 MiB

@@ -385,13 +385,13 @@ shows the trace in the browser. The URL carries the whole `v1` value in its frag
 so the trace does not need to be stored anywhere.
 
 ```
-Tempo-Link: https://dualuse.de/tempo/#t=z.HU67coMwEPyaNGR86IR4WIxmaJJ0aeI6HhB…
+Tempo-Link: https://dualuse.github.io/tempo/#t=z.HU67coMwEPyaNGR86IR4WIxmaJJ0aeI6HhB…
 ```
 
 (The whole link of the worked example, §10, is `testdata/golden/search-example.link`:
 440 characters for the 415-character value.)
 
-The default viewer is the Tempo Timeline at `https://dualuse.de/tempo/`; the base is
+The default viewer is the Tempo Timeline at `https://dualuse.github.io/tempo/`; the base is
 configurable, and a copy of the viewer hosted elsewhere, or opened from a `file:` URL,
 reads the same links. A service MAY send `Tempo-Link` together with `Tempo-Timing` or
 instead of it.

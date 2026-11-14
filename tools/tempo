@@ -388,7 +388,7 @@ def encode(doc):
 # Tempo-Link (FORMAT.md section 9; mirrors tools/tempo_ref.py)
 # ======================================================================
 
-DEFAULT_BASE = "https://dualuse.de/tempo/"
+DEFAULT_BASE = "https://dualuse.github.io/tempo/"
 B64URL_RE = re.compile(r"^[A-Za-z0-9_-]*$")
 MAX_INFLATED = 16 * 1024 * 1024
 
@@ -2461,7 +2461,7 @@ web viewer (Tempo Timeline):
                                      both traces; with --tree, --agg, --pools,
                                      --critical or --diff, on that tab
   --base URL                         another viewer copy (default $TEMPO_LINK_BASE
-                                     or https://dualuse.de/tempo/)
+                                     or https://dualuse.github.io/tempo/)
   The trace travels in the #fragment, which the browser never sends to the
   server; --open only starts the local browser. Nothing else is sent anywhere.
 

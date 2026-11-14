@@ -314,12 +314,12 @@ class LinkInput(unittest.TestCase):
 
     def test_query_form(self):
         z = tempo_ref.pack_value(self.value)
-        self.assertEqual(self.decoded(args=["https://dualuse.de/tempo/?t=" + z])[0], self.expected)
-        self.assertEqual(self.decoded("see https://dualuse.de/tempo/?tab=tree&t=%s\n" % z)[0], self.expected)
+        self.assertEqual(self.decoded(args=["https://dualuse.github.io/tempo/?t=" + z])[0], self.expected)
+        self.assertEqual(self.decoded("see https://dualuse.github.io/tempo/?tab=tree&t=%s\n" % z)[0], self.expected)
         plain = tempo_ref.pack_value(self.value, form="plain")
         self.assertEqual(self.decoded("http://localhost:8000/?t=" + plain)[0], self.expected)
         # the fragment wins over the query, even when the query one is broken
-        both = "https://dualuse.de/tempo/?t=z.broken#t=" + z
+        both = "https://dualuse.github.io/tempo/?t=z.broken#t=" + z
         self.assertEqual(self.decoded(both)[0], self.expected)
         # a query t= that is not a packed value is just some URL, not a link
         code, out, err = cli(["--check"], stdin="GET https://example.com/search?t=42 200\n")

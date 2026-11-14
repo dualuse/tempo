@@ -9,7 +9,7 @@ It is a single source file with no runtime dependencies and targets Java 11.
 
 A trace travels in the `Tempo-Timing` response header or as JSON in a response body;
 the format is specified in [FORMAT.md](FORMAT.md). The web viewer, Tempo Timeline, runs at
-<https://dualuse.de/tempo/>: paste a header or `curl -i` output, nothing is uploaded. A service
+<https://dualuse.github.io/tempo/>: paste a header or `curl -i` output, nothing is uploaded. A service
 can also send a `Tempo-Link` header: a URL to the viewer that carries the compressed trace in
 its `#fragment`, so a click in the terminal opens it in the browser without the trace being
 sent to any server ([FORMAT.md §9](FORMAT.md#9-tempo-link)).
@@ -69,7 +69,7 @@ pbpaste | tempo --tree                   # a value copied from a log or a termin
 tempo response.json                      # JSON with a tempo object anywhere (e.g. under "info")
 tempo before.header --diff after.header  # what changed between two requests
 tempo --stats traces/*.header            # p50/p95/max per path over many requests
-tempo 'https://dualuse.de/tempo/#t=z.…'  # a Tempo-Link, as an argument
+tempo 'https://dualuse.github.io/tempo/#t=z.…'  # a Tempo-Link, as an argument
 tempo --open --critical trace.header     # the same trace in the web viewer
 ```
 
@@ -140,7 +140,7 @@ Python's `webbrowser` module, that is, in the local browser. With `--diff` (or a
 input link with `&c=`) the link holds both traces; with `--tree`, `--agg`, `--pools`, `--critical` or `--diff` it opens
 on that tab. `--base URL` (or `$TEMPO_LINK_BASE`) points `--to link` and `--open` at
 another copy of the viewer, such as a self-hosted one; the default is
-`https://dualuse.de/tempo/`. The trace travels in the URL fragment, which the browser
+`https://dualuse.github.io/tempo/`. The trace travels in the URL fragment, which the browser
 keeps to itself: nothing is uploaded, and the CLI sends nothing anywhere. The link
 does end up in the browser history.
 
