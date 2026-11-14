@@ -414,7 +414,7 @@ class LinkInput(unittest.TestCase):
             with self.subTest(input=os.path.relpath(path, ROOT)):
                 code, url, err = cli(["--to", "link", path])
                 self.assertEqual(code, 0, err)
-                self.assertTrue(url.startswith(tempo_ref.DEFAULT_BASE + "#t=z."), url)
+                self.assertTrue(url.startswith(tempo_ref.default_base({}) + "#t=z."), url)
                 self.assertEqual(url.count("\n"), 1)
                 link = tempo_ref.decode_link(url)
                 want = tempo_ref.strip_ws(tempo_ref.decode_link(read(path)).value if path.endswith(".link")
@@ -544,10 +544,26 @@ class LinkInput(unittest.TestCase):
         gen = os.path.join(ROOT, "tools", "gen_traces.py")
         args = [sys.executable, gen, "--seed", "4", "--candidates", "12"]
         header = subprocess.run(args, stdout=subprocess.PIPE, check=True).stdout.decode().strip()
-        for extra, base in (([], tempo_ref.DEFAULT_BASE), (["http://localhost:8000/t/"], "http://localhost:8000/t/")):
-            url = subprocess.run(args + ["--link"] + extra, stdout=subprocess.PIPE, check=True).stdout.decode().strip()
+        env = {k: v for k, v in os.environ.items() if k != "TEMPO_LINK_BASE"}
+        for extra, base, more in (([], tempo_ref.default_base({}), {}), (["http://127.0.0.1:8000/t/"], "http://127.0.0.1:8000/t/", {}),
+                                  ([], "https://example.org/v/", {"TEMPO_LINK_BASE": "https://example.org/v/"})):
+            url = subprocess.run(args + ["--link"] + extra, stdout=subprocess.PIPE, check=True,
+                                 env=dict(env, **more)).stdout.decode().strip()
             self.assertTrue(url.startswith(base + "#t=z."), url)
             self.assertEqual(tempo_ref.decode_link(url).value, header)
+
+    def test_default_base_of_a_checkout(self):
+        """$TEMPO_LINK_BASE; else a checkout's own GitHub Pages site from its remote origin, as the library build
+        derives it; else the upstream viewer. The CLI and the reference agree."""
+        self.assertEqual(tempo_ref.default_base({"TEMPO_LINK_BASE": "https://example.org/v/"}), "https://example.org/v/")
+        self.assertEqual(tempo.default_base({}), tempo_ref.default_base({}))
+        self.assertIn(tempo_ref.checkout_base(), (None, tempo_ref.default_base({})))
+        for remote, base in (("git@github.com:Some-Owner/tempo-fork.git", "https://some-owner.github.io/tempo-fork/"),
+                             ("https://github.com/dualuse/tempo", "https://dualuse.github.io/tempo/"),
+                             ("ssh://git@github.com:22/someone/someone.github.io.git", "https://someone.github.io/"),
+                             ("git@gitlab.com:some-owner/tempo-fork.git", None), ("", None)):
+            self.assertEqual(tempo_ref.pages_of(tempo_ref.repository_of_remote(remote)), base, remote)
+            self.assertEqual(tempo.pages_of(tempo.repository_of_remote(remote)), base, remote)
 
     def test_link_decoder_matches_reference_decoder(self):
         paths = sorted(glob.glob(os.path.join(GOLDEN, "*.link")) + glob.glob(os.path.join(INVALID, "*.link")))
@@ -1175,8 +1191,8 @@ class Executable(unittest.TestCase):
     def test_python38_syntax_and_stdlib_only(self):
         src = read(CLI)
         tree = ast.parse(src, feature_version=(3, 8))
-        allowed = {"argparse", "base64", "datetime", "json", "math", "os", "re", "shutil", "sys", "textwrap",
-                   "webbrowser", "zlib"}
+        allowed = {"argparse", "base64", "datetime", "json", "math", "os", "re", "shutil", "subprocess", "sys",
+                   "textwrap", "webbrowser", "zlib"}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for a in node.names:

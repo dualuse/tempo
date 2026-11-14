@@ -8,8 +8,11 @@ import java.lang.ref.WeakReference;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
@@ -319,7 +322,10 @@ public final class Tempo {
             return this;
         }
 
-        /** Byte limit of the detailed header ({@link Trace#toHeader()}); default 3000. */
+        /**
+         * Byte limit of the detailed header ({@link Trace#toHeader()}) and of the value a {@link Trace#toLink()}
+         * carries; default 3000. {@link Trace#toHeader(int)} takes a limit per call.
+         */
         public Options headerBytes(int max) {
             this.headerBytes = Math.max(0, max);
             return this;
@@ -327,9 +333,10 @@ public final class Tempo {
 
         /**
          * The viewer that {@link Trace#toLink()} points at. By default the system property {@code
-         * tempo.linkBase}, else the base the library was built with: the GitHub Pages site of the
-         * repository it was built from, {@code https://dualuse.github.io/tempo/} for this one. Null
-         * restores the default.
+         * tempo.linkBase}, else the base the library was built with: {@code -PlinkBase}, else the GitHub
+         * Pages site of the repository it was built from ({@code GITHUB_REPOSITORY} in GitHub Actions,
+         * else the git remote {@code origin}), {@code https://dualuse.github.io/tempo/} for this one. A
+         * copy of this file built elsewhere uses that address. Null restores the default.
          *
          * @throws IllegalArgumentException if {@code base} is not an absolute URL, or has a {@code #},
          *                                  a {@code ,}, whitespace or a non-ASCII character
@@ -2457,12 +2464,27 @@ public final class Tempo {
             return Header.of(this, headerBytes);
         }
 
+        /** Like {@link Trace#toHeader(int)}: at most {@code maxBytes} long; empty if taken after release. */
+        public String toHeader(int maxBytes) {
+            return Header.of(this, maxBytes);
+        }
+
         /**
          * The {@code Tempo-Link} header value (see {@link Trace#toLink()}), carrying {@link #toHeader()};
          * empty if taken after release.
          */
         public String toLink() {
-            return Link.of(linkBase != null ? linkBase : Link.base(), toHeader());
+            return toLink(null);
+        }
+
+        /** Like {@link Trace#toLink(String)}; empty if taken after release. */
+        public String toLink(String base) {
+            return Link.of(Link.base(base, linkBase), toHeader());
+        }
+
+        /** Like {@link Trace#toLink(String, int)}: at most {@code maxBytes} long; empty if taken after release. */
+        public String toLink(String base, int maxBytes) {
+            return Header.link(this, Link.base(base, linkBase), maxBytes);
         }
 
         /** Like {@link Trace#forEachTop}, as the snapshot was taken. */
@@ -2631,23 +2653,27 @@ public final class Tempo {
     /**
      * Writes a {@link Snapshot} as a {@code Tempo-Timing} v1 value in the canonical form of FORMAT.md §7.
      * Two walks over the stitched tree: the first numbers the threads and names the records use, the
-     * second writes the records into the one builder. Records deeper than {@link #maxDepth}, the
-     * aggregates of aggregate-only spans nested in others (the wire has no children under an aggregate)
-     * and the lane-level nodes besides the root (aggregates of a folded task that had no recorded span to
-     * hang them from) are left out with their subtrees and counted as dropped, like a non-finite attribute
-     * value. Every occurrence in an aggregate on the wire counts as folded (FORMAT.md §4), as do folded
-     * spans and tasks still open.
+     * second writes the records into the one builder. Records deeper than {@link #MAX_DEPTH} (wire depth
+     * adds up along handoff chains), the aggregates of aggregate-only spans nested in others (the wire has
+     * no children under an aggregate) and the lane-level nodes besides the root (aggregates of a folded
+     * task that had no recorded span to hang them from) are left out with their subtrees and counted as
+     * dropped, like a non-finite attribute value: a record at depth 35 stands for its whole subtree. Every
+     * occurrence in an aggregate on the wire counts as folded (FORMAT.md §4), as do folded spans and tasks
+     * still open. A value over its limit goes down the {@link Ladder}.
      */
     static final class Header implements SpanVisitor {
         static final int MAX_DEPTH = 35, MIN_BYTES = 256;
         static final int KEEP = 8192; // a thread keeps its builder up to this capacity (one output String per render)
-        private static final char[] DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz".toCharArray(),
-                HEX = "0123456789ABCDEF".toCharArray();
+        static final char[] DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz".toCharArray();
+        private static final char[] HEX = "0123456789ABCDEF".toCharArray();
         private static final int SHOWN = FAILED | CANCELLED | WAIT | HEALED | MISUSE;
 
+        /** Whether a value is short enough: its length, or the length of the link that carries it. */
+        interface Fit {
+            boolean fits(CharSequence value);
+        }
+
         private final Snapshot snap;
-        private final int maxDepth;
-        private final boolean attributes;
         private final int[] nameIndex; // by name id: wire index + 1; -1 for an attribute key not numbered yet
         private final int[] laneIndex; // by lane id: wire thread index + 1, 0 for a lane no record uses
         private int[] order = new int[16], keys = new int[16]; // name ids by wire index; keys by first use
@@ -2656,43 +2682,72 @@ public final class Tempo {
         private final int[] threadAt = new int[MAX_DEPTH + 1];
         private final boolean[] aggregateAt = new boolean[MAX_DEPTH + 1];
         private StringBuilder out; // null during the first walk
-        private int limit, records, skip;
-        private long rootStart, rootDur, left, written, nonFinite; // left, written: spans, aggregates by count
+        private int records, skip, aggregates;
+        private long rootStart, rootDur, left, nonFinite; // left: spans left out, aggregates by count
         private long aggregated, foldedSeen; // occurrences in the aggregates written; folded ones in all aggregates
+        private long unwritten; // what the fallback stands for: every span but the root, as folded and dropped
 
-        private Header(Snapshot snap, int maxDepth, boolean attributes, int nameBound) {
+        private Header(Snapshot snap) {
             this.snap = snap;
-            this.maxDepth = maxDepth;
-            this.attributes = attributes;
-            nameIndex = new int[nameBound];
+            nameIndex = new int[nameBound(snap)];
             laneIndex = new int[snap.shapes.length];
         }
 
         /**
-         * The value of {@code s}, at most {@code maxBytes} long when {@code maxBytes >= 256}. A value that
-         * does not fit keeps the root and its children only, without attributes (ladder step 4 of FORMAT.md
-         * §7.1); below 256 bytes, or if that does not fit either, it is the fallback. Empty without a root.
+         * The value of {@code s}, at most {@code maxBytes} long when {@code maxBytes >= 256}: as it is if it
+         * fits, else the first step of the {@link Ladder} that fits (FORMAT.md §7.1); below 256 bytes, or
+         * if no step fits, the fallback. Empty without a root.
          */
         static String of(Snapshot s, int maxBytes) {
+            StringBuilder b = borrow(maxBytes);
+            try {
+                return value(s, b, v -> v.length() <= maxBytes, maxBytes >= MIN_BYTES);
+            } finally {
+                giveBack(b);
+            }
+        }
+
+        /**
+         * The {@code Tempo-Link} to {@code base} carrying the value of {@code s}, at most {@code maxBytes}
+         * long when {@code maxBytes - base.length() >= 256}: the ladder applies to the value until the
+         * compressed link fits. Empty without a root.
+         */
+        static String link(Snapshot s, String base, int maxBytes) {
+            StringBuilder b = borrow(maxBytes);
+            try (Link.Packer p = new Link.Packer()) {
+                String v = value(s, b, x -> base.length() + p.pack(x) <= maxBytes, (long) maxBytes - base.length() >= MIN_BYTES);
+                if (v.isEmpty()) return "";
+                p.pack(v);
+                return p.link(base);
+            } finally {
+                giveBack(b);
+            }
+        }
+
+        /** The thread's builder, which one render at a time uses; a new one while another render holds it. */
+        private static StringBuilder borrow(int maxBytes) {
             ThreadSlot slot = SLOT.get();
             StringBuilder b = slot.text;
             slot.text = null;
-            if (b == null) b = new StringBuilder(Math.max(64, Math.min(maxBytes, KEEP / 2)));
-            String value = of(s, maxBytes, b);
-            if (b.capacity() <= KEEP) slot.text = b;
-            return value;
+            return b != null ? b : new StringBuilder(Math.max(64, Math.min(maxBytes, KEEP / 2)));
         }
 
-        private static String of(Snapshot s, int maxBytes, StringBuilder b) {
-            int names = nameBound(s);
-            Header full = new Header(s, MAX_DEPTH, true, names);
-            if (full.write(b, maxBytes)) return b.toString();
-            if (full.records == 0) return "";
-            if (maxBytes >= MIN_BYTES && new Header(s, 1, false, names).write(b, maxBytes)) return b.toString();
+        private static void giveBack(StringBuilder b) {
+            if (b.capacity() <= KEEP) SLOT.get().text = b;
+        }
+
+        /** The whole value if {@code fit} takes it; else, with {@code ladder}, the first step it takes; else the fallback. */
+        private static String value(Snapshot s, StringBuilder b, Fit fit, boolean ladder) {
+            Header h = new Header(s);
+            if (!h.write(b)) return "";
+            if (fit.fits(b)) return b.toString();
+            if (ladder) {
+                String v = new Ladder(b.toString()).run(fit, b);
+                if (v != null) return v;
+            }
             b.setLength(0);
-            b36(b.append("v1;x=0."), s.dropped() + full.left + full.written
-                    + Math.max(0, s.folded() - full.foldedSeen)); // folded spans still open are in no aggregate
-            b36(b.append(";T=%3F;N=%3F;S=00.0."), us(full.rootDur));
+            b36(b.append("v1;x=0."), h.unwritten);
+            b36(b.append(";T=%3F;N=%3F;S=00.0."), us(h.rootDur));
             return b.append(";e=1").toString();
         }
 
@@ -2708,8 +2763,8 @@ public final class Tempo {
             return max + 1;
         }
 
-        /** Writes the value into {@code b}, giving up once it is longer than {@code max}; whether it fits. */
-        private boolean write(StringBuilder b, int max) {
+        /** Writes the whole value into {@code b}; false if the snapshot has no root. */
+        private boolean write(StringBuilder b) {
             snap.forEachSpan(this);
             if (records == 0) return false;
             for (int i = 0; i < nKeys; i++) if (nameIndex[keys[i]] < 0) number(keys[i]);
@@ -2721,6 +2776,7 @@ public final class Tempo {
             // aggregates left out count as dropped only; spans folded for want of budget that are still
             // open are in no aggregate yet and count as folded
             long dropped = snap.dropped() + left + nonFinite, folded = aggregated + Math.max(0, snap.folded() - foldedSeen);
+            unwritten = folded + dropped + records - 1 - aggregates;
             if (folded > 0 || dropped > 0) b36(b36(b.append(";x="), folded).append('.'), dropped);
             boolean live = false;
             for (int l = 0; l < laneIndex.length; l++) {
@@ -2736,18 +2792,17 @@ public final class Tempo {
             for (int i = 0; i < names; i++) name(i == 0 ? b : b.append(':'), Name.byId(order[i]).text);
             b.append(";S=");
             out = b;
-            limit = max;
             records = 0;
             skip = -1;
             snap.forEachSpan(this);
             b36(b.append(";e="), records);
-            return b.length() <= max;
+            return true;
         }
 
         @Override
         public void visit(SpanView v) {
             int d = v.depth;
-            if (skip >= 0 && d > skip || d > maxDepth || d == 0 && records > 0 || d > 0 && aggregateAt[d - 1]) {
+            if (skip >= 0 && d > skip || d > MAX_DEPTH || d == 0 && records > 0 || d > 0 && aggregateAt[d - 1]) {
                 if (skip < 0 || d <= skip) skip = d; // left out with its subtree
                 if (out == null) {
                     left += v.count;
@@ -2759,9 +2814,14 @@ public final class Tempo {
             aggregateAt[d] = v.aggregate;
             if (out == null) {
                 foldedSeen += v.folded;
-                if (v.aggregate) aggregated += v.count;
+                if (v.aggregate) {
+                    aggregated += v.count;
+                    aggregates++;
+                }
                 count(v);
-            } else if (out.length() <= limit) record(out, v);
+            } else {
+                record(out, v);
+            }
             records++;
         }
 
@@ -2770,12 +2830,10 @@ public final class Tempo {
             if (records == 0) {
                 rootStart = v.start;
                 rootDur = v.duration;
-            } else {
-                written += v.count;
             }
             if (!unrun(v) && !v.mixed) laneIndex[v.shape.lane] = 1;
             if (nameIndex[v.name.id] <= 0) number(v.name.id);
-            for (int i = 0, n = attributes ? v.attributes() : 0; i < n; i++) {
+            for (int i = 0, n = v.attributes(); i < n; i++) {
                 if (!first(v, i)) continue;
                 int j = last(v, i), key = v.key(j) >>> KIND_BITS;
                 if (!finite(v, j)) {
@@ -2825,7 +2883,7 @@ public final class Tempo {
                 if ((f & WAIT) != 0) b.append('w');
                 if ((f & (HEALED | MISUSE)) != 0) b.append('m');
             }
-            for (int i = 0, n = attributes ? v.attributes() : 0; i < n; i++) {
+            for (int i = 0, n = v.attributes(); i < n; i++) {
                 if (!first(v, i)) continue;
                 int j = last(v, i);
                 if (!finite(v, j)) continue;
@@ -2952,6 +3010,344 @@ public final class Tempo {
                 b.append((char) ('0' + f / m));
                 f %= m;
             }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * The byte-budget ladder of FORMAT.md §7.1, for a value over its limit. It reads the value as a decoder
+     * does (absolute starts in microseconds, threads and names by their index in the value's tables) and
+     * walks the steps, writing the value anew after each change and stopping at the first that fits:
+     * <ol>
+     * <li>fold each group of same-name siblings, handoffs apart from the rest, into one aggregate,
+     *     largest group first; failed records and the slowest one stay single;</li>
+     * <li>drop the deepest level, one at a time, while it is 3 or deeper;</li>
+     * <li>drop the attributes;</li>
+     * <li>drop depth 2: the root and its children remain.</li>
+     * </ol>
+     * The tables shrink to what the remaining records use. A record left out counts as dropped, an
+     * aggregate by its count, which then no longer counts as folded; a record folded counts as folded.
+     * It reads only values its own encoder wrote, so it checks nothing.
+     */
+    static final class Ladder {
+        private static final String FLAGS = "fconwm"; // bit i is FLAGS.charAt(i)
+        private static final int F = 1; // failed
+
+        private final String value;
+        private String wall; // the w= digits, or null
+        private final String[] threads, names; // as written in T and N
+        private final boolean[] live; // by thread index
+        private long folded, dropped;
+        private final int n;
+        private int pos, attrs;
+        private final int[] depth, parent, name, thread, flags, attrFrom, attrTo;
+        // wait: -1 for none (an aggregate's wait sum); cpu: -1 for none; count: 0 for a single record
+        private final long[] start, dur, wait, waitMax, cpu, count, min, max, extent, maxAt;
+        private int[] attrKey = new int[16], valueFrom = new int[16], valueTo = new int[16];
+        private final boolean[] removed;
+        private boolean attributes = true;
+        private final int[] nameNew, nameOrder, threadNew, threadAt = new int[Header.MAX_DEPTH + 1];
+        private final long[] cur = new long[Header.MAX_DEPTH + 2];
+
+        Ladder(String value) {
+            this.value = value;
+            int s = value.indexOf(";S="), e = value.lastIndexOf(";e=");
+            String l = null, tTable = null, nTable = null;
+            for (int i = 3, j; i < s; i = j + 1) { // the fields after "v1;"
+                j = value.indexOf(';', i);
+                String f = value.substring(i + 2, j);
+                switch (value.charAt(i)) {
+                    case 'w': wall = f; break;
+                    case 'x':
+                        folded = Long.parseLong(f.substring(0, f.indexOf('.')), 36);
+                        dropped = Long.parseLong(f.substring(f.indexOf('.') + 1), 36);
+                        break;
+                    case 'l': l = f; break;
+                    case 'T': tTable = f; break;
+                    default: nTable = f;
+                }
+            }
+            threads = tTable.split(":");
+            names = nTable.split(":");
+            live = new boolean[threads.length];
+            if (l != null) for (String x : l.split("\\.")) live[Integer.parseInt(x, 36)] = true;
+            int records = 1;
+            for (int i = s + 3; i < e; i++) if (value.charAt(i) == '/') records++;
+            n = records;
+            depth = new int[n];
+            parent = new int[n];
+            name = new int[n];
+            thread = new int[n];
+            flags = new int[n];
+            attrFrom = new int[n];
+            attrTo = new int[n];
+            start = new long[n];
+            dur = new long[n];
+            wait = new long[n];
+            waitMax = new long[n];
+            cpu = new long[n];
+            count = new long[n];
+            min = new long[n];
+            max = new long[n];
+            extent = new long[n];
+            maxAt = new long[n];
+            removed = new boolean[n];
+            nameNew = new int[names.length];
+            nameOrder = new int[names.length];
+            threadNew = new int[threads.length];
+            int[] path = new int[Header.MAX_DEPTH + 1];
+            pos = s + 3;
+            for (int i = 0; i < n; i++, pos++) { // pos++: past the '/' or ';' that ends the record
+                int d = Character.digit(value.charAt(pos++), 36);
+                depth[i] = d;
+                parent[i] = d == 0 ? -1 : path[d - 1];
+                path[d] = i;
+                name[i] = (int) num();
+                pos++;
+                start[i] = cur[d] + num();
+                cur[d] = cur[d + 1] = start[i];
+                pos++;
+                dur[i] = num();
+                thread[i] = d == 0 ? 0 : thread[parent[i]];
+                wait[i] = waitMax[i] = cpu[i] = -1;
+                if (at('@')) thread[i] = at('_') ? -1 : (int) num();
+                if (at('~')) {
+                    wait[i] = num();
+                    if (at('.')) waitMax[i] = num();
+                }
+                if (at('*')) cpu[i] = num();
+                if (at('+')) {
+                    count[i] = num();
+                    pos++;
+                    min[i] = num();
+                    pos++;
+                    max[i] = num();
+                    pos++;
+                    extent[i] = num();
+                    pos++;
+                    maxAt[i] = num();
+                }
+                if (at('^')) for (int k; pos < e && (k = FLAGS.indexOf(value.charAt(pos))) >= 0; pos++) flags[i] |= 1 << k;
+                attrFrom[i] = attrs;
+                while (at(':')) {
+                    if (attrs == attrKey.length) {
+                        attrKey = Arrays.copyOf(attrKey, 2 * attrs);
+                        valueFrom = Arrays.copyOf(valueFrom, 2 * attrs);
+                        valueTo = Arrays.copyOf(valueTo, 2 * attrs);
+                    }
+                    attrKey[attrs] = (int) num();
+                    valueFrom[attrs] = ++pos; // past '='
+                    for (char c; (c = value.charAt(pos)) != '/' && c != ';' && c != ':'; ) pos++;
+                    valueTo[attrs++] = pos;
+                }
+                attrTo[i] = attrs;
+            }
+        }
+
+        private boolean at(char c) {
+            if (value.charAt(pos) != c) return false;
+            pos++;
+            return true;
+        }
+
+        /** A base-36 number at {@code pos}. */
+        private long num() {
+            long v = 0;
+            for (char c; (c = value.charAt(pos)) >= '0' && c <= '9' || c >= 'a' && c <= 'z'; pos++) v = v * 36 + Character.digit(c, 36);
+            return v;
+        }
+
+        /** The first step whose value {@code fit} takes, written into {@code b}; null if none does. */
+        String run(Header.Fit fit, StringBuilder b) {
+            for (int[] g : groups()) if (fold(g) && fits(fit, b)) return b.toString();
+            for (int d; (d = deepest()) >= 3; ) if (drop(d) && fits(fit, b)) return b.toString();
+            if (attrs > 0) {
+                attributes = false;
+                if (fits(fit, b)) return b.toString();
+            }
+            return drop(2) && fits(fit, b) ? b.toString() : null;
+        }
+
+        private boolean fits(Header.Fit fit, StringBuilder b) {
+            write(b);
+            return fit.fits(b);
+        }
+
+        private boolean waits(int r) {
+            return wait[r] >= 0;
+        }
+
+        /**
+         * Step 1's groups: the children of one parent with one name, handoffs (records with a queue wait)
+         * apart from the rest. Each lists its first record, then those it folds: all but the failed single
+         * records and the slowest single one (the first of equals). Only groups that fold two or more,
+         * the most first, then by their first record.
+         */
+        private int[][] groups() {
+            Integer[] by = new Integer[n - 1];
+            for (int i = 1; i < n; i++) by[i - 1] = i;
+            Comparator<Integer> key = Comparator.<Integer>comparingInt(i -> parent[i]).thenComparingInt(i -> name[i])
+                    .thenComparing(this::waits);
+            Arrays.sort(by, key.thenComparingInt(i -> i));
+            List<int[]> groups = new ArrayList<>();
+            for (int i = 0, j; i < by.length; i = j) {
+                for (j = i + 1; j < by.length && key.compare(by[i], by[j]) == 0; j++) ;
+                int slowest = -1;
+                for (int k = i; k < j; k++) if (count[by[k]] == 0 && (slowest < 0 || dur[by[k]] > dur[slowest])) slowest = by[k];
+                int[] g = new int[j - i + 1];
+                int m = 1;
+                g[0] = by[i];
+                for (int k = i; k < j; k++) {
+                    int r = by[k];
+                    if (r != slowest && (count[r] > 0 || (flags[r] & F) == 0)) g[m++] = r;
+                }
+                if (m > 2) groups.add(Arrays.copyOf(g, m));
+            }
+            groups.sort((a, c) -> a.length != c.length ? c.length - a.length : a[0] - c[0]);
+            return groups.toArray(new int[0][]);
+        }
+
+        /**
+         * Folds the records of group {@code g} into its first one to fold, which keeps its place and start;
+         * their subtrees are dropped. False if an earlier fold dropped the group.
+         */
+        private boolean fold(int[] g) {
+            int t = g[1], th = thread[t], fl = -1;
+            if (removed[t]) return false;
+            long c = 0, sum = 0, lo = Long.MAX_VALUE, hi = -1, end = 0, slowAt = 0, waitSum = 0, waitHi = 0, cpuSum = -1;
+            for (int k = 1; k < g.length; k++) {
+                int r = g[k];
+                boolean agg = count[r] > 0;
+                long longest = agg ? max[r] : dur[r];
+                if (longest > hi) {
+                    hi = longest;
+                    slowAt = agg ? start[r] + maxAt[r] : start[r];
+                }
+                c += agg ? count[r] : 1;
+                sum += dur[r];
+                lo = Math.min(lo, agg ? min[r] : dur[r]);
+                end = Math.max(end, agg ? start[r] + extent[r] : start[r] + Math.max(0, wait[r]) + dur[r]);
+                if (waits(r)) {
+                    waitSum += wait[r];
+                    waitHi = Math.max(waitHi, agg ? waitMax[r] : wait[r]);
+                }
+                if (cpu[r] >= 0) cpuSum = Math.max(0, cpuSum) + cpu[r];
+                if (thread[r] != th) th = -1;
+                fl &= flags[r];
+                if (!agg) folded++;
+                for (int i = r + 1; i < n && depth[i] > depth[r]; i++) if (!removed[i]) remove(i);
+                if (r != t) removed[r] = true;
+            }
+            count[t] = c;
+            dur[t] = sum;
+            min[t] = lo;
+            max[t] = hi;
+            extent[t] = end - start[t];
+            maxAt[t] = slowAt - start[t];
+            if (waits(t)) {
+                wait[t] = waitSum;
+                waitMax[t] = waitHi;
+            }
+            cpu[t] = cpuSum;
+            thread[t] = th;
+            flags[t] = fl;
+            attrTo[t] = attrFrom[t];
+            return true;
+        }
+
+        /** Leaves record {@code i} out: dropped, an aggregate by its count, which is no longer folded. */
+        private void remove(int i) {
+            removed[i] = true;
+            dropped += count[i] > 0 ? count[i] : 1;
+            if (count[i] > 0) folded = Math.max(0, folded - count[i]);
+        }
+
+        private int deepest() {
+            int d = 0;
+            for (int i = 0; i < n; i++) if (!removed[i]) d = Math.max(d, depth[i]);
+            return d;
+        }
+
+        /** Leaves out the records at depth {@code d}, which have no children; whether there were any. */
+        private boolean drop(int d) {
+            boolean any = false;
+            for (int i = 0; i < n; i++) {
+                if (removed[i] || depth[i] != d) continue;
+                remove(i);
+                any = true;
+            }
+            return any;
+        }
+
+        /** Writes the remaining records in canonical form, the tables reduced to what they use. */
+        private void write(StringBuilder b) {
+            Arrays.fill(nameNew, -1);
+            Arrays.fill(threadNew, -1);
+            int nNames = 0, records = 0;
+            for (int i = 0; i < n; i++) {
+                if (removed[i]) continue;
+                if (nameNew[name[i]] < 0) nameOrder[nameNew[name[i]] = nNames++] = name[i];
+                if (thread[i] >= 0) threadNew[thread[i]] = 0;
+            }
+            for (int i = 0; i < n && attributes; i++) {
+                for (int a = attrFrom[i]; a < attrTo[i] && !removed[i]; a++) {
+                    if (nameNew[attrKey[a]] < 0) nameOrder[nameNew[attrKey[a]] = nNames++] = attrKey[a];
+                }
+            }
+            for (int j = 0, k = 0; j < threads.length; j++) if (threadNew[j] == 0) threadNew[j] = k++;
+
+            b.setLength(0);
+            b.append("v1");
+            if (wall != null) b.append(";w=").append(wall);
+            if (folded > 0 || dropped > 0) Header.b36(Header.b36(b.append(";x="), folded).append('.'), dropped);
+            boolean any = false;
+            for (int j = 0; j < threads.length; j++) {
+                if (threadNew[j] < 0 || !live[j]) continue;
+                Header.b36(b.append(any ? "." : ";l="), threadNew[j]);
+                any = true;
+            }
+            b.append(";T=");
+            any = false;
+            for (int j = 0; j < threads.length; j++) {
+                if (threadNew[j] < 0) continue;
+                (any ? b.append(':') : b).append(threads[j]);
+                any = true;
+            }
+            b.append(";N=");
+            for (int k = 0; k < nNames; k++) (k > 0 ? b.append(':') : b).append(names[nameOrder[k]]);
+            b.append(";S=");
+            for (int i = 0; i < n; i++) {
+                if (removed[i]) continue;
+                int d = depth[i];
+                if (records++ > 0) b.append('/');
+                long delta = start[i] - (d == 0 ? 0 : cur[d]);
+                cur[d] = cur[d + 1] = start[i];
+                Header.b36(b.append(Header.DIGITS[d]), nameNew[name[i]]).append('.');
+                Header.b36(Header.b36(b, delta).append('.'), dur[i]);
+                threadAt[d] = thread[i];
+                if (d > 0 && thread[i] != threadAt[d - 1]) {
+                    if (thread[i] < 0) b.append("@_");
+                    else Header.b36(b.append('@'), threadNew[thread[i]]);
+                }
+                if (waits(i)) {
+                    Header.b36(b.append('~'), wait[i]);
+                    if (count[i] > 0) Header.b36(b.append('.'), waitMax[i]);
+                }
+                if (cpu[i] >= 0) Header.b36(b.append('*'), cpu[i]);
+                if (count[i] > 0) {
+                    Header.b36(Header.b36(Header.b36(b.append('+'), count[i]).append('.'), min[i]).append('.'), max[i]);
+                    Header.b36(Header.b36(b.append('.'), extent[i]).append('.'), maxAt[i]);
+                }
+                if (flags[i] != 0) {
+                    b.append('^');
+                    for (int k = 0; k < FLAGS.length(); k++) if ((flags[i] & 1 << k) != 0) b.append(FLAGS.charAt(k));
+                }
+                for (int a = attrFrom[i]; a < attrTo[i] && attributes; a++) {
+                    Header.b36(b.append(':'), nameNew[attrKey[a]]).append('=').append(value, valueFrom[a], valueTo[a]);
+                }
+            }
+            Header.b36(b.append(";e="), records);
         }
     }
 
@@ -3097,13 +3493,32 @@ public final class Tempo {
 
         /**
          * The {@code Tempo-Timing} header value, as specified in {@code FORMAT.md}: one line of at most
-         * {@link Options#headerBytes} bytes. Over that limit only the root and its children are written,
-         * without attributes; if that does not fit either (or the limit is below 256 bytes), the
-         * fixed fallback {@code v1;x=0.<n>;T=%3F;N=%3F;S=00.0.<dur>;e=1}. Renders a {@link #snapshot()},
-         * so spans still open end at one instant; empty after release.
+         * {@link Options#headerBytes} bytes, see {@link #toHeader(int)}. Renders a {@link #snapshot()}, so
+         * spans still open end at one instant; empty after release.
          */
         public String toHeader() {
             return snapshot().toHeader();
+        }
+
+        /**
+         * The {@code Tempo-Timing} header value in at most {@code maxBytes} bytes, for a limit shared with
+         * other headers: a value that fits is written whole; one that does not goes down the ladder of
+         * FORMAT.md §7.1, stopping at the first step that fits: same-name siblings fold into aggregates
+         * (largest group first, failed ones and the slowest kept), then the deepest levels go down to
+         * depth 2, then the attributes, then depth 2. What is left out is counted in {@code x=}. Below 256
+         * bytes, or if no step fits, the value is the fallback {@code v1;x=0.<n>;T=%3F;N=%3F;S=00.0.<dur>;e=1},
+         * which a limit below 256 may not hold. The legacy headers and this one share a limit like this:
+         *
+         * <pre>{@code
+         * String runtime = t.toRuntime(3), timing = t.toServerTiming();
+         * int left = limit - runtime.length() - timing.length(); // minus the header names, if the limit counts them
+         * response.header("Runtime", runtime).header("Server-Timing", timing).header("Tempo-Timing", t.toHeader(left));
+         * }</pre>
+         *
+         * Empty after release.
+         */
+        public String toHeader(int maxBytes) {
+            return snapshot().toHeader(maxBytes);
         }
 
         /**
@@ -3113,6 +3528,27 @@ public final class Tempo {
          */
         public String toLink() {
             return snapshot().toLink();
+        }
+
+        /**
+         * Like {@link #toLink()}, to the viewer at {@code base}; null for the default.
+         *
+         * @throws IllegalArgumentException if {@code base} is not a valid base, see {@link Options#linkBase}
+         */
+        public String toLink(String base) {
+            return snapshot().toLink(base);
+        }
+
+        /**
+         * Like {@link #toLink(String)}, at most {@code maxBytes} long in all, base included: the value goes
+         * down the same ladder as {@link #toHeader(int)} until the compressed link fits. Below 256 bytes
+         * besides the base, or if no step fits, it carries the fallback value. Compresses once per step
+         * tried. Empty after release.
+         *
+         * @throws IllegalArgumentException if {@code base} is not a valid base, see {@link Options#linkBase}
+         */
+        public String toLink(String base, int maxBytes) {
+            return snapshot().toLink(base, maxBytes);
         }
 
         /**
@@ -3836,25 +4272,40 @@ public final class Tempo {
     /**
      * Tempo-Link (FORMAT.md section 9): {@code <base>#t=z.<base64url(raw DEFLATE(value))>}. The default base
      * is baked into the jar at build time as a resource, from the repository the build runs in, so a
-     * fork's jar points at the fork's viewer; a copy of this file without the resource uses {@link #UPSTREAM}.
+     * fork's jar points at the fork's viewer; a copy of this file without the resource uses
+     * {@link #DEFAULT_LINK_BASE}.
      */
     static final class Link {
-        static final String UPSTREAM = "https://dualuse.github.io/tempo/", RESOURCE = "link-base.txt";
-        static final String BUILT = built();
+        /** The viewer a link points at when neither the build, the options nor {@code -Dtempo.linkBase} name one. */
+        static final String DEFAULT_LINK_BASE = "https://dualuse.github.io/tempo/";
+        static final String RESOURCE = "link-base.txt"; // next to Tempo.class
+
+        /** The base the library was built with, read once when a link first needs it. */
+        static final class Built {
+            static final String BASE = read(Tempo.class.getResourceAsStream(RESOURCE));
+        }
 
         /** {@code -Dtempo.linkBase} when it is a valid base, else the base the library was built with. */
         static String base() {
             String p = System.getProperty("tempo.linkBase");
-            return p != null && valid(p) ? p : BUILT;
+            return p != null && valid(p) ? p : Built.BASE;
         }
 
-        private static String built() {
-            try (InputStream in = Tempo.class.getResourceAsStream(RESOURCE)) {
+        /** The base in a resource (closed here), or {@link #DEFAULT_LINK_BASE} if there is none or it is not valid. */
+        static String read(InputStream resource) {
+            try (InputStream in = resource) {
                 String b = in == null ? "" : new String(in.readAllBytes(), StandardCharsets.UTF_8).trim();
-                return valid(b) ? b : UPSTREAM;
+                return valid(b) ? b : DEFAULT_LINK_BASE;
             } catch (IOException | RuntimeException e) {
-                return UPSTREAM;
+                return DEFAULT_LINK_BASE;
             }
+        }
+
+        /** {@code base}, or the default for null. */
+        static String base(String base, String fallback) {
+            if (base == null) return fallback != null ? fallback : base();
+            if (!valid(base)) throw new IllegalArgumentException("not a Tempo-Link base: " + base);
+            return base;
         }
 
         /** An absolute URL of printable ASCII without {@code #} or {@code ,}. */
@@ -3876,19 +4327,42 @@ public final class Tempo {
         /** The link to {@code value} at {@code base}; empty for an empty value. */
         static String of(String base, String value) {
             if (value.isEmpty()) return "";
-            byte[] in = value.getBytes(StandardCharsets.US_ASCII), out = new byte[in.length + 64];
-            Deflater d = new Deflater(Deflater.BEST_COMPRESSION, true);
-            try {
-                d.setInput(in);
-                d.finish();
-                int n = 0;
-                while (!d.finished()) {
+            try (Packer p = new Packer()) {
+                p.pack(value);
+                return p.link(base);
+            }
+        }
+
+        /** Packs values with one raw DEFLATE stream at level 9, reset for each; ended on close. */
+        static final class Packer implements AutoCloseable {
+            private final Deflater deflater = new Deflater(Deflater.BEST_COMPRESSION, true);
+            private byte[] in = new byte[0], out = new byte[256];
+            private int n; // bytes in out
+
+            /** Compresses {@code value} (ASCII); returns the length of {@code #t=z.} and the payload. */
+            int pack(CharSequence value) {
+                int len = value.length();
+                if (in.length < len) in = new byte[Math.max(len, 2 * in.length)];
+                for (int i = 0; i < len; i++) in[i] = (byte) value.charAt(i);
+                deflater.reset();
+                deflater.setInput(in, 0, len);
+                deflater.finish();
+                n = 0;
+                while (!deflater.finished()) {
                     if (n == out.length) out = Arrays.copyOf(out, 2 * n);
-                    n += d.deflate(out, n, out.length - n);
+                    n += deflater.deflate(out, n, out.length - n);
                 }
+                return 5 + (4 * n + 2) / 3; // base64 without padding
+            }
+
+            /** {@code base} with the value last packed. */
+            String link(String base) {
                 return base + "#t=z." + Base64.getUrlEncoder().withoutPadding().encodeToString(Arrays.copyOf(out, n));
-            } finally {
-                d.end();
+            }
+
+            @Override
+            public void close() {
+                deflater.end();
             }
         }
     }

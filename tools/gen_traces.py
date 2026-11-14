@@ -567,9 +567,10 @@ def main(argv=None):
                     help="find: early exit cancels queued loads only; queued matches run on as stragglers")
     ap.add_argument("--max-bytes", type=int, default=3000, help="fold more until the header fits (0: no limit)")
     ap.add_argument("--format", choices=["header", "json"], default="header")
-    ap.add_argument("--link", nargs="?", const=tempo_ref.DEFAULT_BASE, metavar="BASE",
+    ap.add_argument("--link", nargs="?", const="", metavar="BASE",
                     help="print the Tempo-Link URL (FORMAT.md section 9) instead of the header value; "
-                         "BASE is the viewer URL (default %s)" % tempo_ref.DEFAULT_BASE)
+                         "BASE is the viewer URL (default $TEMPO_LINK_BASE, else in a checkout of Tempo "
+                         "its own GitHub Pages site, else %s)" % tempo_ref.DEFAULT_BASE)
     ap.add_argument("-o", "--output", help="write to this file instead of stdout")
     ap.add_argument("--samples", metavar="DIR", help="regenerate the bundled sample set into DIR")
     a = ap.parse_args(argv)
@@ -591,7 +592,7 @@ def main(argv=None):
                           saturation=a.saturation, budget=a.budget)
     if a.link is not None:
         try:
-            text = tempo_ref.encode_link(header, base=a.link) + "\n"
+            text = tempo_ref.encode_link(header, base=a.link or tempo_ref.default_base()) + "\n"
         except ValueError as e:
             ap.error(str(e))
     else:

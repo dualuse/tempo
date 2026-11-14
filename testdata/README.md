@@ -37,19 +37,28 @@ fragment wins over one in the query.
 | `truncated-count` | `e=` present but larger than the record count. |
 | `truncated-empty` | Cut inside the root record: no spans, `truncated: true`. |
 | `whitespace` | The example wrapped with CRLF, LF, spaces and a tab. |
+| `ladder` | A page render with repeated siblings (six `measure`, one failed; five `tile` handoffs on two pool threads with CPU), three levels below `layout`, attributes on every level: the source of the ladder vectors. |
+| `ladder-fold` | `ladder` at 405 bytes, ladder step 1 (FORMAT.md §7.1): `measure` and `tile` folded largest first, the failed `measure` and the slowest of each kept; an aggregate of handoffs on mixed threads with waits and CPU; `pool-1` gone from `T`. |
+| `ladder-depth` | `ladder` at 311 bytes, step 2: depths 4 and 3 dropped, counted in `x=`. |
+| `ladder-attributes` | `ladder` at 274 bytes, step 3: no attributes, their keys gone from `N`. |
+| `ladder-top` | `ladder` at 256 bytes, step 4: the root and its children. |
 | `lenient` | Non-canonical forms decoders must accept: `x=0.0`, lowercase `%2f`, leading zeros, explicit `@` equal to the parent's thread, unordered and repeated flags, a repeated attribute key, `1.50` and `-0`. |
 
 All but `lenient`, `whitespace` and the four `truncated-*` vectors are in canonical form:
 the reference encoder reproduces them byte for byte from their JSON.
+
+[`ladder.json`](ladder.json) lists the ladder vectors with the limit and the ladder step
+each one is: `tools/tempo_ref.py fit <limit>` makes it from `ladder`, and the Java test
+(`LadderTest`) renders it byte for byte from a recording of `ladder`.
 
 ### Wire-only vectors
 
 Six canonical vectors are **wire-only**: they were written for the format and describe
 traces the Java recorder cannot produce by design. Decoders and the reference encoder
 must match them like any other vector; the Java encoder's test (`GoldenTest`) records the
-closest trace it can and checks that byte for byte instead. The other six canonical
-vectors, the worked example among them, are recorded through the public API and rendered
-byte for byte.
+closest trace it can and checks that byte for byte instead. The other eleven canonical
+vectors, the worked example and the ladder vectors among them, are recorded through the
+public API and rendered byte for byte.
 
 | Vector | Why the recorder cannot produce it |
 |---|---|

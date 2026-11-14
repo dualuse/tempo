@@ -1,0 +1,23 @@
+{
+  "v": 1,
+  "unit": "us",
+  "wall": 1794567890123,
+  "folded": 8,
+  "dropped": 10,
+  "threads": ["http-1", "pool-2"],
+  "live": [],
+  "truncated": false,
+  "spans": [
+    {"id":0,"parent":-1,"name":"GET /render","start":0,"dur":52500,"thread":0},
+    {"id":1,"parent":0,"name":"parse","start":100,"dur":2000,"thread":0,"attrs":{"bytes":5120}},
+    {"id":2,"parent":0,"name":"layout","start":2200,"dur":28000,"thread":0},
+    {"id":3,"parent":2,"name":"measure","start":2300,"dur":1780,"thread":0,"agg":{"count":4,"min":400,"max":500,"extent":5430,"maxAt":3000}},
+    {"id":4,"parent":2,"name":"measure","start":4300,"dur":900,"thread":0},
+    {"id":5,"parent":2,"name":"measure","start":6300,"dur":420,"thread":0,"flags":"f"},
+    {"id":6,"parent":2,"name":"flow","start":9000,"dur":20000,"thread":0},
+    {"id":7,"parent":0,"name":"tile","start":30300,"dur":11300,"thread":-1,"cpu":9200,"agg":{"count":4,"min":2300,"max":3200,"extent":9500,"maxAt":100,"waitSum":13750,"waitMax":6500}},
+    {"id":8,"parent":0,"name":"tile","start":30350,"dur":4100,"thread":1,"wait":150,"cpu":3700,"attrs":{"queued":1}},
+    {"id":9,"parent":8,"name":"raster","start":30600,"dur":3900,"thread":1},
+    {"id":10,"parent":0,"name":"encode","start":50000,"dur":2000,"thread":0,"attrs":{"ratio":0.42}}
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "source": "ladder",
+  "steps": [
+    {"vector": "ladder-fold", "maxBytes": 405, "step": 1},
+    {"vector": "ladder-depth", "maxBytes": 311, "step": 2},
+    {"vector": "ladder-attributes", "maxBytes": 274, "step": 3},
+    {"vector": "ladder-top", "maxBytes": 256, "step": 4}
+  ]
+}

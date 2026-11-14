@@ -69,7 +69,7 @@ class GoldenTest {
             names = files.map(p -> p.getFileName().toString()).filter(f -> f.endsWith(".header"))
                     .map(f -> f.substring(0, f.length() - ".header".length())).sorted().collect(Collectors.toList());
         }
-        assertEquals(18, names.size(), "golden vectors");
+        assertEquals(23, names.size(), "golden vectors");
         return names.stream().map(n -> DynamicTest.dynamicTest(n, () -> {
             Object want = Json.parse(read("golden/" + n + ".json"));
             Map<String, Object> got = WireDecoder.decode(read("golden/" + n + ".header"));
@@ -152,6 +152,20 @@ class GoldenTest {
             }
         }
 
+        /**
+         * {@link Trace#toHeader()} on thread 0 at {@code us}; the trace's {@link Trace#toLink(String)} decodes
+         * to the same value.
+         */
+        String render(long us, Trace t) {
+            String[] r = on(0, us, () -> new String[] {t.toHeader(), t.toLink(Tempo.Link.DEFAULT_LINK_BASE)});
+            try {
+                assertEquals(r[0], LinkTest.unpack(r[1], Tempo.Link.DEFAULT_LINK_BASE));
+            } catch (java.util.zip.DataFormatException e) {
+                throw new AssertionError(r[1], e);
+            }
+            return r[0];
+        }
+
         void run(int thread, long us, Runnable step) {
             on(thread, us, () -> {
                 step.run();
@@ -178,7 +192,7 @@ class GoldenTest {
         try (Script s = new Script("single-root")) {
             Trace t = s.on(0, 0, () -> Tempo.start(SEARCH, s.options()));
             s.run(0, 1500, t::close);
-            assertHeader("single-root", golden("single-root"), s.on(0, 1500, t::toHeader));
+            assertHeader("single-root", golden("single-root"), s.render(1500, t));
         }
     }
 
@@ -197,7 +211,7 @@ class GoldenTest {
                     .set(threshold, 0.000001).set(mean, 123456.789).set(skew, -3.141593).set(INDEX, 3));
             s.run(0, 9200, rerank::close);
             s.run(0, 10000, t::close);
-            assertHeader("attributes", golden("attributes"), s.on(0, 10000, t::toHeader));
+            assertHeader("attributes", golden("attributes"), s.render(10000, t));
         }
     }
 
@@ -234,7 +248,7 @@ class GoldenTest {
             s.cpu(2950).run(1, 37207, m2::close);
             s.run(0, 39100, rerank::close);
             s.cpu(-1).run(0, 40000, t::close);
-            assertHeader("handoff", golden("handoff"), s.on(0, 40000, t::toHeader));
+            assertHeader("handoff", golden("handoff"), s.render(40000, t));
         }
     }
 
@@ -260,7 +274,7 @@ class GoldenTest {
             Span encode = s.on(0, 28100, () -> t.root().span(ENCODE));
             s.run(0, 29600, encode::close);
             s.run(0, 30000, t::close);
-            assertHeader("handoff-not-run", golden("handoff-not-run"), s.on(0, 30000, t::toHeader));
+            assertHeader("handoff-not-run", golden("handoff-not-run"), s.render(30000, t));
         }
     }
 
@@ -290,7 +304,7 @@ class GoldenTest {
                 s.run(0, 3400 + 100 * i, x::close);
             }
             s.run(0, 9000, t::close);
-            assertHeader("names", closest, s.on(0, 9000, t::toHeader));
+            assertHeader("names", closest, s.render(9000, t));
         }
     }
 
@@ -331,7 +345,7 @@ class GoldenTest {
             s.run(0, 48400, match::close);
             s.run(0, 49200, index::close);
             s.run(0, 50000, t::close);
-            assertHeader("threads", closest, s.on(0, 50000, t::toHeader));
+            assertHeader("threads", closest, s.render(50000, t));
         }
     }
 
@@ -374,7 +388,7 @@ class GoldenTest {
             s.run(0, 87910, deflate::close);
             s.run(0, 88000, encode::close);
             s.run(0, 90000, t::close);
-            assertHeader("deep-nesting", closest, s.on(0, 90000, t::toHeader));
+            assertHeader("deep-nesting", closest, s.render(90000, t));
         }
     }
 
@@ -403,7 +417,7 @@ class GoldenTest {
             Handoff h = s.on(0, 14300, () -> root.handoff(LOAD));
             Span load = s.on(1, 14360, h::begin);
             s.run(0, 14400, () -> root.span(JOIN).waiting());
-            assertHeader("failed-open", closest, s.on(0, 61000, t::toHeader));
+            assertHeader("failed-open", closest, s.render(61000, t));
             s.run(1, 61000, load::close);
             s.run(0, 61000, t::close);
         }
@@ -440,7 +454,7 @@ class GoldenTest {
             Span w4 = s.on(3, 3500, l2::begin);
             s.run(0, 74100, rerank::close);
             s.run(0, 75000, t::close);
-            assertHeader("live-and-folded", closest, s.on(0, 75050, t::toHeader));
+            assertHeader("live-and-folded", closest, s.render(75050, t));
             s.run(1, 75050, w1::close);
             s.run(2, 75050, w2::close);
             s.run(3, 75050, w4::close);
@@ -503,7 +517,7 @@ class GoldenTest {
             Span encode = s.on(0, 191000, () -> t.root().span(ENCODE));
             s.run(0, 199000, encode::close);
             s.run(0, 200000, t::close);
-            assertHeader("aggregates", closest, s.on(0, 200000, t::toHeader));
+            assertHeader("aggregates", closest, s.render(200000, t));
         }
     }
 
@@ -567,12 +581,12 @@ class GoldenTest {
             Span encode = s.on(0, 182100, () -> root.span(ENCODE));
             s.run(0, 184100, encode::close);
             s.run(0, 184200, t::close);
-            assertHeader("search-example", golden("search-example"), s.on(0, 184200, t::toHeader));
+            assertHeader("search-example", golden("search-example"), s.render(184200, t));
             assertEquals(415, golden("search-example").length());
         }
     }
 
-    /** The fallback: below 256 bytes, and when the root with its children does not fit either. */
+    /** The fallback: below 256 bytes there is no ladder. */
     @Test
     void fallback() {
         try (Script s = new Script("fallback")) {
@@ -582,12 +596,14 @@ class GoldenTest {
                 s.run(0, 600 + 1000 * i, x::close);
             }
             s.run(0, 207126, t::close);
-            assertHeader("fallback", golden("fallback"), s.on(0, 207126, t::toHeader));
+            assertHeader("fallback", golden("fallback"), s.render(207126, t));
             Tempo.Snapshot snap = t.snapshot();
             String full = Tempo.Header.of(snap, 1 << 16);
             assertEquals(939, full.length());
             assertEquals(full, Tempo.Header.of(snap, 939));
-            assertEquals(golden("fallback"), Tempo.Header.of(snap, 938)); // the root and its 100 children need 939
+            // one byte less, and the 100 children fold: 99 into an aggregate beside the first (the slowest of equals)
+            assertEquals("v1;x=2r.0;T=%3F;N=search:load;S=00.0.4fti/11.2s.dw/11.rs.1270+2r.dw.dw.2404.0;e=3", Tempo.Header.of(snap, 938));
+            assertEquals(golden("fallback"), Tempo.Header.of(snap, 255));
             assertEquals(golden("fallback"), Tempo.Header.of(snap, 0));
         }
     }

@@ -1,0 +1,18 @@
+{
+  "v": 1,
+  "unit": "us",
+  "wall": 1794567890123,
+  "folded": 4,
+  "dropped": 18,
+  "threads": ["http-1", "pool-2"],
+  "live": [],
+  "truncated": false,
+  "spans": [
+    {"id":0,"parent":-1,"name":"GET /render","start":0,"dur":52500,"thread":0},
+    {"id":1,"parent":0,"name":"parse","start":100,"dur":2000,"thread":0},
+    {"id":2,"parent":0,"name":"layout","start":2200,"dur":28000,"thread":0},
+    {"id":3,"parent":0,"name":"tile","start":30300,"dur":11300,"thread":-1,"cpu":9200,"agg":{"count":4,"min":2300,"max":3200,"extent":9500,"maxAt":100,"waitSum":13750,"waitMax":6500}},
+    {"id":4,"parent":0,"name":"tile","start":30350,"dur":4100,"thread":1,"wait":150,"cpu":3700},
+    {"id":5,"parent":0,"name":"encode","start":50000,"dur":2000,"thread":0}
+  ]
+}

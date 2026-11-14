@@ -203,10 +203,11 @@ class HeaderTest {
 
     /**
      * Wire depth adds up along handoffs, so it can pass 35 although each lane stops at 34: the records
-     * below depth 35 are left out with their subtrees and counted as dropped.
+     * below depth 35 fold into their depth-35 ancestor, which stands for its subtree; they are left out
+     * and counted as dropped.
      */
     @Test
-    void recordsDeeperThan35AreDropped() throws InterruptedException {
+    void recordsDeeperThan35FoldIntoTheirDepth35Ancestor() throws InterruptedException {
         Trace t = Tempo.start(SEARCH, opts());
         Span s = t.root();
         for (int d = 1; d < 34; d++) s = s.span(LOAD);
@@ -222,36 +223,45 @@ class HeaderTest {
         t.close();
         Map<String, Object> got = WireDecoder.decode(t.toHeader());
         assertEquals(3L, got.get("dropped"));
-        assertEquals(36, ((List<?>) got.get("spans")).size());
+        List<?> spans = (List<?>) got.get("spans");
+        assertEquals(36, spans.size());
+        assertEquals("decode", ((Map<?, ?>) spans.get(35)).get("name")); // depth 35, without its children
+        assertEquals(34L, ((Map<?, ?>) spans.get(35)).get("parent"));
         assertEquals(List.of(Thread.currentThread().getName(), "worker"), got.get("threads"));
     }
 
-    /** Over the limit only the root and its children remain, with the threads and names they use and no attributes. */
+    /**
+     * Over the limit the ladder folds first: the 40 same-name children of decode become an aggregate of 39
+     * beside the slowest, which fits 256 bytes here (LadderTest takes the later steps). The expected value
+     * is what {@code tools/tempo_ref.py fit} makes of the whole one.
+     */
     @Test
-    void overTheLimitTheRootAndItsChildrenRemain() throws InterruptedException {
-        Trace t = Tempo.start(SEARCH, opts().headerBytes(300));
-        Span root = t.root().set(BYTES, 7);
-        clock.add(1000);
-        Span d = root.span(DECODE).set(SCORE, 0.5);
-        for (int i = 0; i < 40; i++) {
-            clock.add(1000);
-            d.span(LOAD).close();
-        }
-        d.close();
-        Handoff h = root.handoff(MATCH);
-        assertNull(TempoTest.onThread("worker", () -> {
-            clock.add(500);
-            try (Span m = h.begin()) {
-                clock.add(1000);
-                m.span(SCORE).fail().close();
+    void overTheLimitTheLadderFoldsFirst() {
+        try (GoldenTest.Script s = new GoldenTest.Script(1794567890123L, "http-1", "worker")) {
+            Trace t = s.on(0, 0, () -> Tempo.start(SEARCH, s.options()));
+            Span root = s.on(0, 0, () -> t.root().set(BYTES, 7));
+            Span d = s.on(0, 1000, () -> root.span(DECODE).set(SCORE, 0.5));
+            for (int i = 0; i < 40; i++) {
+                Span l = s.on(0, 1100 + 100 * i, () -> d.span(LOAD));
+                s.run(0, 1150 + 100 * i + (i == 7 ? 20 : 0), l::close);
             }
-        }));
-        clock.add(10_000);
-        t.close();
-        String main = name(Thread.currentThread().getName());
-        assertEquals("v1;w=mwevdy2z;x=0.15;T=" + main + ":worker;N=search:decode:match;S=00.0.1g/11.1.14/12.14.1@1~0;e=3",
-                t.toHeader()); // 41 records left out
-        assertEquals(44, ((List<?>) WireDecoder.decode(Tempo.Header.of(t.snapshot(), 1 << 16)).get("spans")).size());
+            s.run(0, 6000, d::close);
+            Handoff h = s.on(0, 6000, () -> root.handoff(MATCH));
+            Span m = s.on(1, 6500, h::begin);
+            Span x = s.on(1, 6600, () -> m.span(SCORE).fail());
+            Span y = s.on(1, 6700, () -> x.span(RATIO));
+            s.run(1, 6800, y::close);
+            s.run(1, 7000, x::close);
+            s.run(1, 7500, m::close);
+            s.run(0, 8000, t::close);
+            Snapshot snap = s.on(0, 8000, t::snapshot);
+            assertEquals(45, ((List<?>) WireDecoder.decode(snap.toHeader(1 << 16)).get("spans")).size());
+            String folded = "v1;w=mwevdy2z;x=13.0;T=http-1:worker;N=search:decode:load:match:score:ratio:bytes;"
+                    + "S=00.0.668:6=7/11.rs.3uw:4=0.5/22.2s.1i6+13.1e.1e.31q.0/22.jg.1y/13.3uw.rs@1~dw/24.go.b4^f/35.2s.2s;e=7";
+            assertEquals(folded, snap.toHeader(500)); // 39 loads of 50 µs folded, the one of 70 µs kept
+            assertEquals(folded, snap.toHeader(256));
+            assertEquals("v1;x=0.18;T=%3F;N=%3F;S=00.0.668;e=1", snap.toHeader(255)); // 44 spans; no ladder below 256 bytes
+        }
     }
 
     /** An aggregate nested in another one is left out: its spans count as dropped and no longer as folded. */
@@ -278,16 +288,16 @@ class HeaderTest {
         assertEquals(List.of(3), aggregates(h));
     }
 
-    /** At ladder step 4 an aggregate below depth 1 is left out with the spans: folded drops to 0. */
+    /** At ladder step 4 an aggregate at depth 2 is left out with the spans: folded drops to 0. */
     @Test
     void aggregateLeftOutAtTheLastLadderStepCountsAsDroppedOnly() {
         Trace t = Tempo.start(SEARCH, opts().level(Tempo.DETAIL).budget(0).cpu(false).headerBytes(256));
         Span root = t.root();
         clock.add(1000);
         try (Span d = root.span(DECODE)) {
-            for (int i = 0; i < 40; i++) {
+            for (int i = 0; i < 40; i++) { // names of their own, so that nothing folds
                 clock.add(1000);
-                d.span(LOAD).close();
+                d.span(Tempo.name("load-" + i)).close();
             }
             for (int i = 0; i < 10; i++) {
                 clock.add(1000);
@@ -406,6 +416,31 @@ class HeaderTest {
     }
 
     private void roundTrip(SplittableRandom rnd, int round, Map<String, Integer> seen) {
+        Set<Long> inline = new HashSet<>(); // handoff rows begun as caller-runs, judged when they began
+        Snapshot snap = randomSnapshot(rnd, round, inline);
+        String header = snap.toHeader();
+        Map<String, Object> want = expected(snap, inline), got = WireDecoder.decode(header);
+        assertTrue(Json.same(want, got), () -> "round " + round + ": " + header + "\ngot:  " + Json.show(got)
+                + "\nwant: " + Json.show(want));
+        for (int limit : new int[] {256, 300, 256 + rnd.nextInt(Math.max(1, header.length() - 254)), header.length() - 1,
+                header.length()}) {
+            String h = Tempo.Header.of(snap, limit);
+            assertTrue(h.length() <= limit || limit < 256, () -> limit + ": " + h);
+            assertFalse((Boolean) WireDecoder.decode(h).get("truncated"));
+            if (limit >= header.length()) assertEquals(header, h);
+        }
+        for (int c = 0; c < 20; c++) assertCut(header, rnd.nextInt(header.length() + 1));
+        count(got, seen);
+        seen.merge("inline", inline.size(), Integer::sum);
+    }
+
+    /**
+     * A random recording on four threads (spans, detail and deep spans over a small budget, phases, laps,
+     * attributes, flags, CPU, handoffs begun elsewhere, inline, cancelled or never) on a clock moving in
+     * odd nanoseconds, taken closed or while open, then closed and released. {@code inline} receives the
+     * handoffs ({@code lane << 32 | row}) begun as caller-runs.
+     */
+    static Snapshot randomSnapshot(SplittableRandom rnd, int round, Set<Long> inline) {
         try (GoldenTest.Script s = new GoldenTest.Script(1794567890123L + round, "http-1", "cpu 1", "cpu-2", "io_1")) {
             Options o = s.options().level(rnd.nextInt(3)).budget(rnd.nextInt(10)).cpu(rnd.nextBoolean());
             Trace t = s.at(0, () -> Tempo.start(SEARCH, o));
@@ -413,7 +448,6 @@ class HeaderTest {
             for (int i = 0; i < 4; i++) stacks.add(new ArrayList<>());
             stacks.get(0).add(t.root());
             List<Handoff> pending = new ArrayList<>();
-            Set<Long> inline = new HashSet<>(); // handoff rows begun as caller-runs, judged when they began
             long[] cpu = {0};
             for (int step = 0, steps = rnd.nextInt(10, 400); step < steps; step++) {
                 s.clock.add(rnd.nextInt(4) == 0 ? 0 : rnd.nextInt(1, 5000));
@@ -487,25 +521,12 @@ class HeaderTest {
             boolean open = rnd.nextInt(4) == 0;
             if (!open) close(s, stacks, t);
             Snapshot snap = s.at(0, t::snapshot);
-            String header = snap.toHeader();
-            Map<String, Object> want = expected(snap, inline), got = WireDecoder.decode(header);
-            assertTrue(Json.same(want, got), () -> "round " + round + ": " + header + "\ngot:  " + Json.show(got)
-                    + "\nwant: " + Json.show(want));
-
-            for (int limit : new int[] {256, 300, 256 + rnd.nextInt(Math.max(1, header.length() - 254)), header.length()}) {
-                String h = Tempo.Header.of(snap, limit);
-                assertTrue(h.length() <= limit, () -> limit + ": " + h);
-                assertFalse((Boolean) WireDecoder.decode(h).get("truncated"));
-                if (limit >= header.length()) assertEquals(header, h);
-            }
-            for (int c = 0; c < 20; c++) assertCut(header, rnd.nextInt(header.length() + 1));
             if (open) close(s, stacks, t);
             s.at(0, () -> {
                 t.release();
                 return null;
             });
-            count(got, seen);
-            seen.merge("inline", inline.size(), Integer::sum);
+            return snap;
         }
     }
 

@@ -338,6 +338,21 @@ public class TempoBenchmark {
         return s.snapshot.toHeader();
     }
 
+    /**
+     * The same value under 1,000 bytes: the encoder, then the ladder of FORMAT.md §7.1, whose first fold
+     * (the root's 30 children, the largest group) fits. Reported, not gated.
+     */
+    @Benchmark
+    public String snapshotToHeaderLadder(Rendered s) {
+        return s.snapshot.toHeader(1000);
+    }
+
+    /** A Tempo-Link of at most 1,000 bytes: the ladder, each step compressed until the link fits. Reported, not gated. */
+    @Benchmark
+    public String snapshotToLinkLadder(Rendered s) {
+        return s.snapshot.toLink("https://dualuse.github.io/tempo/", 1000);
+    }
+
     @Benchmark
     public void traceLifecycle() {
         Tempo.Trace t = Tempo.start(ROOT, UNBUDGETED);

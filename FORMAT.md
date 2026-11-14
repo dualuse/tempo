@@ -159,7 +159,8 @@ record is a first child, because entering a parent resets the cursor of the leve
 
 A tree deeper than 35 cannot be written. Wire depth adds up along handoff chains, so it
 can exceed what a single thread records; an encoder folds records deeper than 35 into
-their depth-35 ancestor and counts them in `x=dropped`.
+their depth-35 ancestor: the ancestor's record stands for its whole subtree, and the
+records below it are left out and counted in `x=dropped` (an aggregate by its count).
 
 ## 6. Decoding
 
@@ -313,28 +314,52 @@ or repeated (they normalise to the canonical order), and repeated attribute keys
 
 ### 7.1 Byte budget
 
-A header must fit a size limit (`headerBytes`). The renderer encodes once and, while the
-value is too long, walks this ladder, re-encoding after each step, stopping at the first
-that fits:
+A header must fit a size limit (`headerBytes`). A value within the limit is written as it
+is, whatever the limit, also below 256. A value over a limit of 256 or more goes down this
+**ladder**, which works on the records as a decoder reads them (absolute starts, threads
+and names by their index in `T` and `N`). The encoder re-encodes after every change and
+stops at the first value that fits:
 
-1. Fold same-name siblings under one parent into an aggregate, largest group first,
-   keeping failed spans and the slowest occurrence individually (counted in `x=folded`).
-2. Drop the deepest level, repeatedly (counted in `x=dropped`).
-3. Drop attributes.
-4. Keep only the root and its direct children, with `T` and `N` reduced to what those
-   records use.
+1. **Fold same-name siblings.** A group is the children of one parent with one name that
+   are either all handoffs (a record with `~`, an aggregate with `~sum.max`) or all not.
+   In a group the failed single records (`^f`) and the slowest single record (the largest
+   `dur`, the first of equals) stay as they are; the others, single records and
+   aggregates alike, fold into one aggregate when they are two or more. Groups fold one
+   at a time, the most records to fold first, ties by the position of the group's first
+   record, with a re-encode after each.
+2. **Drop the deepest level**, one level at a time, while it is 3 or deeper.
+3. **Drop the attributes** of every record.
+4. **Drop depth 2**: the root and its direct children remain.
 
-The ladder applies only to a value that does not fit: a value within `headerBytes` is
-written as it is, whatever the limit, also below 256. The value is never cut mid-record,
-and `length <= headerBytes` holds for every `headerBytes >= 256`. When the value does not
-fit and the limit is below 256, or step 4 still does not fit, the value is the
-**fallback**, which under a limit below 256 may itself be longer than the limit:
+The aggregate of step 1 takes the place and start of the first record it folds and has no
+attributes. Its fields follow §6.6 over the folded records, a single record being one
+occurrence of its `dur` that ends at `start + wait + dur`: count, sum, min, max, extent
+(to the last end), maxAt (the slowest occurrence, the first of equals), `~sum.max` for
+handoffs, `*` the sum of the CPU times present (absent if none is), the common thread or
+`@_`, and the flags every folded record has. Their subtrees are dropped.
+
+`T` and `N` list only what the remaining records use, in canonical order (`T` keeps the
+order of the whole value), and `l` the live threads that remain. Each single record folded
+adds 1 to `x=folded`. A record dropped adds 1, an aggregate its count, to `x=dropped`, and
+an aggregate dropped takes its count off `x=folded` (not below 0).
+
+`length <= headerBytes` holds for every `headerBytes >= 256`, and the value is never cut
+mid-record. Under a limit below 256, or when step 4 still does not fit, the value is the
+**fallback**, which below 256 may itself be longer than the limit:
 
 ```
 v1;x=0.<n>;T=%3F;N=%3F;S=00.0.<dur>;e=1
 ```
 
-with `<n>` the number of spans not written and `<dur>` the root duration, both base 36.
+with `<dur>` the root duration and `<n>` the spans not written: the whole value's folded
+and dropped counts plus its records that are neither the root nor aggregates, both base 36.
+
+`tools/tempo_ref.py fit N` is the reference for the ladder. The `ladder` vector and the
+vectors listed in `testdata/ladder.json` pin one value at each step.
+
+**A limit shared with other headers.** A service that limits its timing headers together
+(`Tempo-Timing`, `Server-Timing` and a legacy text header, say) renders the others first
+and passes what is left as the limit; in the Java library that is `toHeader(int maxBytes)`.
 
 ## 8. JSON form
 
@@ -514,6 +539,12 @@ The link adds the base and `#t=` (28 characters with the default base). Small va
 do not compress: on the golden vectors, values of 27–415 characters give `z.` payloads
 from 1 % shorter to 52 % longer; a deep but repetitive one (785) gives 0.60.
 
+An encoder MAY instead limit the whole link, base included: it applies the ladder of §7.1
+to the value until the link fits, and guarantees the limit whenever it leaves at least 256
+bytes besides the base (`toLink(base, maxBytes)` in the Java library). DEFLATE
+implementations differ in their output, so which step such a link stops at is not part of
+the canonical form; the value it carries is always one the ladder tries.
+
 A response with both headers carries the trace twice, about 1.7–1.8 times the value
 plus the base. A service with a limit on the total header size budgets both or sends
 one. Browsers take URLs far longer than these; terminals, chat tools and log
@@ -595,14 +626,15 @@ The full decoded JSON is `testdata/golden/search-example.json`.
 testdata/golden/NAME.header   one header value (may contain whitespace if that is the point)
 testdata/golden/NAME.json     the expected JSON form
 testdata/golden/NAME.link     the value as a Tempo-Link (canonical vectors; zlib level 9)
+testdata/ladder.json          for the ladder vectors: the limit and step of each (§7.1)
 testdata/invalid/NAME.header  values that must be rejected; README.md lists the code per file
 testdata/invalid/NAME.link    links that must be rejected; listed in the same README
 ```
 
 `python3 tests/run_golden.py` decodes every golden vector and compares it with its JSON,
 round-trips each JSON through the encoder, checks that canonical vectors re-encode byte
-for byte, checks every invalid vector's error code, and validates the synthetic traces in
-`samples/`. For links it checks that every `.link` yields its vector's value, and that
+for byte, checks every invalid vector's error code, checks the ladder vectors and the
+length guarantee of §7.1, and validates the synthetic traces in `samples/`. For links it checks that every `.link` yields its vector's value, and that
 the value re-packed at other DEFLATE levels, in the plain form, in the query string,
 padded or wrapped yields it too. Other implementations SHOULD run the same checks:
 decode equality for every golden vector and link, and the listed error code for every

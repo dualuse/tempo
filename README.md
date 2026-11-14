@@ -57,14 +57,33 @@ t.release();                                    // optional: buffers go back to 
   the whole tree; `printOnClose(out, label)` prints the `Runtime` line when the trace closes.
   `toHeader()` gives the `Tempo-Timing` value and `toLink()` the `Tempo-Link` URL.
   `snapshot()` keeps a copy that stays readable after `release()`.
-- **Link base:** `toLink()` points at the viewer the jar was built for: the GitHub Pages site of the
-  repository it was built in (`https://<owner>.github.io/<repo>/`, from `GITHUB_REPOSITORY` in
-  GitHub Actions); any other build uses `https://dualuse.github.io/tempo/`. The viewer only
-  gets there when Pages is on: the `Pages` workflow deploys `site/` on every push to the default
-  branch, so a fork turns on Pages (Settings → Pages, Source: GitHub Actions) and pushes or runs
-  that workflow, or its links point at a page that does not exist. Without Pages,
-  `-Dtempo.linkBase=URL` sets the base for a JVM and `Options.linkBase(url)` for one trace, for
-  instance the upstream viewer or a self-hosted copy of `site/index.html`.
+- **Size limits:** `toHeader()` keeps to `Options.headerBytes` (3000 by default), and
+  `toHeader(maxBytes)` to a limit per call. A trace that does not fit is folded down the ladder
+  of [FORMAT.md §7.1](FORMAT.md): repeated siblings into aggregates (failed ones and the slowest
+  kept), then the deepest levels, then attributes, then everything below the root's children;
+  what is left out is counted in `x=`. When the timing headers share one limit, render the
+  others first and pass what is left:
+
+  ```java
+  String runtime = t.toRuntime(3), timing = t.toServerTiming();
+  int left = 3000 - runtime.length() - timing.length();  // minus the header names if the limit counts them
+  String detail = t.toHeader(left);                        // or t.toLink(null, left) for a Tempo-Link
+  ```
+
+  `toLink(base, maxBytes)` keeps the whole URL within `maxBytes`, folding the value until the
+  compressed link fits.
+- **Link base — forks get their own viewer URL automatically:** `toLink()` points at the viewer
+  the jar was built for. The build bakes it into the jar (`io/github/dualuse/tempo/link-base.txt`
+  and the manifest attribute `Tempo-Link-Base`), from the first of: `-PlinkBase=URL`;
+  `GITHUB_REPOSITORY` (`owner/repo`, which GitHub Actions always sets, so CI and release builds
+  of a fork link to `https://<owner>.github.io/<repo>/`); the git remote `origin` on github.com,
+  for local builds of a clone; else `https://dualuse.github.io/tempo/`, which is also what a copy
+  of `Tempo.java` built into another project uses. The viewer is only there when Pages is on:
+  the `Pages` workflow deploys `site/` on every push to the default branch, so a fork turns on
+  Pages (Settings → Pages, Source: GitHub Actions) and pushes or runs that workflow, or its links
+  point at a page that does not exist. At run time `-Dtempo.linkBase=URL` sets the base for a
+  JVM, `Options.linkBase(url)` for one trace and `toLink(base)` for one link, for instance the
+  upstream viewer or a self-hosted copy of `site/index.html`.
 
 ## Command-line viewer: `tools/tempo`
 
@@ -148,8 +167,10 @@ time is duration minus CPU time, where CPU was measured.
 Python's `webbrowser` module, that is, in the local browser. With `--diff` (or an
 input link with `&c=`) the link holds both traces; with `--tree`, `--agg`, `--pools`, `--critical` or `--diff` it opens
 on that tab. `--base URL` (or `$TEMPO_LINK_BASE`) points `--to link` and `--open` at
-another copy of the viewer, such as a self-hosted one or a fork's; the default is
-`https://dualuse.github.io/tempo/` (the CLI is not built, so a fork sets `TEMPO_LINK_BASE`). The trace travels in the URL fragment, which the browser
+another copy of the viewer, such as a self-hosted one. Otherwise, run from a checkout of
+Tempo, the CLI takes the GitHub Pages site of the checkout's remote `origin`, as the library
+build does, so a fork's clone opens the fork's viewer; elsewhere the default is
+`https://dualuse.github.io/tempo/`. The trace travels in the URL fragment, which the browser
 keeps to itself: nothing is uploaded, and the CLI sends nothing anywhere. The link
 does end up in the browser history.
 
@@ -201,7 +222,9 @@ output change, rerun with `TEMPO_UPDATE_SNAPSHOTS=1` and review the diff) and
 ./gradlew jmh -Pjmh.args="Tempo -f 1 -prof gc"   # explicit JMH command line
 ./gradlew jmhGate                                # the allocation gate CI runs
 ./gradlew jcstress                               # concurrency tests (jcstress, quick mode)
+./gradlew jar                                    # the jar; its Tempo-Link base follows the git remote origin
 GITHUB_REPOSITORY=owner/repo ./gradlew jar       # a jar whose Tempo-Link base is https://owner.github.io/repo/
+./gradlew jar -PlinkBase=https://host/tempo/     # a jar linking to a viewer of your own
 ```
 
 Gradle itself needs JDK 17 or newer; the library is compiled with `--release 11`.

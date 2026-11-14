@@ -18,6 +18,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 import textwrap
 import webbrowser
@@ -391,6 +392,48 @@ def encode(doc):
 DEFAULT_BASE = "https://dualuse.github.io/tempo/"
 B64URL_RE = re.compile(r"^[A-Za-z0-9_-]*$")
 MAX_INFLATED = 16 * 1024 * 1024
+
+
+def pages_of(repository):
+    """The GitHub Pages site of owner/repo (owner lower-cased; owner.github.io is the site root), or None."""
+    m = re.match(r"^([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)$", (repository or "").strip())
+    if not m:
+        return None
+    owner, repo = m.group(1).lower(), m.group(2)
+    return "https://%s.github.io/" % owner + ("" if repo.lower() == owner + ".github.io" else repo + "/")
+
+
+def repository_of_remote(url):
+    """owner/repo of a github.com remote URL (https, ssh or scp-like, with or without .git), or None."""
+    m = re.match(r"^(?:(?:https?|ssh|git)://(?:[^@/]+@)?github\.com(?::\d+)?/|(?:[^@/]+@)?github\.com:)"
+                 r"([A-Za-z0-9-]+)/([A-Za-z0-9._-]+?)(?:\.git)?/?$", (url or "").strip())
+    return m.group(1) + "/" + m.group(2) if m else None
+
+
+_CHECKOUT = []
+
+
+def checkout_base():
+    """When this file runs from a checkout of Tempo (tools/ beside site/index.html), the GitHub Pages site of
+    its git remote origin, as the library build derives it; else None. A fork's checkout opens the fork's viewer."""
+    if not _CHECKOUT:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        url = None
+        if os.path.isfile(os.path.join(root, "site", "index.html")) and os.path.exists(os.path.join(root, ".git")):
+            try:
+                url = subprocess.run(["git", "-C", root, "config", "--get", "remote.origin.url"], stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, universal_newlines=True, timeout=5).stdout
+            except (OSError, subprocess.SubprocessError):
+                url = None
+        _CHECKOUT.append(pages_of(repository_of_remote(url)))
+    return _CHECKOUT[0]
+
+
+def default_base(env=None):
+    """The viewer links point at: $TEMPO_LINK_BASE, else the checkout's own Pages site, else DEFAULT_BASE."""
+    env = os.environ if env is None else env
+    return env.get("TEMPO_LINK_BASE") or checkout_base() or DEFAULT_BASE
+
 
 
 def pack_value(value, level=9):
@@ -2460,8 +2503,9 @@ web viewer (Tempo Timeline):
   --open                             open the trace in the browser; with --diff,
                                      both traces; with --tree, --agg, --pools,
                                      --critical or --diff, on that tab
-  --base URL                         another viewer copy (default $TEMPO_LINK_BASE
-                                     or https://dualuse.github.io/tempo/)
+  --base URL                         another viewer copy (default $TEMPO_LINK_BASE,
+                                     else in a checkout of Tempo its own GitHub
+                                     Pages site, else https://dualuse.github.io/tempo/)
   The trace travels in the #fragment, which the browser never sends to the
   server; --open only starts the local browser. Nothing else is sent anywhere.
 
@@ -2519,8 +2563,8 @@ def build_parser():
                    help="open the trace in the web viewer (the local browser; the trace stays "
                         "in the link fragment)")
     w.add_argument("--base", metavar="URL",
-                   help="viewer URL for --to link and --open (default: $TEMPO_LINK_BASE or %s)"
-                        % DEFAULT_BASE)
+                   help="viewer URL for --to link and --open (default: $TEMPO_LINK_BASE, else in a checkout "
+                        "of Tempo its own GitHub Pages site, else %s)" % DEFAULT_BASE)
     o = ap.add_argument_group("layout")
     o.add_argument("--width", type=int, metavar="N",
                    help="output width (default: terminal; at least %d)" % MIN_WIDTH)
@@ -2598,7 +2642,8 @@ def run(argv, stdin=None, stdout=None, stderr=None, env=None, isatty=None):
         err("--open cannot be combined with --to, --check or --stats")
         return 2
     try:
-        base = check_base(args.base if args.base is not None else env.get("TEMPO_LINK_BASE") or DEFAULT_BASE)
+        links = args.open or args.to == "link"   # the checkout's git remote is only asked when a link is written
+        base = check_base(args.base if args.base is not None else default_base(env)) if links or args.base else None
     except ValueError as e:
         err(str(e))
         return 2

@@ -1,3 +1,6 @@
+import java.io.ByteArrayOutputStream
+import javax.inject.Inject
+
 plugins {
     `java-library`
 }
@@ -36,20 +39,67 @@ dependencies {
     jcstressAnnotationProcessor("org.openjdk.jcstress:jcstress-core:0.16")
 }
 
-// The Tempo-Link base baked into the jar (Tempo.Link): the GitHub Pages site of the repository the build
-// runs in, from GITHUB_REPOSITORY=owner/repo as GitHub Actions sets it, so a fork's jar links to the fork's
-// viewer (.github/workflows/pages.yml deploys it there once Pages is on); the upstream viewer elsewhere. Options.linkBase and -Dtempo.linkBase override it at run time.
+// The Tempo-Link base baked into the jar (Tempo.Link), so a fork's jar links to the fork's viewer
+// (.github/workflows/pages.yml deploys it there once Pages is on). First of:
+//   -PlinkBase=URL                  any viewer, e.g. a copy hosted inside a company
+//   GITHUB_REPOSITORY=owner/repo    as GitHub Actions sets it: https://<owner>.github.io/<repo>/
+//   git remote origin on github.com the same, for builds outside GitHub Actions
+//   https://dualuse.github.io/tempo/
+// Options.linkBase and -Dtempo.linkBase override it at run time; a copy of Tempo.java without the
+// resource uses the same literal (Tempo.Link.DEFAULT_LINK_BASE).
 val upstreamLinkBase = "https://dualuse.github.io/tempo/"
 
-fun linkBaseOf(repository: String?): String {
-    val m = Regex("([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)").matchEntire(repository?.trim() ?: "") ?: return upstreamLinkBase
+/** The GitHub Pages site of owner/repo (owner lower-cased; owner.github.io is the site root); null for anything else. */
+fun pagesOf(repository: String?): String? {
+    val m = Regex("([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)").matchEntire(repository?.trim() ?: "") ?: return null
     val owner = m.groupValues[1].lowercase()
     val repo = m.groupValues[2]
     return if (repo.lowercase() == "$owner.github.io") "https://$owner.github.io/" else "https://$owner.github.io/$repo/"
 }
 
+/** owner/repo of a github.com remote URL (https, ssh or scp-like, with or without .git); null for anything else. */
+fun repositoryOfRemote(url: String?): String? {
+    val m = Regex("(?:(?:https?|ssh|git)://(?:[^@/]+@)?github\\.com(?::\\d+)?/|(?:[^@/]+@)?github\\.com:)([A-Za-z0-9-]+)/([A-Za-z0-9._-]+?)(?:\\.git)?/?")
+        .matchEntire(url?.trim() ?: "") ?: return null
+    return m.groupValues[1] + "/" + m.groupValues[2]
+}
+
+fun linkBaseOf(property: String?, repository: String?, remote: String?): String {
+    val p = property?.trim() ?: ""
+    if (p.isNotEmpty()) {
+        require(Regex("[A-Za-z][A-Za-z0-9+.-]*:[\\x21-\\x7e&&[^#,]]*").matches(p)) { "-PlinkBase=$p is not an absolute URL without '#' or ','" }
+        return p
+    }
+    return pagesOf(repository) ?: pagesOf(repositoryOfRemote(remote)) ?: upstreamLinkBase
+}
+
+/** The URL of the git remote origin of the project directory; absent without git or a remote. */
+abstract class GitOrigin : ValueSource<String, GitOrigin.Params> {
+    interface Params : ValueSourceParameters {
+        val dir: DirectoryProperty
+    }
+
+    @get:Inject
+    abstract val exec: ExecOperations
+
+    override fun obtain(): String? = try {
+        val out = ByteArrayOutputStream()
+        val result = exec.exec {
+            commandLine("git", "-C", parameters.dir.get().asFile.path, "config", "--get", "remote.origin.url")
+            standardOutput = out
+            errorOutput = ByteArrayOutputStream()
+            isIgnoreExitValue = true
+        }
+        out.toString().trim().takeIf { result.exitValue == 0 && it.isNotEmpty() }
+    } catch (e: Exception) {
+        null
+    }
+}
+
+val linkBaseProperty = providers.gradleProperty("linkBase").orElse("")
 val githubRepository = providers.environmentVariable("GITHUB_REPOSITORY").orElse("")
-val linkBase = githubRepository.map { linkBaseOf(it) }
+val gitOrigin = providers.of(GitOrigin::class) { parameters.dir.set(layout.projectDirectory) }.orElse("")
+val linkBase = linkBaseProperty.zip(githubRepository) { p, r -> p to r }.zip(gitOrigin) { (p, r), o -> linkBaseOf(p, r, o) }
 
 val generateLinkBase by tasks.registering {
     description = "Writes the Tempo-Link base the library links to by default."
@@ -65,21 +115,31 @@ val generateLinkBase by tasks.registering {
 }
 sourceSets.main { resources.srcDir(generateLinkBase) }
 
-// ./gradlew checkLinkBase   the rule above, for a few repositories (part of check)
+tasks.jar {
+    manifest.attributes(mapOf("Tempo-Link-Base" to linkBase))
+}
+
+// ./gradlew checkLinkBase   the rule above, for a few cases (part of check)
 val checkLinkBase by tasks.registering {
     group = "verification"
-    description = "Checks the Tempo-Link base derived from GITHUB_REPOSITORY."
-    val cases = mapOf(
-        null to upstreamLinkBase,
-        "" to upstreamLinkBase,
-        "not a repository" to upstreamLinkBase,
-        "dualuse/tempo" to "https://dualuse.github.io/tempo/",
-        "Some-Owner/tempo-fork" to "https://some-owner.github.io/tempo-fork/",
-        "someone/Someone.github.io" to "https://someone.github.io/",
-    ).map { (repository, expected) -> Triple(repository, expected, linkBaseOf(repository)) }
+    description = "Checks how the Tempo-Link base is derived from -PlinkBase, GITHUB_REPOSITORY and the git remote."
+    val cases = listOf(
+        Triple(null, null, null) to upstreamLinkBase,
+        Triple("", "", "") to upstreamLinkBase,
+        Triple(null, "not a repository", "/some/local/path") to upstreamLinkBase,
+        Triple(null, "dualuse/tempo", null) to "https://dualuse.github.io/tempo/",
+        Triple(null, "Some-Owner/tempo-fork", "git@github.com:dualuse/tempo.git") to "https://some-owner.github.io/tempo-fork/",
+        Triple(null, "someone/Someone.github.io", null) to "https://someone.github.io/",
+        Triple(null, "", "git@github.com:Some-Owner/tempo-fork.git") to "https://some-owner.github.io/tempo-fork/",
+        Triple(null, "", "https://github.com/Some-Owner/tempo-fork") to "https://some-owner.github.io/tempo-fork/",
+        Triple(null, "", "https://token@github.com/some-owner/tempo.fork.git/") to "https://some-owner.github.io/tempo.fork/",
+        Triple(null, "", "ssh://git@github.com:22/some-owner/tempo-fork.git") to "https://some-owner.github.io/tempo-fork/",
+        Triple(null, "", "git@gitlab.com:some-owner/tempo-fork.git") to upstreamLinkBase,
+        Triple("https://tempo.example.org/viewer/", "Some-Owner/tempo-fork", null) to "https://tempo.example.org/viewer/",
+    ).map { (input, expected) -> Triple(input, expected, linkBaseOf(input.first, input.second, input.third)) }
     doLast {
         val wrong = cases.filter { it.second != it.third }
-        check(wrong.isEmpty()) { wrong.joinToString("\n") { "GITHUB_REPOSITORY=${it.first}: ${it.third}, expected ${it.second}" } }
+        check(wrong.isEmpty()) { wrong.joinToString("\n") { "${it.first}: ${it.third}, expected ${it.second}" } }
     }
 }
 
@@ -97,9 +157,11 @@ tasks.test {
     val testdata = layout.projectDirectory.dir("testdata")
     inputs.dir(testdata).withPropertyName("testdata")
     systemProperty("tempo.testdata", testdata.asFile.absolutePath)
-    // LinkTest derives the baked base from this on its own
-    inputs.property("githubRepository", githubRepository)
+    // LinkTest derives the baked base from these on its own
+    inputs.property("linkBaseInputs", linkBaseProperty.zip(githubRepository) { p, r -> "$p $r" }.zip(gitOrigin) { a, o -> "$a $o" })
+    systemProperty("tempo.linkBaseProperty", linkBaseProperty.get())
     systemProperty("tempo.githubRepository", githubRepository.get())
+    systemProperty("tempo.gitOrigin", gitOrigin.get())
     if (testJdk.isPresent) {
         javaLauncher = javaToolchains.launcherFor {
             languageVersion = JavaLanguageVersion.of(testJdk.get())

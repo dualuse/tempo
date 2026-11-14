@@ -21,6 +21,10 @@ jobs:
           java-version: |
             ${{ matrix.java }}
             21
+      # LadderTest checks Java's values and links with the reference (python3) and the viewer's parser (node)
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - uses: gradle/actions/setup-gradle@v4
       - name: Test on JDK ${{ matrix.java }}
         run: >
@@ -40,13 +44,23 @@ jobs:
           -PtestJdk=${{ matrix.java }}
           -Porg.gradle.java.installations.auto-download=false
           -Porg.gradle.java.installations.fromEnv=JAVA_HOME_${{ matrix.java }}_X64
-      # The jar links to the GitHub Pages viewer of the repository it is built in (GITHUB_REPOSITORY),
-      # so a fork's jar opens the fork's viewer (deployed by pages.yml once the fork turns on Pages);
-      # the second build checks that rule for a made-up fork.
+      # The jar links to the GitHub Pages viewer of the repository it is built in (GITHUB_REPOSITORY,
+      # which Actions always sets), so a fork's jar opens the fork's viewer (deployed by pages.yml once
+      # the fork turns on Pages); the next builds check that rule for a made-up fork and -PlinkBase.
       - name: Library jar with this repository's Tempo-Link base
         if: matrix.java == 21
         run: |
           ./gradlew jar checkLinkBase
           unzip -p build/libs/tempo-*.jar io/github/dualuse/tempo/link-base.txt
+          unzip -p build/libs/tempo-*.jar META-INF/MANIFEST.MF | grep "^Tempo-Link-Base: https://${GITHUB_REPOSITORY_OWNER,,}.github.io/"
           GITHUB_REPOSITORY=Some-Owner/tempo-fork ./gradlew test --tests '*LinkTest*' jar
           test "$(unzip -p build/libs/tempo-*.jar io/github/dualuse/tempo/link-base.txt)" = "https://some-owner.github.io/tempo-fork/"
+          ./gradlew test --tests '*LinkTest*' jar -PlinkBase=https://tempo.example.org/viewer/
+          test "$(unzip -p build/libs/tempo-*.jar io/github/dualuse/tempo/link-base.txt)" = "https://tempo.example.org/viewer/"
+      # The format's shared tests: the vectors and the ladder against the reference, the CLI, the viewer's parser.
+      - name: Format tests (Python, Node)
+        if: matrix.java == 21
+        run: |
+          python3 tests/run_golden.py
+          python3 -m unittest tests.test_cli
+          for t in tests/test_*.mjs tests/check_spa_parser_sync.mjs; do node "$t"; done

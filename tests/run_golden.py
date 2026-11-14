@@ -14,6 +14,9 @@
     compressed bytes: the value re-packed at DEFLATE levels 0, 1 and 6, in the
     plain form, padded and line-wrapped must decode to the same value; so must
     the query-string form, and a fragment t= must win over a query t=.
+  * testdata/ladder.json: the byte-budget ladder (FORMAT.md 7.1) fits its source
+    vector into each listed vector at its limit, at the listed step; and for every
+    golden vector and sample, every limit from 256 bytes on holds.
   * testdata/invalid/*.header and *.link must be rejected with the code listed
     in testdata/invalid/README.md.
   * samples/**/*.header (if present) must decode to the matching .json, and
@@ -155,6 +158,38 @@ def run_links(res):
     return n
 
 
+def run_ladder(res):
+    """testdata/ladder.json: the ladder (FORMAT.md 7.1) fits its source vector into each step's vector."""
+    manifest = json.loads(read(os.path.join(ROOT, "testdata", "ladder.json")))
+    doc = tempo_ref.decode(read(os.path.join(ROOT, "testdata", "golden", manifest["source"] + ".header")))
+    tried = list(tempo_ref.ladder_steps(doc))
+    for step in manifest["steps"]:
+        name, limit = step["vector"], step["maxBytes"]
+        want = tempo_ref.strip_ws(read(os.path.join(ROOT, "testdata", "golden", name + ".header")))
+        got = tempo_ref.fit(doc, limit)
+        res.check("ladder   " + name, got == want, "\n  got  %s\n  want %s" % (got, want))
+        first = next((n for n, v in tried if len(v) <= limit), None)
+        res.check("ladder   %s is step %d" % (name, step["step"]), first == step["step"], "it is step %s" % first)
+    # the limit holds from 256 bytes on, for every vector and sample: every limit near the steps, a sample elsewhere
+    values = [read(p) for p in glob.glob(os.path.join(ROOT, "testdata", "golden", "*.header"))
+              + glob.glob(os.path.join(ROOT, "samples", "**", "*.header"), recursive=True)]
+    bad = []
+    for value in values:
+        doc = tempo_ref.decode(value)
+        if doc["truncated"]:
+            continue
+        full = tempo_ref.encode(doc)
+        lengths = {len(v) for _, v in tempo_ref.ladder_steps(doc)} if len(full) > 256 else set()
+        for limit in sorted({n + d for n in lengths | {len(full)} for d in (-1, 0, 1)} | set(range(256, len(full), 97))):
+            if limit < 256:
+                continue
+            got = tempo_ref.fit(doc, limit)
+            if len(got) > limit or tempo_ref.decode(got)["truncated"] or (limit >= len(full)) != (got == full):
+                bad.append("%d: %s" % (limit, got))
+    res.check("ladder   every limit from 256 bytes holds (%d values)" % len(values), not bad, "; ".join(bad[:3]))
+    return len(manifest["steps"])
+
+
 def check_prefixes(value, full):
     """A cut value must never yield a record the full value does not have."""
     for k in range(len(value)):
@@ -241,13 +276,14 @@ def main():
     res = Result()
     g = run_golden(res)
     k = run_links(res)
+    d = run_ladder(res)
     i = run_invalid(res)
     s = run_samples(res)
     r = run_regenerate(res)
     for f in res.failed:
         print("FAIL " + f)
-    print("golden vectors: %d, links: %d, invalid vectors: %d, samples: %d, regenerated files: %d"
-          % (g, k, i, s, r))
+    print("golden vectors: %d, links: %d, ladder steps: %d, invalid vectors: %d, samples: %d, regenerated files: %d"
+          % (g, k, d, i, s, r))
     print("checks passed: %d, failed: %d" % (res.passed, len(res.failed)))
     return 1 if res.failed else 0
 

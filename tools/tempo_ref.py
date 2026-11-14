@@ -6,6 +6,7 @@ them. It is deliberately small and strict; it is not the end-user CLI.
 
     tempo_ref.py decode [FILE|-]   header value  -> JSON form
     tempo_ref.py encode [FILE|-]   JSON form     -> canonical header value
+    tempo_ref.py fit N [FILE|-]    header value  -> the same in at most N bytes (FORMAT.md 7.1)
     tempo_ref.py link   [FILE|-]   header value  -> Tempo-Link URL (FORMAT.md section 9)
     tempo_ref.py unlink [FILE|-]   Tempo-Link URL -> header value
 
@@ -15,12 +16,14 @@ Python 3.8+, standard library only.
 import base64
 import collections
 import json
+import os
 import re
+import subprocess
 import sys
 import zlib
 
-__all__ = ["TempoFormatError", "decode", "encode", "dump_json", "strip_ws",
-           "DEFAULT_BASE", "Link", "encode_link", "decode_link", "pack_value", "unpack_value", "link_params"]
+__all__ = ["TempoFormatError", "decode", "encode", "fit", "fallback", "ladder_steps", "dump_json", "strip_ws",
+           "DEFAULT_BASE", "default_base", "Link", "encode_link", "decode_link", "pack_value", "unpack_value", "link_params"]
 
 ALPHABET = frozenset("0123456789abcdefghijklmnopqrstuvwxyz"
                      "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -392,10 +395,219 @@ def encode(doc):
     return ";".join(out)
 
 
+# ---------------------------------------------------------------- byte budget (FORMAT.md 7.1)
+
+MIN_BYTES = 256
+
+
+def fit(doc, max_bytes):
+    """The canonical value of doc in at most max_bytes: whole if it fits, else the first ladder step
+    that fits (FORMAT.md 7.1), else the fallback. Below 256 bytes there is no ladder."""
+    value = encode(doc)
+    if len(value) <= max_bytes:
+        return value
+    if max_bytes >= MIN_BYTES:
+        for _, value in ladder_steps(doc):
+            if len(value) <= max_bytes:
+                return value
+    return fallback(doc)
+
+
+def ladder_steps(doc):
+    """Every value the ladder tries for doc, in order, as (step number, value)."""
+    return _Ladder(doc).steps()
+
+
+def fallback(doc):
+    """v1;x=0.<n>;T=%3F;N=%3F;S=00.0.<dur>;e=1: n counts every span but the root."""
+    spans = doc["spans"]
+    n = doc.get("folded", 0) + doc.get("dropped", 0) + sum(1 for s in spans[1:] if "agg" not in s)
+    return "v1;x=0.%s;T=%%3F;N=%%3F;S=00.0.%s;e=1" % (to_b36(n), to_b36(spans[0]["dur"]))
+
+
+class _Ladder:
+    """The records of a JSON form as flat pre-order lists, rewritten step by step."""
+
+    def __init__(self, doc):
+        self.doc = doc
+        self.spans = [dict(s) for s in doc["spans"]]
+        self.depth = []
+        for s in self.spans:
+            self.depth.append(0 if s["parent"] < 0 else self.depth[s["parent"]] + 1)
+        self.removed = [False] * len(self.spans)
+        self.folded = doc.get("folded", 0)
+        self.dropped = doc.get("dropped", 0)
+        self.attributes = True
+
+    def steps(self):
+        """Yields (step, value) after every change, in ladder order."""
+        for group in self.groups():
+            if self.fold(group):
+                yield 1, self.value()
+        while self.deepest() >= 3:
+            self.drop(self.deepest())
+            yield 2, self.value()
+        if any("attrs" in s for s in self.spans):
+            self.attributes = False
+            yield 3, self.value()
+        if self.drop(2):
+            yield 4, self.value()
+
+    @staticmethod
+    def waits(s):
+        return "waitSum" in s["agg"] if "agg" in s else "wait" in s
+
+    def groups(self):
+        """Same parent, name and waits; each: [first record, records it folds...], folding two or more."""
+        by = collections.OrderedDict()
+        for i, s in enumerate(self.spans[1:], 1):
+            by.setdefault((s["parent"], s["name"], self.waits(s)), []).append(i)
+        groups = []
+        for members in by.values():
+            slowest = None
+            for i in members:
+                if "agg" not in self.spans[i] and (slowest is None or self.spans[i]["dur"] > self.spans[slowest]["dur"]):
+                    slowest = i
+            fold = [i for i in members if i != slowest and ("agg" in self.spans[i] or "f" not in self.spans[i].get("flags", ""))]
+            if len(fold) >= 2:
+                groups.append([members[0]] + fold)
+        groups.sort(key=lambda g: (-len(g), g[0]))
+        return groups
+
+    def remove(self, i):
+        self.removed[i] = True
+        agg = self.spans[i].get("agg")
+        self.dropped += agg["count"] if agg else 1
+        if agg:
+            self.folded = max(0, self.folded - agg["count"])
+
+    def fold(self, group):
+        t = group[1]
+        if self.removed[t]:
+            return False
+        first = self.spans[t]
+        count = total = 0
+        lo, hi, end, slow_at = None, -1, 0, 0
+        wait_sum = wait_max = 0
+        cpu = None
+        thread = first["thread"]
+        flags = set(FLAG_ORDER)
+        for r in group[1:]:
+            s = self.spans[r]
+            agg = s.get("agg")
+            longest = agg["max"] if agg else s["dur"]
+            if longest > hi:
+                hi = longest
+                slow_at = s["start"] + agg["maxAt"] if agg else s["start"]
+            count += agg["count"] if agg else 1
+            total += s["dur"]
+            least = agg["min"] if agg else s["dur"]
+            lo = least if lo is None else min(lo, least)
+            end = max(end, s["start"] + agg["extent"] if agg else s["start"] + s.get("wait", 0) + s["dur"])
+            if self.waits(s):
+                wait_sum += agg["waitSum"] if agg else s["wait"]
+                wait_max = max(wait_max, agg["waitMax"] if agg else s["wait"])
+            if "cpu" in s:
+                cpu = (cpu or 0) + s["cpu"]
+            if s["thread"] != thread:
+                thread = -1
+            flags &= set(s.get("flags", ""))
+            if not agg:
+                self.folded += 1
+            i = r + 1
+            while i < len(self.spans) and self.depth[i] > self.depth[r]:
+                if not self.removed[i]:
+                    self.remove(i)
+                i += 1
+            if r != t:
+                self.removed[r] = True
+        out = {k: first[k] for k in ("id", "parent", "name", "start")}
+        out.update(dur=total, thread=thread)
+        if cpu is not None:
+            out["cpu"] = cpu
+        if flags:
+            out["flags"] = "".join(f for f in FLAG_ORDER if f in flags)
+        out["agg"] = {"count": count, "min": lo, "max": hi, "extent": end - first["start"], "maxAt": slow_at - first["start"]}
+        if self.waits(first):
+            out["agg"].update(waitSum=wait_sum, waitMax=wait_max)
+        self.spans[t] = out
+        return True
+
+    def deepest(self):
+        return max(d for d, gone in zip(self.depth, self.removed) if not gone)
+
+    def drop(self, depth):
+        hit = [i for i, d in enumerate(self.depth) if d == depth and not self.removed[i]]
+        for i in hit:
+            self.remove(i)
+        return bool(hit)
+
+    def value(self):
+        """The remaining records as a JSON form, encoded; threads reduced to those used."""
+        keep = [i for i in range(len(self.spans)) if not self.removed[i]]
+        new_id = {old: new for new, old in enumerate(keep)}
+        used = sorted({self.spans[i]["thread"] for i in keep if self.spans[i]["thread"] >= 0})
+        thread = {old: new for new, old in enumerate(used)}
+        spans = []
+        for i in keep:
+            s = dict(self.spans[i])
+            s["id"] = new_id[i]
+            s["parent"] = -1 if s["parent"] < 0 else new_id[s["parent"]]
+            s["thread"] = thread.get(s["thread"], -1)
+            if not self.attributes:
+                s.pop("attrs", None)
+            spans.append(s)
+        doc = dict(self.doc, spans=spans, folded=self.folded, dropped=self.dropped,
+                   threads=[self.doc["threads"][t] for t in used],
+                   live=[thread[t] for t in self.doc.get("live", []) if t in thread])
+        return encode(doc)
+
+
 # ---------------------------------------------------------------- Tempo-Link (FORMAT.md section 9)
 
 DEFAULT_BASE = "https://dualuse.github.io/tempo/"
 LINK_TABS = ("lanes", "tree", "agg", "pools", "critical", "diff", "stats")
+def pages_of(repository):
+    """The GitHub Pages site of owner/repo (owner lower-cased; owner.github.io is the site root), or None."""
+    m = re.match(r"^([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)$", (repository or "").strip())
+    if not m:
+        return None
+    owner, repo = m.group(1).lower(), m.group(2)
+    return "https://%s.github.io/" % owner + ("" if repo.lower() == owner + ".github.io" else repo + "/")
+
+
+def repository_of_remote(url):
+    """owner/repo of a github.com remote URL (https, ssh or scp-like, with or without .git), or None."""
+    m = re.match(r"^(?:(?:https?|ssh|git)://(?:[^@/]+@)?github\.com(?::\d+)?/|(?:[^@/]+@)?github\.com:)"
+                 r"([A-Za-z0-9-]+)/([A-Za-z0-9._-]+?)(?:\.git)?/?$", (url or "").strip())
+    return m.group(1) + "/" + m.group(2) if m else None
+
+
+_CHECKOUT = []
+
+
+def checkout_base():
+    """When this file runs from a checkout of Tempo (tools/ beside site/index.html), the GitHub Pages site of
+    its git remote origin, as the library build derives it; else None. A fork's checkout opens the fork's viewer."""
+    if not _CHECKOUT:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        url = None
+        if os.path.isfile(os.path.join(root, "site", "index.html")) and os.path.exists(os.path.join(root, ".git")):
+            try:
+                url = subprocess.run(["git", "-C", root, "config", "--get", "remote.origin.url"], stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, universal_newlines=True, timeout=5).stdout
+            except (OSError, subprocess.SubprocessError):
+                url = None
+        _CHECKOUT.append(pages_of(repository_of_remote(url)))
+    return _CHECKOUT[0]
+
+
+def default_base(env=None):
+    """The viewer links point at: $TEMPO_LINK_BASE, else the checkout's own Pages site, else DEFAULT_BASE."""
+    env = os.environ if env is None else env
+    return env.get("TEMPO_LINK_BASE") or checkout_base() or DEFAULT_BASE
+
+
 B64URL_RE = re.compile(r"^[A-Za-z0-9_-]*$")
 MAX_INFLATED = 16 * 1024 * 1024   # FORMAT.md 9.2: decoders accept at least 1 MiB
 
@@ -543,13 +755,17 @@ def _read(path):
 
 
 def main(argv):
-    if len(argv) < 2 or argv[1] not in ("decode", "encode", "link", "unlink"):
+    if len(argv) < 2 or argv[1] not in ("decode", "encode", "fit", "link", "unlink") \
+            or argv[1] == "fit" and (len(argv) < 3 or not argv[2].isdigit()):
         sys.stderr.write(__doc__)
         return 2
-    text = _read(argv[2] if len(argv) > 2 else None)
+    args = argv[3:] if argv[1] == "fit" else argv[2:]
+    text = _read(args[0] if args else None)
     try:
         if argv[1] == "decode":
             sys.stdout.write(dump_json(decode(text)))
+        elif argv[1] == "fit":
+            sys.stdout.write(fit(decode(text), int(argv[2])) + "\n")
         elif argv[1] == "link":
             decode(text)
             sys.stdout.write(encode_link(text) + "\n")
