@@ -375,8 +375,15 @@ public final class SearchRequest {
                 + (r.tempoLink == null ? 0 : Demo.bytes(r.tempoLink));
         Demo.check(total <= HEADER_LIMIT, "the timing headers keep to " + HEADER_LIMIT + " bytes together: " + total);
         Demo.check(r.tempoLink != null, "Tempo-Timing and Tempo-Link fit together, carrying the same value");
-        Demo.check(Arrays.asList(names(r.tempoTiming)).containsAll(List.of("load", "match")),
-                "within " + TEMPO_BYTES + " bytes, the value keeps the loads and the matches below them");
+        // How far down the ladder the value goes depends on how many spans the timing let in, so the loads
+        // and matches may or may not survive the limit; what the ladder leaves out is always counted.
+        List<String> kept = Arrays.asList(names(r.tempoTiming));
+        String x = Demo.field(r.tempoTiming, "x");
+        long dropped = x == null ? 0 : Long.parseLong(x.substring(x.indexOf('.') + 1), 36);
+        Demo.check(kept.containsAll(List.of("describe", "lookup", "rerank")),
+                "within " + TEMPO_BYTES + " bytes, the value keeps the request's own steps");
+        Demo.check(kept.containsAll(List.of("load", "match")) || dropped > 0,
+                "spans the ladder left out are counted as dropped in x=");
 
         Demo.check(count(rows, v -> v.name == LOAD && v.open && v.attr(COLD) == 1 && v.thread.startsWith("io-")) == 1,
                 "the cold load was still open on io-* when the headers were rendered (^o)");
