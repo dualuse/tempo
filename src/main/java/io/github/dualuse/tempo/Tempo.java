@@ -4651,9 +4651,39 @@ public final class Tempo {
          * without running {@code task}.
          */
         public Runnable runnable(Runnable task) {
-            if (lane == null) return task;
-            return () -> {
-                Span s = tryBegin();
+            return lane == null ? task : new WrappedRunnable(this, task);
+        }
+
+        /**
+         * Like {@link #runnable} for a {@link Callable}; cancelled or rejected before it began, it throws
+         * {@link CancellationException} without running {@code task}.
+         */
+        public <V> Callable<V> callable(Callable<V> task) {
+            return lane == null ? task : new WrappedCallable<>(this, task);
+        }
+
+        /** Like {@link #callable} for a {@link Supplier}. */
+        public <V> Supplier<V> supplier(Supplier<V> task) {
+            return lane == null ? task : new WrappedSupplier<>(this, task);
+        }
+
+        /*
+         * The wrappers of runnable, callable and supplier: one object per wrap of the same size as a capturing
+         * lambda (24 B), but plain classes. A lambda is linked (invokedynamic) on its first use in a JVM, on
+         * the submitting thread after the submit was taken, and that would show as the first task's queue wait.
+         */
+        private static final class WrappedRunnable implements Runnable {
+            private final Handoff h;
+            private final Runnable task;
+
+            WrappedRunnable(Handoff h, Runnable task) {
+                this.h = h;
+                this.task = task;
+            }
+
+            @Override
+            public void run() {
+                Span s = h.tryBegin();
                 if (s == null) return;
                 try {
                     task.run();
@@ -4663,17 +4693,21 @@ public final class Tempo {
                 } finally {
                     s.close();
                 }
-            };
+            }
         }
 
-        /**
-         * Like {@link #runnable} for a {@link Callable}; cancelled or rejected before it began, it throws
-         * {@link CancellationException} without running {@code task}.
-         */
-        public <V> Callable<V> callable(Callable<V> task) {
-            if (lane == null) return task;
-            return () -> {
-                Span s = tryBegin();
+        private static final class WrappedCallable<V> implements Callable<V> {
+            private final Handoff h;
+            private final Callable<V> task;
+
+            WrappedCallable(Handoff h, Callable<V> task) {
+                this.h = h;
+                this.task = task;
+            }
+
+            @Override
+            public V call() throws Exception {
+                Span s = h.tryBegin();
                 if (s == null) throw cancelled();
                 try {
                     return task.call();
@@ -4683,14 +4717,21 @@ public final class Tempo {
                 } finally {
                     s.close();
                 }
-            };
+            }
         }
 
-        /** Like {@link #callable} for a {@link Supplier}. */
-        public <V> Supplier<V> supplier(Supplier<V> task) {
-            if (lane == null) return task;
-            return () -> {
-                Span s = tryBegin();
+        private static final class WrappedSupplier<V> implements Supplier<V> {
+            private final Handoff h;
+            private final Supplier<V> task;
+
+            WrappedSupplier(Handoff h, Supplier<V> task) {
+                this.h = h;
+                this.task = task;
+            }
+
+            @Override
+            public V get() {
+                Span s = h.tryBegin();
                 if (s == null) throw cancelled();
                 try {
                     return task.get();
@@ -4700,7 +4741,7 @@ public final class Tempo {
                 } finally {
                     s.close();
                 }
-            };
+            }
         }
 
         private static CancellationException cancelled() {

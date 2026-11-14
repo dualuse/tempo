@@ -189,6 +189,25 @@ class CancelTest {
     }
 
     /**
+     * The wrappers are plain classes, not lambdas: a lambda is linked on its first use in a JVM, on the
+     * submitting thread after the submit, and that (most of a millisecond) would be the first task's queue wait.
+     */
+    @Test
+    void theWrappersAreNotLambdas() {
+        Trace t = Tempo.start(SEARCH, strict());
+        Handoff h = t.root().handoff(MATCH);
+        Runnable r = h.runnable(() -> { });
+        Callable<Integer> c = h.callable(() -> 1);
+        Supplier<Integer> s = h.supplier(() -> 1);
+        assertTrue(h.cancel());
+        t.close();
+        for (Object w : List.of(r, c, s)) {
+            assertFalse(w.getClass().isSynthetic(), w.getClass() + " is a lambda");
+            assertSame(Tempo.class, w.getClass().getEnclosingClass().getEnclosingClass(), w.getClass().getName());
+        }
+    }
+
+    /**
      * Many tasks on a pool, and an early exit that cancels every one still pending while the workers take
      * them: every body that ran is recorded as run, every task recorded as cancelled never ran its body,
      * each cancel's result says which, and strict mode finds no misuse.
