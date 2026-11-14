@@ -28,6 +28,18 @@ val jcstress: SourceSet by sourceSets.creating {
 val jcstressImplementation: Configuration by configurations.getting
 val jcstressAnnotationProcessor: Configuration by configurations.getting
 
+// The demo source set: small programs that use Tempo the way an application does, graded simple,
+// medium and complex (src/demo/README.md). They see main, need nothing else and ship nowhere.
+val demo: SourceSet by sourceSets.creating {
+    compileClasspath += sourceSets.main.get().output
+    runtimeClasspath += sourceSets.main.get().output
+}
+
+// The demos are read as examples, so they compile without a single warning.
+tasks.named<JavaCompile>(demo.compileJavaTaskName) {
+    options.compilerArgs.addAll(listOf("-Xlint:all", "-Werror"))
+}
+
 // TempoJackson compiles against the Jackson 2.16 API; the library itself needs nothing.
 val jackson = "2.16.1"
 
@@ -218,6 +230,31 @@ tasks.register<JavaExec>("jcstress") {
     }
 }
 
+// ./gradlew demo                              lists the demos
+// ./gradlew -q demo -Pdemo=FirstTrace         runs one: its story, then its response headers
+// ./gradlew -q demo -Pdemo=FirstTrace | tools/tempo   the same, drawn as lanes in the terminal
+// ./gradlew demos [-PtestJdk=11]              runs every demo and checks what each one claims
+tasks.register<JavaExec>("demo") {
+    group = "demo"
+    description = "Lists the demos, or runs the one named by -Pdemo=Name."
+    classpath = demo.runtimeClasspath
+    mainClass = "io.github.dualuse.tempo.demo.Demos"
+    args(listOfNotNull(providers.gradleProperty("demo").orNull))
+}
+
+val demos by tasks.registering(JavaExec::class) {
+    group = "verification"
+    description = "Runs every demo and fails if one of them does not show what it claims."
+    classpath = demo.runtimeClasspath
+    mainClass = "io.github.dualuse.tempo.demo.Demos"
+    args("--all")
+    if (testJdk.isPresent) {
+        javaLauncher = javaToolchains.launcherFor {
+            languageVersion = JavaLanguageVersion.of(testJdk.get())
+        }
+    }
+}
+
 tasks.check {
-    dependsOn(tasks.named("jmhClasses"), tasks.named("jcstressClasses"), checkLinkBase)
+    dependsOn(tasks.named("jmhClasses"), tasks.named("jcstressClasses"), checkLinkBase, demos)
 }

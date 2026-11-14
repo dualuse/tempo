@@ -8,7 +8,7 @@ stable.
 Run what CI runs:
 
 ```
-./gradlew check                    # unit tests, the golden vectors in Java, the link-base rule
+./gradlew check                    # unit tests, the golden vectors in Java, the link-base rule, the demos
 ./gradlew jmhGate                  # allocation gate: recording must not allocate
 python3 tests/run_golden.py        # vectors, ladder and samples against tools/tempo_ref.py
 python3 -m unittest tests.test_cli # the command-line viewer (Python 3.8+)
@@ -27,6 +27,9 @@ node tests/check_site_headless.mjs   # Tempo Timeline in headless Chrome: sample
 - **The format is a contract.** [FORMAT.md](FORMAT.md) is normative. A change to the wire or
   JSON form changes FORMAT.md, the vectors in `testdata/`, `tools/tempo_ref.py`, the Java
   encoder and both viewers in one pull request.
+- **Demos are checked.** Each demo in `src/demo` checks what it claims about its own trace, and
+  `./gradlew demos` (part of `check`) runs them all. A change to the API or its behaviour updates
+  the demos that show it; see [src/demo/README.md](src/demo/README.md).
 - **Invented names only.** Examples, tests, samples and commit messages use made-up span names,
   hosts and timings, never ones taken from a real service.
 

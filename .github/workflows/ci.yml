@@ -35,6 +35,12 @@ jobs:
           -PtestJdk=${{ matrix.java }}
           -Porg.gradle.java.installations.auto-download=false
           -Porg.gradle.java.installations.fromEnv=JAVA_HOME_${{ matrix.java }}_X64
+      - name: Demos on JDK ${{ matrix.java }}
+        run: >
+          ./gradlew demos
+          -PtestJdk=${{ matrix.java }}
+          -Porg.gradle.java.installations.auto-download=false
+          -Porg.gradle.java.installations.fromEnv=JAVA_HOME_${{ matrix.java }}_X64
       - name: Allocation gate on JDK ${{ matrix.java }}
         run: >
           ./gradlew jmhGate

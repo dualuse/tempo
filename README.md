@@ -125,7 +125,9 @@ executor.execute(() -> {
 `runnable`, `callable` and `supplier` wrap a task in `begin()` and close. A task that runs
 inline on the submitting thread (caller-runs) becomes a plain child. One that never runs is
 marked with `h.cancel()` (an early exit) or `h.reject()` (the executor refused it), and shows
-as never started. The `Handoff` is the one object Tempo allocates while recording, 32 bytes.
+as cancelled before it began (flag `c`, no run time); a handoff neither begun nor cancelled
+when the trace renders shows as never started (`n`). The `Handoff` is the one object Tempo
+allocates while recording, 32 bytes.
 
 On a thread without a trace, `t.submitted()` and `t.waited(name, token)` measure a queue
 wait into `t.aggregate(name)` with a single clock read each.
@@ -204,6 +206,21 @@ when the trace closes, as a drop-in for a stopwatch log line.
 (start, duration, thread, queue wait, CPU, flags, attributes, aggregate statistics);
 `forEachTop(visitor)` visits the legacy steps. `snapshot()` takes an immutable copy that stays
 readable after `release()`, for rendering later or on another thread.
+
+## Demos
+
+`src/demo` holds eleven small programs that use Tempo the way an application does, graded
+simple, medium and complex: a first trace, phases and laps, failures, levels and opt-in,
+thread pools with queue wait and CPU time, metrics from spans, headers under a byte limit,
+and services with several pools, pipelines, fan-out, deadlines and early exits. They need
+nothing but the library and start no servers. Each one checks what it claims about its own
+trace. See [src/demo/README.md](src/demo/README.md) for the reading order.
+
+```
+./gradlew demo                                      # the list
+./gradlew -q demo -Pdemo=FirstTrace                 # one demo: its story, then its response headers
+./gradlew -q demo -Pdemo=WorkerPool | tools/tempo   # the trace drawn as lanes in the terminal
+```
 
 ## Headers
 
@@ -470,7 +487,8 @@ CI gates the allocation of every recording operation on JDK 11, 17 and 21
 ```
 ./gradlew test                                   # unit tests
 ./gradlew test -PtestJdk=11                      # the tests on another installed JDK
-./gradlew check                                  # tests and the link-base rule
+./gradlew check                                  # tests, the link-base rule and the demos
+./gradlew demos                                  # every demo, with the checks of what each one shows
 ./gradlew jmhGate                                # the allocation gate CI runs
 ./gradlew jmh                                    # benchmarks, with -prof gc
 ./gradlew jcstress                               # concurrency tests (jcstress, quick mode)
