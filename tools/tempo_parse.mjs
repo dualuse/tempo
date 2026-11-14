@@ -457,10 +457,18 @@ const TempoParse = (function () {
     if (typeof DecompressionStream !== "function") fail("E_LINK", "this browser has no DecompressionStream, so it cannot inflate a z. link; open it in a current browser or paste the Tempo-Timing header instead");
     let ds;
     try { ds = new DecompressionStream("deflate-raw"); } catch (e) { fail("E_LINK", "this browser cannot inflate deflate-raw, so it cannot read a z. link; open it in a current browser or paste the Tempo-Timing header instead"); }
+    const input = b64urlToBytes(b64);
     let bytes;
-    try { bytes = await transformBytes(b64urlToBytes(b64), ds, LINK_INFLATE_MAX); } catch (e) {
+    try { bytes = await transformBytes(input, ds, LINK_INFLATE_MAX); } catch (e) {
       fail("E_LINK", e instanceof RangeError ? "the z. payload inflates to " + e.message : "the z. payload is corrupt or truncated" + (e && e.message ? " (" + e.message + ")" : ""));
     }
+    // Some runtimes (Node 22, older browsers) ignore bytes after the end of the DEFLATE stream. A stream
+    // ends in its last byte, so if the payload still inflates without that byte, bytes follow the stream.
+    let endsEarly = input.length > 1;
+    if (endsEarly) {
+      try { await transformBytes(input.subarray(0, input.length - 1), new DecompressionStream("deflate-raw"), LINK_INFLATE_MAX); } catch (e) { endsEarly = false; }
+    }
+    if (endsEarly) fail("E_LINK", "the z. payload has bytes after the end of the DEFLATE stream");
     if (!utf8Strict) utf8Strict = new TextDecoder("utf-8", { fatal: true });
     try { return utf8Strict.decode(bytes); } catch (e) { return fail("E_LINK", "the z. payload is not UTF-8 text"); }
   }
