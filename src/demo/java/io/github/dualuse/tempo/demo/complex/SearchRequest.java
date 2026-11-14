@@ -3,7 +3,6 @@ package io.github.dualuse.tempo.demo.complex;
 import io.github.dualuse.tempo.Tempo;
 import io.github.dualuse.tempo.demo.Demo;
 
-import java.lang.management.ManagementFactory;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -13,7 +12,6 @@ import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
-import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -32,8 +30,9 @@ import java.util.function.Predicate;
  * times the routing before the handler, an opt-in ({@code tempo=1}) that raises the trace to
  * {@code DETAIL} once, handoffs from the request thread and from a pool thread (the chain
  * request → {@code io-N} → {@code cpu-N}, with a queue wait on each hop), blocking waits, a hot loop
- * that spends the detail budget and folds, an early exit that cancels queued tasks without racing the
- * ones already running, a straggler, and the four response headers. It puts together what
+ * that spends the detail budget and folds, an early exit that takes back every task that has not begun
+ * (each cancel either wins, and the task never runs, or loses to a task already running), a straggler,
+ * and the four response headers. It puts together what
  * {@code WorkerPool}, {@code LevelsAndOptIn} and {@code ResponseHeaders} show one at a time.
  *
  * <pre>
@@ -98,14 +97,10 @@ public final class SearchRequest {
         }
     }
 
-    /** What a service does before it takes traffic: start its threads, load what the first request would. */
+    /** What a service does before it takes traffic: start its threads. */
     void start() {
         io.prestartAllCoreThreads();
         cpu.prestartAllCoreThreads();
-        // Works around how Tempo samples CPU today: at DETAIL it reads thread CPU as the first task begins,
-        // before it reads the clock for the queue wait, and the first read in a JVM loads java.management
-        // (tens of milliseconds), so the first queue wait of the process would include it.
-        ManagementFactory.getThreadMXBean().getCurrentThreadCpuTime();
     }
 
     // ------------------------------------------------------------------ the filter and the handler
@@ -144,7 +139,10 @@ public final class SearchRequest {
     Response handle(Tempo.Trace t, String query) throws Exception {
         Tempo.Span root = t.root();
 
-        // The opt-in gate: once, and before the first detail span, or raise refuses (strict: throws).
+        // The opt-in gate: once, and before the first detail span, or raise refuses (strict: throws). At
+        // DETAIL every task measures its CPU time; the first CPU read in a JVM sets that clock up (it takes
+        // milliseconds), and raise() does it here, on the request thread: in the first such request of a
+        // JVM it shows in this lap, never as a task's queue wait.
         if (query.contains("tempo=1")) t.raise(Tempo.DETAIL);
 
         Demo.cpu(1_000);
@@ -182,9 +180,9 @@ public final class SearchRequest {
             }
             w.set(HITS, hits.size());
         }
-        int cancelled = rerank.stop(); // enough hits: take back whatever has not started
+        int cancelled = rerank.stop(); // enough hits: take back whatever has not begun
         root.done(RERANK, "Rerank").phaseSet(HITS, hits.size()).phaseSet(CANCELLED, cancelled);
-        Demo.say("early exit at " + hits.size() + " good hits: " + cancelled + " queued loads and matches cancelled");
+        Demo.say("early exit at " + hits.size() + " good hits: " + cancelled + " loads and matches cancelled before they began");
 
         Response r = new Response();
         r.hits = hits;
@@ -197,8 +195,11 @@ public final class SearchRequest {
 
     /** On {@code io-N}: reads one candidate, then hands its data to a match on {@code cpu}. */
     void load(Rerank rerank, int id, Tempo.Handoff h) {
-        // begin() records the queue wait; the span is the root of io-N's lane, and its handle stays on io-N.
-        try (Tempo.Span l = h.begin()) {
+        // tryBegin() records the queue wait; the span is the root of io-N's lane, and its handle stays on
+        // io-N. It is null when the early exit took the task back first: then there is nothing to do.
+        Tempo.Span l = h.tryBegin();
+        if (l == null) return;
+        try (l) {
             if (id == COLD_ID) {
                 l.set(COLD, 1);
                 awaitColdStorage();
@@ -213,7 +214,9 @@ public final class SearchRequest {
 
     /** On {@code cpu-N}: a hot loop of one detail span per feature. Past the budget, they fold. */
     void match(Rerank rerank, int id, Tempo.Handoff h) {
-        try (Tempo.Span m = h.begin()) {
+        Tempo.Span m = h.tryBegin();
+        if (m == null) return; // taken back by the early exit before it began
+        try (m) {
             for (int f = 0; f < FEATURES; f++) {
                 try (Tempo.Span s = m.detail(SCORE)) {
                     Demo.cpu(SCORE_MICROS);
@@ -242,25 +245,23 @@ public final class SearchRequest {
             if (stopped) return;
             // The pool's queue length at submit: tools/tempo --pools draws it as the pool-wide signal.
             Tempo.Handoff h = parent.handoff(name).set(QUEUED, pool.getQueue().size());
-            FutureTask<Void> f = new FutureTask<>(task.apply(h), null);
-            pool.execute(f);
-            tasks.add(new Queued(pool, f, h));
+            tasks.add(new Queued(pool.submit(task.apply(h)), h));
         }
 
         /**
-         * Stops the fan-out and cancels every task still in a queue; returns how many. remove() decides the
-         * race: it succeeds only while the task sits in the pool's queue, so no thread will begin its
-         * handoff, and cancel() is safe. A task a worker has taken is left to run: cancelling its handoff
-         * could land just before its begin(), which is misuse (strict: an AssertionError in the task).
-         * Future.cancel(false) cannot tell the two apart; it succeeds on a running task too.
+         * Stops the fan-out and cancels every task that has not begun; returns how many. The handoff decides
+         * the race with a worker: cancel() wins only if the task has not begun, and then the wrapper skips
+         * its body even if a worker takes it right now, so the trace shows it cancelled before it began. A
+         * lost cancel means the task is running: it is left to finish. The cancelled tasks stay in the
+         * queues, where they cost a worker nothing; ThreadPoolExecutor.remove would only free the slots of a
+         * bounded queue sooner, and these queues are unbounded.
          */
         synchronized int stop() {
             stopped = true;
             int n = 0;
             for (Queued q : tasks) {
-                if (q.pool.remove(q.task)) {
+                if (q.handoff.cancel()) {
                     q.task.cancel(false); // completes the future for anyone who waits on it
-                    q.handoff.cancel();
                     n++;
                 }
             }
@@ -278,12 +279,10 @@ public final class SearchRequest {
     }
 
     static final class Queued {
-        final ThreadPoolExecutor pool;
-        final FutureTask<Void> task;
+        final Future<?> task;
         final Tempo.Handoff handoff;
 
-        Queued(ThreadPoolExecutor pool, FutureTask<Void> task, Tempo.Handoff handoff) {
-            this.pool = pool;
+        Queued(Future<?> task, Tempo.Handoff handoff) {
             this.task = task;
             this.handoff = handoff;
         }
@@ -448,7 +447,7 @@ public final class SearchRequest {
         long count, dur, waitMax, cpu;
         final Map<Tempo.Name, Long> attrs = new HashMap<>();
 
-        /** Began on a worker: neither still queued nor cancelled (this demo cancels only queued tasks). */
+        /** Began on a worker: neither still queued nor cancelled (a task whose cancel won never began). */
         boolean ran() {
             return !neverStarted && !cancelled;
         }

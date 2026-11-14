@@ -6,7 +6,6 @@ import io.github.dualuse.tempo.demo.Demo;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Future;
-import java.util.concurrent.FutureTask;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -23,7 +22,7 @@ import java.util.function.ToLongFunction;
  * <p>It shows a {@code Handoff} captured at submit and its queue wait, a blocking join marked
  * {@code waiting()}, CPU time per pool task at {@code DETAIL}, and the three ways a handoff ends other
  * than running on a pool thread: inline (caller-runs), rejected ({@code reject()}) and skipped by an
- * early exit ({@code cancel()}).
+ * early exit ({@code cancel()}, which says whether it won the race with the worker).
  *
  * <pre>
  * ./gradlew -q demo -Pdemo=WorkerPool                         the story and the response
@@ -75,17 +74,14 @@ public final class WorkerPool {
         // moment a pool thread begins the task; taken inside the task it could not see the queue. It is
         // the one object Tempo allocates while recording (32 bytes). Its attributes describe the submit:
         // which shard, and how many tasks were already waiting in the pool's queue.
-        List<FutureTask<Boolean>> tasks = new ArrayList<>();
+        List<Future<Boolean>> tasks = new ArrayList<>();
         List<Tempo.Handoff> handoffs = new ArrayList<>();
         for (int shard = 0; shard < SHARDS; shard++) {
             int n = shard;
             Tempo.Handoff h = s.handoff(MATCH).set(SHARD, n).set(QUEUED, work.getQueue().size());
             // callable() wraps the task in h.begin() and close(): the span opens on the pool thread.
-            // A FutureTask of our own (rather than submit()) lets the early exit take it out of the queue.
-            FutureTask<Boolean> task = new FutureTask<>(h.callable(() -> matchShard(n)));
             handoffs.add(h);
-            tasks.add(task);
-            work.execute(task);
+            tasks.add(work.submit(h.callable(() -> matchShard(n))));
         }
 
         // Gather. The request thread blocks here; waiting() tells the viewers so: they draw the join as
@@ -98,14 +94,17 @@ public final class WorkerPool {
             }
         }
 
-        // Early exit: the hit is all the request needs. A task still in the queue is taken out and its
-        // handoff cancelled: it shows as cancelled before it began (flag c), with no run time. remove()
-        // is the proof that no thread will begin it, so cancel() cannot race a worker; a task already
-        // running is left to finish: it keeps running past the join and ends before the response.
+        // Early exit: the hit is all the request needs. Each later shard's handoff is cancelled. Cancel and
+        // begin race for a handoff and exactly one wins, so cancel() returning true proves the task never
+        // began, nor will: callable() skips it even if a worker takes it this very moment, and it shows as
+        // cancelled before it began (flag c), with no run time. false means it is running: it is left to
+        // finish, past the join, before the response. Future.cancel completes the future for anyone who
+        // waits on it. The cancelled tasks stay in the queue at no cost; ThreadPoolExecutor.remove would only
+        // free the slots of a bounded queue sooner.
         int skipped = 0;
         for (int n = hit + 1; n < SHARDS; n++) {
-            if (work.remove(tasks.get(n))) {
-                handoffs.get(n).cancel();
+            if (handoffs.get(n).cancel()) {
+                tasks.get(n).cancel(false);
                 skipped++;
             }
         }
@@ -191,7 +190,7 @@ public final class WorkerPool {
 
         long skipped = Demo.attribute(t, REQUEST, SKIPPED);
         Demo.check(Demo.attribute(t, REQUEST, HIT) == HIT_SHARD, "the request found its hit in shard " + HIT_SHARD);
-        Demo.check(skipped >= 1, "the early exit took at least one queued match out of the queue");
+        Demo.check(skipped >= 1, "the early exit cancelled at least one match before it began");
         Demo.check(Demo.count(t, v -> v.name() == MATCH && v.cancelled() && v.durationNanos() == 0
                         && v.cpuNanos() < 0 && shard(v) > HIT_SHARD) == skipped,
                 "each skipped match is cancelled before it began (c, not n): no run time, no CPU");
@@ -208,7 +207,7 @@ public final class WorkerPool {
         Demo.check(Demo.count(t, v -> v.healed() || v.misuse()) == 0, "the strict trace has no healed or misused span");
 
         Demo.say("POST /match: 12 shards on 3 work threads; shard " + HIT_SHARD + " held the hit, "
-                + skipped + " queued shards were skipped (c); those already running finished after the join.");
+                + skipped + " shards were cancelled before they began (c); those already running finished after the join.");
         Demo.say("store: the writer was full, so one write ran on " + request + " itself; notify: the full pool refused one (c).");
     }
 

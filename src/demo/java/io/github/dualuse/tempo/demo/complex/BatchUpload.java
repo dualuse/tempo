@@ -30,8 +30,9 @@ import java.util.concurrent.TimeoutException;
  * the I/O thread), a failure that reaches the item's result while the batch goes on, a refused
  * submission ({@code h.reject()}) that falls back to running inline on the I/O thread, and items that
  * had not started by the deadline ({@code h.cancel()}): an I/O thread that takes one too late drops it,
- * and at the deadline the request thread takes the rest back out of the queue. The body carries the
- * per-item results and the whole trace as JSON. It builds on {@code WorkerPool} (handoffs, rejection,
+ * and at the deadline the request thread cancels the rest. Both cancel the same handoff, and only one of
+ * them wins, so the two never both handle an item. The body carries the per-item results and the whole
+ * trace as JSON. It builds on {@code WorkerPool} (handoffs, rejection,
  * cancel) and {@code AttributesAndFailures} (failures).
  *
  * <pre>
@@ -84,17 +85,16 @@ public final class BatchUpload {
                 // The deadline is enforced where a worker takes the item, before the handoff begins: an item
                 // taken too late is cancelled, however late the request thread itself wakes up. Each item keeps
                 // an io thread for at least 16 ms (11 ms for the corrupt one), so no thread starts a fourth
-                // item before 43 ms: at most 12 items start before the 40 ms deadline.
+                // item before 43 ms: at most 12 items start before the 40 ms deadline. If the request thread
+                // cancelled the item first, this cancel loses, and callable() throws CancellationException.
                 Item it = new Item(index, h);
-                it.task = new FutureTask<>(() -> {
-                    if (System.nanoTime() - deadline > 0) {
+                it.task = io.submit(() -> {
+                    if (System.nanoTime() - deadline > 0 && h.cancel()) {
                         it.cancelled = true;
-                        h.cancel();
                         throw new CancellationException("not started by the deadline");
                     }
                     return run.call();
                 });
-                io.execute(it.task); // our own FutureTask, so that the request thread can take it back out of the queue
                 items.add(it);
             }
 
@@ -112,15 +112,16 @@ public final class BatchUpload {
                 }
             }
 
-            // Past the deadline, the request thread cancels what is still queued, so the io threads need not
-            // take each late item only to drop it. remove() decides the race with a worker taking the task
-            // right now, so that the two paths never both handle one item: Future.cancel(false) alone could
-            // cancel the handoff a moment before the worker begins it, which strict mode reports as misuse.
+            // Past the deadline, the request thread cancels every item that has not begun. The handoff decides
+            // the race with a worker taking the item right now, and with that worker's own deadline check:
+            // exactly one cancel or begin wins, so the two paths never both handle one item. A won cancel
+            // means the item never runs (callable() skips it); a lost one, that it began, or that its worker
+            // cancelled it already. The cancelled items stay in the io queue, where they cost a worker
+            // nothing: ThreadPoolExecutor.remove would only free the slots of a bounded queue sooner.
             for (Item it : items) {
-                if (io.remove(it.task)) {
-                    it.cancelled = true;
-                    it.handoff.cancel();      // the trace: never started, cancelled (^c)
-                    it.task.cancel(false);    // the result: CancellationException
+                if (it.handoff.cancel()) {
+                    it.cancelled = true;      // the trace: cancelled before it began (^c)
+                    it.task.cancel(false);    // the result: cancelled, for whoever waits on it
                 }
             }
 
@@ -131,10 +132,15 @@ public final class BatchUpload {
                         it.descriptor = it.task.get();
                         ok++;
                     } catch (CancellationException | ExecutionException e) {
-                        // cancelled here, or by the worker that took it too late (then the cause says so)
-                        it.error = e instanceof ExecutionException ? e.getCause().getMessage() : "not started by the deadline";
-                        if (it.cancelled) cancelled++;
-                        else failed++;
+                        // cancelled here or by the worker that took it too late, which the cancel's result
+                        // recorded in it.cancelled; or failed (then the cause says why)
+                        if (it.cancelled) {
+                            it.error = "not started by the deadline";
+                            cancelled++;
+                        } else {
+                            it.error = (e instanceof ExecutionException ? e.getCause() : e).getMessage();
+                            failed++;
+                        }
                     }
                 }
             }
@@ -165,7 +171,7 @@ public final class BatchUpload {
     static final class Item {
         final int index;
         final Tempo.Handoff handoff;
-        FutureTask<String> task;
+        Future<String> task;
         volatile boolean cancelled; // by the request thread, or by the io thread that took it past the deadline
         String descriptor, error;
 

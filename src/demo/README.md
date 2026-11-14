@@ -50,7 +50,7 @@ metrics, headers), and the complex ones combine them into a service.
 | Demo | What it teaches | Tempo API it introduces |
 |---|---|---|
 | `LevelsAndOptIn` | Coarse tracing for every request, detail when the client asks for it, and a hot loop folded into one aggregate once the budget is spent. | `COARSE` / `DETAIL` / `DEEP`, `detail`, `deep`, `Trace.raise`, `detailed`, `Options.budget`, aggregates, `Trace.aggregate` |
-| `WorkerPool` | Work handed to a thread pool: queue wait, CPU time per task, a blocking join, and the ways a task ends without running on the pool (caller-runs, rejected, cancelled by an early exit). | `handoff`, `Handoff.callable` / `runnable`, `waiting`, `Handoff.reject`, `Handoff.cancel`, CPU time at `DETAIL` |
+| `WorkerPool` | Work handed to a thread pool: queue wait, CPU time per task, a blocking join, and the ways a task ends without running on the pool (caller-runs, rejected, cancelled by an early exit that races the workers and knows who won). | `handoff`, `Handoff.callable` / `runnable`, `waiting`, `Handoff.reject`, `Handoff.cancel`, CPU time at `DETAIL` |
 | `MetricsAndListeners` | Spans that also feed a service's metrics, and queue wait of pool tasks without recording them as spans. | `Name.sink`, `Name.aggregate`, `Trace.on`, `Tempo.serialized`, `Tempo.seconds`, `Tempo.time`, `Trace.add`, `submitted` / `waited` |
 | `ResponseHeaders` | Getting a trace out of a service: four headers under one byte limit, a link to a self-hosted viewer, JSON in the body, reading a trace in code. | `toHeader(maxBytes)`, `toLink(base, maxBytes)`, `Options.linkBase`, `snapshot`, `Snapshot.writeJson`, `x=folded.dropped` |
 
@@ -58,9 +58,9 @@ metrics, headers), and the complex ones combine them into a service.
 
 | Demo | What it teaches | Combines |
 |---|---|---|
-| `SearchRequest` | One request through a filter and a handler with an `io` pool and a `cpu` pool: a chain of handoffs request → `io-N` → `cpu-N`, an early exit that cancels queued work without racing running work, a straggler still open at render. | `LevelsAndOptIn`, `WorkerPool`, `ResponseHeaders` |
+| `SearchRequest` | One request through a filter and a handler with an `io` pool and a `cpu` pool: a chain of handoffs request → `io-N` → `cpu-N`, an early exit that cancels every task not yet begun while hand-written tasks return early (`Handoff.tryBegin`), a straggler still open at render. | `LevelsAndOptIn`, `WorkerPool`, `ResponseHeaders` |
 | `IngestPipeline` | An upload processed by stage workers connected by bounded queues: long-running workers joining a request's trace, backpressure, end of stream, a summary from aggregates. | `WorkerPool`, `MetricsAndListeners`, `ResponseHeaders` |
-| `BatchUpload` | A batch processed in parallel with nested fan-out (two hops), one corrupt item, a bounded pool that refuses work, and a deadline. | `WorkerPool`, `AttributesAndFailures` |
+| `BatchUpload` | A batch processed in parallel with nested fan-out (two hops), one corrupt item, a bounded pool that refuses work, and a deadline enforced by the workers and the request thread at once, one cancel winning per item. | `WorkerPool`, `AttributesAndFailures` |
 | `PoolDiagnosis` | One pool or two? The same concurrent load under both layouts, compared by reading the traces in code, with `--diff`, `--stats` and `--pools`. | `WorkerPool`, reading a trace (`ResponseHeaders`) |
 
 ## What to look for
