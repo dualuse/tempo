@@ -8,6 +8,8 @@
 // * Every prefix of every canonical vector is rejected as cut or decodes to a span prefix.
 // * testdata/invalid/*.header fail with the code listed in testdata/invalid/README.md.
 // * samples/**/*.header decode to their .json.
+// * Tempo-Link URLs built with zlib from every golden and sample decode to the same document
+//   (fragment, pasted URL, curl -i with a Tempo-Link line); corrupt and truncated links are E_LINK.
 // * Input extraction (curl -i, bare values, JSON bodies), number encoding, and, when
 //   python3 is available, agreement with tools/tempo_ref.py and tools/gen_traces.py.
 
@@ -16,6 +18,7 @@ import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
+import { deflateRawSync } from "node:zlib";
 import * as P from "../tools/tempo_parse.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -187,6 +190,118 @@ check("extract garbage reports E_VERSION", codeOf(() => P.extractTraces("hello w
 check("extract JSON without trace reports E_INPUT", codeOf(() => P.extractTraces("{\"a\": 1}")) === "E_INPUT");
 check("load JSON form re-encodes to the canonical header", P.load({ doc: exampleDoc }).header === example);
 check("normalizeJson rejects a bad parent", codeOf(() => P.normalizeJson({ v: 1, threads: ["a"], spans: [{ id: 0, parent: -1, name: "r", start: 0, dur: 1, thread: 0 }, { id: 1, parent: 5, name: "c", start: 0, dur: 1, thread: 0 }] })) === "E_JSON");
+
+// ---------------------------------------------------------------- Tempo-Link (#t=… fragments)
+// Links are built here with Node's zlib, independently of the page's packValue, and must decode to
+// the same document as the header: via the fragment (what the page does on open), via a pasted URL,
+// and via pasted `curl -i` output that has a Tempo-Link line (alone or next to Tempo-Timing).
+async function codeOfAsync(promise) {
+  try { await promise; return null; } catch (e) { if (e instanceof P.TempoFormatError) return e.code; throw e; }
+}
+const zOf = (value) => "z." + deflateRawSync(Buffer.from(value, "utf8")).toString("base64url");
+const plainOf = (value) => value.replace(/%/g, "%25");
+const BASES = ["https://dualuse.de/tempo/", "file:///home/me/tempo/site/index.html", "http://localhost:8080/tools/tempo.html?x=1"];
+const linkVectors = goldens.map((n) => [join(goldenDir, n + ".header"), join(goldenDir, n + ".json")])
+  .concat(samples.map((p) => [p, p.slice(0, -7) + ".json"]));
+let nLinks = 0;
+for (const [hp, jp] of linkVectors) {
+  const value = P.stripWs(read(hp));
+  const want = JSON.parse(read(jp));
+  const viaHeader = P.decode(value);
+  const label = "link " + hp;
+  for (const [form, packed] of [["z", zOf(value)], ["plain", plainOf(value)]]) {
+    const base = BASES[nLinks % BASES.length];
+    const url = base + "#t=" + packed;
+    nLinks++;
+    try {
+      // the fragment path: what the page does when it is opened with #t=…
+      const fromFragment = P.decode(await P.unpackValue(P.linkParams(url).t));
+      check(label + " " + form + " fragment", same(fromFragment, want) && same(fromFragment, viaHeader), firstDiff(fromFragment, want));
+      // a pasted URL
+      const pasted = P.extractTraces(url);
+      const r1 = pasted.length === 1 ? await P.loadAsync(pasted[0]) : null;
+      check(label + " " + form + " pasted URL", r1 && r1.source === "link" && same(r1.doc, want), JSON.stringify(pasted).slice(0, 120));
+      // curl -i with only a Tempo-Link, wrapped by the terminal at 80 columns
+      const curlLink = "HTTP/2 200 \r\ncontent-type: application/json\r\n" + wrap("tempo-link: " + url, 80).replace(/\n/g, "\r\n") + "\r\nserver-timing: total;dur=12\r\n\r\n{\"ok\":true}\n";
+      const items = P.extractTraces(curlLink);
+      const r2 = items.length === 1 ? await P.loadAsync(items[0]) : null;
+      check(label + " " + form + " curl -i Tempo-Link only", r2 && same(r2.doc, want), JSON.stringify(items).slice(0, 120));
+      // curl -i with both headers: one trace, from Tempo-Timing, no note
+      const curlBoth = "HTTP/1.1 200 OK\nTempo-Timing: " + value + "\nTempo-Link: " + url + "\nContent-Type: application/json\n\n{}\n";
+      const both = P.extractTraces(curlBoth);
+      const r3 = both.length === 1 ? await P.loadAsync(both[0]) : null;
+      check(label + " " + form + " curl -i both headers", r3 && r3.source === "header" && !r3.note && same(r3.doc, want), JSON.stringify(both).slice(0, 120));
+    } catch (e) {
+      check(label + " " + form, false, "threw " + e.message);
+    }
+  }
+}
+const sv = P.stripWs(read("samples/find-saturated.header")), hv = P.stripWs(read("samples/find-healthy.header"));
+const svDoc = P.decode(sv), hvDoc = P.decode(hv);
+const svUrl = "https://dualuse.de/tempo/#t=" + zOf(sv);
+const hvUrl = "https://dualuse.de/tempo/#t=" + zOf(hv);
+{
+  // several links -> several traces (the page sends them to stats)
+  const several = P.extractTraces([svUrl, hvUrl, "see " + svUrl + "."].join("\n"));
+  const loaded = await Promise.all(several.map(P.loadAsync));
+  check("links: three URLs give three traces", loaded.length === 3 && same(loaded[0].doc, svDoc) && same(loaded[1].doc, hvDoc) && same(loaded[2].doc, svDoc));
+  const twoCurls = ["HTTP/2 200", "tempo-link: " + svUrl, "", "{}", "HTTP/2 200", "tempo-timing: " + hv, "tempo-link: " + hvUrl, "", "{}"].join("\n");
+  const tc2 = await Promise.all(P.extractTraces(twoCurls).map(P.loadAsync));
+  check("links: two curl outputs, link only and both headers", tc2.length === 2 && same(tc2[0].doc, svDoc) && tc2[1].source === "header" && same(tc2[1].doc, hvDoc));
+  // c= and tab=
+  const pair = await P.loadAsync(P.extractTraces(svUrl + "&c=" + zOf(hv) + "&tab=diff")[0]);
+  check("links: c= and tab= of a pasted link", same(pair.doc, svDoc) && pair.compare === hv && pair.tab === "diff");
+  // the page's own packing round-trips and makeLink keeps the base without its hash
+  const made = await P.makeLink("https://example.org/tempo/index.html#t=old&tab=x", sv, hv);
+  check("makeLink base and shape", /^https:\/\/example\.org\/tempo\/index\.html#t=z\.[A-Za-z0-9_-]+&c=z\.[A-Za-z0-9_-]+$/.test(made), made.slice(0, 80));
+  const mp = P.linkParams(made);
+  check("makeLink round trip", (await P.unpackValue(mp.t)) === sv && (await P.unpackValue(mp.c)) === hv);
+  check("packValue of a value with % escapes", (await P.unpackValue(await P.packValue("v1;T=a;N=%C3%A4;S=00.0.1;e=1"))) === "v1;T=a;N=%C3%A4;S=00.0.1;e=1");
+  check("linkParams without t=", P.linkParams("https://x/#tab=lanes") === null && P.linkParams("https://x/") === null);
+  check("curl -v '(#0)' is not a link", P.extractTraces("* Connected to localhost (127.0.0.1) port 80 (#0)\n< HTTP/1.1 200 OK\n< Tempo-Timing: " + example + "\n<\n{}").length === 1);
+}
+{
+  // corrupt and truncated payloads -> E_LINK
+  const z = zOf(P.stripWs(read("samples/small.header"))).slice(2);
+  let prefixesRejected = 0;
+  for (let n = 1; n < z.length; n++) if ((await codeOfAsync(P.unpackValue("z." + z.slice(0, n)))) === "E_LINK") prefixesRejected++;
+  check("every truncated z. payload is E_LINK", prefixesRejected === z.length - 1, prefixesRejected + "/" + (z.length - 1));
+  const flipped = z.slice(0, 40) + (z[40] === "A" ? "B" : "A") + z.slice(41);
+  const corrupt = [
+    ["flipped character", "z." + flipped],
+    ["not base64url", "z.abc$def"],
+    ["impossible base64 length", "z.A"],
+    ["empty payload", "z."],
+    ["not deflate", "z." + Buffer.from("hello, not deflate at all").toString("base64url")],
+    ["trailing junk", "z." + Buffer.concat([deflateRawSync(Buffer.from("v1;T=a;N=r;S=00.0.1;e=1")), Buffer.from("junk")]).toString("base64url")],
+    ["not UTF-8", "z." + deflateRawSync(Buffer.from([0x76, 0x31, 0x3b, 0xff, 0xfe])).toString("base64url")]
+  ];
+  for (const [label, packed] of corrupt) {
+    const code = await codeOfAsync(P.loadAsync(P.extractTraces("https://dualuse.de/tempo/#t=" + packed)[0] || { source: "link", link: { t: packed } }));
+    check("corrupt link: " + label, code === "E_LINK", "got " + code);
+  }
+  check("Tempo-Link header without a fragment", (await codeOfAsync(P.loadAsync(P.extractTraces("HTTP/1.1 200 OK\nTempo-Link: https://dualuse.de/tempo/\n\n{}")[0]))) === "E_LINK");
+  check("load() refuses a link item", codeOf(() => P.load(P.extractTraces(svUrl)[0])) === "E_LINK");
+  // a corrupt Tempo-Link next to a good Tempo-Timing: the header wins, with a note
+  const badBeside = await P.loadAsync(P.extractTraces("HTTP/1.1 200 OK\nTempo-Timing: " + sv + "\nTempo-Link: https://dualuse.de/tempo/#t=z." + flipped + "\n\n{}")[0]);
+  check("corrupt Tempo-Link beside Tempo-Timing", same(badBeside.doc, svDoc) && /does not decode/.test(badBeside.note || ""), badBeside.note);
+  // a cut Tempo-Timing next to a complete Tempo-Link: the link wins, with a note
+  const cutBeside = await P.loadAsync(P.extractTraces("HTTP/1.1 200 OK\nTempo-Timing: " + sv.slice(0, 900) + "\nTempo-Link: " + svUrl + "\n\n{}")[0]);
+  check("cut Tempo-Timing beside a complete Tempo-Link", cutBeside.source === "link" && same(cutBeside.doc, svDoc) && /was cut/.test(cutBeside.note || ""), cutBeside.note);
+  // a different trace in the link: the header wins, with a note
+  const differ = await P.loadAsync(P.extractTraces("HTTP/1.1 200 OK\nTempo-Timing: " + sv + "\nTempo-Link: " + hvUrl + "\n\n{}")[0]);
+  check("Tempo-Link with a different trace", same(differ.doc, svDoc) && /different/.test(differ.note || ""), differ.note);
+  // no DecompressionStream (older browsers): a clear E_LINK, plain links still work
+  const DS = globalThis.DecompressionStream;
+  delete globalThis.DecompressionStream;
+  let noDs = null;
+  try { await P.unpackValue("z." + z); } catch (e) { noDs = e; }
+  const plainStill = await P.unpackValue(plainOf(sv)).catch(() => null);
+  globalThis.DecompressionStream = DS;
+  check("no DecompressionStream is E_LINK", noDs && noDs.code === "E_LINK" && /DecompressionStream/.test(noDs.message), noDs && noDs.message);
+  check("no DecompressionStream, plain link still decodes", plainStill === sv);
+}
+console.log("links: " + nLinks + " built with zlib from " + linkVectors.length + " goldens and samples");
 
 // ---------------------------------------------------------------- numbers
 const numbers = [[2, "2"], [2.0, "2"], [-0, "0"], [-0.0000001, "0"], [1.5, "1.5"], [0.83, "0.83"], [0.000001, "0.000001"],

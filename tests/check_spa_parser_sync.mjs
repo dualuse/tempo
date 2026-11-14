@@ -27,7 +27,7 @@ const MODULES = [
     foot: "\nexport default TempoParse;\n" +
           "export const {\n  ALPHABET_CHARS, FLAG_ORDER, FLAG_NAMES, MAX_DEPTH, RECORD_RE, ERRORS,\n" +
           "  TempoFormatError, stripWs, decode, decodeName, encodeName, encodeNumber, encode,\n" +
-          "  normalizeJson, dumpJson, extractTraces, load\n} = TempoParse;\n"
+          "  normalizeJson, dumpJson, extractTraces, load,\n  linkParams, packValue, unpackValue, makeLink, loadAsync\n} = TempoParse;\n"
   },
   {
     tag: "TEMPO ANALYSIS",
