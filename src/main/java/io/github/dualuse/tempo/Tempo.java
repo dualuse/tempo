@@ -45,8 +45,10 @@ import java.util.zip.Deflater;
  * }
  * }</pre>
  *
- * <p>A {@link Span} is a handle that only its lane's owner thread may use; the handle object is
- * reused for the next span opened at the same depth, so it must not be used after it is closed.
+ * <p>A {@link Span} is a handle that only its lane's owner thread may use. The handle object is reused
+ * for the next span opened at the same depth on that thread, so a handle is its span only until then:
+ * keep it inside its block ({@code set}, {@code fail} and {@code cancel} after close, as in a catch
+ * block right after, are fine).
  * Work for another thread goes through a {@link Handoff}: {@code s.handoff(n)} where the task is
  * submitted, {@code h.begin()} (or {@code h.runnable(r)}) where it runs, which records its queue wait.
  */
@@ -4029,9 +4031,13 @@ public final class Tempo {
     // ---------------------------------------------------------------------------------------------
 
     /**
-     * Same-thread handle to one open span. Handles are cached per depth and reused, so a handle is
-     * valid from its open until the next span opens at the same depth. Calls on a foreign thread or
-     * after close are ignored and counted as misuse; methods that open spans then return {@link #NOOP}.
+     * Same-thread handle to a span. A thread reuses one handle object per depth, so a handle is its span
+     * only until the next span opens at the same depth on that thread; from then on it is that span, and
+     * every call through it acts on the new one, undetected, even under {@link Options#strict}. Keep a
+     * handle inside the block that opened it. Until the next span opens there, {@link #set}, {@link #fail},
+     * {@link #cancel} and {@link #waiting} work after close too, as in the catch block right after; the
+     * other calls after close, and every call on a foreign thread, are ignored and counted as misuse, and
+     * methods that open spans then return {@link #NOOP}.
      */
     public static final class Span implements AutoCloseable {
         final Lane lane;
@@ -4231,7 +4237,10 @@ public final class Tempo {
             return Name.UNKNOWN;
         }
 
-        /** Attaches a number to this span, also after it closed (e.g. in a catch block). */
+        /**
+         * Attaches a number to this span. Also after it closed (e.g. in the catch block right after), until
+         * the next span opens at the same depth on this thread: from then on the handle is that span.
+         */
         public Span set(Name key, long value) {
             if (owned() && row != Lane.FRAME) lane.event(row, key(key) << KIND_BITS | ATTR_LONG, value);
             return this;
@@ -4259,17 +4268,17 @@ public final class Tempo {
             return name != null ? lane.handoff(name, 0) : lane.handoff(nullName(), MISUSE);
         }
 
-        /** Marks the span failed. Works after close as well, so a catch block can call it. */
+        /** Marks the span failed. Also after close, until the next span opens at this depth, like {@link #set(Name, long)}. */
         public Span fail() {
             return flag(FAILED);
         }
 
-        /** Marks the span failed; only the flag is recorded, not the throwable. */
+        /** Marks the span failed; only the flag is recorded, not the throwable. Also after close, like {@link #fail()}. */
         public Span fail(Throwable cause) {
             return flag(FAILED);
         }
 
-        /** Marks the span cancelled or rejected. */
+        /** Marks the span cancelled or rejected. Also after close, like {@link #set(Name, long)}. */
         public Span cancel() {
             return flag(CANCELLED);
         }

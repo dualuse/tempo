@@ -88,7 +88,9 @@ Plan p = t.root().call(PLAN, () -> plan(request));           // the same, with a
 ```
 
 A span nests under the innermost open span of its thread. A `Span` handle belongs to its
-thread and is reused for the next span at the same depth, so it is not kept after close.
+thread, which reuses one handle object per depth: a handle is its span until the next span
+opens at the same depth on that thread, and from then on it is that span, without any check
+(not even `strict` can tell). Keep a handle inside the block that opened it.
 Deep in a call stack, `Tempo.current()` returns the innermost open span of the thread, or
 `Tempo.NOOP` (a handle that records nothing) outside a trace. `run`, `call` and `lap` flag
 the span failed when the body throws and rethrow the throwable unwrapped.
@@ -171,9 +173,11 @@ try {
 }
 ```
 
-`set`, `fail()` and `cancel()` also work after the span closed, so a catch block can call
-them. `waiting()` marks a blocking wait (a join, a `take`, a `get`), which the viewers draw
-apart from run time and follow across threads on the critical path.
+`set`, `fail()` and `cancel()` also work after the span closed, as in the catch block right
+after it, until the next span opens at the same depth on the thread: from then on the handle
+is that span, and a late call lands there. `waiting()` marks a blocking wait (a join, a
+`take`, a `get`), which the viewers draw apart from run time and follow across threads on the
+critical path.
 
 ### Levels
 

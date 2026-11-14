@@ -620,6 +620,26 @@ class TempoTest {
         assertEquals("", tree(t));
     }
 
+    /**
+     * Pins current behaviour, documented in the Span Javadoc, not a guarantee: a thread reuses one handle
+     * per depth, so once the next span opens at that depth the old variable is the new span, and a late
+     * call through it lands there, undetected even under strict. A redesign of the handles changes this.
+     */
+    @Test
+    void pinsCurrentBehaviourAHandleIsTheNextSpanOpenedAtItsDepth() {
+        Trace t = Tempo.start(SEARCH, strict());
+        Span d = t.root().span(DECODE);
+        d.close();
+        d.set(BYTES, 7);                 // still decode: right after close is fine
+        Span l = t.root().span(LOAD);    // the next span at the same depth on this thread
+        assertSame(d, l);                // ...is the same handle
+        d.fail().set(SCORE, 0.5);        // so these land on load
+        l.close();
+        t.close();
+        assertEquals(lines("search 0+0", "  decode 0+0 bytes=7", "  load 0+0 failed score=0.5"), tree(t));
+        assertEquals(0, t.misuses());
+    }
+
     // ---- phases and laps ------------------------------------------------------------------------------
 
     @Test

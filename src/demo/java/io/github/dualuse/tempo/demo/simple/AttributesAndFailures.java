@@ -57,7 +57,8 @@ public final class AttributesAndFailures {
         // strict(true) is for tests: misuse (opening a child on a span that already closed, a call on a
         // foreign thread, closing a span while a child is still open) throws AssertionError where Tempo
         // detects it, instead of being healed and counted. set, fail and cancel after close are allowed
-        // and are not misuse. In production leave it off.
+        // until the next span opens at the same depth (see thumbnails below), and are not misuse. In
+        // production leave it off.
         Tempo.Trace t = Tempo.start(UPLOAD, new Tempo.Options().strict(true));
         try (t) {
             upload(t.root());
