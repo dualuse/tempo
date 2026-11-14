@@ -45,7 +45,7 @@ public final class Tempo {
     // Row flag bits (16-bit column).
     static final int PHASE = 1, RETRO = 1 << 1, HANDOFF = 1 << 2, WAIT = 1 << 3, FAILED = 1 << 4,
             CANCELLED = 1 << 5, HEALED = 1 << 6, MISUSE = 1 << 7, DETAIL_ROW = 1 << 8, DEEP_ROW = 1 << 9,
-            LEGACY = 1 << 10;
+            LEGACY = 1 << 10, TASK = 1 << 11;
 
     // Event kinds, in the low KIND_BITS of an event's key; the rest is a Name id for attributes.
     static final int KIND_BITS = 4, KIND_MASK = (1 << KIND_BITS) - 1,
@@ -518,6 +518,60 @@ public final class Tempo {
             return n;
         }
 
+        /**
+         * {@link Snapshot#aggregate} read in place: the same rows, task waits and lane aggregates, summed
+         * without a copy. A read racing {@link #release()} may see recycled chunks; like a Snapshot's, it
+         * is thrown away, also when what it read made it fail.
+         */
+        Aggregate aggregate(int id) {
+            if (released) return Aggregate.EMPTY;
+            long count = 0, sum = 0, min = Long.MAX_VALUE, max = 0, waits = 0, waitSum = 0, waitMax = 0;
+            try {
+                for (Lane l = lanes; l != null; l = l.next) {
+                    if (l.retired()) continue;
+                    long commit = l.committed();
+                    int rows = (int) (commit >>> 32), events = (int) commit;
+                    for (int r = 0; r < rows; r++) {
+                        Rows c = l.rows[r >>> Lane.CHUNK_BITS];
+                        int i = r & Lane.MASK, f = c.flags[i];
+                        if (c.name[i] != id || (f & HANDOFF) != 0 || (f & (RETRO | MISUSE)) == (RETRO | MISUSE)
+                                || (f & (TASK | CANCELLED)) == (TASK | CANCELLED)) continue;
+                        long d = (long) Lane.DUR.getOpaque(c.dur, i);
+                        if (d == Lane.OPEN) continue;
+                        count++;
+                        sum += d;
+                        min = Math.min(min, d);
+                        max = Math.max(max, d);
+                    }
+                    for (int e = 0; e < events; e++) { // every task row, begun or cancelled, has one QWAIT
+                        Events c = l.events[e >>> Lane.CHUNK_BITS];
+                        int i = e & Lane.MASK;
+                        if ((c.key[i] & KIND_MASK) != QWAIT || l.nameOf(c.row[i]) != id) continue;
+                        long w = c.value[i];
+                        waits++;
+                        waitSum += w;
+                        waitMax = Math.max(waitMax, w);
+                    }
+                    Aggs a = (Aggs) Lane.AGGS.getAcquire(l);
+                    for (int e = 0, n = a == null ? 0 : a.size(); e < n; e++) {
+                        int k = e * Aggs.KEY, b = e * Aggs.CELLS;
+                        // as in Shape: not ended yet, or moved under a lap row past the rows read
+                        if (a.keys[k + Aggs.NAME] != id || a.cells[b + Aggs.COUNT] == 0 || a.keys[k] >= rows) continue;
+                        count += a.cells[b + Aggs.COUNT];
+                        sum += a.cells[b + Aggs.SUM];
+                        min = Math.min(min, a.cells[b + Aggs.MIN]);
+                        max = Math.max(max, a.cells[b + Aggs.MAX_DUR]);
+                    }
+                }
+            } catch (RuntimeException e) {
+                VarHandle.acquireFence();
+                if (released) return Aggregate.EMPTY;
+                throw e;
+            }
+            VarHandle.acquireFence();
+            return released ? Aggregate.EMPTY : Totals.merge(totals, id, count, sum, min, max, waits, waitSum, waitMax);
+        }
+
         /** Hands a lane up to one block of the detail budget; 0 when it is spent. */
         int credits() {
             int c, n;
@@ -646,17 +700,28 @@ public final class Tempo {
             }
         }
 
-        Aggregate get(int id) {
-            for (Totals t = this; t != null; t = t.next) {
+        /**
+         * The lane sums of {@code id} (min {@link Long#MAX_VALUE} when count is 0) plus its lane-less
+         * entry in {@code totals}, which may be null; one allocation.
+         */
+        static Aggregate merge(Totals totals, int id, long count, long sum, long min, long max,
+                long waits, long waitSum, long waitMax) {
+            for (Totals t = totals; t != null; t = t.next) {
                 int s = t.slot(id, false);
                 if (s < 0) continue;
                 long[] c = t.cells;
                 int b = s * CELLS;
-                long count = cell(c, b + COUNT);
-                return new Aggregate(count, cell(c, b + SUM), count == 0 ? 0 : Long.MAX_VALUE - cell(c, b + MIN),
-                        cell(c, b + MAX), cell(c, b + WAITS), cell(c, b + WAIT_SUM), cell(c, b + WAIT_MAX));
+                long n = cell(c, b + COUNT);
+                if (n > 0) min = Math.min(min, Long.MAX_VALUE - cell(c, b + MIN));
+                count += n;
+                sum += cell(c, b + SUM);
+                max = Math.max(max, cell(c, b + MAX));
+                waits += cell(c, b + WAITS);
+                waitSum += cell(c, b + WAIT_SUM);
+                waitMax = Math.max(waitMax, cell(c, b + WAIT_MAX));
+                break;
             }
-            return Aggregate.EMPTY;
+            return new Aggregate(count, sum, count == 0 ? 0 : min, max, waits, waitSum, waitMax);
         }
 
         /** The slot of {@code id}, claiming a free one if {@code claim}; -1 if absent (and, claiming, the table is full). */
@@ -937,10 +1002,10 @@ public final class Tempo {
             if (eventCount > MAX_EVENTS - 2) {
                 dropped++;
             } else if (run) {
-                s = stack(n, 0);
+                s = stack(n, TASK);
                 r = s == NOOP ? -1 : s.row;
             } else {
-                r = row(n, CANCELLED, root ? -1 : rowAt[depth - 1]);
+                r = row(n, TASK | CANCELLED, root ? -1 : rowAt[depth - 1]);
             }
             if (r < 0) {
                 if (root) idle();
@@ -990,7 +1055,7 @@ public final class Tempo {
         Span budgeted(Name n, int flags) {
             if (credit == 0 && (credit = ctx.credits()) == 0) {
                 Span h = frame(n);
-                if (h != NOOP) folded++;
+                if (h != NOOP && h.agg >= 0) folded++; // past the aggregate cap the frame counted a drop
                 return h;
             }
             Span h = push(n, flags);
@@ -1788,10 +1853,10 @@ public final class Tempo {
          * The trace now, or {@link #EMPTY} once it is released. A copy racing {@link Trace#release()} may
          * read chunks that went back to the pool; it is thrown away, also when what it read made it fail.
          */
-        static Snapshot of(Context ctx, boolean stitch) {
+        static Snapshot of(Context ctx) {
             if (ctx.released) return EMPTY;
             try {
-                Snapshot s = new Snapshot(ctx, stitch);
+                Snapshot s = new Snapshot(ctx);
                 VarHandle.acquireFence();
                 return ctx.released ? EMPTY : s;
             } catch (RuntimeException e) {
@@ -1801,7 +1866,7 @@ public final class Tempo {
             }
         }
 
-        private Snapshot(Context ctx, boolean stitch) {
+        private Snapshot(Context ctx) {
             now = ctx.now();
             Lane[] lanes = ctx.lanesById();
             shapes = new Shape[lanes.length];
@@ -1810,7 +1875,6 @@ public final class Tempo {
             misuses = ctx.misuses.get();
             dropped = ctx.dropped();
             folded = ctx.folded();
-            if (!stitch) return;
             for (long x : ctx.lost()) {
                 Shape s = shape(x);
                 if (s != null && (int) x < s.rows) s.hide((int) x);
@@ -1983,11 +2047,7 @@ public final class Tempo {
                     max = Math.max(max, s.aggCell[b + Aggs.MAX_DUR]);
                 }
             }
-            Aggregate t = totals == null ? Aggregate.EMPTY : totals.get(id);
-            if (t.count() > 0) min = Math.min(min, t.minNanos());
-            return new Aggregate(count + t.count(), sum + t.sumNanos(), count + t.count() == 0 ? 0 : min,
-                    Math.max(max, t.maxNanos()), waits + t.waitCount(), waitSum + t.waitSumNanos(),
-                    Math.max(waitMax, t.waitMaxNanos()));
+            return Totals.merge(totals, id, count, sum, min, max, waits, waitSum, waitMax);
         }
 
         /** Wall time of the root span: its duration, or while it was open its age when the snapshot was taken. */
@@ -2144,10 +2204,11 @@ public final class Tempo {
          * budget, aggregate-only (an always-on name below the level, see {@link Name#aggregate()}) and
          * added through {@link #add}; and the queue waits of its tasks, of tasks left unrecorded at a cap,
          * and those added through {@link #addWait} and {@link #waited}. Exact once the contributing threads
-         * are done, best effort while they run; empty after release. Copies the trace, see {@link #snapshot()}.
+         * are done, best effort while they run; empty after release. Reads the lanes in place: no copy,
+         * one allocation, time linear in the trace's rows, events and aggregates.
          */
         public Aggregate aggregate(Name name) {
-            return name == null ? Aggregate.EMPTY : Snapshot.of(ctx, false).aggregate(name);
+            return name == null ? Aggregate.EMPTY : ctx.aggregate(name.id);
         }
 
         /**
@@ -2164,7 +2225,7 @@ public final class Tempo {
          * it before releasing when the trace is rendered later. Empty after release.
          */
         public Snapshot snapshot() {
-            return Snapshot.of(ctx, true);
+            return Snapshot.of(ctx);
         }
 
         int misuses() {

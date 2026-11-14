@@ -214,6 +214,92 @@ class BudgetTest {
         assertEquals("count=4 sum=17 min=0 max=10 waits=0 waitSum=0 waitMax=0", t.aggregate(LOAD).toString());
     }
 
+    /** Each coarse span is a new anchor, so its folded child needs a new aggregate until the lane has its maximum. */
+    @Test
+    void detailSpansPastTheAggregateCapAreDroppedNotFolded() {
+        Trace t = Tempo.start(SEARCH, opts(0));
+        Span s = t.root();
+        int opened = Tempo.Aggs.MAX + 904;
+        for (int i = 0; i < opened; i++) {
+            Span m = s.span(MATCH);
+            Span x = m.detail(LOAD);
+            clock.add(1);
+            x.close();
+            m.close();
+        }
+        t.close();
+        int[] rows = {0};
+        long[] folded = {0};
+        t.forEachSpan(v -> {
+            if (v.name() != LOAD) return;
+            if (v.aggregate()) folded[0] += v.count();
+            else rows[0]++;
+        });
+        assertEquals(0, rows[0]);
+        assertEquals(Tempo.Aggs.MAX, folded[0]);
+        assertEquals(Tempo.Aggs.MAX, t.folded());
+        assertEquals(904, t.dropped());
+        assertEquals(opened, rows[0] + t.folded() + t.dropped());
+        assertEquals("count=4096 sum=4096 min=1 max=1 waits=0 waitSum=0 waitMax=0", t.aggregate(LOAD).toString());
+        assertEquals(0, t.misuses());
+    }
+
+    @Test
+    void traceAggregateSumsInPlaceWhatTheSnapshotSums() {
+        Trace t = Tempo.start(SEARCH, opts(1));
+        Span s = t.root();
+        Span a = s.span(MATCH);
+        clock.add(3);
+        a.close();
+        Span c = s.span(MATCH).cancel(); // cancelled, but not a task: it counts
+        clock.add(2);
+        c.close();
+        Handoff h = s.handoff(MATCH);
+        clock.add(4);
+        Span b = h.begin();               // inline task: waited 4, ran 5
+        clock.add(5);
+        b.close();
+        Handoff g = s.handoff(MATCH);
+        clock.add(6);
+        g.cancel();                       // a cancelled task: its wait counts, its row does not
+        spans(s, MATCH, 1, 7);            // recorded, then folded
+        t.add(MATCH, 9);
+        t.addWait(MATCH, 8);
+        Span open = s.span(MATCH);        // open: left out
+        clock.add(20);
+        String expected = "count=6 sum=27 min=1 max=9 waits=3 waitSum=18 waitMax=8";
+        assertEquals(expected, t.aggregate(MATCH).toString());
+        assertEquals(expected, t.snapshot().aggregate(MATCH).toString());
+        open.close();
+        t.close();
+        assertEquals("count=7 sum=47 min=1 max=20 waits=3 waitSum=18 waitMax=8", t.aggregate(MATCH).toString());
+        assertEquals(0, t.misuses() + t.dropped());
+        t.release();
+        assertEquals("count=0 sum=0 min=0 max=0 waits=0 waitSum=0 waitMax=0", t.aggregate(MATCH).toString());
+    }
+
+    /** Trace.aggregate reads the lanes in place: one result object per call, however large the trace. */
+    @Test
+    void traceAggregateCopiesNothing() {
+        Trace t = Tempo.start(SEARCH, opts(100));
+        Span s = t.root();
+        for (int i = 0; i < 5_000; i++) {
+            s.span(MATCH).set(DECODE, i).close();
+            spans(s, LOAD, 1);
+        }
+        t.add(LOAD, 1);
+        t.close();
+        int calls = 1_000;
+        Runnable reads = () -> {
+            for (int i = 0; i < calls; i++) t.aggregate(LOAD);
+        };
+        for (int i = 0; i < 3; i++) reads.run();
+        long bytes = allocatedBy(reads);
+        assertTrue(bytes <= 72L * calls, bytes + " B for " + calls + " calls");
+        assertEquals("count=5001 sum=5001 min=1 max=1 waits=0 waitSum=0 waitMax=0", t.aggregate(LOAD).toString());
+        t.release();
+    }
+
     @Test
     void foldedSpansAllocateNothingOnceWarm() {
         Trace t = Tempo.start(SEARCH, opts(0));
