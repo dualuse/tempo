@@ -2,6 +2,7 @@ package io.github.dualuse.tempo;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.lang.ref.WeakReference;
 import java.util.Arrays;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
@@ -413,20 +414,24 @@ public final class Tempo {
     /**
      * Per-thread state. Holds no {@link Trace}; only lane-root opens and closes touch {@code current}.
      * Pool threads interleave tasks of concurrent traces, so the slot remembers its lanes of the last
-     * four traces; a lane found retired is dropped at the next lookup.
+     * four traces; a lane found retired or collected is dropped at the next lookup. The references are
+     * weak: a lane reaches its trace's registry, so a strong one would keep an unreleased trace with
+     * all its lanes alive for as long as the thread idles. The registry keeps the lanes of a live trace.
      */
     static final class ThreadSlot {
         Lane current;
-        final Lane[] lanes = new Lane[4];
+        @SuppressWarnings("unchecked")
+        final WeakReference<Lane>[] lanes = new WeakReference[4];
         private int victim;
 
         /** An idle lane of this thread for the trace, from the cache or new; null at the trace's lane cap. */
         Lane lane(Context ctx) {
             int free = -1;
             for (int i = 0; i < lanes.length; i++) {
-                Lane l = lanes[i];
-                if (l != null && l.retired()) lanes[i] = l = null;
-                if (l == null) {
+                WeakReference<Lane> w = lanes[i];
+                Lane l = w == null ? null : w.get();
+                if (l == null || l.retired()) {
+                    lanes[i] = null;
                     if (free < 0) free = i;
                 } else if (l.ctx == ctx && l.depth == 0) {
                     return l;
@@ -434,7 +439,7 @@ public final class Tempo {
             }
             if (ctx.full()) return null;
             Lane l = ctx.register(new Lane(ctx, this));
-            if (l != null) lanes[free >= 0 ? free : victim++ & 3] = l;
+            if (l != null) lanes[free >= 0 ? free : victim++ & 3] = new WeakReference<>(l);
             return l;
         }
     }
@@ -1053,7 +1058,7 @@ public final class Tempo {
             shapes = new Shape[lanes.length];
             for (int i = 0; i < lanes.length; i++) if (lanes[i] != null) shapes[i] = Shape.of(lanes[i]);
             for (long x : ctx.lost()) {
-                Shape s = shapes[(int) (x >>> 32)];
+                Shape s = shape(x);
                 if (s != null && (int) x < s.rows) s.hide((int) x);
             }
             // A task whose handoff row is not visible (a live render racing the submit) is left out.
@@ -1063,12 +1068,21 @@ public final class Tempo {
                     long x = s.link[r];
                     if (x < 0) continue;
                     s.hide(r);
-                    Shape t = shapes[(int) (x >>> 32)];
+                    Shape t = shape(x);
                     int h = (int) x;
                     if (t != null && h < t.rows && (t.flags(h) & HANDOFF) != 0) t.link(h, s.lane.id, r);
                 }
             }
             for (Shape s : shapes) if (s != null) s.tree();
+        }
+
+        /**
+         * The shape of the lane in a {@code laneId << 32 | row} link; null if not read. A live render can
+         * see a link to a lane registered after it read the registry.
+         */
+        private Shape shape(long link) {
+            int id = (int) (link >>> 32);
+            return id < shapes.length ? shapes[id] : null;
         }
 
         /** Visits the records in pre-order; the lane roots of each lane, by lane id, are the top level. */

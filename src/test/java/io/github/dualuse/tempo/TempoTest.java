@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
@@ -19,6 +20,9 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -1434,7 +1438,8 @@ class TempoTest {
 
     static int cachedLanes() {
         int n = 0;
-        for (Tempo.Lane l : Tempo.SLOT.get().lanes) {
+        for (WeakReference<Tempo.Lane> w : Tempo.SLOT.get().lanes) {
+            Tempo.Lane l = w == null ? null : w.get();
             assertFalse(l != null && l.retired(), "a retired lane stayed cached");
             if (l != null) n++;
         }
@@ -1474,6 +1479,100 @@ class TempoTest {
         } finally {
             pool.shutdown();
         }
+    }
+
+    @Test
+    void anUnreleasedTraceIsCollectedWhileAPoolThreadCachesItsLane() throws Exception {
+        ExecutorService pool = worker("worker-1");
+        try {
+            List<WeakReference<Object>> refs = unreleasedTraceWithATaskOn(pool);
+            assertEquals(1, pool.submit(TempoTest::cachedLanes).get());
+            for (int i = 0; i < 20 && refs.stream().anyMatch(r -> r.get() != null); i++) System.gc();
+            for (WeakReference<Object> r : refs) assertNull(r.get(), "still reachable: " + r.get());
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    /** The trace, its root lane and the worker's lane, held weakly; a separate frame so no local pins them. */
+    private List<WeakReference<Object>> unreleasedTraceWithATaskOn(ExecutorService pool) throws Exception {
+        Trace t = Tempo.start(SEARCH, opts());
+        Handoff h = t.root().handoff(MATCH);
+        pool.submit(() -> h.begin().close()).get();
+        t.close();
+        Tempo.Lane[] lanes = t.ctx.lanesById();
+        assertEquals(2, lanes.length);
+        return List.of(new WeakReference<>(t), new WeakReference<>(lanes[0]), new WeakReference<>(lanes[1]));
+    }
+
+    /**
+     * A live render races tasks begun on an old lane whose handoffs sit on lanes registered after the
+     * render read the registry. Such a task is left out until its lane is read; the render never throws.
+     */
+    @Test
+    void renderingWhileNewLanesHandOffNeverThrows() throws Exception {
+        int n = 1000;
+        Trace t = Tempo.start(SEARCH, opts().lanes(n + 2));
+        for (int i = 0; i < 8000; i++) t.root().set(BYTES, i); // a slow first shape widens the window
+        AtomicBoolean stop = new AtomicBoolean();
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        SynchronousQueue<Handoff> queue = new SynchronousQueue<>();
+        Handoff first = t.root().handoff(LOAD);
+        Thread worker = new Thread(() -> { // lane 1, begins the nested handoffs of the newer lanes
+            try {
+                first.begin().close();
+                while (!stop.get()) {
+                    Handoff h = queue.poll(1, TimeUnit.MILLISECONDS);
+                    if (h != null) h.begin().close();
+                }
+            } catch (Throwable e) {
+                thrown.compareAndSet(null, e);
+            }
+        }, "worker-1");
+        Thread renderer = new Thread(() -> {
+            try {
+                while (!stop.get()) assertWellFormed(t);
+            } catch (Throwable e) {
+                thrown.compareAndSet(null, e);
+            }
+        }, "renderer");
+        worker.start();
+        renderer.start();
+        Handoff[] outer = handoffs(t.root(), n);
+        for (int i = 0; i < n && thrown.get() == null; i++) {
+            Handoff o = outer[i];
+            Throwable e = onThread("fresh-" + i, () -> { // registers a new lane
+                try (Span s = o.begin()) {
+                    queue.put(s.handoff(MATCH));
+                } catch (InterruptedException x) {
+                    throw new AssertionError(x);
+                }
+            });
+            if (e != null) thrown.compareAndSet(null, e);
+        }
+        stop.set(true);
+        worker.join();
+        renderer.join();
+        t.close();
+        if (thrown.get() != null) throw new AssertionError(thrown.get());
+        assertEquals(2 + 2 * n, assertWellFormed(t));
+        t.forEachSpan(v -> assertFalse(v.neverStarted()));
+        assertEquals(0, t.misuses() + t.dropped());
+        t.release();
+    }
+
+    /** Checks the ids, parents, depths and durations of every record; returns the count. */
+    static int assertWellFormed(Trace t) {
+        List<Integer> depths = new ArrayList<>();
+        t.forEachSpan(v -> {
+            assertEquals(depths.size(), v.id());
+            assertTrue(v.parent() >= -1 && v.parent() < v.id(), "parent " + v.parent() + " of " + v.id());
+            assertEquals(v.parent() < 0 ? 0 : depths.get(v.parent()) + 1, v.depth());
+            assertNotNull(v.name());
+            assertTrue(v.durationNanos() >= 0 && v.waitNanos() >= 0);
+            depths.add(v.depth());
+        });
+        return depths.size();
     }
 
     @Test
