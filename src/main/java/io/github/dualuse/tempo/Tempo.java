@@ -429,7 +429,13 @@ public final class Tempo {
             level = -1; // below COARSE, so NOOP.detail() returns at the level check
         }
 
+        /**
+         * Reads the clock first: that reading is the trace's zero point and the root's start, so the setup
+         * that follows (the lane, the first CPU read of a JVM) is counted in the root's time, not hidden.
+         */
         Context(Options o) {
+            epoch = o.clock.getAsLong();
+            wall = o.wallClock.getAsLong();
             id = IDS.incrementAndGet();
             clock = o.clock;
             cpuClock = o.cpuClock;
@@ -442,8 +448,6 @@ public final class Tempo {
             maxLanes = o.lanes;
             level = o.level;
             listening = Name.anySink;
-            wall = o.wallClock.getAsLong();
-            epoch = clock.getAsLong();
         }
 
         long now() {
@@ -1187,15 +1191,21 @@ public final class Tempo {
             return a == null ? -1 : a.keys[e * Aggs.KEY + Aggs.NAME];
         }
 
-        Span openRoot(Name n, int flags) {
+        /**
+         * Opens the trace's root, which starts at 0: the clock reading the {@link Context} took first. {@code
+         * cpu} is the CPU time read right after it, or -1 if not measured. So the setup in between, this
+         * lane's included, is the root's own time.
+         */
+        Span openRoot(Name n, int flags, long cpu) {
             if (!activate()) return NOOP;
             Span h = stack(n, flags);
             if (h == NOOP) {
                 idle();
                 return NOOP;
             }
-            if (ctx.cpu()) sampleCpu(0);
-            start(h);
+            startCpu(0, cpu);
+            rows[h.row >>> CHUNK_BITS].start[h.row & MASK] = 0;
+            publish();
             saved = slot.current;
             slot.current = this;
             return h;
@@ -1317,8 +1327,11 @@ public final class Tempo {
 
         /** Starts measuring the CPU time of the span at depth {@code d}, unless it is already or the read is -1. */
         void sampleCpu(int d) {
-            if ((cpuMask >>> d & 1) != 0) return;
-            long t = ctx.cpuNow();
+            if ((cpuMask >>> d & 1) == 0) startCpu(d, ctx.cpuNow());
+        }
+
+        /** Measures the CPU time of the span at depth {@code d} from {@code t}, a reading of it; -1 is none. */
+        private void startCpu(int d, long t) {
             if (t < 0) return;
             if (cpuAt == null) cpuAt = new long[MAX_DEPTH];
             cpuAt[d] = t;
@@ -2706,7 +2719,7 @@ public final class Tempo {
         private StringBuilder out;
         private JsonSink json;
         private int records, skip, aggregates;
-        private long rootStart, rootDur, left, nonFinite; // left: spans left out, aggregates by count
+        private long rootDur, left, nonFinite; // left: spans left out, aggregates by count
         private long aggregated, foldedSeen; // occurrences in the aggregates written; folded ones in all aggregates
         private long folded, dropped; // x=
         private long unwritten; // what the fallback stands for: every span but the root, as folded and dropped
@@ -2912,10 +2925,7 @@ public final class Tempo {
 
         /** First walk: numbers the record's thread, name and attribute keys. */
         private void count(SpanView v) {
-            if (records == 0) {
-                rootStart = v.start;
-                rootDur = v.duration;
-            }
+            if (records == 0) rootDur = v.duration;
             if (!unrun(v) && !v.mixed) laneIndex[v.shape.lane] = 1;
             if (nameIndex[v.name.id] <= 0) number(v.name.id);
             for (int i = 0, n = v.attributes(); i < n; i++) {
@@ -3038,13 +3048,13 @@ public final class Tempo {
         }
 
         /**
-         * The record's start in microseconds from the root's, as a decoder reads it: delta-coded against
-         * its previous sibling or its parent, so never before them. An inline handoff is a plain child from
-         * when it began (FORMAT.md §6.5).
+         * The record's start in microseconds from the root's, which is the trace's zero point, as a decoder
+         * reads it: delta-coded against its previous sibling or its parent, so never before them. An inline
+         * handoff is a plain child from when it began (FORMAT.md §6.5).
          */
         private long start(SpanView v) {
             int d = v.depth;
-            long start = Math.max(cur[d], us(v.start + (v.inline ? v.wait : 0) - rootStart));
+            long start = Math.max(cur[d], us(v.start + (v.inline ? v.wait : 0)));
             cur[d] = cur[d + 1] = start;
             return start;
         }
@@ -3706,7 +3716,10 @@ public final class Tempo {
         private final Span root;
 
         Trace(Name name, Options options) {
-            ctx = new Context(options == null ? Options.DEFAULTS : options);
+            ctx = new Context(options == null ? Options.DEFAULTS : options); // reads the clock first: the root's start
+            // Right after: CPU covers the root like its wall time, and the first CPU read of a JVM (it loads
+            // the management bean, milliseconds) happens here, counted in the root's own time.
+            long cpu = ctx.cpu() ? ctx.cpuNow() : -1;
             int flags = 0;
             if (name == null) {
                 ctx.misuse("null name");
@@ -3714,10 +3727,14 @@ public final class Tempo {
                 flags = MISUSE;
             }
             rootLane = ctx.register(new Lane(ctx, SLOT.get()));
-            root = rootLane.openRoot(name, flags);
+            root = rootLane.openRoot(name, flags, cpu);
         }
 
-        /** The root span, opened at {@link Tempo#start}. */
+        /**
+         * The root span, opened at {@link Tempo#start}. It starts at 0, the moment {@code start} was entered,
+         * so Tempo's own setup (and in the first trace of a JVM that measures CPU, the CPU clock's one-time
+         * initialization) is part of its time, never hidden.
+         */
         public Span root() {
             return root;
         }

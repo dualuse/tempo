@@ -75,8 +75,11 @@ turns it into an `AssertionError` for tests.
 ### Traces and spans
 
 `Tempo.start(name)` opens a trace and its root span on the calling thread;
-`Tempo.start(name, options)` takes `Options`. Closing the trace ends the root, and any span
-still open, at that instant. The trace stays readable until `release()`.
+`Tempo.start(name, options)` takes `Options`. The root starts the moment `start` is entered,
+at 0 in every reading of the trace, so Tempo's own setup is part of the root's time (and of
+the totals of `Runtime` and `Server-Timing`) as time no child covers, never hidden. Closing
+the trace ends the root, and any span still open, at that instant. The trace stays readable
+until `release()`.
 
 ```java
 try (Tempo.Span s = t.root().span(PARSE)) { parse(body); }   // always recorded

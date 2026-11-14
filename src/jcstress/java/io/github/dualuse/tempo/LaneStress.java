@@ -38,7 +38,7 @@ public final class LaneStress {
 
         @Actor
         public void owner() {
-            lane.openRoot(N, 0);
+            lane.openRoot(N, 0, -1);
             lane.flag(0, Tempo.FAILED);
             lane.event(0, K.id << Tempo.KIND_BITS | Tempo.ATTR_LONG, 42);
             lane.close(0);
@@ -68,7 +68,7 @@ public final class LaneStress {
         final Tempo.Lane lane = lane(ctx);
 
         {
-            lane.openRoot(N, 0);
+            lane.openRoot(N, 0, -1);
             lane.close(0);
         }
 
@@ -110,7 +110,7 @@ public final class LaneStress {
         public void straggler(II_Result r) {
             Tempo.Lane l = lane(ctx);
             late = l;
-            if (l != null && l.openRoot(N, 0) != Tempo.NOOP) {
+            if (l != null && l.openRoot(N, 0, -1) != Tempo.NOOP) {
                 l.close(0);
                 r.r1 = 1;
             }
@@ -141,7 +141,7 @@ public final class LaneStress {
 
         {
             Tempo.Lane root = lane(ctx);
-            root.openRoot(N, 0); // stays open: the submitter's root
+            root.openRoot(N, 0, -1); // stays open: the submitter's root
             handoff = root.handoff(N, 0);
         }
 

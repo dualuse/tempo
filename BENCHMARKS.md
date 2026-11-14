@@ -70,7 +70,7 @@ Apple M3 Max, macOS, Amazon Corretto 24.0.2, JMH 1.37, one fork, 3 × 1 s warm-u
 | `handoff` | 18.8 ± 0.3 | submit: the row and the `Handoff` |
 | `handoffInline` | 60.2 ± 2.7 | submit, begin and close on the submitting thread, recorded |
 | `handoffFolded` | 50.3 ± 7.1 | the same past the budget: no row, the task folded |
-| `traceLifecycle` | 114 ± 40 | start, close, release |
+| `traceLifecycle` | 114 ± 40 | start, close, release; the root starts as `start` is entered, so its time includes this setup |
 | `snapshotToHeader` | 14,772 ± 218 | encoder alone, 300 spans |
 | `snapshotToHeaderLadder` | 47,513 ± 457 | the same under 1,000 bytes: the value read back, the largest group (the root's 30 children) folded, re-encoded (2026-11-14) |
 | `snapshotToLinkLadder` | 94,863 ± 2,273 | a link of at most 1,000 bytes: each step also compressed (2026-11-14) |
