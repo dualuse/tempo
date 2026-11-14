@@ -1,62 +1,77 @@
 [1mGET /search[0m  ·  100.496 ms  ·  2026-11-13 09:02:46.299 UTC  ·  58 spans on 13 threads
-[1mspan                     start      wait       dur      self       cpu   off-cpu  thread  flags  attributes[0m
-GET /search              0.000             100.496     0.396    10.666    89.830  http-3
-[2m├─ [0mdecode                0.291               4.260     4.260     3.961     0.299  http-3         bytes=262641
-[2m├─ [0mscale                 4.566               1.430     1.430                      http-3         px=512
-[2m├─ [0mdescribe              6.011              21.585     0.033                      http-3         crops=2
-[2m│  ├─ [0minfer              6.016[33m     2.772[0m    15.239    15.239    14.963     0.276  cpu-4          crop=1 queued=3 active=6
-[2m│  ├─ [0minfer              6.019[33m     7.392[0m    13.385    13.385    12.902     0.483  cpu-5          crop=2 queued=4 active=6
-[2m│  ├─ [0mawait              6.024              20.772    20.772                      http-3  [35mw[0m
-[2m│  └─ [0mfingerprint       26.806               0.780     0.780                      http-3
-[2m├─ [0mindex                27.611               9.509     0.518                      http-3         k=48
-[2m│  ├─ [0mquery             27.615     0.000     3.357     3.357     0.433     2.924  io-4           collection=1 hits=27 queued=0 active=3
-[2m│  ├─ [0mquery             27.617     0.000     8.995     8.995     1.144     7.851  io-5           collection=2 hits=20 queued=0 active=4
-[2m│  └─ [0mawait             27.621               8.991     8.991                      http-3  [35mw[0m
-[2m├─ [0mrerank               37.135              61.766     3.281                      http-3         candidates=48 cancelled=4
-[2m│  ├─ [0mload              37.140     0.000     2.274     2.274     0.200     2.074  io-2           bytes=46046 queued=0 active=2
-[2m│  ├─ [0mload              37.142     0.000     2.721     2.721     0.233     2.488  io-4           bytes=56883 queued=0 active=3
-[2m│  ├─ [0m[31mload[0m              37.144     0.000     1.154     1.154     0.075     1.079  io-5    [31mf[0m      bytes=69465 queued=0 active=4
-[2m│  ├─ [0mload              37.146     0.000     3.590     3.590     0.295     3.295  io-6           bytes=122536 queued=0 active=5
-[2m│  ├─ [0mload              37.148[33m     0.816[0m     1.753     1.753     0.178     1.575  io-1           bytes=57009 queued=0 active=6
-[2m│  ├─ [0mload              37.150[33m     1.148[0m     2.310     2.310     0.194     2.116  io-5           bytes=64896 queued=1 active=6
-[2m│  ├─ [0mload              37.152[33m     1.902[0m     2.358     2.358     0.156     2.202  io-3           bytes=110637 queued=2 active=6
-[2m│  ├─ [0mload              37.154[33m     2.260[0m     3.995     3.995     0.405     3.590  io-2           bytes=38161 queued=3 active=6
-[2m│  ├─ [0mawait             37.158              58.485    58.485                      http-3  [35mw[0m
-[2m│  ├─ [0mload              38.304[33m     4.478[0m     3.832     3.832     0.141     3.691  io-4           bytes=165444 queued=7 active=6
-[2m│  ├─ [0mload              39.420[33m     4.308[0m     3.620     3.620     0.215     3.405  io-3           bytes=103810 queued=8 active=6
-[2m│  ├─ [0mmatch             39.422[33m     0.902[0m     4.495     4.495     4.388     0.107  cpu-5          queued=2 active=6 score=0.31
-[2m│  ├─ [0mload              39.723[33m     5.083[0m     5.630     5.630     0.403     5.227  io-5           bytes=113085 queued=8 active=6
-[2m│  ├─ [0mmatch             39.725[33m     1.701[0m     7.230     7.230     7.109     0.121  cpu-6          queued=2 active=6 score=0.43
-[2m│  ├─ [0mload              39.869[33m     6.178[0m     3.006     3.006     0.173     2.833  io-6           bytes=126103 queued=8 active=6
-[2m│  ├─ [0mmatch             39.871[33m     2.049[0m     3.181     3.181     3.053     0.128  cpu-4          queued=3 active=6 score=0.24
-[2m│  ├─ [0mload              40.614[33m     5.861[0m     1.290     1.290     0.107     1.183  io-2           bytes=40890 queued=8 active=6
-[2m│  ├─ [0mmatch             40.616[33m     3.717[0m     2.869     2.869     2.764     0.105  cpu-1          queued=3 active=6 score=0.26
-[2m│  ├─ [0mload              40.742[33m     5.872[0m     4.378     4.378     0.302     4.076  io-4           bytes=91138 queued=8 active=6
-[2m│  ├─ [0mmatch             40.744[33m     4.075[0m     4.380     4.380     4.244     0.136  cpu-5          queued=4 active=6 score=0.68
-[2m│  ├─ [0mload              41.418[33m     5.930[0m     0.497     0.497     0.053     0.444  io-3           bytes=80497 queued=8 active=6
-[2m│  ├─ [0mmatch             41.420[33m     3.681[0m     5.574     5.574     5.405     0.169  cpu-4          queued=5 active=6 score=0.64
-[2m│  ├─ [0mload              43.415[33m     4.350[0m     2.496     2.496     0.133     2.363  io-2           bytes=21641 queued=7 active=6
-[2m│  ├─ [0mmatch             43.417[33m     5.239[0m     7.928     7.928     7.636     0.292  cpu-6          queued=6 active=6 score=0.21
-[2m│  ├─ [0mload              46.620[33m     2.358[0m     1.585     1.585     0.159     1.426  io-3           bytes=72245 queued=4 active=6
-[2m│  ├─ [0mmatch             46.622[33m     2.577[0m     3.499     3.499     3.391     0.108  cpu-5          queued=3 active=6 score=0.66
-[2m│  ├─ [0mload              47.354[33m     1.699[0m     3.432     3.432     0.180     3.252  io-6           bytes=29462 queued=4 active=6
-[2m│  ├─ [0mmatch             47.356[33m     2.697[0m     5.107     5.107     4.981     0.126  cpu-2          queued=3 active=6 score=0.2
-[2m│  ├─ [0mload              47.771[33m     2.490[0m     3.438     3.438     0.367     3.071  io-2           bytes=31794 queued=4 active=6
-[2m│  ├─ [0mmatch             47.773[33m     2.902[0m     4.046     4.046     3.891     0.155  cpu-4          queued=4 active=6 score=0.67
-[2m│  ├─ [0mload              47.851[33m     2.585[0m     1.275     1.275     0.091     1.184  io-5           bytes=92975 queued=4 active=6
-[2m│  ├─ [0mmatch             47.853[33m     4.845[0m     2.739     2.739     2.708     0.031  cpu-5          queued=5 active=6 score=0.32
-[2m│  ├─ [0mload              49.059[33m     2.652[0m     3.556     3.556     0.231     3.325  io-5           bytes=106045 queued=4 active=6
-[2m│  ├─ [0mmatch             49.061[33m     5.660[0m     2.085     2.085     2.016     0.069  cpu-4          queued=5 active=6 score=0.84
-[2m│  ├─ [0mload              50.267[33m     1.704[0m     2.351     2.351     0.159     2.192  io-1           bytes=34889 queued=4 active=6
-[2m│  ├─ [0mmatch             50.269[33m     6.537[0m     4.454     4.454     4.298     0.156  cpu-4          queued=7 active=6 score=0.39
-[2m│  ├─ [0mload              50.442[33m     2.043[0m     1.446     1.446     0.133     1.313  io-6           bytes=96062 queued=4 active=6
-[2m│  ├─ [0mmatch             50.444[33m     7.144[0m     6.182     6.182     6.071     0.111  cpu-5          queued=8 active=6 score=0.65
-[2m│  ├─ [0mload ×23          50.569[33m    40.724[0m    66.073    66.073     5.273    60.800  io-*           [min=0.760 max=15.895 extent=22.568 maxAt=+5.148 waitMax=3.481 par=2.93]
-[2m│  ├─ [0mmatch ×26         50.571[33m   496.065[0m   132.624   132.624   129.301     3.323  cpu-*          [min=2.767 max=7.150 extent=49.189 maxAt=+7.559 waitMax=28.714 par=2.70]
-[2m│  ├─ [0m[31mload[0m              54.328[33m     1.291[0m     2.100     2.100     0.064     2.036  io-2    [31mf[0m      bytes=37604 queued=3 active=6
-[2m│  ├─ [0m[31mload[0m              60.101[33m     1.591[0m     1.908     1.908     0.105     1.803  io-2    [31mf[0m      bytes=89763 queued=3 active=6
-[2m│  ├─ [0mmatch             66.182[33m    28.038[0m     6.276     6.276     6.177     0.099  cpu-1   [35mo[0m      queued=30 active=6
-[2m│  └─ [0mmatch ×4          67.050[33m   106.045[0m     0.000     0.000                      -       [35mc[0m      [min=0.000 max=0.000 extent=28.593 maxAt=+0.000 waitMax=28.593 par=0.00]
-[2m└─ [0mencode               98.916               1.550     1.550                      http-3
+[1mspan                  start    wait     dur    self     cpu off-cpu thread flags attributes[0m
+GET /search           0.000         100.496   0.396  10.666  89.830 http-3
+[2m├─ [0mdecode             0.291           4.260   4.260   3.961   0.299 http-3       bytes=262641
+[2m├─ [0mscale              4.566           1.430   1.430                 http-3       px=512
+[2m├─ [0mdescribe           6.011          21.585   0.033                 http-3       crops=2
+[2m│  ├─ [0minfer           6.016 [33m  2.772[0m  15.239  15.239  14.963   0.276 cpu-4        crop=1 queued=3 active=6
+[2m│  ├─ [0minfer           6.019 [33m  7.392[0m  13.385  13.385  12.902   0.483 cpu-5        crop=2 queued=4 active=6
+[2m│  ├─ [0mawait           6.024          20.772  20.772                 http-3 [35mw[0m
+[2m│  └─ [0mfingerprint    26.806           0.780   0.780                 http-3
+[2m├─ [0mindex             27.611           9.509   0.518                 http-3       k=48
+[2m│  ├─ [0mquery          27.615   0.000   3.357   3.357   0.433   2.924 io-4         collection=1 hits=27 queued=0
+[2m│  │  [0m                                                                           active=3
+[2m│  ├─ [0mquery          27.617   0.000   8.995   8.995   1.144   7.851 io-5         collection=2 hits=20 queued=0
+[2m│  │  [0m                                                                           active=4
+[2m│  └─ [0mawait          27.621           8.991   8.991                 http-3 [35mw[0m
+[2m├─ [0mrerank            37.135          61.766   3.281                 http-3       candidates=48 cancelled=4
+[2m│  ├─ [0mload           37.140   0.000   2.274   2.274   0.200   2.074 io-2         bytes=46046 queued=0 active=2
+[2m│  ├─ [0mload           37.142   0.000   2.721   2.721   0.233   2.488 io-4         bytes=56883 queued=0 active=3
+[2m│  ├─ [0m[31mload[0m           37.144   0.000   1.154   1.154   0.075   1.079 io-5   [31mf[0m     bytes=69465 queued=0 active=4
+[2m│  ├─ [0mload           37.146   0.000   3.590   3.590   0.295   3.295 io-6         bytes=122536 queued=0
+[2m│  │  [0m                                                                           active=5
+[2m│  ├─ [0mload           37.148 [33m  0.816[0m   1.753   1.753   0.178   1.575 io-1         bytes=57009 queued=0 active=6
+[2m│  ├─ [0mload           37.150 [33m  1.148[0m   2.310   2.310   0.194   2.116 io-5         bytes=64896 queued=1 active=6
+[2m│  ├─ [0mload           37.152 [33m  1.902[0m   2.358   2.358   0.156   2.202 io-3         bytes=110637 queued=2
+[2m│  │  [0m                                                                           active=6
+[2m│  ├─ [0mload           37.154 [33m  2.260[0m   3.995   3.995   0.405   3.590 io-2         bytes=38161 queued=3 active=6
+[2m│  ├─ [0mawait          37.158          58.485  58.485                 http-3 [35mw[0m
+[2m│  ├─ [0mload           38.304 [33m  4.478[0m   3.832   3.832   0.141   3.691 io-4         bytes=165444 queued=7
+[2m│  │  [0m                                                                           active=6
+[2m│  ├─ [0mload           39.420 [33m  4.308[0m   3.620   3.620   0.215   3.405 io-3         bytes=103810 queued=8
+[2m│  │  [0m                                                                           active=6
+[2m│  ├─ [0mmatch          39.422 [33m  0.902[0m   4.495   4.495   4.388   0.107 cpu-5        queued=2 active=6 score=0.31
+[2m│  ├─ [0mload           39.723 [33m  5.083[0m   5.630   5.630   0.403   5.227 io-5         bytes=113085 queued=8
+[2m│  │  [0m                                                                           active=6
+[2m│  ├─ [0mmatch          39.725 [33m  1.701[0m   7.230   7.230   7.109   0.121 cpu-6        queued=2 active=6 score=0.43
+[2m│  ├─ [0mload           39.869 [33m  6.178[0m   3.006   3.006   0.173   2.833 io-6         bytes=126103 queued=8
+[2m│  │  [0m                                                                           active=6
+[2m│  ├─ [0mmatch          39.871 [33m  2.049[0m   3.181   3.181   3.053   0.128 cpu-4        queued=3 active=6 score=0.24
+[2m│  ├─ [0mload           40.614 [33m  5.861[0m   1.290   1.290   0.107   1.183 io-2         bytes=40890 queued=8 active=6
+[2m│  ├─ [0mmatch          40.616 [33m  3.717[0m   2.869   2.869   2.764   0.105 cpu-1        queued=3 active=6 score=0.26
+[2m│  ├─ [0mload           40.742 [33m  5.872[0m   4.378   4.378   0.302   4.076 io-4         bytes=91138 queued=8 active=6
+[2m│  ├─ [0mmatch          40.744 [33m  4.075[0m   4.380   4.380   4.244   0.136 cpu-5        queued=4 active=6 score=0.68
+[2m│  ├─ [0mload           41.418 [33m  5.930[0m   0.497   0.497   0.053   0.444 io-3         bytes=80497 queued=8 active=6
+[2m│  ├─ [0mmatch          41.420 [33m  3.681[0m   5.574   5.574   5.405   0.169 cpu-4        queued=5 active=6 score=0.64
+[2m│  ├─ [0mload           43.415 [33m  4.350[0m   2.496   2.496   0.133   2.363 io-2         bytes=21641 queued=7 active=6
+[2m│  ├─ [0mmatch          43.417 [33m  5.239[0m   7.928   7.928   7.636   0.292 cpu-6        queued=6 active=6 score=0.21
+[2m│  ├─ [0mload           46.620 [33m  2.358[0m   1.585   1.585   0.159   1.426 io-3         bytes=72245 queued=4 active=6
+[2m│  ├─ [0mmatch          46.622 [33m  2.577[0m   3.499   3.499   3.391   0.108 cpu-5        queued=3 active=6 score=0.66
+[2m│  ├─ [0mload           47.354 [33m  1.699[0m   3.432   3.432   0.180   3.252 io-6         bytes=29462 queued=4 active=6
+[2m│  ├─ [0mmatch          47.356 [33m  2.697[0m   5.107   5.107   4.981   0.126 cpu-2        queued=3 active=6 score=0.2
+[2m│  ├─ [0mload           47.771 [33m  2.490[0m   3.438   3.438   0.367   3.071 io-2         bytes=31794 queued=4 active=6
+[2m│  ├─ [0mmatch          47.773 [33m  2.902[0m   4.046   4.046   3.891   0.155 cpu-4        queued=4 active=6 score=0.67
+[2m│  ├─ [0mload           47.851 [33m  2.585[0m   1.275   1.275   0.091   1.184 io-5         bytes=92975 queued=4 active=6
+[2m│  ├─ [0mmatch          47.853 [33m  4.845[0m   2.739   2.739   2.708   0.031 cpu-5        queued=5 active=6 score=0.32
+[2m│  ├─ [0mload           49.059 [33m  2.652[0m   3.556   3.556   0.231   3.325 io-5         bytes=106045 queued=4
+[2m│  │  [0m                                                                           active=6
+[2m│  ├─ [0mmatch          49.061 [33m  5.660[0m   2.085   2.085   2.016   0.069 cpu-4        queued=5 active=6 score=0.84
+[2m│  ├─ [0mload           50.267 [33m  1.704[0m   2.351   2.351   0.159   2.192 io-1         bytes=34889 queued=4 active=6
+[2m│  ├─ [0mmatch          50.269 [33m  6.537[0m   4.454   4.454   4.298   0.156 cpu-4        queued=7 active=6 score=0.39
+[2m│  ├─ [0mload           50.442 [33m  2.043[0m   1.446   1.446   0.133   1.313 io-6         bytes=96062 queued=4 active=6
+[2m│  ├─ [0mmatch          50.444 [33m  7.144[0m   6.182   6.182   6.071   0.111 cpu-5        queued=8 active=6 score=0.65
+[2m│  ├─ [0mload ×23       50.569 [33m 40.724[0m  66.073  66.073   5.273  60.800 io-*         [min=0.760 max=15.895
+[2m│  │  [0m                                                                           extent=22.568 maxAt=+5.148
+[2m│  │  [0m                                                                           waitMax=3.481 par=2.93]
+[2m│  ├─ [0mmatch ×26      50.571 [33m496.065[0m 132.624 132.624 129.301   3.323 cpu-*        [min=2.767 max=7.150
+[2m│  │  [0m                                                                           extent=49.189 maxAt=+7.559
+[2m│  │  [0m                                                                           waitMax=28.714 par=2.70]
+[2m│  ├─ [0m[31mload[0m           54.328 [33m  1.291[0m   2.100   2.100   0.064   2.036 io-2   [31mf[0m     bytes=37604 queued=3 active=6
+[2m│  ├─ [0m[31mload[0m           60.101 [33m  1.591[0m   1.908   1.908   0.105   1.803 io-2   [31mf[0m     bytes=89763 queued=3 active=6
+[2m│  ├─ [0mmatch          66.182 [33m 28.038[0m   6.276   6.276   6.177   0.099 cpu-1  [35mo[0m     queued=30 active=6
+[2m│  └─ [0mmatch ×4       67.050 [33m106.045[0m   0.000   0.000                 -      [35mc[0m     [min=0.000 max=0.000
+[2m│     [0m                                                                           extent=28.593 maxAt=+0.000
+[2m│     [0m                                                                           waitMax=28.593 par=0.00]
+[2m└─ [0mencode            98.916           1.550   1.550                 http-3
 [33mx=: 53 spans folded into aggregates, 0 dropped (not on the wire)[0m
 [35ml=: lanes live at render: cpu-1 (their records are best effort)[0m

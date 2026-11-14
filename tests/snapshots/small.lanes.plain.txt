@@ -11,10 +11,12 @@ cpu
   cpu-3                                                                        match██
   cpu-4                                                                         match██
 io
-  io-1                                                                   lo…█▓▓▓
+  io-1                                                                   lo…█
+                                                                         ░░░░███
   io-2                                                            query██load▓▓
   io-3                                                            query██load▓▓▓▓▓▓▓▓▓▓▓▓
-  io-4                                                                   ██load▓▓▓▓▓▓▓▓▓
+  io-4                                                                   ██
+                                                                         ░░load█████████
   queued ≤2                                                              ▅█▆▄▂
 
 █ run  ░ queue wait  ─ blocking wait  ▚ aggregate ×count, ┃ slowest  ✗ failed  ⊘ cancelled  ▶ open

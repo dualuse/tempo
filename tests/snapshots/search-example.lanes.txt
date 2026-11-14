@@ -10,7 +10,8 @@ cpu
   (mixed)                                                    match ×36▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚┃▚▚▚▚▚▚▚▚▚▚▚
   queued ≤1       █▄                                  ▁   ▁  ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
 io
-  io-1                                              ███▓▓✗ ▚▚▚▚▚▚▚▚▚▚▚▚▚┃load ×36▚▚▚▚▚▚
+  io-1                                              ███    ▚▚▚▚▚▚▚▚▚▚▚▚▚┃load ×36▚▚▚▚▚▚
+                                                    ░░░██✗
   queued ≤2                                         ███   ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
 
 █ run  ░ queue wait  ─ blocking wait  ▚ aggregate ×count, ┃ slowest  ✗ failed  ⊘ cancelled  ▶ open

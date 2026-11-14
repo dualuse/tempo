@@ -34,6 +34,8 @@ shell syntax.
 **Default view: lanes.** One row group per thread, grouped into pools by stripping a
 trailing `-<digits>` from the thread name (`cpu-1`, `cpu-2` form the pool `cpu`;
 `Thread-N` threads stay ungrouped). Nested spans stack into rows below their parent.
+A handoff that queued while its thread was still busy with earlier work of the request
+moves to a free row of that lane, so its queue wait stays visible.
 
 | Glyph | Meaning |
 |---|---|
@@ -82,6 +84,15 @@ time is duration minus CPU time, where CPU was measured.
 `--no-color`, `--color` (force colours into a pipe), `--ascii` (no Unicode glyphs).
 Colours are off when output is not a terminal, when `NO_COLOR` is set, or when
 `TERM=dumb`.
+
+Every view fits its lines to the width. The lanes and charts need at least 40
+columns; a smaller `--width` is raised to 40 (with a warning). Tables never cut a
+number: they shorten span names and paths (keeping the end of a path), wrap
+attributes, aggregate details and the span text of `--critical`, shorten the file
+names in the `--diff` title, and split a table that is still too wide into blocks
+stacked one under the other, each repeating the path column. So tables have a floor
+of their own, about 80 columns for `--tree`, 70 for `--critical` and 60 for the
+others; below it their lines run over.
 
 **Exit status.** 0 on success, 1 on malformed input (or a cut value with `--check`),
 2 on a usage error.

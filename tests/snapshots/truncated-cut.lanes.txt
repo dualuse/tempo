@@ -9,7 +9,8 @@ cpu
   cpu-2
   queued ≤1       █▄
 io
-  io-1                                              ███▓▓✗
+  io-1                                              ███
+                                                    ░░░██✗
   queued ≤2                                         ███
 
 █ run  ░ queue wait  ─ blocking wait  ▚ aggregate ×count, ┃ slowest  ✗ failed  ⊘ cancelled  ▶ open

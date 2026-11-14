@@ -23,7 +23,8 @@
 47.376  47.382  [33m     [0m          [34m  0.006[0m  http-8  rerank
 47.382  49.890  [33m0.466[0m   2.042  [34m       [0m  io-4    rerank/load
 49.890  49.898  [33m     [0m          [34m  0.008[0m  http-8  rerank
-49.898  83.045  [33m     [0m  33.147  [34m       [0m  cpu-*   rerank/match ×30 (aggregate: extent; per-occurrence wait not on the wire)
+49.898  83.045  [33m     [0m  33.147  [34m       [0m  cpu-*   rerank/match ×30 (aggregate: extent; per-occurrence wait not
+                [33m     [0m          [34m       [0m          on the wire)
 83.045  86.165  [33m     [0m   3.090  [34m  0.030[0m  http-8  rerank
 86.165  86.180  [33m     [0m   0.015  [34m       [0m  http-8  GET /search
 86.180  87.698  [33m     [0m   1.518  [34m       [0m  http-8  encode

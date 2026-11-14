@@ -23,7 +23,8 @@ the chain of spans that determined the end time, walking back from the root's en
 47.376  47.382                   0.006  http-8  rerank
 47.382  49.890  0.466   2.042           io-4    rerank/load
 49.890  49.898                   0.008  http-8  rerank
-49.898  83.045         33.147           cpu-*   rerank/match ×30 (aggregate: extent; per-occurrence wait not on the wire)
+49.898  83.045         33.147           cpu-*   rerank/match ×30 (aggregate: extent; per-occurrence wait not
+                                                on the wire)
 83.045  86.165          3.090    0.030  http-8  rerank
 86.165  86.180          0.015           http-8  GET /search
 86.180  87.698          1.518           http-8  encode

@@ -320,6 +320,11 @@ EXTRA = {
     "find-healthy.tree.min-ms-5": (["--tree", "--min-ms", "5"], "find-healthy"),
     "find-healthy.agg.focus-match": (["--agg", "--focus", "rerank/match"], "find-healthy"),
     "pipeline.lanes.width-60": (["--width", "60"], "pipeline"),
+    "small.lanes.focus-rerank-200": (["--focus", "rerank", "--width", "200"], "small"),
+    "find-saturated.tree.width-80": (["--tree", "--width", "80"], "find-saturated"),
+    "find-saturated.agg.width-80": (["--agg", "--width", "80"], "find-saturated"),
+    "pipeline.pools.width-80": (["--pools", "--width", "80"], "pipeline"),
+    "pipeline.critical.width-80": (["--critical", "--width", "80"], "pipeline"),
     "search-example.lanes": ([], "../testdata/golden/search-example"),
     "search-example.tree": (["--tree"], "../testdata/golden/search-example"),
     "failed-open.lanes": ([], "../testdata/golden/failed-open"),
@@ -375,6 +380,12 @@ class Snapshots(unittest.TestCase):
                                                 "--diff", rel(after, ROOT)])
                 with self.subTest(snapshot="stats." + mode):
                     self.check("stats." + mode, [flag, "--stats"] + [rel(b, ROOT) for b in batch])
+            with self.subTest(snapshot="diff.width-80"):
+                self.check("diff.width-80", ["--no-color", "--width", "80", rel(before, ROOT),
+                                             "--diff", rel(after, ROOT)])
+            with self.subTest(snapshot="stats.width-160"):
+                self.check("stats.width-160", ["--no-color", "--width", "160", "--stats"]
+                           + [rel(b, ROOT) for b in batch])
         finally:
             os.chdir(cwd)
 
@@ -413,6 +424,86 @@ class Layout(unittest.TestCase):
                     for line in out.splitlines():
                         self.assertLessEqual(len(ANSI_RE.sub("", line)), width,
                                              "%s width %d %s: %r" % (h, width, flag, line))
+
+    def test_every_view_fits_the_width(self):
+        # numbers are never cut, so tables have a floor (--help: about 80
+        # columns for --tree); at 80 and 100 every line of every view fits
+        before = os.path.join(SAMPLES, "diff", "before.header")
+        batch = sorted(glob.glob(os.path.join(SAMPLES, "batch", "*.header")))
+        views = [[], ["--tree"], ["--agg"], ["--pools"], ["--findings"], ["--critical"]]
+        for width in (80, 100):
+            runs = [(view + [h], h) for h in all_inputs() for view in views]
+            runs += [([h, "--diff", before], h) for h in sample_headers()]
+            runs.append((["--stats"] + batch, "batch"))
+            for args, what in runs:
+                for flags in (["--no-color"], ["--color", "--ascii"]):
+                    code, out, err = cli(flags + ["--width", str(width)] + args)
+                    self.assertEqual(code, 0, err)
+                    for line in out.splitlines():
+                        self.assertLessEqual(len(ANSI_RE.sub("", line)), width,
+                                             "%s %s: %r" % (os.path.relpath(what, ROOT), args[:1], line))
+
+    def test_tables_keep_numbers_whole(self):
+        # a narrow table shortens paths and splits into blocks, but every
+        # number of the wide table is still there
+        path = os.path.join(SAMPLES, "find-saturated.header")
+        number = re.compile(r"(?<![\w.])-?\d+\.\d{3}(?![\w.])")
+        for view in (["--agg"], ["--pools"], ["--tree"], ["--critical"]):
+            wide = cli(view + ["--no-color", "--width", "400", path])[1]
+            narrow = cli(view + ["--no-color", "--width", "80", path])[1]
+            self.assertNotEqual(narrow, wide)
+            self.assertEqual(sorted(number.findall(narrow)), sorted(number.findall(wide)), view)
+
+    def test_width_below_the_minimum_is_raised_with_a_warning(self):
+        code, out, err = cli(["--no-color", "--width", "30", os.path.join(SAMPLES, "small.header")])
+        self.assertEqual(code, 0)
+        self.assertIn("minimum of 40", err)
+        self.assertLessEqual(max(len(line) for line in out.splitlines()), 40)
+        code, out, err = cli(["--no-color", os.path.join(SAMPLES, "small.header")], env={"COLUMNS": "20"})
+        self.assertEqual(err, "")
+        self.assertIn("at least 40", tempo.build_parser().format_help())
+
+    def test_queue_wait_shows_in_front_of_every_run(self):
+        # a handoff that queued while its thread still ran earlier work of the
+        # request moves to a free row of the lane, so its wait stays visible
+        p = tempo.Painter()
+        moved = 0
+        for path in all_inputs():
+            t = trace_of(path)
+            if not t.spans:
+                continue
+            groups, by_lane = tempo.lane_groups(t, t.spans, tempo.Filter())
+            for width in (60, 100, 200):
+                scale = tempo.Scale(0, t.end, width)
+                for key, spans in by_lane.items():
+                    rowof = {}
+                    rows = tempo.draw_lane(spans, scale, p, rowof)
+                    for s in spans:
+                        if not s.handoff or s.agg or s.not_run or s.wait <= 0:
+                            continue
+                        c0 = scale.cols(s.run_start, s.end)[0]
+                        w0 = scale.rd(s.start)
+                        if c0 - w0 < 2:
+                            continue
+                        cells = rows[rowof[s.id]]
+                        with self.subTest(trace=os.path.relpath(path, ROOT), span=s.id, width=width):
+                            self.assertEqual(cells[c0 - 1][0], p.g["wait"])
+                        moved += rowof[s.id] > 0
+        self.assertGreater(moved, 0)
+        # the case from the review: rerank/load on io-1 and io-4 of small
+        code, out, err = cli(["--no-color", "--width", "200", "--focus", "rerank",
+                              os.path.join(SAMPLES, "small.header")])
+        lanes = {}
+        name = None
+        for line in out.splitlines():
+            if line[:2] == "  " and line[2:3].strip():
+                name = line.split()[0]
+            elif line[:1].strip():
+                name = None
+            if name:
+                lanes[name] = lanes.get(name, "") + line[14:] + "\n"
+        for thread in ("io-1", "io-4"):
+            self.assertIn(p.g["wait"], lanes[thread], thread)
 
     def test_ascii_output_is_ascii(self):
         for view in ([], ["--tree"], ["--pools"], ["--critical"], ["--findings"], ["--agg"]):
@@ -549,7 +640,8 @@ class Analysis(unittest.TestCase):
         # splitting the shared pool removes most of the queue wait of the loads
         self.assertLess(tb["rerank/load"]["wait"], ta["rerank/load"]["wait"] / 2)
         self.assertLess(b.root.dur, a.root.dur)
-        code, out, err = cli(["--no-color", os.path.join(SAMPLES, "diff", "before.header"),
+        code, out, err = cli(["--no-color", "--width", "400",
+                              os.path.join(SAMPLES, "diff", "before.header"),
                               "--diff", os.path.join(SAMPLES, "diff", "after.header")])
         self.assertEqual(code, 0, err)
         rows = [l for l in out.splitlines()[2:] if l and not l.startswith("Δ")]
@@ -565,7 +657,7 @@ class Analysis(unittest.TestCase):
 
     def test_diff_against_itself_is_zero(self):
         p = os.path.join(SAMPLES, "find-healthy.header")
-        code, out, err = cli(["--no-color", p, "--diff", p])
+        code, out, err = cli(["--no-color", "--width", "400", p, "--diff", p])
         self.assertEqual(code, 0, err)
         body = out.splitlines()[2:-1]
         self.assertTrue(body)
@@ -581,7 +673,7 @@ class Analysis(unittest.TestCase):
         self.assertEqual(tempo.percentile(sums, 50), p50)
         self.assertEqual(tempo.percentile(sums, 95), p95)
         self.assertEqual(tempo.percentile([7], 95), 7)
-        code, out, err = cli(["--no-color", "--stats"] + files)
+        code, out, err = cli(["--no-color", "--width", "200", "--stats"] + files)
         self.assertEqual(code, 0, err)
         self.assertIn("over 30 traces", out)
         row = [l for l in out.splitlines() if l.startswith("rerank/match ")][0].split()

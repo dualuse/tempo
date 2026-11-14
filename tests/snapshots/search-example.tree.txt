@@ -1,16 +1,22 @@
 GET /search  ·  184.200 ms  ·  2026-11-13 11:04:50.123 UTC  ·  13 spans on 4 threads
-span                     start      wait       dur      self       cpu   off-cpu  thread  flags  attributes
-GET /search              0.000             184.200     0.400                      http-7
-├─ decode                0.120               8.300     8.300                      http-7
-├─ describe              8.450              41.200    41.200    40.100     1.100  http-7
-├─ fingerprint           8.460     0.310    22.900    22.900    22.000     0.900  cpu-1
-├─ index                49.700              30.500    30.500                      http-7         k=40
-├─ rerank               80.250             101.800   101.800                      http-7
-│  ├─ load              80.300     0.045     6.100     6.100                      io-1           bytes=48213
-│  ├─ load              80.310     6.200     7.400     7.400                      io-1    f
-│  ├─ match             86.500     0.020     9.400     9.400     9.350     0.050  cpu-1          score=0.83
-│  ├─ match             94.000     0.015     8.800     8.800     8.700     0.100  cpu-2          score=0.41
-│  ├─ load ×36          94.400     1.800    54.000    54.000     2.100    51.900  io-1           [min=0.600 max=4.100 extent=61.000 maxAt=+30.000 waitMax=0.400 par=0.89]
-│  └─ match ×36        100.400     0.900   147.600   147.600   146.900     0.700  cpu-*          [min=2.100 max=9.400 extent=78.000 maxAt=+52.000 waitMax=0.060 par=1.89]
-└─ encode              182.100               2.000     2.000                      http-7
+span               start  wait     dur    self     cpu off-cpu thread flags attributes
+GET /search        0.000       184.200   0.400                 http-7
+├─ decode          0.120         8.300   8.300                 http-7
+├─ describe        8.450        41.200  41.200  40.100   1.100 http-7
+├─ fingerprint     8.460 0.310  22.900  22.900  22.000   0.900 cpu-1
+├─ index          49.700        30.500  30.500                 http-7       k=40
+├─ rerank         80.250       101.800 101.800                 http-7
+│  ├─ load        80.300 0.045   6.100   6.100                 io-1         bytes=48213
+│  ├─ load        80.310 6.200   7.400   7.400                 io-1   f
+│  ├─ match       86.500 0.020   9.400   9.400   9.350   0.050 cpu-1        score=0.83
+│  ├─ match       94.000 0.015   8.800   8.800   8.700   0.100 cpu-2        score=0.41
+│  ├─ load ×36    94.400 1.800  54.000  54.000   2.100  51.900 io-1         [min=0.600 max=4.100
+│  │                                                                        extent=61.000
+│  │                                                                        maxAt=+30.000
+│  │                                                                        waitMax=0.400 par=0.89]
+│  └─ match ×36  100.400 0.900 147.600 147.600 146.900   0.700 cpu-*        [min=2.100 max=9.400
+│                                                                           extent=78.000
+│                                                                           maxAt=+52.000
+│                                                                           waitMax=0.060 par=1.89]
+└─ encode        182.100         2.000   2.000                 http-7
 x=: 72 spans folded into aggregates, 0 dropped (not on the wire)

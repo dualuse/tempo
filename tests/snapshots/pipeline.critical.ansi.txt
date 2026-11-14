@@ -13,7 +13,8 @@
  58.653   58.658  [33m     [0m           [34m  0.005[0m  http-10  pipeline
  58.658   71.461  [33m5.938[0m    6.865  [34m       [0m  cpu-4    pipeline/describe
  71.461   71.466  [33m     [0m           [34m  0.005[0m  http-10  pipeline
- 71.466  783.034  [33m     [0m  711.568  [34m       [0m  ?-*      pipeline/store ×120 (aggregate: extent; per-occurrence wait not on the wire)
+ 71.466  783.034  [33m     [0m  711.568  [34m       [0m  ?-*      pipeline/store ×120 (aggregate: extent; per-occurrence
+                  [33m     [0m           [34m       [0m           wait not on the wire)
 783.034  783.074  [33m     [0m    0.035  [34m  0.005[0m  http-10  pipeline
 783.074  783.094  [33m     [0m    0.020  [34m       [0m  http-10  PUT /video
 783.094  790.191  [33m     [0m    7.097  [34m       [0m  http-10  commit

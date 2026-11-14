@@ -11,10 +11,12 @@
   cpu-3                                                                        [30;46mmatch[0m[36m██[0m
   cpu-4                                                                         [30;46mmatch[0m[36m██[0m
 [1mio[0m
-  io-1                                                                   [30;46mlo…[0m[36m█▓▓▓[0m
+  io-1                                                                   [30;46mlo…[0m[36m█[0m
+                                                                         [2;33m░░░░[0m[36m███[0m
   io-2                                                            [30;46mquery[0m[36m██[0m[30;46mload[0m[36m▓▓[0m
   io-3                                                            [30;46mquery[0m[36m██[0m[30;46mload[0m[36m▓▓▓▓▓▓▓▓▓▓▓▓[0m
-  io-4                                                                   [36m██[0m[30;46mload[0m[36m▓▓▓▓▓▓▓▓▓[0m
+  io-4                                                                   [36m██[0m
+                                                                         [2;33m░░[0m[30;46mload[0m[36m█████████[0m
 [2m  queued ≤2[0m                                                              [33m▅█▆▄▂[0m
 
 [36m█[0m run  [2;33m░[0m queue wait  [34m─[0m blocking wait  [36m▚[0m aggregate ×count, ┃ slowest  [1;31m✗[0m failed  [33m⊘[0m cancelled  [1;35m▶[0m open

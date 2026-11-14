@@ -1,10 +1,10 @@
 GET /search  ·  87.728 ms  ·  2026-11-13 09:01:27.109 UTC  ·  63 spans on 17 threads
-span                     start      wait       dur      self       cpu   off-cpu  thread  flags  attributes
-GET /search              0.000              87.728     0.378     9.768    77.960  http-8
-├─ decode                0.273               3.583     3.583     3.332     0.251  http-8         bytes=343644
-├─ scale                 3.871               1.739     1.739                      http-8         px=768
-├─ describe              5.625              20.501     0.030                      http-8         crops=1
-├─ index                26.141              16.618     0.410                      http-8         k=48
-├─ rerank               42.774              43.391     3.117                      http-8         candidates=48 cancelled=0
-└─ encode               86.180               1.518     1.518                      http-8
+span                  start wait    dur  self   cpu off-cpu thread flags attributes
+GET /search           0.000      87.728 0.378 9.768  77.960 http-8
+├─ decode             0.273       3.583 3.583 3.332   0.251 http-8       bytes=343644
+├─ scale              3.871       1.739 1.739               http-8       px=768
+├─ describe           5.625      20.501 0.030               http-8       crops=1
+├─ index             26.141      16.618 0.410               http-8       k=48
+├─ rerank            42.774      43.391 3.117               http-8       candidates=48 cancelled=0
+└─ encode            86.180       1.518 1.518               http-8
 x=: 50 spans folded into aggregates, 0 dropped (not on the wire)

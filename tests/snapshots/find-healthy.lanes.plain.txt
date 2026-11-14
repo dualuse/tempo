@@ -6,24 +6,39 @@ http
                de…█▓▓describe██████████████index▓▓▓▓▓▓▓▓▓▓▓▓▓rerank█████████████████████████████████████████▓▓
                      await─────────────────await─────────────await───────────────────────────────────────
 cpu
-  cpu-1                                                         ░░██mat…▓███
-  cpu-2                                                        ░mat…█mat…▓mat…█
+  cpu-1                                                         ░░██░░░░░███
+                                                                 ░░░mat…█
+  cpu-2                                                        ░mat…█
+                                                                  ░░░mat…█
+                                                                    ░░░░░░mat…█
   cpu-3              infer█████████████████
   cpu-4
-  cpu-5                                                        ░░ma…█match▓▓▓
-  cpu-6                                                       mat…█ma…▓
-  cpu-7                                                        mat…█match▓ma…█
-  cpu-8                                                        match█▓▓▓mat…█
+  cpu-5                                                        ░░ma…█
+                                                                   ░░match███
+  cpu-6                                                       mat…█
+                                                                ░░░ma…█
+  cpu-7                                                        mat…█ ░░░░░ma…█
+                                                                  ░░match█
+  cpu-8                                                        match█
+                                                                  ░░░███
+                                                                    ░░░░mat…█
   (mixed)                                                            ▚▚▚▚▚▚▚▚▚▚┃match ×30▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚
   queued ≤13.1                                                 ▁▂▂▃▄▄████▇▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▅
 io
-  io-1                                     query█████████████▓▓███load▓▓▓▓▓▓▓▓
-  io-2                                     qu…█              ██▓▓▓load███
-  io-3                                     query████         ███lo…▓██    ░lo…✗
-  io-4                                     query███          ███▓▓✗██load▓▓▓▓▓▓
-  io-5                                     qu…█              lo…█▓▓▓lo…█
-  io-6                                                       ██ ░██lo…▓
-  io-7                                                       █▓███▓▓▓███
+  io-1                                     query█████████████▓▓███
+                                                                ░░load████████
+  io-2                                     qu…█              ██   load███
+                                                             ░░███
+  io-3                                     query████         ███   ░██    ░lo…✗
+                                                               ░lo…█
+  io-4                                     query███          ███  ░██
+                                                               ░██✗ ░load██████
+  io-5                                     qu…█              lo…█  ░lo…█
+                                                               ░░███
+  io-6                                                       ██ ░██
+                                                                  ░lo…█
+  io-7                                                       █░███  ░███
+                                                             ░█  ░███
   io-8                                                       load███▓█
   (mixed)                                                            ▚▚┃load ×20▚▚▚
   queued ≤3                                                  ▄▆██▆▆▆▆▆▅▅▅▆█▆▅▅▅▅▅▅▄

@@ -13,7 +13,8 @@ the chain of spans that determined the end time, walking back from the root's en
  58.653   58.658                    0.005  http-10  pipeline
  58.658   71.461  5.938    6.865           cpu-4    pipeline/describe
  71.461   71.466                    0.005  http-10  pipeline
- 71.466  783.034         711.568           ?-*      pipeline/store ×120 (aggregate: extent; per-occurrence wait not on the wire)
+ 71.466  783.034         711.568           ?-*      pipeline/store ×120 (aggregate: extent; per-occurrence
+                                                    wait not on the wire)
 783.034  783.074           0.035    0.005  http-10  pipeline
 783.074  783.094           0.020           http-10  PUT /video
 783.094  790.191           7.097           http-10  commit

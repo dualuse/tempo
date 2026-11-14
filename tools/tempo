@@ -20,6 +20,7 @@ import sys
 import textwrap
 
 VERSION = "1.0"
+MIN_WIDTH = 40    # narrowest output: the lanes need a label column and a time axis
 
 # ======================================================================
 # Decoder (FORMAT.md section 6; mirrors tools/tempo_ref.py)
@@ -997,20 +998,28 @@ def pool_title(pool):
     return "(pool unknown)" if pool == "?" else pool
 
 
-def draw_lane(spans, scale, p):
-    """Pack the spans of one lane into rows; returns a list of cell rows."""
+def draw_lane(spans, scale, p, rowof=None):
+    """Pack the spans of one lane into rows; returns a list of cell rows.
+
+    `rowof`, when given, receives the row of each span id."""
     g = p.g
     w = scale.w
     rows = []
     occ = []
     last = []
-    rowof = {}
+    rowof = {} if rowof is None else rowof
     for s in spans:
         # rows separate nesting and true concurrency; spans that merely share a
         # cell at this resolution stay in one row (the later one draws over)
         ta = s.start if (s.not_run or s.agg) else s.run_start
         tb = s.end
         c0, c1 = scale.cols(ta, tb)
+        # a handoff's queue wait is drawn in front of its run, so it is reserved
+        # too: when the thread was still busy (with earlier work of this request)
+        # while the task queued, the task moves to a free row and the wait shows
+        wa, wc0 = ta, c0
+        if s.handoff and not s.agg and not s.not_run and s.wait > 0 and scale.rd(s.start) < c0:
+            wa, wc0 = s.start, scale.rd(s.start)
         floor = 0
         if not s.handoff and not s.not_run:
             a = s.parent
@@ -1025,10 +1034,10 @@ def draw_lane(spans, scale, p):
                 rows.append([(" ", None)] * w)
                 occ.append([])
                 last.append((-1, 0))
-            if not any(_clash(ta, tb, c0, c1, o) for o in occ[r]):
+            if not any(_clash(wa, tb, wc0, c1, o) for o in occ[r]):
                 break
             r += 1
-        occ[r].append((ta, tb, c0, c1))
+        occ[r].append((wa, tb, wc0, c1))
         rowof[s.id] = r
         cells = rows[r]
         failed = "f" in s.flags
@@ -1319,29 +1328,110 @@ def view_pools(trace, flt, p, width):
         rows.append([pool, thr, str(n), ms(run), ms(wait), ms(wmax), ms(cpu), ms(off),
                      _short(pr), _short(pq), "" if gq is None else fmt_num(gq),
                      "" if ga is None else fmt_num(ga)])
-    out.extend(render_table(heads, rows, p, left=1))
+    out.extend(render_table(heads, rows, p, width, "l" + "r" * 11,
+                            groups=[[1, 2], [3, 4, 5, 6, 7], [8, 9, 10, 11]]))
     out.extend(wrap("threads: seen running this request's tasks / in the thread table. "
                     "peak: most at once (aggregates count as their average).", width, "dim", p, ""))
     out.extend(notices(trace, p, width))
     return out
 
 
-def render_table(heads, rows, p, left=1, styles=None):
-    widths = [max(len(h), max([len(r[i]) for r in rows] or [0])) for i, h in enumerate(heads)]
-    out = []
+KEY_MIN = 16    # a path column keeps this many columns before a table splits into blocks
+TEXT_MIN = 16   # a wrapped free-text column keeps at least this many
 
-    def line(cells, row_styles=None):
+
+def fit_mid(text, n, g):
+    """`text` shortened to n columns by an ellipsis in the middle (keeps a path's leaf)."""
+    if len(text) <= n:
+        return text
+    if n <= 1:
+        return text[:n]
+    tail = (n - 1) - (n - 1) // 3
+    return text[:n - 1 - tail] + g["ell"] + text[len(text) - tail:]
+
+
+def render_table(heads, rows, p, width, align, styles=None, groups=None, wrap_last=False):
+    """A table fitted to `width`, as lines. `align` has 'l' or 'r' per column.
+
+    Numbers are never cut. Column 0 (a path or name) is shortened in the middle
+    when the table is too wide; when it would get fewer than KEY_MIN columns,
+    the other columns are split into blocks of whole `groups` (lists of column
+    indices), stacked one under the other, each repeating column 0. With
+    `wrap_last` the last column is free text that wraps instead."""
+    n = len(heads)
+    nat = [max([len(heads[i])] + [len(r[i]) for r in rows]) for i in range(n)]
+    if wrap_last:
+        rest = sum(nat[:-1]) + 2 * (n - 1)
+        widths = nat[:-1] + [max(TEXT_MIN, width - rest)]
+        return _table_block(heads, rows, p, list(range(n)), widths, align, styles, True)
+
+    def need(cols):
+        return sum(nat[i] + 2 for i in cols)
+
+    def key_width(cols):
+        return max(min(nat[0], 8), min(nat[0], width - need(cols)))
+
+    cols = list(range(1, n))
+    if width - need(cols) >= min(nat[0], KEY_MIN):
+        return _table_block(heads, rows, p, [0] + cols, _widths(nat, [0] + cols, key_width(cols)),
+                            align, styles)
+    blocks = []
+    cur = []
+    kmin = min(nat[0], KEY_MIN)
+    for grp in groups or [[i] for i in cols]:
+        if cur and kmin + need(cur + grp) > width:
+            blocks.append(cur)
+            cur = []
+        cur = cur + list(grp)
+    blocks.append(cur)
+    out = []
+    for k, b in enumerate(blocks):
+        if k:
+            out.append("")
+        out.extend(_table_block(heads, rows, p, [0] + b, _widths(nat, [0] + b, key_width(b)),
+                                align, styles))
+    return out
+
+
+def _widths(nat, cols, kw):
+    return [kw if i == 0 else nat[i] for i in cols]
+
+
+def _table_block(heads, rows, p, cols, widths, align, styles, wrap_last=False):
+    """Lines of the columns `cols` (widths in the same order); the last one unpadded."""
+    g = p.g
+    m = len(cols)
+
+    def line(cells, st=None):
         parts = []
-        for i, c in enumerate(cells):
-            t = c.ljust(widths[i]) if i < left else c.rjust(widths[i])
-            if row_styles and row_styles[i]:
-                t = p.c(t, row_styles[i])
+        for j, i in enumerate(cols):
+            c = cells[i]
+            if i == 0 and len(c) > widths[j]:
+                c = fit_mid(c, widths[j], g)
+            if j == m - 1 and align[i] == "l":
+                t = c
+            elif align[i] == "l":
+                t = c.ljust(widths[j])
+            else:
+                t = c.rjust(widths[j])
+            if st and st[i]:
+                t = p.c(t, st[i])
             parts.append(t)
         return "  ".join(parts).rstrip()
 
-    out.append(p.c(line(heads), "bold") if p.color else line(heads))
+    out = [p.c(line(heads), "bold")]
     for k, r in enumerate(rows):
-        out.append(line(r, styles[k] if styles else None))
+        st = styles[k] if styles else None
+        if not wrap_last:
+            out.append(line(r, st))
+            continue
+        last = cols[-1]
+        pieces = textwrap.wrap(r[last], widths[-1], break_long_words=True,
+                               break_on_hyphens=False) or [""]
+        for q, piece in enumerate(pieces):
+            cells = list(r) if q == 0 else [""] * len(r)
+            cells[last] = piece
+            out.append(line(cells, st))
     return out
 
 
@@ -1371,40 +1461,95 @@ def view_tree(trace, flt, p, width):
         else:
             name_prefix = prefix + (g["tl"] if last else g["tm"])
             child_prefix = prefix + (g["tb"] if last else g["tp"])
-        lines.append((name_prefix, s))
         kids = [c for c in s.children if c.id in shown]
+        # continuation lines of a row (wrapped attributes) carry the tree's guides
+        lines.append((name_prefix, child_prefix + (g["tp"] if kids else ""), s))
         for i, c in enumerate(kids):
             walk(c, child_prefix, i == len(kids) - 1, False)
 
     for r in roots:
         if r.id in shown:
             walk(r, "", True, True)
-    tw = max([len(trace.thread_label(s)) for _, s in lines] + [6])
-    fixed = 6 * 10 + tw + 2 + 6
-    nw = max(20, min(max(len(pre) + len(span_label(s, g)) for pre, s in lines), width - fixed))
+    heads = ("start", "wait", "dur", "self", "cpu", "off-cpu")
+    table = [[ms(s.start), ms(s.wait) if s.handoff else "", ms(s.dur), ms(s.self_time),
+              ms(s.cpu), ms(s.offcpu)] for _, _, s in lines]
+    nat = [max([len(h)] + [len(v[k]) for v in table]) for k, h in enumerate(heads)]
+    tw = max([len(trace.thread_label(s)) for _, _, s in lines] + [6])
+    fw = max([len(s.flags) for _, _, s in lines] + [5])
+    names = max(len(pre) + len(span_label(s, g)) for pre, _, s in lines)
+    attr_max = max(len(attr_text(s)) for _, _, s in lines)
+    # numbers keep their full text. When the line is too wide, the number
+    # columns close up and the attributes wrap in their column (the name
+    # column shortened to make room); when that leaves too little room, the
+    # attributes go on lines of their own below the row
+    configs = []
+    for num_min, sep in ((8, 2), (0, 2), (0, 1)):
+        nws = [max(num_min, n) for n in nat]
+        configs.append((nws, sep, sum(sep + n for n in nws) + sep + tw + sep + fw))
+    nw_nat = max(20, names)
+    nw_min = min(names, 20)
+    layout = None
+    for nws, sep, fixed in configs:
+        if nw_nat + fixed + sep + attr_max <= width:
+            layout = (nws, sep, fixed, nw_nat)
+            break
+    for nws, sep, fixed in configs if layout is None else ():
+        nw = min(nw_nat, width - fixed - sep - TEXT_MIN - 8)
+        if nw >= nw_min:
+            layout = (nws, sep, fixed, nw)
+            break
+    for nws, sep, fixed in configs if layout is None else ():
+        if width - fixed >= nw_min or sep == 1:
+            layout = (nws, sep, fixed, max(min(names, 12), min(nw_nat, width - fixed)))
+            break
+    nws, sep, fixed, nw = layout
+    acol = nw + fixed + sep
+    avail = width - acol
+    gap = " " * sep
     out = [header_line(trace, p, width=width)]
-    head = ("span".ljust(nw) + "".join(h.rjust(10) for h in
-                                         ("start", "wait", "dur", "self", "cpu", "off-cpu"))
-            + "  " + "thread".ljust(tw) + "  flags  attributes")
+    head = ("span".ljust(nw) + "".join(gap + h.rjust(n) for h, n in zip(heads, nws))
+            + gap + "thread".ljust(tw) + gap + "flags".ljust(fw))
+    if avail >= len("attributes"):
+        head += gap + "attributes"
     out.append(p.c(head, "bold"))
-    for pre, s in lines:
-        name = fit(pre + span_label(s, g), nw, g)
+    for (pre, cont, s), vals in zip(lines, table):
+        label = span_label(s, g)
+        # a deep prefix loses its outer levels first, so the name stays readable
+        room = nw - min(len(label), 10)
+        if pre and len(pre) > room:
+            cut = len(pre) - max(0, room - 1)
+            pre = g["ell"] + pre[cut:]
+            cont = " " + cont[cut:]
+        name = fit(pre + label, nw, g)
         ctx = s.id not in vis
         name_st = "dim" if ctx else ("red" if "f" in s.flags else None)
-        tail = name[len(pre):] if name.startswith(pre) else name
-        cols = [p.c(pre, "dim") + p.c(tail, name_st) + " " * (nw - len(name))]
-        vals = [ms(s.start), ms(s.wait) if s.handoff else "", ms(s.dur), ms(s.self_time),
-                ms(s.cpu), ms(s.offcpu)]
+        k = min(len(pre), len(name))
+        cols = [p.c(name[:k], "dim") + p.c(name[k:], name_st) + " " * (nw - len(name))]
         for k, v in enumerate(vals):
             st = "dim" if ctx else ("yellow" if (k == 1 and s.wait > 0) else None)
-            cols.append(p.c(v.rjust(10), st))
-        cols.append("  " + trace.thread_label(s).ljust(tw))
-        cols.append("  " + p.c(s.flags, "red" if "f" in s.flags else ("magenta" if s.flags else None))
-                    + " " * (5 - len(s.flags)))
-        cols.append("  " + attr_text(s))
-        out.append("".join(cols).rstrip())
+            cols.append(gap + p.c(v.rjust(nws[k]), st))
+        cols.append(gap + trace.thread_label(s).ljust(tw))
+        cols.append(gap + p.c(s.flags, "red" if "f" in s.flags else ("magenta" if s.flags else None))
+                    + " " * (fw - len(s.flags)))
+        attrs = attr_text(s)
+        cont = cont[:nw]
+        if not attrs or len(attrs) <= avail:
+            out.append(("".join(cols) + gap + attrs).rstrip())
+        elif avail >= 24:
+            pieces = _wrap_text(attrs, avail)
+            out.append("".join(cols) + gap + pieces[0])
+            out.extend(p.c(cont, "dim") + " " * (acol - len(cont)) + q for q in pieces[1:])
+        else:
+            out.append("".join(cols).rstrip())
+            ind = min(len(cont), width // 3)
+            out.extend(p.c(cont[:ind], "dim") + "  " + q
+                       for q in _wrap_text(attrs, width - ind - 2))
     out.extend(notices(trace, p, width))
     return out
+
+
+def _wrap_text(text, n):
+    return textwrap.wrap(text, n, break_long_words=True, break_on_hyphens=False) or [""]
 
 
 def attr_text(s):
@@ -1478,7 +1623,8 @@ def view_agg(trace, flt, p, width):
         styles.append(st)
     out = [header_line(trace, p, "Aggregates", width=width)]
     out.extend(render_table(["path", "count", "sum", "self", "min", "max", "wait sum",
-                             "wait max", "cpu", "flags"], rows, p, left=1, styles=styles))
+                             "wait max", "cpu", "flags"], rows, p, width, "l" + "r" * 9,
+                            styles=styles, groups=[[1, 2, 3, 4, 5], [6, 7], [8, 9]]))
     out.extend(wrap("times in ms; aggregates contribute their count, sum, min and max",
                     width, "dim", p, ""))
     out.extend(notices(trace, p, width))
@@ -1753,8 +1899,8 @@ def view_critical(trace, flt, p, width):
                      trace.thread_label(s), name])
         styles.append([None, None, "yellow", None, "blue", None,
                        "red" if "f" in s.flags else None])
-    widths_head = ["from", "to", "wait", "run", "blocked", "thread", "span"]
-    out.extend(_render_left_last(widths_head, rows, p, styles))
+    out.extend(render_table(["from", "to", "wait", "run", "blocked", "thread", "span"], rows, p,
+                            width, "rrrrrll", styles, wrap_last=True))
     kinds = {"run": 0, "wait": 0, "blocked": 0, "agg": 0}
     by_pool = {}
     for h in hops:
@@ -1792,30 +1938,6 @@ def view_critical(trace, flt, p, width):
     return out
 
 
-def _render_left_last(heads, rows, p, styles):
-    widths = [max(len(h), max([len(r[i]) for r in rows] or [0])) for i, h in enumerate(heads)]
-    out = []
-
-    def line(cells, st=None):
-        parts = []
-        for i, c in enumerate(cells):
-            if i == len(cells) - 1:
-                t = c
-            elif i >= len(cells) - 2:
-                t = c.ljust(widths[i])
-            else:
-                t = c.rjust(widths[i])
-            if st and st[i]:
-                t = p.c(t, st[i])
-            parts.append(t)
-        return "  ".join(parts).rstrip()
-
-    out.append(p.c(line(heads), "bold") if p.color else line(heads))
-    for k, r in enumerate(rows):
-        out.append(line(r, styles[k] if styles else None))
-    return out
-
-
 # ---------------------------------------------------------------- diff
 
 def view_diff(a, b, flt, p, width):
@@ -1839,9 +1961,9 @@ def view_diff(a, b, flt, p, width):
     rows.sort(key=lambda r: (-r[0], r[1]))
     da = a.root.end
     db = b.root.end
-    out = [p.c("Diff", "bold") + "  A %s %s ms  %s  B %s %s ms  %s  %s %s ms (%s)" % (
-        a.label, ms(da), g["arrow"], b.label, ms(db), g["dot"], g["delta"],
-        ms_signed(db - da), ("%+.1f%%" % (100.0 * (db - da) / da)) if da else "-")]
+    out = diff_header(a.label, ms(da), b.label, ms(db), "%s %s ms (%s)" % (
+        g["delta"], ms_signed(db - da), ("%+.1f%%" % (100.0 * (db - da) / da)) if da else "-"),
+        p, width)
     D = g["delta"]
     heads = ["path", "count A%sB" % g["arrow"], D + "count", D + "sum", D + "self", D + "wait",
              D + "cpu", "sum A", "sum B", ""]
@@ -1858,10 +1980,25 @@ def view_diff(a, b, flt, p, width):
             elif d[f] < 0:
                 st[i] = "green"
         styles.append(st)
-    out.extend(render_table(heads, body, p, left=1, styles=styles))
+    out.extend(render_table(heads, body, p, width, "l" + "r" * 9, styles=styles,
+                            groups=[[1, 2], [3, 4, 5, 6], [7, 8, 9]]))
     out.extend(wrap("%s = B %s A in ms, sorted by the largest absolute change; red is slower, "
                     "green faster" % (D, "-" if g is ASCII else "−"), width, "dim", p, ""))
     return out
+
+
+def diff_header(label_a, ms_a, label_b, ms_b, delta, p, width):
+    """`Diff  A <file> <ms>  →  B <file> <ms>  ·  Δ ...` on one line when it fits,
+    else one line per trace with the file names shortened in the middle."""
+    g = p.g
+    one = "Diff  A %s %s ms  %s  B %s %s ms  %s  %s" % (
+        label_a, ms_a, g["arrow"], label_b, ms_b, g["dot"], delta)
+    if len(one) <= width:
+        return [p.c("Diff", "bold") + one[4:]]
+    room = max(8, width - len("Diff  A ") - len(" %s ms" % max(ms_a, ms_b, key=len)))
+    return [p.c("Diff", "bold") + "  A %s %s ms" % (fit_mid(label_a, room, g), ms_a),
+            "      B %s %s ms" % (fit_mid(label_b, room, g), ms_b),
+            "      " + delta]
 
 
 # ---------------------------------------------------------------- stats
@@ -1895,9 +2032,12 @@ def view_stats(traces, flt, p, width):
     n = sum(1 for t in traces if t.spans)
     if "" in per and len(roots) > 1:
         per[""]["label"] = "(root)"
-    out = [p.c("Stats", "bold") + " over %d trace%s: %s" % (
+    title = "Stats over %d trace%s: %s" % (
         n, "" if n == 1 else "s",
-        ", ".join("%s %s%d" % (k, g["times"], v) for k, v in sorted(roots.items())))]
+        ", ".join("%s %s%d" % (k, g["times"], v) for k, v in sorted(roots.items())))
+    out = textwrap.wrap(title, width, subsequent_indent="    ", break_long_words=True,
+                        break_on_hyphens=False)
+    out[0] = p.c("Stats", "bold") + out[0][len("Stats"):]
     heads = ["path", "traces", "count p50", "sum p50", "p95", "max", "self p50", "p95", "max",
              "wait p50", "p95", "max"]
     rows = []
@@ -1909,7 +2049,8 @@ def view_stats(traces, flt, p, width):
             row.extend([ms(percentile(r[f], 50)), ms(percentile(r[f], 95)), ms(max(r[f]))])
         rows.append(row)
         styles.append([None] * 9 + ["yellow" if max(r["wait"]) else None] * 3)
-    out.extend(render_table(heads, rows, p, left=1, styles=styles))
+    out.extend(render_table(heads, rows, p, width, "l" + "r" * 11, styles=styles,
+                            groups=[[1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]]))
     out.extend(wrap("ms per trace; percentiles by nearest rank over the traces that contain "
                     "the path", width, "dim", p, ""))
     return out
@@ -2032,6 +2173,13 @@ input:
 views (default: lanes per thread, grouped into pools):
   --tree, --agg, --pools, --findings, --critical, --diff OTHER, --stats FILES...
 
+layout:
+  Lanes and charts fit --width down to 40 columns (a smaller width is
+  raised to it). Tables never cut a number; they shorten names and paths,
+  wrap attributes and span text, and split wide tables into stacked blocks.
+  So they have a floor of their own: about 80 columns for --tree, 70 for
+  --critical and 60 for the other tables; narrower, their lines run over.
+
 exit status: 0 ok, 1 malformed or (with --check) truncated input, 2 usage error.
 """
 
@@ -2070,7 +2218,8 @@ def build_parser():
     f.add_argument("--min-ms", type=float, metavar="X",
                    help="hide spans (and their subtrees) shorter than X ms")
     o = ap.add_argument_group("layout")
-    o.add_argument("--width", type=int, metavar="N", help="output width (default: terminal)")
+    o.add_argument("--width", type=int, metavar="N",
+                   help="output width (default: terminal; at least %d)" % MIN_WIDTH)
     o.add_argument("--no-color", action="store_true", help="no ANSI colours (also NO_COLOR)")
     o.add_argument("--color", action="store_true", help="ANSI colours even when not a terminal")
     o.add_argument("--ascii", action="store_true", help="ASCII instead of Unicode block characters")
@@ -2121,7 +2270,9 @@ def run(argv, stdin=None, stdout=None, stderr=None, env=None, isatty=None):
             width = int(env.get("COLUMNS") or 100)
         except ValueError:
             width = 100
-    width = max(40, width)
+    if args.width and args.width < MIN_WIDTH:
+        err("--width %d is below the minimum of %d; using %d" % (args.width, MIN_WIDTH, MIN_WIDTH))
+    width = max(MIN_WIDTH, width)
     p = Painter(color, args.ascii)
     try:
         flt = Filter(args.threads, args.focus, args.depth, args.min_ms)
