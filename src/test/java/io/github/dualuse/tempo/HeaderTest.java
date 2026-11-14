@@ -227,6 +227,66 @@ class HeaderTest {
         assertEquals(44, ((List<?>) WireDecoder.decode(Tempo.Header.of(t.snapshot(), 1 << 16)).get("spans")).size());
     }
 
+    /** An aggregate nested in another one is left out: its spans count as dropped and no longer as folded. */
+    @Test
+    void aggregateNestedInAnAggregateCountsAsDroppedOnly() {
+        Name marked = Tempo.name("marked-only").aggregate();
+        Trace t = Tempo.start(SEARCH, opts().level(Tempo.DETAIL).budget(0));
+        Span root = t.root();
+        for (int i = 0; i < 3; i++) {
+            clock.add(1000);
+            try (Span b = root.detail(LOAD)) {
+                for (int j = 0; j < 2; j++) {
+                    clock.add(1000);
+                    b.detail(MATCH).close();
+                }
+                b.deep(marked).close(); // aggregate-only (below DEEP), not folded: left out, never counted as folded
+            }
+        }
+        clock.add(1000);
+        t.close();
+        assertEquals(9, t.snapshot().folded());
+        String h = t.toHeader();
+        assertTrue(h.contains(";x=3.9;"), h); // 3 load on the wire; 6 match and 3 marked-only left out
+        assertEquals(List.of(3), aggregates(h));
+    }
+
+    /** At ladder step 4 an aggregate below depth 1 is left out with the spans: folded drops to 0. */
+    @Test
+    void aggregateLeftOutAtTheLastLadderStepCountsAsDroppedOnly() {
+        Trace t = Tempo.start(SEARCH, opts().level(Tempo.DETAIL).budget(0).cpu(false).headerBytes(256));
+        Span root = t.root();
+        clock.add(1000);
+        try (Span d = root.span(DECODE)) {
+            for (int i = 0; i < 40; i++) {
+                clock.add(1000);
+                d.span(LOAD).close();
+            }
+            for (int i = 0; i < 10; i++) {
+                clock.add(1000);
+                d.detail(SCORE).close();
+            }
+        }
+        clock.add(1000);
+        t.close();
+        assertEquals(10, t.snapshot().folded());
+        assertEquals("v1;w=mwevdy2z;x=0.1e;T=" + name(Thread.currentThread().getName()) + ";N=search:decode;S=00.0.1g/11.1.1e;e=2",
+                t.toHeader()); // 40 spans and the aggregate of 10 left out
+        Map<String, Object> fallback = WireDecoder.decode(Tempo.Header.of(t.snapshot(), 100));
+        assertEquals(0L, fallback.get("folded"));
+        assertEquals(51L, fallback.get("dropped"));
+    }
+
+    /** Counts of the aggregate records of a value, in order. */
+    private static List<Integer> aggregates(String header) {
+        List<Integer> counts = new ArrayList<>();
+        for (Object o : (List<?>) WireDecoder.decode(header).get("spans")) {
+            Map<?, ?> agg = (Map<?, ?>) ((Map<?, ?>) o).get("agg");
+            if (agg != null) counts.add(((Long) agg.get("count")).intValue());
+        }
+        return counts;
+    }
+
     @Test
     void releasedTraceRendersEmptyAndAnEarlierSnapshotStillRenders() {
         Trace t = Tempo.start(SEARCH, opts());
@@ -436,13 +496,14 @@ class HeaderTest {
     static Map<String, Object> expected(Snapshot snap) {
         List<Seen> seen = new ArrayList<>();
         int[] skip = {-1};
-        long[] left = {0};
+        long[] left = {0, 0}; // spans left out; folded occurrences of the aggregates among them
         boolean[] aggregate = new boolean[MAX_DEPTH + 1];
         snap.forEachSpan(v -> {
             int d = v.depth();
             if (skip[0] >= 0 && d > skip[0] || d > MAX_DEPTH || d == 0 && !seen.isEmpty() || d > 0 && aggregate[d - 1]) {
                 if (skip[0] < 0 || d <= skip[0]) skip[0] = d;
                 left[0] += v.count();
+                left[1] += v.folded;
                 return;
             }
             skip[0] = -1;
@@ -490,7 +551,7 @@ class HeaderTest {
         if (snap.wall > 0) doc.put("wall", snap.wall);
         long nonFinite = 0;
         for (Seen x : seen) nonFinite += x.nonFinite;
-        doc.put("folded", (long) snap.folded());
+        doc.put("folded", snap.folded() - left[1]); // a left-out aggregate counts as dropped only
         doc.put("dropped", snap.dropped() + left[0] + nonFinite);
         TreeMap<Integer, Integer> lanes = new TreeMap<>();
         for (Seen x : seen) if (!x.unrun) lanes.put(x.lane, 0);

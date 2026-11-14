@@ -1072,7 +1072,10 @@ public final class Tempo {
         Span budgeted(Name n, int flags) {
             if (credit == 0 && (credit = ctx.credits()) == 0) {
                 Span h = frame(n);
-                if (h != NOOP && h.agg >= 0) folded++; // past the aggregate cap the frame counted a drop
+                if (h != NOOP && h.agg >= 0) { // past the aggregate cap the frame counted a drop
+                    h.folded = true;
+                    folded++;
+                }
                 return h;
             }
             Span h = push(n, flags);
@@ -1107,6 +1110,7 @@ public final class Tempo {
             h.row = FRAME;
             h.frame = n;
             h.agg = agg;
+            h.folded = false;
             h.time = ctx.now();
             return h;
         }
@@ -1239,7 +1243,7 @@ public final class Tempo {
             if (h.row == FRAME) {
                 long start = h.time, dur = Math.max(0, now - start), cpu = cpuSince(k);
                 h.time = dur;
-                if (h.agg >= 0) aggs.add(h.agg, start, dur, cpu);
+                if (h.agg >= 0) aggs.add(h.agg, start, dur, cpu, h.folded);
                 return heal;
             }
             int r = h.row;
@@ -1583,7 +1587,8 @@ public final class Tempo {
      */
     static final class Aggs {
         static final int MAX = 4096, KEY = 4, ANCHOR = 0, LAP = 1, PARENT = 2, NAME = 3;
-        static final int CELLS = 8, COUNT = 0, SUM = 1, MIN = 2, MAX_DUR = 3, FIRST = 4, LAST = 5, MAX_AT = 6, CPU = 7;
+        static final int CELLS = 9, COUNT = 0, SUM = 1, MIN = 2, MAX_DUR = 3, FIRST = 4, LAST = 5, MAX_AT = 6, CPU = 7,
+                FOLDED = 8; // occurrences folded for want of budget; the rest were aggregate-only
         private static final VarHandle SIZE;
 
         static {
@@ -1629,7 +1634,7 @@ public final class Tempo {
             keys[k + LAP] = lap;
             keys[k + PARENT] = parent;
             keys[k + NAME] = name;
-            cells[b + COUNT] = cells[b + SUM] = cells[b + MAX_AT] = 0;
+            cells[b + COUNT] = cells[b + SUM] = cells[b + MAX_AT] = cells[b + FOLDED] = 0;
             cells[b + MIN] = cells[b + FIRST] = Long.MAX_VALUE;
             cells[b + MAX_DUR] = cells[b + LAST] = Long.MIN_VALUE;
             cells[b + CPU] = -1;
@@ -1654,7 +1659,7 @@ public final class Tempo {
             return a;
         }
 
-        void add(int e, long start, long dur, long cpu) {
+        void add(int e, long start, long dur, long cpu, boolean folded) {
             long[] c = cells;
             int b = e * CELLS;
             c[b + SUM] += dur;
@@ -1666,6 +1671,7 @@ public final class Tempo {
             if (start < c[b + FIRST]) c[b + FIRST] = start;
             if (start + dur > c[b + LAST]) c[b + LAST] = start + dur;
             if (cpu >= 0) c[b + CPU] = c[b + CPU] < 0 ? cpu : c[b + CPU] + cpu;
+            if (folded) c[b + FOLDED]++;
             c[b + COUNT]++;
         }
 
@@ -2047,6 +2053,7 @@ public final class Tempo {
                 v.wait = 0;
                 v.aggregate = true;
                 v.count = c[b + Aggs.COUNT];
+                v.folded = c[b + Aggs.FOLDED];
                 v.min = c[b + Aggs.MIN];
                 v.max = c[b + Aggs.MAX_DUR];
                 v.extent = c[b + Aggs.LAST] - v.start;
@@ -2078,6 +2085,7 @@ public final class Tempo {
             v.subTo = begun ? s.from[r + 1] : 0;
             v.aggregate = false;
             v.count = 1;
+            v.folded = 0;
             v.min = v.max = v.extent = v.duration;
             v.maxAt = 0;
             visitor.visit(v);
@@ -2307,7 +2315,8 @@ public final class Tempo {
      * Two walks over the stitched tree: the first numbers the threads and names the records use, the
      * second writes the records into the one builder. Records deeper than {@link #maxDepth}, and the
      * aggregates of aggregate-only spans nested in others (the wire has no children under an aggregate),
-     * are left out with their subtrees and counted as dropped, like a non-finite attribute value.
+     * are left out with their subtrees and counted as dropped (an aggregate's folded spans then no longer
+     * as folded), like a non-finite attribute value.
      */
     static final class Header implements SpanVisitor {
         static final int MAX_DEPTH = 35, MIN_BYTES = 256;
@@ -2328,6 +2337,7 @@ public final class Tempo {
         private StringBuilder out; // null during the first walk
         private int limit, records, skip;
         private long rootStart, rootDur, left, written, nonFinite; // left, written: spans, aggregates by count
+        private long leftFolded, foldedSeen; // folded occurrences of the aggregates left out, of all aggregates
 
         private Header(Snapshot snap, int maxDepth, boolean attributes) {
             this.snap = snap;
@@ -2349,7 +2359,8 @@ public final class Tempo {
             if (full.records == 0) return "";
             if (maxBytes >= MIN_BYTES && new Header(s, 1, false).write(b, maxBytes)) return b.toString();
             b.setLength(0);
-            b36(b.append("v1;x=0."), s.dropped() + full.left + full.written);
+            b36(b.append("v1;x=0."), s.dropped() + full.left + full.written
+                    + Math.max(0, s.folded() - full.foldedSeen)); // folded spans still open are in no aggregate
             b36(b.append(";T=%3F;N=%3F;S=00.0."), us(full.rootDur));
             return b.append(";e=1").toString();
         }
@@ -2364,8 +2375,10 @@ public final class Tempo {
             b.setLength(0);
             b.append("v1");
             if (snap.wall > 0) b36(b.append(";w="), snap.wall);
-            long dropped = snap.dropped() + left + nonFinite;
-            if (snap.folded() > 0 || dropped > 0) b36(b36(b.append(";x="), snap.folded()).append('.'), dropped);
+            // aggregates left out count as dropped, so their folded occurrences no longer count as folded;
+            // folded spans still open are in no aggregate yet and stay folded
+            long dropped = snap.dropped() + left + nonFinite, folded = snap.folded() - leftFolded;
+            if (folded > 0 || dropped > 0) b36(b36(b.append(";x="), folded).append('.'), dropped);
             boolean live = false;
             for (int l = 0; l < laneIndex.length; l++) {
                 if (laneIndex[l] == 0 || !snap.shapes[l].live) continue;
@@ -2393,13 +2406,19 @@ public final class Tempo {
             int d = v.depth;
             if (skip >= 0 && d > skip || d > maxDepth || d == 0 && records > 0 || d > 0 && aggregateAt[d - 1]) {
                 if (skip < 0 || d <= skip) skip = d; // left out with its subtree
-                if (out == null) left += v.count;
+                if (out == null) {
+                    left += v.count;
+                    leftFolded += v.folded;
+                    foldedSeen += v.folded;
+                }
                 return;
             }
             skip = -1;
             aggregateAt[d] = v.aggregate;
-            if (out == null) count(v);
-            else if (out.length() <= limit) record(out, v);
+            if (out == null) {
+                foldedSeen += v.folded;
+                count(v);
+            } else if (out.length() <= limit) record(out, v);
             records++;
         }
 
@@ -2839,6 +2858,7 @@ public final class Tempo {
         int row;    // Lane.FRAME for an aggregate-only span, which has the next three
         Name frame;
         int agg;    // its entry in the lane's aggregates, or -1
+        boolean folded; // folded for want of budget, not aggregate-only
         long time;  // start while open, then duration
 
         Span(Lane lane, Context ctx, int depth) {
@@ -3132,6 +3152,7 @@ public final class Tempo {
         Name name;
         String label;
         long start, duration, wait, cpu, count, min, max, extent, maxAt;
+        long folded; // of count, the occurrences folded for want of budget (x=folded)
         boolean open, live, handoff, begun, aggregate;
         boolean inline; // a handoff begun on the submitting thread inside the submitter's lane
 
