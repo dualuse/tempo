@@ -1,0 +1,31 @@
+Critical path  ·  PUT /video  ·  790.221 ms  ·  2026-11-13 09:00:39.595 UTC
+34 spans on 9 threads
+the chain of spans that determined the end time, walking back from the root's
+end through handoffs
+   from       to   wait      run  blocked  thread   span
+  0.000    0.200           0.200           http-10  PUT /video
+  0.200   44.355          44.155           http-10  upload
+ 44.355   44.375           0.020           http-10  PUT /video
+ 44.375   48.308           3.933           http-10  probe
+ 48.308   48.328           0.020           http-10  PUT /video
+ 48.328   48.339           0.011           http-10  pipeline
+ 48.339   51.395           3.056           io-3     pipeline/read
+ 51.395   51.400                    0.005  http-10  pipeline
+ 51.400   58.653           7.253           cpu-4    pipeline/decode
+ 58.653   58.658                    0.005  http-10  pipeline
+ 58.658   71.461  5.938    6.865           cpu-4    pipeline/describe
+ 71.461   71.466                    0.005  http-10  pipeline
+ 71.466  783.034         711.568           ?-*      pipeline/store ×120
+                                                    (aggregate: extent;
+                                                    per-occurrence wait not on
+                                                    the wire)
+783.034  783.074           0.035    0.005  http-10  pipeline
+783.074  783.094           0.020           http-10  PUT /video
+783.094  790.191           7.097           http-10  commit
+790.191  790.221           0.030           http-10  PUT /video
+
+790.221 ms on the path: run 72.695 ms (9.2%), queue wait 5.938 ms (0.8%),
+    blocked 0.020 ms (0.0%), aggregates 711.568 ms (90.0%)
+by pool: http: 55.521 ms running, 0.020 ms blocked; cpu: 5.938 ms waiting,
+    14.118 ms running; io: 3.056 ms running; ?: 711.568 ms in aggregates
+x=: 456 spans folded into aggregates, 0 dropped (not on the wire)

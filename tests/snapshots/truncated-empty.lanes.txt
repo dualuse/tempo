@@ -1,0 +1,2 @@
+no spans: the value was cut inside the root record
+truncated: the value was cut; the last record was discarded

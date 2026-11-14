@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "unit": "us",
+  "wall": 1794567890131,
+  "folded": 0,
+  "dropped": 0,
+  "threads": ["http-5"],
+  "live": [],
+  "truncated": false,
+  "spans": [
+    {"id":0,"parent":-1,"name":"search","start":0,"dur":10000,"thread":0,"attrs":{"k":10,"offset":-42,"zero":0}},
+    {"id":1,"parent":0,"name":"index","start":100,"dur":4000,"thread":0,"attrs":{"hits":9007199254740991,"ratio":0.5,"delta":-0.25}},
+    {"id":2,"parent":0,"name":"rerank","start":4200,"dur":5000,"thread":0,"attrs":{"threshold":1e-06,"mean":123456.789,"skew":-3.141593,"index":3}}
+  ]
+}

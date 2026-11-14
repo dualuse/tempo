@@ -1,0 +1,5 @@
+Aggregates  ·  GET /search  ·  87.728 ms  ·  2026-11-13 09:01:27.109 UTC  ·  63 spans on 17 threads
+path          count      sum     self    min     max  wait sum  wait max      cpu  flags
+rerank/match     46  208.923  208.923  2.358  11.252   303.042    14.529  203.708
+times in ms; aggregates contribute their count, sum, min and max
+x=: 50 spans folded into aggregates, 0 dropped (not on the wire)

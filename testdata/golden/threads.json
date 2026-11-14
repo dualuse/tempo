@@ -1,0 +1,22 @@
+{
+  "v": 1,
+  "unit": "us",
+  "wall": 1794567890126,
+  "folded": 0,
+  "dropped": 0,
+  "threads": ["http-1", "worker", "worker", "io-2"],
+  "live": [],
+  "truncated": false,
+  "spans": [
+    {"id":0,"parent":-1,"name":"search","start":0,"dur":50000,"thread":0},
+    {"id":1,"parent":0,"name":"decode","start":10,"dur":4000,"thread":0},
+    {"id":2,"parent":0,"name":"describe","start":4100,"dur":20000,"thread":1},
+    {"id":3,"parent":2,"name":"infer","start":4200,"dur":15000,"thread":1},
+    {"id":4,"parent":3,"name":"encode","start":4300,"dur":2000,"thread":0},
+    {"id":5,"parent":2,"name":"infer","start":4250,"dur":16000,"thread":2},
+    {"id":6,"parent":5,"name":"load","start":4400,"dur":900,"thread":3},
+    {"id":7,"parent":0,"name":"index","start":24200,"dur":25000,"thread":0},
+    {"id":8,"parent":7,"name":"load","start":24300,"dur":10000,"thread":3},
+    {"id":9,"parent":7,"name":"match","start":34400,"dur":14000,"thread":0}
+  ]
+}

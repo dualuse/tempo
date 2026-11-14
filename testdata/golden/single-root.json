@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "unit": "us",
+  "wall": 1794567890124,
+  "folded": 0,
+  "dropped": 0,
+  "threads": ["main"],
+  "live": [],
+  "truncated": false,
+  "spans": [
+    {"id":0,"parent":-1,"name":"search","start":0,"dur":1500,"thread":0}
+  ]
+}

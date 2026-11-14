@@ -1,0 +1,57 @@
+[1mPUT /video[0m  ·  790.221 ms  ·  2026-11-13 09:00:39.595 UTC  ·  34 spans on 9 threads
+[1mspan                   start     wait      dur     self     cpu off-cpu thread  flags attributes[0m
+PUT /video             0.000           790.221    0.290                 http-10
+[2m├─ [0mupload              0.200            44.155   44.155                 http-10       bytes=26289111
+[2m├─ [0mprobe              44.375             3.933    3.933                 http-10       frames=120
+[2m├─ [0mpipeline           48.328           734.746    0.064                 http-10       frames=120
+[2m│  ├─ [0mread            48.333    0.000    2.995    2.995   0.239   2.756 io-1          frame=0 queued=0
+[2m│  │  [0m                                                                                active=0
+[2m│  ├─ [0mread            48.336    0.000    3.072    3.072   0.245   2.827 io-2          frame=1 queued=0
+[2m│  │  [0m                                                                                active=1
+[2m│  ├─ [0mread            48.339    0.000    3.056    3.056   0.244   2.812 io-3          frame=2 queued=0
+[2m│  │  [0m                                                                                active=2
+[2m│  ├─ [0mread            48.342    0.000    2.736    2.736   0.218   2.518 io-4          frame=3 queued=0
+[2m│  │  [0m                                                                                active=3
+[2m│  ├─ [0mread            48.345 [33m   2.733[0m    2.276    2.276   0.182   2.094 io-4          frame=4 queued=0
+[2m│  │  [0m                                                                                active=4
+[2m│  ├─ [0mread            48.348 [33m   2.980[0m    2.065    2.065   0.165   1.900 io-1          frame=5 queued=1
+[2m│  │  [0m                                                                                active=4
+[2m│  ├─ [0mread            48.351 [33m   3.044[0m    2.971    2.971   0.237   2.734 io-3          frame=6 queued=2
+[2m│  │  [0m                                                                                active=4
+[2m│  ├─ [0mread            48.354 [33m   3.054[0m    2.241    2.241   0.179   2.062 io-2          frame=7 queued=3
+[2m│  │  [0m                                                                                active=4
+[2m│  ├─ [0mawait           48.357           734.682  734.682                 http-10 [35mw[0m
+[2m│  ├─ [0mdecode          51.083    0.000    7.811    7.811   7.576   0.235 cpu-2         queued=0 active=1
+[2m│  ├─ [0mdecode          51.333    0.000    6.059    6.059   5.877   0.182 cpu-3         queued=0 active=2
+[2m│  ├─ [0mdecode          51.400    0.000    7.253    7.253   7.035   0.218 cpu-4         queued=0 active=3
+[2m│  ├─ [0mdecode          51.413 [33m   5.979[0m    4.371    4.371   4.239   0.132 cpu-3         queued=0 active=4
+[2m│  ├─ [0mdecode          53.359 [33m   5.294[0m    5.943    5.943   5.764   0.179 cpu-4         queued=1 active=4
+[2m│  ├─ [0mdecode          53.398 [33m   5.496[0m    4.869    4.869   4.722   0.147 cpu-2         queued=2 active=4
+[2m│  ├─ [0mdecode          53.654 [33m   6.010[0m    5.312    5.312   5.152   0.160 cpu-1         queued=3 active=4
+[2m│  ├─ [0mdecode          54.371 [33m   7.392[0m    4.491    4.491   4.356   0.135 cpu-3         queued=4 active=4
+[2m│  ├─ [0mdescribe        57.397 [33m   6.366[0m   10.622   10.622  10.303   0.319 cpu-2         queued=4 active=4
+[2m│  ├─ [0mdescribe        58.658 [33m   5.938[0m    6.865    6.865   6.659   0.206 cpu-4         queued=4 active=4
+[2m│  ├─ [0mdescribe        58.899 [33m   6.077[0m   12.985   12.985  12.595   0.390 cpu-1         queued=4 active=4
+[2m│  ├─ [0mdescribe        61.768 [33m   4.486[0m   12.041   12.041  11.679   0.362 cpu-3         queued=3 active=4
+[2m│  ├─ [0mdescribe        63.768 [33m  10.617[0m   11.583   11.583  11.235   0.348 cpu-2         queued=4 active=4
+[2m│  ├─ [0mdescribe        64.601 [33m  12.866[0m    9.703    9.703   9.411   0.292 cpu-4         queued=4 active=4
+[2m│  ├─ [0mdescribe        64.981 [33m  12.980[0m    7.191    7.191   6.975   0.216 cpu-1         queued=4 active=4
+[2m│  ├─ [0mdescribe        66.259 [33m  12.036[0m   10.872   10.872  10.545   0.327 cpu-3         queued=4 active=4
+[2m│  ├─ [0mstore ×120      71.466    0.000  232.592  232.592  23.207 209.385 ?-*           [min=0.880 max=5.261
+[2m│  │  [0m                                                                                extent=711.568
+[2m│  │  [0m                                                                                maxAt=+475.755
+[2m│  │  [0m                                                                                waitMax=0.000 par=0.33]
+[2m│  ├─ [0mread ×112       73.278    0.000  299.748  299.748  23.925 275.823 io-*          [min=1.123 max=6.168
+[2m│  │  [0m                                                                                extent=663.971
+[2m│  │  [0m                                                                                maxAt=+656.518
+[2m│  │  [0m                                                                                waitMax=0.000 par=0.45]
+[2m│  ├─ [0mdecode ×112     75.226 [33m1655.931[0m  640.749  640.749 621.469  19.280 cpu-*         [min=2.462 max=12.541
+[2m│  │  [0m                                                                                extent=685.559
+[2m│  │  [0m                                                                                maxAt=+660.743
+[2m│  │  [0m                                                                                waitMax=26.642 par=0.93]
+[2m│  └─ [0mdescribe ×112   90.883 [33m1637.183[0m 1009.082 1009.082 978.758  30.324 cpu-*         [min=4.222 max=17.081
+[2m│     [0m                                                                                extent=690.331
+[2m│     [0m                                                                                maxAt=+568.093
+[2m│     [0m                                                                                waitMax=27.451 par=1.46]
+[2m└─ [0mcommit            783.094             7.097    7.097                 http-10
+[33mx=: 456 spans folded into aggregates, 0 dropped (not on the wire)[0m

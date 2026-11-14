@@ -1,0 +1,25 @@
+{
+  "v": 1,
+  "unit": "us",
+  "wall": 1794567890123,
+  "folded": 72,
+  "dropped": 0,
+  "threads": ["http-7", "cpu-1", "cpu-2", "io-1"],
+  "live": [],
+  "truncated": false,
+  "spans": [
+    {"id":0,"parent":-1,"name":"GET /search","start":0,"dur":184200,"thread":0},
+    {"id":1,"parent":0,"name":"decode","start":120,"dur":8300,"thread":0},
+    {"id":2,"parent":0,"name":"describe","start":8450,"dur":41200,"thread":0,"cpu":40100},
+    {"id":3,"parent":0,"name":"fingerprint","start":8460,"dur":22900,"thread":1,"wait":310,"cpu":22000},
+    {"id":4,"parent":0,"name":"index","start":49700,"dur":30500,"thread":0,"attrs":{"k":40}},
+    {"id":5,"parent":0,"name":"rerank","start":80250,"dur":101800,"thread":0},
+    {"id":6,"parent":5,"name":"load","start":80300,"dur":6100,"thread":3,"wait":45,"attrs":{"bytes":48213}},
+    {"id":7,"parent":5,"name":"load","start":80310,"dur":7400,"thread":3,"wait":6200,"flags":"f"},
+    {"id":8,"parent":5,"name":"match","start":86500,"dur":9400,"thread":1,"wait":20,"cpu":9350,"attrs":{"score":0.83}},
+    {"id":9,"parent":5,"name":"match","start":94000,"dur":8800,"thread":2,"wait":15,"cpu":8700,"attrs":{"score":0.41}},
+    {"id":10,"parent":5,"name":"load","start":94400,"dur":54000,"thread":3,"cpu":2100,"agg":{"count":36,"min":600,"max":4100,"extent":61000,"maxAt":30000,"waitSum":1800,"waitMax":400}},
+    {"id":11,"parent":5,"name":"match","start":100400,"dur":147600,"thread":-1,"cpu":146900,"agg":{"count":36,"min":2100,"max":9400,"extent":78000,"maxAt":52000,"waitSum":900,"waitMax":60}},
+    {"id":12,"parent":0,"name":"encode","start":182100,"dur":2000,"thread":0}
+  ]
+}

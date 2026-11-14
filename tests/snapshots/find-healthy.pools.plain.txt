@@ -1,0 +1,21 @@
+Pools  ·  GET /search  ·  87.728 ms  ·  2026-11-13 09:01:27.109 UTC  ·  63 spans on 17 threads
+this request's share of each pool; gauges are the pool's queue depth and active count at submit (all requests)
+                   ms 0                   20                  40                  60                  80
+                      ┬───────────────────┬───────────────────┬───────────────────┬───────────────────┬───────
+cpu
+  running ≤10.2            ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁                 ▁▂▄▄▅▅▅██████▇▇▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▁
+  queued ≤13.1                                                    ▁▂▃▃▄▄███▇▇▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▂
+  queued@submit ≤6         ▁                                     ▁▂▄ ▆▆█
+  active@submit ≤8         ▃                                     ▅██ ███
+io
+  running ≤11.9                                 ▃▄▄▄▃▃▃▂▁▁▁▁▁▁▁▁▁▆▅▅▆▆▆▆█▇▆▅▄▅▅▅▅▄▃▃▃
+  queued ≤3                                                     ▁▆▇█▆▆▆▆▆▅▅▅▆▇▅▅▅▅▅▅▄
+  queued@submit ≤2                              ▁               ▄███ ▄▄▄    █
+  active@submit ≤8                              ▄               ████ ███    █
+
+pool  threads  tasks   run ms  wait ms  wait max   cpu ms  off-cpu  peak run  peak q  q@submit  a@submit
+cpu       7/8     47  228.942  303.042    14.529  223.334    5.608      10.2    13.1         6         8
+io        8/8     53  177.509   39.042     2.056   12.653  164.856      11.9       3         2         8
+threads: seen running this request's tasks / in the thread table. peak: most at once (aggregates count as
+their average).
+x=: 50 spans folded into aggregates, 0 dropped (not on the wire)

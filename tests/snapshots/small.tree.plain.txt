@@ -1,0 +1,42 @@
+GET /search  ·  48.675 ms  ·  2026-11-13 09:00:55.433 UTC  ·  26 spans on 9 threads
+span                   start   wait     dur    self     cpu  off-cpu  thread  flags  attributes
+GET /search            0.000         48.675   0.389  12.007   36.668  http-6
+├─ decode              0.284          6.889   6.889   6.406    0.483  http-6         bytes=64839
+├─ scale               7.188          1.648   1.648                   http-6         px=768
+├─ describe            8.851         17.099   0.030                   http-6         crops=1
+│  ├─ infer            8.856  0.000  16.435  16.435  15.803    0.632  cpu-2          crop=1 queued=0 active=1
+│  ├─ await            8.861         16.430  16.430                   http-6  w
+│  └─ fingerprint     25.301          0.639   0.639                   http-6
+├─ index              25.965          3.945   0.279                   http-6         k=6
+│  ├─ query           25.969  0.000   3.551   3.551   0.212    3.339  io-2           collection=1 hits=41
+│  │                                                                                 queued=0 active=1
+│  ├─ query           25.971  0.000   3.670   3.670   0.318    3.352  io-3           collection=2 hits=26
+│  │                                                                                 queued=0 active=2
+│  └─ await           25.975          3.666   3.666                   http-6  w
+├─ rerank             29.925         16.826   1.978                   http-6         candidates=6 cancelled=0
+│  ├─ load            29.930  0.000   2.023   2.023   0.148    1.875  io-1           bytes=83706 queued=0
+│  │                                                                                 active=0
+│  ├─ load            29.932  0.000   2.713   2.713   0.134    2.579  io-2           bytes=48413 queued=0
+│  │                                                                                 active=1
+│  ├─ load            29.934  0.000   8.233   8.233   0.462    7.771  io-3           bytes=46995 queued=0
+│  │                                                                                 active=2
+│  ├─ load            29.936  0.000   0.990   0.990   0.048    0.942  io-4           bytes=24187 queued=0
+│  │                                                                                 active=3
+│  ├─ load            29.938  0.988   6.727   6.727   0.688    6.039  io-4           bytes=127632 queued=0
+│  │                                                                                 active=4
+│  ├─ load            29.940  2.013   1.329   1.329   0.101    1.228  io-1           bytes=35736 queued=1
+│  │                                                                                 active=4
+│  ├─ await           29.944         14.848  14.848                   http-6  w
+│  ├─ match           30.934  0.000   4.302   4.302   4.238    0.064  cpu-1          queued=0 active=0
+│  │                                                                                 score=0.15
+│  ├─ match           31.961  0.000   4.227   4.227   4.111    0.116  cpu-2          queued=0 active=1
+│  │                                                                                 score=0.46
+│  ├─ match           32.653  0.000   3.786   3.786   3.737    0.049  cpu-3          queued=0 active=2
+│  │                                                                                 score=0.65
+│  ├─ match           33.290  0.000   3.380   3.380   3.280    0.100  cpu-4          queued=0 active=3
+│  │                                                                                 score=0.49
+│  ├─ match           37.661  0.000   3.684   3.684   3.643    0.041  cpu-1          queued=0 active=0
+│  │                                                                                 score=0.43
+│  └─ match           38.175  0.000   6.587   6.587   6.443    0.144  cpu-2          queued=0 active=1
+│                                                                                    score=0.56
+└─ encode             46.766          1.879   1.879                   http-6

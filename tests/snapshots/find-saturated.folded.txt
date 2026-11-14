@@ -1,0 +1,15 @@
+GET /search 147
+GET /search;decode 4119
+GET /search;scale 1692
+GET /search;describe 36
+GET /search;describe;infer 55261
+GET /search;describe;await 35901
+GET /search;describe;fingerprint 652
+GET /search;index 327
+GET /search;index;query 14345
+GET /search;index;await 8144
+GET /search;rerank 1939
+GET /search;rerank;load 105184
+GET /search;rerank;await 97680
+GET /search;rerank;match 169261
+GET /search;encode 1012

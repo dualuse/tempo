@@ -1,0 +1,18 @@
+{
+  "v": 1,
+  "unit": "us",
+  "wall": 1794567890133,
+  "folded": 48,
+  "dropped": 3,
+  "threads": ["http-4", "cpu-1", "cpu-2", "io-1"],
+  "live": [1, 2, 3],
+  "truncated": false,
+  "spans": [
+    {"id":0,"parent":-1,"name":"search","start":0,"dur":75000,"thread":0},
+    {"id":1,"parent":0,"name":"rerank","start":100,"dur":74000,"thread":0},
+    {"id":2,"parent":1,"name":"match","start":200,"dur":74800,"thread":1,"wait":50,"cpu":70000,"flags":"o"},
+    {"id":3,"parent":1,"name":"match","start":300,"dur":70000,"thread":2,"wait":4700,"cpu":69000,"flags":"o"},
+    {"id":4,"parent":1,"name":"load","start":400,"dur":3000,"thread":3,"wait":5},
+    {"id":5,"parent":1,"name":"load","start":3500,"dur":20000,"thread":3,"wait":0,"cpu":500,"flags":"o"}
+  ]
+}

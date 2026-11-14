@@ -1,0 +1,21 @@
+{
+  "v": 1,
+  "unit": "us",
+  "wall": 1794567890129,
+  "folded": 0,
+  "dropped": 0,
+  "threads": ["http-9", "io-4"],
+  "live": [0, 1],
+  "truncated": false,
+  "spans": [
+    {"id":0,"parent":-1,"name":"search","start":0,"dur":61000,"thread":0,"flags":"o"},
+    {"id":1,"parent":0,"name":"decode","start":30,"dur":2000,"thread":0,"flags":"f"},
+    {"id":2,"parent":0,"name":"index","start":2100,"dur":12000,"thread":0},
+    {"id":3,"parent":2,"name":"await","start":2150,"dur":11800,"thread":0,"flags":"w"},
+    {"id":4,"parent":0,"name":"rerank","start":14200,"dur":46800,"thread":0,"flags":"o"},
+    {"id":5,"parent":4,"name":"load","start":14300,"dur":46640,"thread":1,"wait":60,"flags":"o"},
+    {"id":6,"parent":4,"name":"join","start":14400,"dur":46600,"thread":0,"flags":"ow"},
+    {"id":7,"parent":0,"name":"describe","start":14250,"dur":0,"thread":0,"flags":"m"},
+    {"id":8,"parent":0,"name":"decode","start":14260,"dur":0,"thread":0,"flags":"fm"}
+  ]
+}

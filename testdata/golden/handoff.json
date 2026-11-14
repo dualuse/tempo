@@ -1,0 +1,23 @@
+{
+  "v": 1,
+  "unit": "us",
+  "wall": 1794567890127,
+  "folded": 0,
+  "dropped": 0,
+  "threads": ["http-7", "cpu-1", "io-1"],
+  "live": [],
+  "truncated": false,
+  "spans": [
+    {"id":0,"parent":-1,"name":"search","start":0,"dur":40000,"thread":0},
+    {"id":1,"parent":0,"name":"describe","start":50,"dur":30000,"thread":0,"cpu":1200},
+    {"id":2,"parent":1,"name":"infer","start":100,"dur":5000,"thread":1,"wait":120,"cpu":4800},
+    {"id":3,"parent":2,"name":"encode","start":230,"dur":1000,"thread":1,"cpu":990},
+    {"id":4,"parent":2,"name":"load","start":1300,"dur":800,"thread":2,"wait":30,"cpu":50},
+    {"id":5,"parent":2,"name":"match","start":2200,"dur":900,"thread":1,"wait":3100,"cpu":880},
+    {"id":6,"parent":1,"name":"infer","start":140,"dur":6000,"thread":1,"wait":6100,"cpu":5900},
+    {"id":7,"parent":1,"name":"fingerprint","start":11500,"dur":2500,"thread":0},
+    {"id":8,"parent":0,"name":"rerank","start":30100,"dur":9000,"thread":0},
+    {"id":9,"parent":8,"name":"load","start":30110,"dur":4000,"thread":2,"wait":0,"cpu":300},
+    {"id":10,"parent":8,"name":"match","start":34200,"dur":3000,"thread":1,"wait":7,"cpu":2950}
+  ]
+}

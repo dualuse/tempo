@@ -1,0 +1,4 @@
+[1mFindings[0m  ·  GET /search  ·  48.675 ms  ·  2026-11-13 09:00:55.433 UTC  ·  26 spans on 9 threads
+  [33mqueue-wait[0m  rerank/load on io-1: waited 2.013 ms before a 1.329 ms run (1.5× the run)
+  [33mqueue-wait[0m  rerank/load on io-4: waited 0.988 ms before a 6.727 ms run (0.1× the run)
+  [33mqueue-wait[0m  by pool: io 3.001 ms over 8 (max 2.013)

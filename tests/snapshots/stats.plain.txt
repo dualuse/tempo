@@ -1,0 +1,35 @@
+Stats over 30 traces: GET /search ×30
+path                  traces  count p50  sum p50      p95      max  self p50      p95      max
+GET /search            30/30          1  108.481  144.924  145.936     0.246    0.428    0.434
+decode                 30/30          1    5.972   12.681   12.865     5.972   12.681   12.865
+scale                  30/30          1    1.607    2.497    3.278     1.607    2.497    3.278
+describe               30/30          1   21.095   31.431   33.665     0.033    0.039    0.039
+describe/infer         30/30          2   34.164   70.225   71.806    34.164   70.225   71.806
+describe/await         30/30          1   19.434   30.907   32.704    19.434   30.907   32.704
+describe/fingerprint   30/30          1    0.709    1.288    1.893     0.709    1.288    1.893
+index                  30/30          1   10.025   21.068   23.411     0.413    0.670    0.745
+index/query            30/30          4   27.547   41.615   48.012    27.547   41.615   48.012
+index/await            30/30          1    9.612   20.710   22.853     9.612   20.710   22.853
+rerank                 30/30          1   67.965   98.908  103.376     2.599    4.198    4.813
+rerank/load            30/30         40  104.230  128.375  158.921   104.230  128.375  158.921
+rerank/await           30/30          1   64.756   94.095  101.624    64.756   94.095  101.624
+rerank/match           30/30         39  160.034  202.047  202.354   160.034  202.047  202.354
+encode                 30/30          1    1.256    1.933    2.248     1.256    1.933    2.248
+
+path                  wait p50       p95       max
+GET /search              0.000     0.000     0.000
+decode                   0.000     0.000     0.000
+scale                    0.000     0.000     0.000
+describe                 0.000     0.000     0.000
+describe/infer           4.461    31.537    53.677
+describe/await           0.000     0.000     0.000
+describe/fingerprint     0.000     0.000     0.000
+index                    0.000     0.000     0.000
+index/query              0.000     0.000     0.452
+index/await              0.000     0.000     0.000
+rerank                   0.000     0.000     0.000
+rerank/load             55.294    87.256    91.708
+rerank/await             0.000     0.000     0.000
+rerank/match           917.644  1823.145  2027.531
+encode                   0.000     0.000     0.000
+ms per trace; percentiles by nearest rank over the traces that contain the path

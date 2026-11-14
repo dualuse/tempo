@@ -5,3 +5,5 @@ build/
 
 # private planning documents, never committed
 /docs/
+
+__pycache__/

@@ -1,0 +1,47 @@
+GET /search  ·  87.728 ms  ·  2026-11-13 09:01:27.109 UTC  ·  63 spans on 17 threads
+focus rerank: 42.774 → 86.165 ms
+            ms               50                 60                  70                 80
+               ──────────────┬──────────────────┬───────────────────┬──────────────────┬────────────
+http
+  http-8       rerank███████████████████████████████████████████████████████████████████████████████
+               await──────────────────────────────────────────────────────────────────────────
+cpu
+  cpu-1             ░░░mat…█░░░░░░░match█
+                     ░░░░░░░match██
+  cpu-2           ░match████
+                        ░░░░match████
+                            ░░░░░░░░░match████
+  cpu-5           ░░░░match██
+                          ░░░match██████████
+  cpu-6         match████
+                     ░░░░match███
+  cpu-7           match█████ ░░░░░░░░░match█
+                       ░░░░░match█████
+  cpu-8           match█████
+                        ░░░░match█
+                           ░░░░░░░match█████
+  (mixed)                    ▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚┃match ×30▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚
+  queued ≤13.1    ▁▁▂▃▂▂▃▄▄▄▄██████▇▇▇▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▅
+io
+  io-1         ███load▓
+                     ░░load███████████████████
+  io-2         ███     ░load████████
+               ░░░load██
+  io-3         load██    ░░lo…█       ░░load███✗
+                  ░░░load██
+  io-4         load█    ░lo…█
+                  ░░load✗   ░load███████████████
+  io-5         load██     ░░load██
+                  ░░░load███
+  io-6         ███  ░load█
+                        ░░load███
+  io-7         █░░load██    ░load█
+               ░██   ░░░load█
+  io-8         load█████████ ░█
+                           ░██
+  (mixed)                    ▚▚▚▚▚┃load ×20▚▚▚▚▚▚▚▚▚▚▚
+  queued ≤3    ▆▆▆███▇▆▆▆▆▆▆▆▆▅▅▅▅▅▅▅▆██▆▅▅▅▅▅▅▅▅▅▅▅▅▅
+
+█ run  ░ queue wait  ─ blocking wait  ▚ aggregate ×count, ┃ slowest  ✗ failed  ⊘ cancelled  ▶ open
+∅ never started  ● live lane  ▄ this request's queued handoffs
+x=: 50 spans folded into aggregates, 0 dropped (not on the wire)
