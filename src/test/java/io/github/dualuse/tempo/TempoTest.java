@@ -8,10 +8,14 @@ import io.github.dualuse.tempo.Tempo.Trace;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.File;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.lang.ref.WeakReference;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
@@ -24,6 +28,7 @@ import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -1943,6 +1948,374 @@ class TempoTest {
         calls.run();
         assertEquals(0, allocatedBy(calls));
         t.close();
+    }
+
+    // ---- always-on names and listeners ----------------------------------------------------------------
+    // Marks and global sinks are global: each test marks names of its own.
+
+    @Test
+    void listenerFiresAtCoarse() {
+        List<Long> global = new ArrayList<>(), local = new ArrayList<>();
+        Name fetch = Tempo.name("coarse-fetch").sink(global::add), hash = Tempo.name("coarse-hash");
+        Trace t = Tempo.start(SEARCH, opts());
+        t.on(hash, local::add);
+        Span s = t.root();
+        assertEquals(COARSE, t.level());
+        Span f = s.detail(fetch);
+        assertNotSame(NOOP, f);
+        clock.add(7);
+        assertEquals(7, f.elapsedNanos());
+        f.close();
+        clock.add(1);
+        assertEquals(7, f.elapsedNanos());
+        Span h = s.deep(hash);
+        clock.add(3);
+        h.close();
+        assertSame(NOOP, s.detail(MATCH)); // not always-on
+        t.close();
+        assertEquals(List.of(7L), global);
+        assertEquals(List.of(3L), local);
+        assertEquals(lines("search 0+11"), tree(t)); // aggregate-only: no rows
+        assertEquals("count=1 sum=7 min=7 max=7 waits=0 waitSum=0 waitMax=0", t.aggregate(fetch).toString());
+        assertEquals(3, t.aggregate(hash).sumNanos());
+        assertEquals(0, t.misuses());
+        t.release();
+        assertEquals(0, f.elapsedNanos());
+    }
+
+    @Test
+    void aggregateOnlySpansTimeThemselvesAndIgnoreTheRest() {
+        Name parse = Tempo.name("agg-parse").aggregate();
+        Trace t = Tempo.start(SEARCH, opts());
+        Span s = t.root();
+        for (long d : new long[] {2, 3, 5}) {
+            Span p = s.detail(parse);
+            clock.add(d);
+            p.close();
+        }
+        Span p = s.detail(parse);
+        assertSame(p, Tempo.current());
+        assertTrue(p.recording());
+        assertSame(NOOP, p.detail(MATCH));
+        p.set(BYTES, 1).set(SCORE, 0.5).fail().cancel().waiting().cpu()
+                .phase(DECODE).done(DECODE).done(DECODE, "x").legacy().phaseSet(BYTES, 2);
+        assertEquals(1, (int) p.lap(DECODE, () -> 1));
+        Span inner = p.span(LOAD);         // recorded, under the nearest recorded span
+        Span deeper = inner.detail(parse); // aggregate-only above a recorded span
+        assertSame(deeper, Tempo.current());
+        clock.add(4);
+        deeper.close();
+        inner.close();
+        clock.add(1);
+        p.close();
+        t.close();
+        assertEquals(lines("search 0+15", "  load 10+4"), tree(t));
+        assertEquals("count=5 sum=19 min=2 max=5 waits=0 waitSum=0 waitMax=0", t.aggregate(parse).toString());
+        assertEquals(0, t.misuses());
+    }
+
+    @Test
+    void anAlwaysOnNameIsASpanAtItsLevelAndAggregateOnlyBelow() {
+        Name sort = Tempo.name("agg-sort").aggregate();
+        List<Long> calls = new ArrayList<>();
+        Trace t = Tempo.start(SEARCH, opts().level(DETAIL));
+        t.on(sort, calls::add);
+        Span s = t.root();
+        Span a = s.detail(sort);
+        clock.add(2);
+        a.close();
+        Span b = s.deep(sort);
+        clock.add(3);
+        b.close();
+        t.close();
+        assertEquals(lines("search 0+5", "  agg-sort 0+2 detail"), tree(t));
+        assertEquals(List.of(2L, 3L), calls);
+    }
+
+    @Test
+    void aggregateOnlySpansOnNoopForeignThreadsAndCaps() throws Exception {
+        Name merge = Tempo.name("agg-merge").aggregate();
+        assertSame(NOOP, NOOP.detail(merge));
+        assertSame(NOOP, NOOP.deep(merge));
+
+        Trace t = Tempo.start(SEARCH, opts());
+        Span s = t.root();
+        assertNull(onOtherThread(() -> assertSame(NOOP, s.detail(merge))));
+        assertEquals(1, t.misuses());
+        s.detail(merge);
+        clock.add(4);
+        t.close(); // heals the open aggregate-only span, which still counts
+        assertEquals(2, t.misuses());
+        assertEquals(4, t.aggregate(merge).sumNanos());
+        assertEquals(lines("search 0+4"), tree(t));
+
+        Trace u = Tempo.start(SEARCH, opts());
+        Span x = u.root();
+        for (int i = 1; i < 35; i++) x = x.span(LOAD);
+        assertSame(NOOP, x.detail(merge));
+        assertEquals(1, u.dropped());
+        u.close();
+    }
+
+    @Test
+    void listenersFireOncePerEndOnTheEndingThread() throws Exception {
+        Name span = Tempo.name("l-span"), phase = Tempo.name("l-phase"), lap = Tempo.name("l-lap"),
+                task = Tempo.name("l-task"), sum = Tempo.name("l-sum");
+        Thread main = Thread.currentThread();
+        List<String> calls = Collections.synchronizedList(new ArrayList<>());
+        Trace t = Tempo.start(SEARCH, opts());
+        for (Name n : new Name[] {SEARCH, span, phase, lap, task, sum}) {
+            t.on(n, nanos -> calls.add(n + "=" + nanos
+                    + (Thread.currentThread() == main ? "" : "@" + Thread.currentThread().getName())));
+        }
+        Span s = t.root();
+        s.phase(phase);
+        clock.add(2);
+        s.phase(phase);  // ends the first phase implicitly
+        clock.add(3);
+        s.done(phase);   // ends the open phase
+        Span x = s.span(span);
+        clock.add(1);
+        x.close();
+        clock.add(4);
+        s.done(lap);     // a lap from the last boundary
+        Span z = s.span(span);
+        z.span(span);
+        clock.add(2);
+        z.close();       // heals its child: both end
+        Handoff h = s.handoff(task);
+        assertNull(onThread("worker", () -> {
+            Span w = h.begin();
+            clock.add(6);
+            w.close();
+        }));
+        assertNull(onThread("adder", () -> t.add(sum, 9)));
+        clock.add(1);
+        t.close();
+        assertEquals(List.of("l-phase=2", "l-phase=3", "l-span=1", "l-lap=5", "l-span=2", "l-span=2",
+                "l-task=6@worker", "l-sum=9@adder", "search=19"), calls);
+        assertEquals(1, t.misuses());
+    }
+
+    @Test
+    void listenersAreAddedOnTheStartingThreadBeforeTheFirstChildSpan() throws Exception {
+        Name late = Tempo.name("late-heard"), merge = Tempo.name("agg-freeze").aggregate();
+        List<Long> calls = new ArrayList<>();
+        Trace t = Tempo.start(SEARCH, opts());
+        t.on(null, calls::add).on(late, null);
+        assertNull(onOtherThread(() -> t.on(late, calls::add)));
+        assertEquals(3, t.misuses());
+        t.root().span(DECODE).close();
+        t.on(late, calls::add);
+        assertEquals(4, t.misuses());
+        t.root().span(late).close();
+        assertSame(NOOP, t.root().detail(late)); // not always-on in this trace
+        t.close();
+        assertEquals(List.of(), calls);
+
+        Trace u = Tempo.start(SEARCH, strict());
+        u.root().detail(merge).close(); // an aggregate-only span is a child span too
+        assertThrows(AssertionError.class, () -> u.on(late, calls::add));
+        u.close();
+    }
+
+    @Test
+    void aThrowingListenerIsCountedAndTheRecordingStaysConsistent() {
+        Name boom = Tempo.name("boom");
+        LongConsumer throwing = n -> {
+            throw new IllegalStateException("listener");
+        };
+        Trace t = Tempo.start(SEARCH, opts());
+        t.on(boom, throwing).on(SEARCH, throwing);
+        Span b = t.root().span(boom);
+        clock.add(2);
+        b.close();
+        t.add(boom, 3);
+        assertSame(t.root(), Tempo.current());
+        t.close();
+        assertSame(NOOP, Tempo.current());
+        assertEquals(3, t.misuses());
+        assertEquals(lines("search 0+2", "  boom 0+2"), tree(t));
+
+        Trace u = Tempo.start(SEARCH, strict());
+        u.on(boom, throwing).on(SEARCH, throwing);
+        Span c = u.root().span(boom);
+        AssertionError e = assertThrows(AssertionError.class, c::close);
+        assertInstanceOf(IllegalStateException.class, e.getCause());
+        assertSame(u.root(), Tempo.current());
+        assertThrows(AssertionError.class, () -> u.add(boom, 1));
+        assertThrows(AssertionError.class, u::close); // thrown once the root has closed and the thread let go
+        assertSame(NOOP, Tempo.current());
+        assertEquals(lines("search 0+0", "  boom 0+0"), tree(u));
+    }
+
+    @Test
+    void secondsAndSerializedAdaptListeners() throws Exception {
+        double[] seconds = {0};
+        Tempo.seconds(v -> seconds[0] = v).accept(1_500_000_000L);
+        assertEquals(1.5, seconds[0]);
+
+        long[] count = {0}, total = {0}; // not thread-safe on its own
+        Name n = Tempo.name("serial-sink").sink(Tempo.serialized(v -> {
+            count[0]++;
+            total[0] += v;
+        }));
+        Trace t = Tempo.start(SEARCH, opts());
+        int threads = 8, adds = 50_000;
+        CountDownLatch go = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        try {
+            List<Future<?>> fs = new ArrayList<>();
+            for (int k = 0; k < threads; k++) {
+                fs.add(pool.submit(() -> {
+                    go.await();
+                    for (int i = 0; i < adds; i++) t.add(n, i % 7);
+                    return null;
+                }));
+            }
+            go.countDown();
+            for (Future<?> f : fs) f.get();
+        } finally {
+            pool.shutdown();
+        }
+        long perThread = 0;
+        for (int i = 0; i < adds; i++) perThread += i % 7;
+        assertEquals((long) threads * adds, count[0]);
+        assertEquals(threads * perThread, total[0]);
+        t.close();
+    }
+
+    @Test
+    void timeReportsTheWallTimeOfABodyWithoutATrace() {
+        List<Long> got = new ArrayList<>();
+        assertEquals(42, (int) Tempo.time(got::add, () -> 42));
+        Tempo.time(got::add, () -> {
+            got.size();
+        });
+        IOException e = assertThrows(IOException.class, () -> Tempo.time(got::add, () -> {
+            throw new IOException("unwrapped");
+        }));
+        assertEquals("unwrapped", e.getMessage());
+        assertEquals(3, got.size());
+        for (long v : got) assertTrue(v >= 0);
+        assertEquals("x", Tempo.time(null, () -> "x"));
+        assertSame(NOOP, Tempo.current());
+    }
+
+    // ---- CPU time -------------------------------------------------------------------------------------
+
+    /** {@code name=cpu} per span in visiting order. */
+    static String cpus(Trace t) {
+        StringBuilder b = new StringBuilder();
+        t.forEachSpan(s -> b.append(b.length() == 0 ? "" : " ").append(s.name()).append('=').append(s.cpuNanos()));
+        return b.toString();
+    }
+
+    @Test
+    void cpuTimeIsMeasuredAtLaneRootsWhenDetailedAndOnRequest() throws Exception {
+        Clock cpu = new Clock();
+        Trace t = Tempo.start(SEARCH, opts().level(DETAIL).cpuClock(cpu));
+        Span s = t.root();
+        Span a = s.span(LOAD);
+        cpu.add(5);
+        clock.add(10);
+        a.close();
+        Span b = s.span(MATCH).cpu();
+        cpu.add(3);
+        clock.add(4);
+        b.close();
+        Span c = s.span(JOIN).cpu().cpu(); // asking twice keeps the first read
+        c.span(SCORE).cpu();
+        cpu.add(2);
+        c.close(); // heals SCORE, which is measured too
+        Handoff h = s.handoff(DECODE);
+        assertNull(onThread("worker", () -> {
+            Span w = h.begin();
+            cpu.add(7);
+            clock.add(9);
+            w.close();
+        }));
+        Span open = s.span(RERANK).cpu();
+        cpu.add(1);
+        assertEquals("search=-1 load=-1 match=3 join=2 score=2 decode=7 rerank=-1", cpus(t)); // open: not yet
+        open.close();
+        t.close();
+        assertEquals("search=18 load=-1 match=3 join=2 score=2 decode=7 rerank=1", cpus(t));
+        assertEquals(1, t.misuses());
+    }
+
+    @Test
+    void cpuTimeFollowsTheLevelUnlessForced() {
+        Clock cpu = new Clock();
+        Options[] options = {
+                opts().cpuClock(cpu),                           // COARSE: never, not even on request
+                opts().cpuClock(cpu).cpu(true),                 // forced on at COARSE
+                opts().cpuClock(cpu).level(DETAIL).cpu(false),  // forced off at DETAIL
+                opts().cpuClock(cpu),                           // raised to DETAIL after the root opened
+                opts().cpuClock(() -> -1).level(DETAIL),        // a clock that reads -1: not measured
+        };
+        List<String> got = new ArrayList<>();
+        for (int i = 0; i < options.length; i++) {
+            Trace t = Tempo.start(SEARCH, options[i]);
+            if (i == 3) assertTrue(t.raise(DETAIL));
+            Span x = t.root().span(LOAD).cpu();
+            cpu.add(4);
+            x.close();
+            t.close();
+            got.add(cpus(t));
+        }
+        assertEquals(List.of("search=-1 load=-1", "search=4 load=4", "search=-1 load=-1",
+                "search=-1 load=4", "search=-1 load=-1"), got);
+    }
+
+    @Test
+    void realCpuTimeIsReadFromTheThread() {
+        assumeTrue(Tempo.Cpu.now() >= 0, "thread CPU time is not supported here");
+        Trace t = Tempo.start(SEARCH, opts().level(DETAIL));
+        Span s = t.root().span(LOAD).cpu();
+        long x = 1;
+        for (int i = 0; i < 1_000_000; i++) x = x * 31 + i;
+        s.set(BYTES, x).close();
+        t.close();
+        t.forEachSpan(v -> assertTrue(v.cpuNanos() >= 0, v.name() + " cpu " + v.cpuNanos()));
+    }
+
+    @Test
+    void tempoLoadsAndRecordsWithoutJavaManagement() throws Exception {
+        String java = Paths.get(System.getProperty("java.home"), "bin", "java").toString();
+        String cp = location(WithoutManagement.class) + File.pathSeparator + location(Tempo.class);
+        Process p = new ProcessBuilder(java, "--limit-modules", "java.base", "-cp", cp, WithoutManagement.class.getName())
+                .redirectErrorStream(true).start();
+        String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+        assertTrue(p.waitFor(60, TimeUnit.SECONDS), out);
+        assertEquals(0, p.exitValue(), out);
+        assertEquals("management=false search cpu=-1 decode cpu=-1", out);
+    }
+
+    static String location(Class<?> c) throws Exception {
+        return Paths.get(c.getProtectionDomain().getCodeSource().getLocation().toURI()).toString();
+    }
+
+    @Test
+    void aggregateOnlySpansAndListenersAllocateNothingOnceWarm() {
+        Name agg = Tempo.name("alloc-agg").aggregate(), heard = Tempo.name("alloc-heard");
+        long[] sum = {0};
+        Trace t = Tempo.start(SEARCH, opts());
+        t.on(heard, n -> sum[0] += n);
+        Span s = t.root();
+        Runnable calls = () -> {
+            for (int i = 0; i < 10_000; i++) {
+                s.detail(agg).close();
+                Span h = s.deep(heard);
+                clock.add(1);
+                h.close();
+                t.add(heard, 1);
+            }
+        };
+        calls.run();
+        assertEquals(0, allocatedBy(calls));
+        t.close();
+        assertEquals(40_000, sum[0]);
     }
 
     // ---- release and memory ---------------------------------------------------------------------------

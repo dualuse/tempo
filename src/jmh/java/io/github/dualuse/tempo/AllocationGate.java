@@ -28,7 +28,7 @@ public final class AllocationGate {
     static final double SETUP = 1024;    // B per trace start + close + release
     static final double HANDOFF = 32;    // B per handoff: exactly one small object
     static final String GATED = "span|spanNotInlined|phase|done|setLong|detailDisabled|traceLifecycle"
-            + "|handoff|handoffInline|currentDetailNoTrace|currentDetailCoarse|waited";
+            + "|handoff|handoffInline|currentDetailNoTrace|currentDetailCoarse|waited|alwaysOn";
 
     public static void main(String[] args) throws RunnerException {
         Iterable<RunResult> results = new Runner(new OptionsBuilder()

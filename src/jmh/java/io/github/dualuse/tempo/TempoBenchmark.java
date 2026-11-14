@@ -34,7 +34,8 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
 @Fork(1)
 public class TempoBenchmark {
 
-    static final Tempo.Name ROOT = Tempo.name("bench"), CHILD = Tempo.name("child"), KEY = Tempo.name("key");
+    static final Tempo.Name ROOT = Tempo.name("bench"), CHILD = Tempo.name("child"), KEY = Tempo.name("key"),
+            ALWAYS = Tempo.name("always").aggregate();
 
     @State(Scope.Thread)
     public static class Cycling {
@@ -174,6 +175,20 @@ public class TempoBenchmark {
     @Benchmark
     public void handoffInline(CyclingTwice s) {
         s.root().handoff(CHILD).begin().close();
+    }
+
+    /** Explicit handle, always-on name, COARSE trace: an aggregate-only span (two clock reads, no row). */
+    @Benchmark
+    public Tempo.Span alwaysOn(Coarse s) {
+        Tempo.Span d = s.root.detail(ALWAYS);
+        d.close();
+        return d;
+    }
+
+    /** One read of the calling thread's CPU time, as taken at lane roots and by {@code Span.cpu()}. */
+    @Benchmark
+    public long cpuTime() {
+        return Tempo.Cpu.now();
     }
 
     @Benchmark
