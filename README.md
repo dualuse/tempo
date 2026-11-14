@@ -479,6 +479,7 @@ python3 tests/run_golden.py                      # format vectors, ladder and sa
 python3 -m unittest tests.test_cli               # the command-line viewer
 python3 -m unittest tests.test_check_private     # the private-term check
 node tests/test_parser.mjs                       # the web viewer's parser
+node tests/check_site_headless.mjs               # the web viewer in headless Chrome
 ```
 
 Gradle needs JDK 17 or newer; the library is compiled with `--release 11`. See

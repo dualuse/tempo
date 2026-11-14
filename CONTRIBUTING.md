@@ -14,6 +14,7 @@ python3 tests/run_golden.py        # vectors, ladder and samples against tools/t
 python3 -m unittest tests.test_cli # the command-line viewer (Python 3.8+)
 python3 -m unittest tests.test_check_private  # tools/check-private.sh
 node tests/test_parser.mjs && node tests/test_analysis.mjs && node tests/check_spa_parser_sync.mjs
+node tests/check_site_headless.mjs   # Tempo Timeline in headless Chrome: samples, themes, phone and desktop
 ```
 
 - **One file.** The library is `Tempo.java`, plus the optional `TempoJackson.java`. It targets
