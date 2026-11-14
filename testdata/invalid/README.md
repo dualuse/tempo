@@ -1,6 +1,7 @@
-# Invalid Tempo-Timing values
+# Invalid Tempo-Timing values and Tempo-Link URLs
 
-Every `*.header` file here must be rejected by a decoder. The expected error code
+Every `*.header` file here must be rejected by a decoder, and so must every `*.link`
+file (a `Tempo-Link` URL, FORMAT.md section 9). The expected error code
 (see FORMAT.md, "Errors") is listed per file; `tests/run_golden.py` reads this table.
 Each file has exactly one defect; `empty.header` is an empty file. Trailing newlines
 are whitespace and are stripped like any other whitespace before decoding.
@@ -42,3 +43,14 @@ are whitespace and are stripped like any other whitespace before decoding.
 | `aggregate-count-zero.header` | `E_AGG` | Aggregate with count 0. |
 | `cut-in-tables.header` | `E_CUT` | Cut inside the name table: no span list survives. |
 | `cut-before-spans.header` | `E_CUT` | Cut right before `S=`. |
+| `link-bare-base.link` | `E_LINK` | The viewer URL alone: no `t=` in the fragment or the query. |
+| `link-no-t.link` | `E_LINK` | Fragment without a `t=` parameter. |
+| `link-empty-t.link` | `E_LINK` | `t=` with an empty value. |
+| `link-standard-base64.link` | `E_LINK` | Standard base64 (`+`, `/`) instead of base64url. |
+| `link-base64-length.link` | `E_LINK` | Payload length leaves 1 character over a multiple of 4: not base64 at all. |
+| `link-zlib-wrapper.link` | `E_LINK` | zlib stream (RFC 1950 header and checksum) instead of raw DEFLATE. |
+| `link-cut.link` | `E_LINK` | Payload cut: the DEFLATE stream is incomplete. |
+| `link-trailing-bytes.link` | `E_LINK` | Bytes after the end of the DEFLATE stream. |
+| `link-fragment-wins.link` | `E_LINK` | Valid `t=` in the query, cut `t=` in the fragment: the fragment wins. |
+| `link-bad-compare.link` | `E_LINK` | Valid `t=`, but the `c=` payload is cut. |
+| `link-bad-value.link` | `E_DEPTH` | The link is fine; the value it carries is not (the code is the value's own). |

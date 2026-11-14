@@ -6,15 +6,21 @@ them. It is deliberately small and strict; it is not the end-user CLI.
 
     tempo_ref.py decode [FILE|-]   header value  -> JSON form
     tempo_ref.py encode [FILE|-]   JSON form     -> canonical header value
+    tempo_ref.py link   [FILE|-]   header value  -> Tempo-Link URL (FORMAT.md section 9)
+    tempo_ref.py unlink [FILE|-]   Tempo-Link URL -> header value
 
 Python 3.8+, standard library only.
 """
 
+import base64
+import collections
 import json
 import re
 import sys
+import zlib
 
-__all__ = ["TempoFormatError", "decode", "encode", "dump_json", "strip_ws"]
+__all__ = ["TempoFormatError", "decode", "encode", "dump_json", "strip_ws",
+           "DEFAULT_BASE", "Link", "encode_link", "decode_link", "pack_value", "unpack_value", "link_params"]
 
 ALPHABET = frozenset("0123456789abcdefghijklmnopqrstuvwxyz"
                      "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -386,6 +392,122 @@ def encode(doc):
     return ";".join(out)
 
 
+# ---------------------------------------------------------------- Tempo-Link (FORMAT.md section 9)
+
+DEFAULT_BASE = "https://dualuse.de/tempo/"
+LINK_TABS = ("lanes", "tree", "agg", "pools", "critical", "diff", "stats")
+B64URL_RE = re.compile(r"^[A-Za-z0-9_-]*$")
+MAX_INFLATED = 16 * 1024 * 1024   # FORMAT.md 9.2: decoders accept at least 1 MiB
+
+Link = collections.namedtuple("Link", ["value", "compare", "tab"])
+Link.__doc__ = "A decoded Tempo-Link: the t= value, the c= value or None, the tab or None."
+
+
+def pack_value(value, form="z", level=9):
+    """One fragment parameter value: 'z.' + base64url(raw deflate) or the plain form.
+
+    form is "z", "plain" or "auto" (the shorter of the two, as the web viewer does).
+    """
+    if form not in ("z", "plain", "auto"):
+        raise ValueError("form must be z, plain or auto")
+    plain = value.replace("%", "%25")
+    if form == "plain":
+        return plain
+    co = zlib.compressobj(level, zlib.DEFLATED, -15)
+    raw = co.compress(value.encode("utf-8")) + co.flush()
+    z = "z." + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    if form == "auto" and len(plain) <= len(z):
+        return plain
+    return z
+
+
+def inflate_raw(data, limit=MAX_INFLATED):
+    """Raw DEFLATE (RFC 1951) -> bytes. The stream must be complete and nothing may follow it."""
+    d = zlib.decompressobj(-15)
+    try:
+        out = d.decompress(data, limit + 1)
+    except zlib.error as e:
+        raise TempoFormatError("E_LINK", "payload is not raw DEFLATE (%s)" % e)
+    if len(out) > limit:
+        raise TempoFormatError("E_LINK", "payload inflates to more than %d bytes" % limit)
+    if not d.eof:
+        raise TempoFormatError("E_LINK", "DEFLATE stream is incomplete (link cut?)")
+    if d.unused_data:
+        raise TempoFormatError("E_LINK", "%d bytes follow the DEFLATE stream" % len(d.unused_data))
+    return out
+
+
+def b64url_decode(text):
+    s = text[:-2] if text.endswith("==") else text[:-1] if text.endswith("=") else text  # tolerated padding
+    if not B64URL_RE.match(s):
+        bad = next(ch for ch in s if not B64URL_RE.match(ch))
+        raise TempoFormatError("E_LINK", "character %r is not base64url" % bad)
+    if len(s) % 4 == 1:
+        raise TempoFormatError("E_LINK", "base64url length %d is impossible" % len(s))
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def unpack_value(packed):
+    """A fragment parameter value -> the Tempo-Timing value it carries (not yet validated)."""
+    p = strip_ws(packed)
+    if not p:
+        raise TempoFormatError("E_LINK", "empty trace parameter")
+    if p.startswith("z."):
+        return inflate_raw(b64url_decode(p[2:])).decode("utf-8", "replace")
+    return re.sub(r"%([0-9A-Fa-f]{2})", lambda m: chr(int(m.group(1), 16)), p)
+
+
+def _params(text):
+    out = {}
+    for part in text.split("&"):
+        k, eq, v = part.partition("=")
+        if k and eq:
+            out[k] = v                     # a repeated parameter: the last one wins
+    return out
+
+
+def link_params(url):
+    """The parameters of a link: dict name -> raw value.
+
+    Taken from the fragment when it carries t=, otherwise from the query string
+    (FORMAT.md 9.1). Encoders always write the fragment form.
+    """
+    u = strip_ws(url)
+    u, _, frag = u.partition("#")
+    frag_params = _params(frag)
+    if frag_params.get("t"):
+        return frag_params
+    query_params = _params(u.partition("?")[2])
+    if query_params.get("t"):
+        return query_params
+    raise TempoFormatError("E_LINK", "link has no t= parameter in the fragment or the query")
+
+
+def encode_link(value, base=DEFAULT_BASE, compare=None, tab=None, form="z", level=9):
+    """The Tempo-Link URL for a Tempo-Timing value (and an optional second value to diff)."""
+    if "#" in base or any(ch in WHITESPACE or ch == "," for ch in base):
+        raise ValueError("base must not contain '#', ',' or whitespace: %r" % base)
+    if tab is not None and not re.match(r"^[a-z]+$", tab):
+        raise ValueError("bad tab %r" % tab)
+    url = base + "#t=" + pack_value(strip_ws(value), form, level)
+    if compare is not None:
+        url += "&c=" + pack_value(strip_ws(compare), form, level)
+    if tab is not None:
+        url += "&tab=" + tab
+    return url
+
+
+def decode_link(url):
+    """Decode a Tempo-Link URL into Link(value, compare, tab).
+
+    Link-level defects raise E_LINK; the values themselves are validated by decode().
+    """
+    params = link_params(url)
+    value = unpack_value(params["t"])
+    compare = unpack_value(params["c"]) if params.get("c") else None
+    return Link(value, compare, params.get("tab") or None)
+
+
 # ---------------------------------------------------------------- JSON output
 
 TOP_KEYS = ["v", "unit", "wall", "folded", "dropped", "threads", "live", "truncated"]
@@ -421,13 +543,20 @@ def _read(path):
 
 
 def main(argv):
-    if len(argv) < 2 or argv[1] not in ("decode", "encode"):
+    if len(argv) < 2 or argv[1] not in ("decode", "encode", "link", "unlink"):
         sys.stderr.write(__doc__)
         return 2
     text = _read(argv[2] if len(argv) > 2 else None)
     try:
         if argv[1] == "decode":
             sys.stdout.write(dump_json(decode(text)))
+        elif argv[1] == "link":
+            decode(text)
+            sys.stdout.write(encode_link(text) + "\n")
+        elif argv[1] == "unlink":
+            link = decode_link(text)
+            decode(link.value)
+            sys.stdout.write(link.value + "\n")
         else:
             doc = json.loads(text)
             if "tempo" in doc and "spans" not in doc:

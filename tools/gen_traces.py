@@ -21,6 +21,8 @@ Two shapes, both produced by a small discrete-event simulation of thread pools:
 Examples:
   gen_traces.py --seed 3 --candidates 48 --saturation 1.2           # header
   gen_traces.py --format json --mode pipeline --frames 200
+  gen_traces.py --seed 3 --link                                      # Tempo-Link URL
+  gen_traces.py --mode pipeline --link http://localhost:8000/        # self-hosted viewer
   gen_traces.py --samples samples                                    # rebuild samples/
 
 Output is deterministic for a given set of arguments. Python 3.8+, stdlib only;
@@ -565,9 +567,16 @@ def main(argv=None):
                     help="find: early exit cancels queued loads only; queued matches run on as stragglers")
     ap.add_argument("--max-bytes", type=int, default=3000, help="fold more until the header fits (0: no limit)")
     ap.add_argument("--format", choices=["header", "json"], default="header")
+    ap.add_argument("--link", nargs="?", const=tempo_ref.DEFAULT_BASE, metavar="BASE",
+                    help="print the Tempo-Link URL (FORMAT.md section 9) instead of the header value; "
+                         "BASE is the viewer URL (default %s)" % tempo_ref.DEFAULT_BASE)
     ap.add_argument("-o", "--output", help="write to this file instead of stdout")
     ap.add_argument("--samples", metavar="DIR", help="regenerate the bundled sample set into DIR")
     a = ap.parse_args(argv)
+    if a.link is not None and a.format == "json":
+        ap.error("--link writes a URL; it cannot be combined with --format json")
+    if a.link is not None and a.samples:
+        ap.error("--link does not apply to --samples")
 
     if a.samples:
         for name, size, spans, folded in write_samples(a.samples, a.max_bytes):
@@ -580,7 +589,13 @@ def main(argv=None):
     else:
         doc, header = fit(pipeline_trace, a.max_bytes, seed=a.seed, frames=a.frames, cpu=a.cpu, io=a.io,
                           saturation=a.saturation, budget=a.budget)
-    text = header + "\n" if a.format == "header" else tempo_ref.dump_json(doc)
+    if a.link is not None:
+        try:
+            text = tempo_ref.encode_link(header, base=a.link) + "\n"
+        except ValueError as e:
+            ap.error(str(e))
+    else:
+        text = header + "\n" if a.format == "header" else tempo_ref.dump_json(doc)
     if a.output:
         with open(a.output, "w", encoding="utf-8") as fh:
             fh.write(text)

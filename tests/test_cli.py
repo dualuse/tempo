@@ -241,6 +241,332 @@ class InputForms(unittest.TestCase):
 
 
 # ======================================================================
+# Tempo-Link (FORMAT.md section 9)
+# ======================================================================
+
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+try:
+    import tempo_ref  # noqa: E402
+finally:
+    sys.path.pop(0)
+
+
+def link_table():
+    table = {}
+    for line in read(os.path.join(INVALID, "README.md")).splitlines():
+        m = re.match(r"^\| `([^`]+\.link)` \| `(E_[A-Z]+)` \|", line)
+        if m:
+            table[m.group(1)] = m.group(2)
+    return table
+
+
+class FakeBrowser(object):
+    """Stands in for webbrowser.open: records the URL instead of starting a browser."""
+
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.urls = []
+
+    def __enter__(self):
+        self.saved = tempo.webbrowser.open
+        tempo.webbrowser.open = self.open
+        return self
+
+    def __exit__(self, *exc):
+        tempo.webbrowser.open = self.saved
+
+    def open(self, url, *args, **kw):
+        self.urls.append(url)
+        return self.ok
+
+
+class LinkInput(unittest.TestCase):
+
+    def setUp(self):
+        self.value = read(os.path.join(SAMPLES, "small.header")).strip()
+        self.expected = json.loads(read(os.path.join(SAMPLES, "small.json")))
+        self.link = tempo_ref.encode_link(self.value)
+        self.other = read(os.path.join(SAMPLES, "pipeline.header")).strip()
+
+    def decoded(self, text=None, args=()):
+        code, out, err = cli(["--to", "json"] + list(args), stdin=text or "")
+        self.assertEqual(code, 0, err)
+        return json.loads(out), err
+
+    def test_golden_links_decode_to_their_json(self):
+        links = sorted(glob.glob(os.path.join(GOLDEN, "*.link")))
+        self.assertGreaterEqual(len(links), 12)
+        for path in links:
+            with self.subTest(vector=os.path.basename(path)):
+                doc, _ = self.decoded(args=[path])
+                self.assertEqual(doc, json.loads(read(path[:-5] + ".json")))
+
+    def test_bare_url_on_stdin_and_as_argument(self):
+        self.assertEqual(self.decoded(self.link + "\n")[0], self.expected)
+        self.assertEqual(self.decoded(args=[self.link])[0], self.expected)
+        code, out, err = cli(["--check", self.link])
+        self.assertEqual((code, out.split(":")[0]), (0, "ok  link"), err)
+
+    def test_bare_fragment_and_other_base(self):
+        frag = self.link[self.link.index("#"):]
+        self.assertEqual(self.decoded(frag)[0], self.expected)
+        self.assertEqual(self.decoded("file:///srv/viewer/index.html?x=1" + frag)[0], self.expected)
+
+    def test_query_form(self):
+        z = tempo_ref.pack_value(self.value)
+        self.assertEqual(self.decoded(args=["https://dualuse.de/tempo/?t=" + z])[0], self.expected)
+        self.assertEqual(self.decoded("see https://dualuse.de/tempo/?tab=tree&t=%s\n" % z)[0], self.expected)
+        plain = tempo_ref.pack_value(self.value, form="plain")
+        self.assertEqual(self.decoded("http://localhost:8000/?t=" + plain)[0], self.expected)
+        # the fragment wins over the query, even when the query one is broken
+        both = "https://dualuse.de/tempo/?t=z.broken#t=" + z
+        self.assertEqual(self.decoded(both)[0], self.expected)
+        # a query t= that is not a packed value is just some URL, not a link
+        code, out, err = cli(["--check"], stdin="GET https://example.com/search?t=42 200\n")
+        self.assertEqual(code, 1)
+        self.assertNotIn("E_LINK", err)
+
+    def test_plain_form(self):
+        plain = tempo_ref.encode_link(self.value, form="plain")
+        self.assertIn("%25", plain)
+        self.assertEqual(self.decoded(plain)[0], self.expected)
+
+    def test_link_inside_a_log_line(self):
+        log = '12:00:01 INFO GET /search 200 tempo=%s, took 48ms (see "%s").\n' % (self.link, self.link)
+        code, out, err = cli(["--check"], stdin=log)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.count("ok "), 2)
+
+    def test_several_links_feed_stats(self):
+        other = tempo_ref.encode_link(read(os.path.join(SAMPLES, "batch", "find-01.header")))
+        log = "a %s\nb %s\nc %s\n" % (self.link, other, self.link)
+        code, out, err = cli(["--stats", "--no-color"], stdin=log)
+        self.assertEqual(code, 0, err)
+        self.assertIn("over 3 traces", out)
+        doc, err = self.decoded(log)
+        self.assertEqual(doc, self.expected)
+        self.assertIn("3 traces found", err)
+
+    def test_links_and_values_in_one_log(self):
+        log = "a %s\nb %s\n" % (self.link, self.other)
+        code, out, err = cli(["--check"], stdin=log)
+        self.assertEqual((code, out.count("ok ")), (0, 2), err)
+
+    def test_bare_link_wrapped_by_terminal(self):
+        lines = [self.link[i:i + 57] for i in range(0, len(self.link), 57)]
+        self.assertEqual(self.decoded("\n".join(lines) + "\n")[0], self.expected)
+        self.assertEqual(self.decoded("trace: " + "\r\n".join(lines) + "\r\nnext line here\n")[0],
+                         self.expected)
+
+    def test_curl_i_tempo_link_header(self):
+        text = ("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                "tEmPo-LiNk: %s\r\nServer-Timing: total;dur=1\r\n\r\n{\"ok\":true}\n" % self.link)
+        self.assertEqual(self.decoded(text)[0], self.expected)
+
+    def test_curl_i_tempo_link_wrapped_and_folded(self):
+        parts = [self.link[i:i + 70] for i in range(0, len(self.link), 70)]
+        wrapped = "HTTP/2 200\r\nTempo-Link: " + "\r\n".join(parts) + "\r\nx-request-id: 7\r\n\r\nbody\n"
+        self.assertEqual(self.decoded(wrapped)[0], self.expected)
+        folded = "HTTP/1.1 200 OK\nTempo-Link:\n " + "\n\t".join(parts) + "\nVia: proxy\n\n"
+        self.assertEqual(self.decoded(folded)[0], self.expected)
+
+    def test_both_headers_agree(self):
+        text = "HTTP/1.1 200 OK\r\nTempo-Timing: %s\r\nTempo-Link: %s\r\n\r\n" % (self.value, self.link)
+        doc, err = self.decoded(text)
+        self.assertEqual(doc, self.expected)
+        self.assertEqual(err, "")
+
+    def test_both_headers_disagree_tempo_timing_wins(self):
+        other_link = tempo_ref.encode_link(self.other)
+        for text in ("HTTP/1.1 200 OK\r\nTempo-Link: %s\r\nTempo-Timing: %s\r\n\r\n" % (other_link, self.value),
+                     "HTTP/1.1 200 OK\r\nTempo-Timing: %s\r\nTempo-Link: %s\r\n\r\n" % (self.value, other_link)):
+            doc, err = self.decoded(text)
+            self.assertEqual(doc, self.expected)
+            self.assertIn("disagree; using Tempo-Timing", err)
+        code, out, err = cli(["--check"], stdin="HTTP/1.1 200 OK\nTempo-Timing: %s\nTempo-Link: %s\n\n"
+                             % (self.value, self.link[:200]))
+        self.assertEqual(code, 0, err)
+        self.assertIn("Tempo-Link ignored (E_LINK", err)
+
+    def test_rejected_tempo_timing_falls_back_to_the_link(self):
+        text = "HTTP/1.1 200 OK\nTempo-Timing: v2;broken\nTempo-Link: %s\n\n" % self.link
+        doc, err = self.decoded(text)
+        self.assertEqual(doc, self.expected)
+        self.assertIn("Tempo-Timing rejected (E_VERSION", err)
+
+    def test_headers_pair_per_response(self):
+        # curl -iL: two responses, each with both headers; no cross-talk between them
+        other_link = tempo_ref.encode_link(self.other)
+        text = ("HTTP/1.1 302 Found\nTempo-Timing: %s\nTempo-Link: %s\nLocation: /x\n\n"
+                "HTTP/1.1 200 OK\nTempo-Timing: %s\nTempo-Link: %s\n\n"
+                % (self.other, other_link, self.value, self.link))
+        code, out, err = cli(["--check"], stdin=text)
+        self.assertEqual((code, out.count("ok "), err), (0, 2, ""))
+
+    def test_json_body_still_wins(self):
+        body = json.dumps({"info": {"tempo": self.expected}})
+        text = "HTTP/1.1 200 OK\r\nTempo-Link: %s\r\n\r\n%s\n" % (tempo_ref.encode_link(self.other), body)
+        self.assertEqual(self.decoded(text)[0], self.expected)
+
+    def test_to_link_round_trip(self):
+        paths = sample_headers()[:8] + sorted(glob.glob(os.path.join(GOLDEN, "*.link")))
+        for path in paths:
+            with self.subTest(input=os.path.relpath(path, ROOT)):
+                code, url, err = cli(["--to", "link", path])
+                self.assertEqual(code, 0, err)
+                self.assertTrue(url.startswith(tempo_ref.DEFAULT_BASE + "#t=z."), url)
+                self.assertEqual(url.count("\n"), 1)
+                link = tempo_ref.decode_link(url)
+                want = tempo_ref.strip_ws(tempo_ref.decode_link(read(path)).value if path.endswith(".link")
+                                          else read(path))
+                self.assertEqual(link.value, want)
+                code, out, err = cli(["--to", "json", url.strip()])
+                self.assertEqual(json.loads(out), tempo_ref.decode(want))
+
+    def test_to_link_from_json_encodes_the_trace(self):
+        for name in ("search-example", "names", "aggregates", "attributes"):
+            with self.subTest(vector=name):
+                code, url, err = cli(["--to", "link", os.path.join(GOLDEN, name + ".json")])
+                self.assertEqual(code, 0, err)
+                self.assertEqual(tempo_ref.decode_link(url).value,
+                                 tempo_ref.strip_ws(read(os.path.join(GOLDEN, name + ".header"))))
+
+    def test_to_link_base(self):
+        code, url, err = cli(["--to", "link", "--base", "http://localhost:8000/tempo/",
+                              os.path.join(SAMPLES, "small.header")])
+        self.assertEqual(code, 0, err)
+        self.assertTrue(url.startswith("http://localhost:8000/tempo/#t=z."))
+        code, url, err = cli(["--to", "link", os.path.join(SAMPLES, "small.header")],
+                             env={"TEMPO_LINK_BASE": "https://example.org/v/"})
+        self.assertTrue(url.startswith("https://example.org/v/#t=z."), url)
+        for bad in ("https://x/#frag", "has space", ""):
+            code, out, err = cli(["--to", "link", "--base", bad, os.path.join(SAMPLES, "small.header")])
+            self.assertEqual(code, 2, bad)
+
+    def test_to_link_keeps_the_compare_trace(self):
+        pair = tempo_ref.encode_link(self.value, compare=self.other, tab="diff")
+        code, url, err = cli(["--to", "link", pair])
+        self.assertEqual(code, 0, err)
+        link = tempo_ref.decode_link(url)
+        self.assertEqual((link.value, link.compare, link.tab), (self.value, self.other, None))
+
+    def test_diff_takes_the_compare_trace_of_a_link(self):
+        pair = tempo_ref.encode_link(self.value, compare=self.other)
+        code, out, err = cli(["--diff", "--no-color", "--width", "120"], stdin=pair)
+        self.assertEqual(code, 0, err)
+        self.assertIn("B stdin (c=)", out)
+        code2, out2, err2 = cli(["--diff", os.path.join(SAMPLES, "pipeline.header"), "--no-color", "--width", "120"],
+                                stdin=self.value)
+        self.assertEqual(code2, 0, err2)
+        rows = lambda text: text[text.index("\npath "):].splitlines()   # noqa: E731 (the title names the inputs)
+        self.assertEqual(rows(out), rows(out2))
+        # an explicit OTHER wins over c=; OTHER may be a link too
+        code3, out3, err3 = cli([pair, "--no-color", "--width", "120", "--diff", self.link])
+        self.assertEqual(code3, 0, err3)
+        self.assertIn("Δ +0.000 ms", out3)
+
+    def test_diff_without_other_needs_a_compare_trace(self):
+        code, out, err = cli(["--diff"], stdin=self.link)
+        self.assertEqual(code, 2)
+        self.assertIn("&c=", err)
+        broken = self.link + "&c=z.AAAA"
+        code, out, err = cli(["--diff"], stdin=broken)
+        self.assertEqual(code, 1)
+        self.assertIn("E_LINK", err)
+
+    def test_open_builds_the_link_and_starts_the_browser(self):
+        with FakeBrowser() as fb:
+            code, out, err = cli(["--open", os.path.join(SAMPLES, "small.header")])
+            self.assertEqual(code, 0, err)
+            self.assertEqual(fb.urls, [out.strip()])
+            self.assertEqual(tempo_ref.decode_link(fb.urls[0]), (self.value, None, None))
+            code, out, err = cli(["--open", "--tree", "--base", "http://localhost:1/",
+                                  os.path.join(SAMPLES, "small.header")])
+            self.assertEqual(code, 0, err)
+            self.assertTrue(fb.urls[-1].startswith("http://localhost:1/#t=z."))
+            self.assertTrue(fb.urls[-1].endswith("&tab=tree"))
+            code, out, err = cli(["--open", "--agg", os.path.join(SAMPLES, "small.header")])
+            self.assertTrue(fb.urls[-1].endswith("&tab=agg"))
+            code, out, err = cli(["--open", os.path.join(SAMPLES, "small.header"),
+                                  "--diff", os.path.join(SAMPLES, "pipeline.header")])
+            self.assertEqual(code, 0, err)
+            self.assertEqual(tempo_ref.decode_link(fb.urls[-1]), (self.value, self.other, "diff"))
+            code, out, err = cli(["--open", os.path.join(GOLDEN, "search-example.json")])
+            self.assertEqual(code, 0, err)
+            self.assertEqual(tempo_ref.decode_link(fb.urls[-1]).value,
+                             tempo_ref.strip_ws(read(os.path.join(GOLDEN, "search-example.header"))))
+            self.assertEqual(len(fb.urls), 5)
+
+    def test_open_errors(self):
+        with FakeBrowser(ok=False) as fb:
+            code, out, err = cli(["--open", self.link])
+            self.assertEqual(code, 1)
+            self.assertIn("could not start a web browser", err)
+            self.assertEqual(out.strip(), fb.urls[0])          # the link is still printed
+            for extra in (["--to", "json"], ["--check"], ["--stats"]):
+                code, out, err = cli(["--open"] + extra + [self.link])
+                self.assertEqual(code, 2, extra)
+            self.assertEqual(len(fb.urls), 1)
+            code, out, err = cli(["--open", self.link[:120]])
+            self.assertEqual(code, 1)
+            self.assertIn("E_LINK", err)
+            self.assertEqual(len(fb.urls), 1)                  # nothing opened for a broken link
+
+    def test_corrupt_links_are_rejected(self):
+        table = link_table()
+        files = sorted(os.path.basename(p) for p in glob.glob(os.path.join(INVALID, "*.link")))
+        self.assertEqual(sorted(table), files)
+        self.assertGreaterEqual(len(files), 10)
+        for fname, code_expected in sorted(table.items()):
+            path = os.path.join(INVALID, fname)
+            text = read(path)
+            with self.subTest(vector=fname):
+                if "&c=" in text:
+                    # a broken second trace only matters where it is used
+                    for args in (["--diff"], ["--to", "link"]):
+                        code, out, err = cli([path] + args)     # (--diff PATH would make PATH the OTHER)
+                        self.assertEqual((code, out), (1, ""), (args, err))
+                        self.assertIn(code_expected, err)
+                    self.assertEqual(cli(["--check", path])[0], 0)
+                    continue
+                recognised = "t=" in text     # without t= the CLI cannot tell a link from other text
+                for args in (["--check"], [], ["--tree"], ["--to", "json"], ["--to", "link"]):
+                    code, out, err = cli(args + [path])
+                    self.assertEqual((code, out), (1, ""), (args, err))
+                    if recognised:
+                        self.assertIn(code_expected, err)
+                code, out, err = cli(["--check", text.strip()])     # the URL as an argument
+                self.assertEqual(code, 1, err)
+                if recognised:
+                    self.assertIn(code_expected, err)
+
+    def test_generator_writes_links(self):
+        gen = os.path.join(ROOT, "tools", "gen_traces.py")
+        args = [sys.executable, gen, "--seed", "4", "--candidates", "12"]
+        header = subprocess.run(args, stdout=subprocess.PIPE, check=True).stdout.decode().strip()
+        for extra, base in (([], tempo_ref.DEFAULT_BASE), (["http://localhost:8000/t/"], "http://localhost:8000/t/")):
+            url = subprocess.run(args + ["--link"] + extra, stdout=subprocess.PIPE, check=True).stdout.decode().strip()
+            self.assertTrue(url.startswith(base + "#t=z."), url)
+            self.assertEqual(tempo_ref.decode_link(url).value, header)
+
+    def test_link_decoder_matches_reference_decoder(self):
+        paths = sorted(glob.glob(os.path.join(GOLDEN, "*.link")) + glob.glob(os.path.join(INVALID, "*.link")))
+        for path in paths:
+            text = read(path)
+            try:
+                want = tempo_ref.decode_link(text)
+            except tempo_ref.TempoFormatError as e:
+                want = e.code
+            try:
+                p = tempo.link_params(text)
+                got = (tempo.unpack_value(p["t"]), tempo.unpack_value(p["c"]) if p.get("c") else None,
+                       p.get("tab"))
+            except tempo.TempoFormatError as e:
+                got = e.code
+            self.assertEqual(got, want if isinstance(want, str) else tuple(want), path)
+
+
+# ======================================================================
 # Model rules
 # ======================================================================
 
@@ -849,7 +1175,8 @@ class Executable(unittest.TestCase):
     def test_python38_syntax_and_stdlib_only(self):
         src = read(CLI)
         tree = ast.parse(src, feature_version=(3, 8))
-        allowed = {"argparse", "datetime", "json", "math", "os", "re", "shutil", "sys", "textwrap"}
+        allowed = {"argparse", "base64", "datetime", "json", "math", "os", "re", "shutil", "sys", "textwrap",
+                   "webbrowser", "zlib"}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for a in node.names:
@@ -857,6 +1184,27 @@ class Executable(unittest.TestCase):
             elif isinstance(node, ast.ImportFrom):
                 self.assertIn(node.module.split(".")[0], allowed)
             self.assertNotIsInstance(node, getattr(ast, "Match", ()))
+
+    def test_python38_syntax_of_the_other_tools(self):
+        for name in ("tempo_ref.py", "gen_traces.py"):
+            ast.parse(read(os.path.join(ROOT, "tools", name)), feature_version=(3, 8))
+        ast.parse(read(os.path.join(ROOT, "tests", "run_golden.py")), feature_version=(3, 8))
+        ast.parse(read(os.path.abspath(__file__)), feature_version=(3, 8))
+
+    def test_link_as_argument_and_pipe(self):
+        value = read(os.path.join(SAMPLES, "small.header")).strip()
+        r = self.run_cli(["--to", "link", "--base", "http://localhost:1/"], stdin=value)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        url = r.stdout.decode().strip()
+        self.assertTrue(url.startswith("http://localhost:1/#t=z."))
+        r = self.run_cli(["--check", url])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.run_cli(["--check", url[:150]])
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(b"E_LINK", r.stderr)
+        r = self.run_cli(["--help"])
+        for opt in (b"--open", b"--base", b"Tempo-Link", b"link"):
+            self.assertIn(opt, r.stdout)
 
 
 if __name__ == "__main__":
