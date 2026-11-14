@@ -132,6 +132,27 @@ as cancelled before it began (flag `c`, no run time); a handoff neither begun no
 when the trace renders shows as never started (`n`). The `Handoff` is the one object Tempo
 allocates while recording, 32 bytes.
 
+Cancel and begin race for the handoff, and exactly one of them wins. `cancel()` and `reject()`
+return `true` if they won: the task is recorded as cancelled before it began, and a wrapped
+task skips its body when a worker takes it (`runnable` returns, `callable` and `supplier` throw
+`CancellationException`). They return `false` if the task has begun (it runs, and is recorded
+as it runs), was cancelled already, or the trace was released. So an early exit needs neither
+a lock nor the executor's help:
+
+```java
+for (Pending p : pending) {
+  if (p.handoff.cancel()) p.future.cancel(false);   // won: the body will not run
+}
+```
+
+`h.cancel()` alone on every pending handoff is enough for the trace and the work: a task whose
+handoff was cancelled costs nothing when a worker takes it. `future.cancel(false)` completes
+the future for whoever waits on it (if a worker took the task a moment before, the future may
+complete through the wrapper instead, so go by what `cancel()` returned), and
+`ThreadPoolExecutor.remove` is only needed to free the slots of a bounded queue at once. A
+hand-written task begins with `tryBegin()`, which returns `null` when the cancel won, and
+returns early; `begin()` returns `Tempo.NOOP` then. Neither is misuse; beginning twice is.
+
 On a thread without a trace, `t.submitted()` and `t.waited(name, token)` measure a queue
 wait into `t.aggregate(name)` with a single clock read each.
 

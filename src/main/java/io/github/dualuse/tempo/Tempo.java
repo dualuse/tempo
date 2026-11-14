@@ -16,6 +16,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -4501,10 +4502,26 @@ public final class Tempo {
 
     /**
      * A task handed from one thread to another, created by {@link Span#handoff} on the submitting thread.
-     * The task calls {@link #begin()} where it starts to run, or is wrapped with {@link #runnable},
-     * {@link #callable} or {@link #supplier}; a task that will not run is {@link #cancel() cancelled} or
-     * {@link #reject() rejected}. Each handoff is used once and never reused, so a straggler cannot
-     * record into another request.
+     * The task calls {@link #begin()} (or {@link #tryBegin()}) where it starts to run, or is wrapped with
+     * {@link #runnable}, {@link #callable} or {@link #supplier}; a task that will not run is
+     * {@link #cancel() cancelled} or {@link #reject() rejected}. Each handoff is used once and never
+     * reused, so a straggler cannot record into another request.
+     *
+     * <p>Begin and cancel race for the handoff, and exactly one of them wins: the task is recorded as run,
+     * or as cancelled before it began. {@link #cancel()} returns whether it won, and a wrapped task whose
+     * handoff was cancelled first skips its body. So an early exit cancels whatever has not begun with no
+     * lock and no help from the executor:
+     *
+     * <pre>{@code
+     * for (Pending p : pending) {
+     *     if (p.handoff.cancel()) p.future.cancel(false); // won: the body will not run; completes the future
+     * }
+     * }</pre>
+     *
+     * A lost cancel means the task began: it runs, and is recorded as it runs. {@code h.cancel()} alone on
+     * every pending handoff is enough for the trace and the work, since a task whose handoff was cancelled
+     * costs nothing when a worker takes it; {@code Future.cancel} completes the future for whoever waits on
+     * it, and {@code ThreadPoolExecutor.remove} is only needed to free the queue's slots at once.
      */
     public static final class Handoff {
         private static final int NEW = 0, BEGUN = 1, ENDED = 2, STATES = 3, ROW = 2; // ENDED: cancelled or rejected
@@ -4518,7 +4535,7 @@ public final class Tempo {
             }
         }
 
-        /** The handoff of {@link Tempo#NOOP}: begins {@link Tempo#NOOP} and wraps nothing. */
+        /** The handoff of {@link Tempo#NOOP}: begins {@link Tempo#NOOP}, wraps nothing, never cancels. */
         public static final Handoff NOOP = new Handoff(null, -1, 0);
 
         // Header plus these four fields is 32 B with compressed oops.
@@ -4545,22 +4562,58 @@ public final class Tempo {
          * thread's lane, and {@link Tempo#current()} returns it until it closes. For a handoff past the budget
          * it is aggregate-only (see {@link Span#detail}): its duration and wait go to the handoff's aggregate,
          * and spans opened in it, with no row to hang from on a thread outside the trace, are aggregate-only
-         * too. {@link Tempo#NOOP} after release, past the lane cap, and on a second begin or a begin after
-         * cancel (both misuse).
+         * too. {@link Tempo#NOOP} after release, past the lane cap, when the handoff was cancelled or
+         * rejected first (a race {@link #cancel()} won, not misuse; {@link #tryBegin()} tells it apart), and
+         * on a second begin (misuse).
          */
         public Span begin() {
-            if (!claim(BEGUN)) return Tempo.NOOP;
-            return task(true);
+            Span s = tryBegin();
+            return s == null ? Tempo.NOOP : s;
         }
 
-        /** Marks the task cancelled before it began, e.g. by an early exit. A no-op once it has begun. */
-        public void cancel() {
-            if (claim(ENDED)) task(false);
+        /**
+         * Like {@link #begin()}, but {@code null} when the handoff was cancelled or rejected before it
+         * began, so a hand-written task can skip its work the way the wrappers do:
+         *
+         * <pre>{@code
+         * Tempo.Span s = h.tryBegin();
+         * if (s == null) return;  // cancelled before it began: recorded so, nothing to do
+         * try (s) {
+         *     work();
+         * }
+         * }</pre>
+         */
+        public Span tryBegin() {
+            if (lane == null) return Tempo.NOOP;
+            int s = state;
+            if ((s & STATES) == ENDED) return null;
+            if (lane.ctx.released) return Tempo.NOOP;
+            if ((s & STATES) == NEW && STATE.compareAndSet(this, s, s | BEGUN)) return task(true);
+            if ((state & STATES) == ENDED) return null; // a cancel won the race
+            lane.ctx.misuse("handoff begun twice");
+            return Tempo.NOOP;
         }
 
-        /** Marks the task rejected by the executor; recorded like {@link #cancel()}. */
-        public void reject() {
-            cancel();
+        /**
+         * Marks the task cancelled before it began, e.g. by an early exit; any thread. Returns {@code true}
+         * if this call won the race with {@link #begin()}: the task is recorded as cancelled before it
+         * began, a later begin returns {@link Tempo#NOOP} ({@link #tryBegin()}: {@code null}), and a wrapped
+         * task ({@link #runnable}, {@link #callable}, {@link #supplier}) skips its body. {@code false} if
+         * it changed nothing: the task has begun (it runs and is recorded as it runs), the handoff was
+         * cancelled or rejected already, the trace was released (then nothing is recorded any more, and a
+         * wrapped task that runs runs its body), or this is {@link #NOOP}.
+         */
+        public boolean cancel() {
+            if (lane == null || lane.ctx.released) return false;
+            int s = state;
+            if ((s & STATES) != NEW || !STATE.compareAndSet(this, s, s | ENDED)) return false;
+            task(false);
+            return true;
+        }
+
+        /** Marks the task rejected by the executor; recorded, and returns, like {@link #cancel()}. */
+        public boolean reject() {
+            return cancel();
         }
 
         /** Attaches a number to the handoff at submit, e.g. the executor's queue length. Submitting thread only. */
@@ -4572,11 +4625,16 @@ public final class Tempo {
             return this;
         }
 
-        /** Wraps {@code task} in {@link #begin()} and close; a throwable marks the span failed and is rethrown. */
+        /**
+         * Wraps {@code task} in {@link #tryBegin()} and close; a throwable marks the span failed and is
+         * rethrown. If the handoff was cancelled or rejected before the wrapper runs, it returns at once
+         * without running {@code task}.
+         */
         public Runnable runnable(Runnable task) {
             if (lane == null) return task;
             return () -> {
-                Span s = begin();
+                Span s = tryBegin();
+                if (s == null) return;
                 try {
                     task.run();
                 } catch (Throwable t) {
@@ -4588,11 +4646,15 @@ public final class Tempo {
             };
         }
 
-        /** Like {@link #runnable} for a {@link Callable}. */
+        /**
+         * Like {@link #runnable} for a {@link Callable}; cancelled or rejected before it began, it throws
+         * {@link CancellationException} without running {@code task}.
+         */
         public <V> Callable<V> callable(Callable<V> task) {
             if (lane == null) return task;
             return () -> {
-                Span s = begin();
+                Span s = tryBegin();
+                if (s == null) throw cancelled();
                 try {
                     return task.call();
                 } catch (Throwable t) {
@@ -4604,11 +4666,12 @@ public final class Tempo {
             };
         }
 
-        /** Like {@link #runnable} for a {@link Supplier}. */
+        /** Like {@link #callable} for a {@link Supplier}. */
         public <V> Supplier<V> supplier(Supplier<V> task) {
             if (lane == null) return task;
             return () -> {
-                Span s = begin();
+                Span s = tryBegin();
+                if (s == null) throw cancelled();
                 try {
                     return task.get();
                 } catch (Throwable t) {
@@ -4620,17 +4683,13 @@ public final class Tempo {
             };
         }
 
+        private static CancellationException cancelled() {
+            return new CancellationException("Tempo handoff cancelled before it began");
+        }
+
         /** Neither begun nor cancelled (nor rejected) yet; any thread. */
         boolean waiting() {
             return (state & STATES) == NEW;
-        }
-
-        private boolean claim(int to) {
-            if (lane == null || lane.ctx.released) return false;
-            int s = state;
-            if ((s & STATES) == NEW && STATE.compareAndSet(this, s, s | to)) return true;
-            if (to == BEGUN) lane.ctx.misuse((state & STATES) == BEGUN ? "handoff begun twice" : "handoff begun after cancel");
-            return false;
         }
 
         private Span task(boolean run) {

@@ -1272,13 +1272,14 @@ class TempoTest {
         Span root = t.root();
         Handoff a = root.handoff(MATCH), b = root.handoff(LOAD), c = root.handoff(DECODE);
         clock.add(5);
-        a.cancel();
+        assertTrue(a.cancel());
         clock.add(2);
-        b.reject();
-        a.cancel(); // once is enough
+        assertTrue(b.reject());
+        assertFalse(a.cancel()); // once is enough
+        assertFalse(a.reject());
+        assertSame(NOOP, a.begin()); // the cancel won the race: not misuse
+        assertNull(a.tryBegin());
         assertEquals(0, t.misuses());
-        assertSame(NOOP, a.begin());
-        assertEquals(1, t.misuses());
         clock.add(3);
         t.close();
         assertEquals(lines(
@@ -1292,7 +1293,7 @@ class TempoTest {
                 "  match 0+0 cancelled handoff~5",
                 "  load 0+0 cancelled handoff~7",
                 "  decode 0+0 handoff~14 unstarted"), tree(t));
-        assertEquals(1, t.misuses());
+        assertEquals(0, t.misuses());
     }
 
     @Test
@@ -1305,7 +1306,7 @@ class TempoTest {
         assertSame(NOOP, s);
         t.close();
         assertEquals(lines("search 0+6", "  match 0+0 cancelled handoff~6 @canceller"), tree(t));
-        assertEquals(1, t.misuses());
+        assertEquals(0, t.misuses());
     }
 
     @Test
@@ -1317,7 +1318,7 @@ class TempoTest {
         assertSame(NOOP, h.begin());
         assertEquals(1, t.misuses());
         s.close();
-        h.cancel();
+        assertFalse(h.cancel());
         assertEquals(1, t.misuses());
         assertNull(onOtherThread(() -> h.set(QUEUED, 1)));
         assertEquals(2, t.misuses());
@@ -1330,8 +1331,9 @@ class TempoTest {
         AssertionError e = assertThrows(AssertionError.class, g::begin);
         assertEquals("Tempo misuse: handoff begun twice", e.getMessage());
         Handoff k = u.root().handoff(LOAD);
-        k.cancel();
-        assertEquals("Tempo misuse: handoff begun after cancel", assertThrows(AssertionError.class, k::begin).getMessage());
+        assertTrue(k.cancel());
+        assertSame(NOOP, k.begin()); // begin after cancel is a race the cancel won, not misuse
+        assertEquals("Tempo misuse: handoff begun twice", assertThrows(AssertionError.class, g::tryBegin).getMessage());
         Throwable foreign = onOtherThread(() -> g.set(QUEUED, 1));
         assertEquals("Tempo misuse: handoff set on a foreign thread", foreign.getMessage());
         u.close();
@@ -1347,8 +1349,9 @@ class TempoTest {
         assertSame(c, Handoff.NOOP.callable(c));
         assertSame(s, Handoff.NOOP.supplier(s));
         assertSame(NOOP, Handoff.NOOP.begin());
-        Handoff.NOOP.set(QUEUED, 1).cancel();
-        Handoff.NOOP.reject();
+        assertFalse(Handoff.NOOP.set(QUEUED, 1).cancel());
+        assertFalse(Handoff.NOOP.reject());
+        assertSame(NOOP, Handoff.NOOP.tryBegin());
 
         Trace t = Tempo.start(SEARCH, opts());
         AtomicReference<Handoff> h = new AtomicReference<>();
