@@ -176,10 +176,12 @@ public final class Tempo {
         }
 
         /**
-         * Threads that may record into one trace, the starting thread included; default 256, at least 1.
-         * Meant for pools of platform threads: with a thread per task (virtual threads) the tasks begun
-         * past the cap are not recorded. Such a task's handoff is left out of the tree, its queue wait is
-         * added to {@link Trace#aggregate(Name)} of the handoff's name, and it counts as dropped.
+         * Lanes of one trace, the starting thread's root lane included; default 256, at least 1. A lane
+         * is one thread's record of the trace: a thread records its tasks in one lane, and opens another
+         * only for a task that begins while that lane is open under another trace's task. A pool
+         * of platform threads stays far below the cap; with a thread per task (virtual threads) the tasks
+         * begun past it are not recorded. Such a task's handoff is left out of the tree, its queue wait
+         * is added to {@link Trace#aggregate(Name)} of the handoff's name, and it counts as dropped.
          */
         public Options lanes(int max) {
             this.lanes = Math.max(1, max);
@@ -281,6 +283,14 @@ public final class Tempo {
             // release() stores released, then walks the registry; this CASed the registry, then reads released
             if (released) lane.requestRetire();
             return lane;
+        }
+
+        /** A task lane of {@code owner} whose root is closed; called by the owner, which alone writes depth. */
+        Lane idleLane(Thread owner) {
+            for (Lane l = lanes; l != null; l = l.next) {
+                if (l.owner == owner && l.id != 0 && l.depth == 0 && !l.retired()) return l;
+            }
+            return null;
         }
 
         Lane[] lanesById() {
@@ -414,9 +424,11 @@ public final class Tempo {
     /**
      * Per-thread state. Holds no {@link Trace}; only lane-root opens and closes touch {@code current}.
      * Pool threads interleave tasks of concurrent traces, so the slot remembers its lanes of the last
-     * four traces; a lane found retired or collected is dropped at the next lookup. The references are
-     * weak: a lane reaches its trace's registry, so a strong one would keep an unreleased trace with
-     * all its lanes alive for as long as the thread idles. The registry keeps the lanes of a live trace.
+     * four traces; a lane found retired or collected is dropped at the next lookup. A miss reuses the
+     * thread's idle lane from the trace's registry before it registers a new one, so a trace holds at
+     * most one idle lane per thread however many traces interleave. The references are weak: a lane
+     * reaches its trace's registry, so a strong one would keep an unreleased trace with all its lanes
+     * alive for as long as the thread idles. The registry keeps the lanes of a live trace.
      */
     static final class ThreadSlot {
         Lane current;
@@ -424,7 +436,7 @@ public final class Tempo {
         final WeakReference<Lane>[] lanes = new WeakReference[4];
         private int victim;
 
-        /** An idle lane of this thread for the trace, from the cache or new; null at the trace's lane cap. */
+        /** An idle lane of this thread for the trace: cached, found in the registry, or new; null at the lane cap. */
         Lane lane(Context ctx) {
             int free = -1;
             for (int i = 0; i < lanes.length; i++) {
@@ -437,8 +449,8 @@ public final class Tempo {
                     return l;
                 }
             }
-            if (ctx.full()) return null;
-            Lane l = ctx.register(new Lane(ctx, this));
+            Lane l = ctx.idleLane(Thread.currentThread());
+            if (l == null && !ctx.full()) l = ctx.register(new Lane(ctx, this));
             if (l != null) lanes[free >= 0 ? free : victim++ & 3] = new WeakReference<>(l);
             return l;
         }
@@ -812,16 +824,23 @@ public final class Tempo {
             append(r, LABEL, labelCount++);
         }
 
-        /** Restores the slot's previous lane, skipping lanes that closed out of order meanwhile. */
+        /**
+         * Unlinks this lane from the slot's chain of open lane roots ({@code current}, then each
+         * {@code saved}). Roots may close in any order, so the chain holds open lanes only and a lane
+         * reopened later never links back into it.
+         */
         private void exitRoot() {
-            Lane prev = saved;
-            while (prev != null && prev.depth == 0) prev = prev.saved;
             if (slot.current == this) {
-                slot.current = prev;
-                saved = null;
+                slot.current = saved;
             } else {
-                saved = prev; // a lane opened above this one still restores through it
+                for (Lane l = slot.current; l != null; l = l.saved) {
+                    if (l.saved == this) {
+                        l.saved = saved;
+                        break;
+                    }
+                }
             }
+            saved = null;
             idle();
         }
 

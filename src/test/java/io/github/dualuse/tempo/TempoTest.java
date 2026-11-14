@@ -1436,6 +1436,77 @@ class TempoTest {
         }
     }
 
+    /** More traces than the slot caches interleave on one pool thread; each keeps one lane there. */
+    @Test
+    void moreInterleavedTracesThanCachedLanesReuseTheirLane() throws Exception {
+        ExecutorService pool = worker("worker-1");
+        try {
+            List<Trace> traces = new ArrayList<>();
+            for (int k = 0; k < 6; k++) traces.add(Tempo.start(SEARCH, opts()));
+            for (int i = 0; i < 3; i++) {
+                for (Trace t : traces) {
+                    Handoff h = t.root().handoff(MATCH);
+                    pool.submit(() -> h.begin().close()).get();
+                }
+            }
+            for (int k = traces.size() - 1; k >= 0; k--) traces.get(k).close();
+            for (Trace t : traces) {
+                assertEquals(2, t.ctx.lanesById().length); // the root's and worker-1's
+                assertEquals(lines(
+                        "search 0+0",
+                        "  match 0+0 handoff~0 @worker-1",
+                        "  match 0+0 handoff~0 @worker-1",
+                        "  match 0+0 handoff~0 @worker-1"), tree(t));
+                assertEquals(0, t.misuses() + t.dropped());
+            }
+            assertEquals(4, pool.submit(TempoTest::cachedLanes).get());
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    /** Begin and close in separate callbacks of one thread: lane roots of two traces close out of order. */
+    @Test
+    void laneRootsClosedOutOfOrderAndReopenedRestoreTheCurrentSpan() throws Exception {
+        Handoff[] hs = new Handoff[3];
+        Trace[] ts = new Trace[2];
+        assertNull(onThread("request-1", () -> {
+            ts[0] = Tempo.start(SEARCH, opts());
+            hs[0] = ts[0].root().handoff(MATCH);
+            hs[1] = ts[0].root().handoff(LOAD);
+            ts[0].close();
+        }));
+        assertNull(onThread("request-2", () -> {
+            ts[1] = Tempo.start(RERANK, opts());
+            hs[2] = ts[1].root().handoff(MATCH);
+            ts[1].close();
+        }));
+        String here = assertTimeoutPreemptively(java.time.Duration.ofSeconds(30), () -> {
+            Span a = hs[0].begin();
+            clock.add(1);
+            Span b = hs[2].begin();
+            clock.add(1);
+            a.close();
+            assertSame(b, Tempo.current());
+            Span a2 = hs[1].begin(); // reopens the lane a closed
+            assertSame(a2, Tempo.current());
+            clock.add(1);
+            b.close();
+            assertSame(a2, Tempo.current());
+            clock.add(1);
+            a2.close();
+            assertSame(NOOP, Tempo.current());
+            return Thread.currentThread().getName();
+        });
+        assertEquals(lines(
+                "search 0+0",
+                "  match 0+2 handoff~0 @" + here,
+                "  load 0+2 handoff~2 @" + here), tree(ts[0])); // drawn at the submit
+        assertEquals(lines("rerank 0+0", "  match 0+2 handoff~1 @" + here), tree(ts[1]));
+        assertEquals(2, ts[0].ctx.lanesById().length);
+        assertEquals(0, ts[0].misuses() + ts[1].misuses());
+    }
+
     static int cachedLanes() {
         int n = 0;
         for (WeakReference<Tempo.Lane> w : Tempo.SLOT.get().lanes) {
@@ -1715,6 +1786,7 @@ class TempoTest {
                 assertEquals(tasks, handoffs[0]);
                 assertEquals(1 + 2 * tasks, spans[0]);
                 assertEquals(0, t.misuses() + t.dropped());
+                assertTrue(t.ctx.lanesById().length <= 1 + 4, "lanes: " + t.ctx.lanesById().length); // root + pool
                 t.release();
             }
         } finally {
