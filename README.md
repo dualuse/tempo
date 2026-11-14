@@ -31,7 +31,7 @@ search                 0.000         31.600   0.000  1.526   30.074  main
 
 Pre-release (0.1.0). The recording API, the wire format v1, the JSON form and both viewers
 are complete and tested; the API may still change before 1.0. There is no Maven Central
-artifact yet: build the jar (`./gradlew jar`) or copy
+artifact yet: take the jar from a GitHub release, build it (`./gradlew jar`) or copy
 `src/main/java/io/github/dualuse/tempo/Tempo.java` into your source tree.
 
 ## Quick start
@@ -252,9 +252,11 @@ and the manifest attribute `Tempo-Link-Base`), from the first of:
 3. the git remote `origin` on github.com, for local builds of a clone,
 4. `https://dualuse.github.io/tempo/`, also used by a copy of `Tempo.java` built elsewhere.
 
-So a fork's CI and release builds link to the fork's own viewer without any change. The
-viewer is there once the fork turns on Pages (Settings → Pages, Source: GitHub Actions) and
-pushes to `master` or runs the `Pages` workflow by hand. At run time,
+The `Release` workflow (`.github/workflows/release.yml`) builds the jar on GitHub Actions and
+delivers it: a pushed tag `v<version>` attaches it to a GitHub release, and every run keeps it
+as a workflow artifact. It names no owner, so a fork's release links to the fork's own viewer
+without any change. The viewer is there once the fork turns on Pages (Settings → Pages,
+Source: GitHub Actions) and pushes to `master` or runs the `Pages` workflow by hand. At run time,
 `-Dtempo.linkBase=URL` sets the base for a JVM, `Options.linkBase(url)` for one trace and
 `toLink(base)` for one link, for instance a self-hosted copy of `site/index.html`.
 
@@ -475,6 +477,7 @@ CI gates the allocation of every recording operation on JDK 11, 17 and 21
 ./gradlew jar                                    # the jar; its Tempo-Link base follows the git remote origin
 python3 tests/run_golden.py                      # format vectors, ladder and samples
 python3 -m unittest tests.test_cli               # the command-line viewer
+python3 -m unittest tests.test_check_private     # the private-term check
 node tests/test_parser.mjs                       # the web viewer's parser
 ```
 

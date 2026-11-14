@@ -12,6 +12,7 @@ Run what CI runs:
 ./gradlew jmhGate                  # allocation gate: recording must not allocate
 python3 tests/run_golden.py        # vectors, ladder and samples against tools/tempo_ref.py
 python3 -m unittest tests.test_cli # the command-line viewer (Python 3.8+)
+python3 -m unittest tests.test_check_private  # tools/check-private.sh
 node tests/test_parser.mjs && node tests/test_analysis.mjs && node tests/check_spa_parser_sync.mjs
 ```
 
@@ -43,6 +44,8 @@ Install it as the pre-push hook of your clone:
 mkdir -p ~/.config/tempo && $EDITOR ~/.config/tempo/denylist
 ln -s ../../tools/check-private.sh .git/hooks/pre-push
 ```
+
+Git passes the hook the remote's name and URL; the script ignores them.
 
 CI runs the same check on every push to `master`, with the list taken from the repository
 secret `TEMPO_DENYLIST` (the file's contents). Forks and pull requests have no such secret, so

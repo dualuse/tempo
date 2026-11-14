@@ -3,8 +3,9 @@
 # messages included) for the patterns of a deny-list kept OUTSIDE the repository, and exits 1
 # on a hit. Meant as a pre-push hook (see CONTRIBUTING.md); CI runs it on pushes to master.
 #
-#   tools/check-private.sh [--names-only]
+#   tools/check-private.sh [--names-only] [<remote> <url>]
 #
+# Git runs a pre-push hook with the remote's name and URL as arguments; they are ignored.
 # The deny-list is the file named by $TEMPO_DENYLIST, default ~/.config/tempo/denylist: one
 # extended regular expression per line, matched case-insensitively and unanchored; blank lines
 # and lines starting with # are ignored. Without the file the check is skipped with a warning.
@@ -14,11 +15,13 @@
 set -eu
 
 names_only=false
-case "${1-}" in
-  --names-only) names_only=true ;;
-  "") ;;
-  *) echo "usage: $0 [--names-only]" >&2; exit 2 ;;
-esac
+for arg in "$@"; do
+  case "$arg" in
+    --names-only) names_only=true ;;
+    -*) echo "usage: $0 [--names-only] [<remote> <url>]" >&2; exit 2 ;;
+    *) ;;  # the pre-push hook's <remote> <url>
+  esac
+done
 
 list=${TEMPO_DENYLIST:-$HOME/.config/tempo/denylist}
 if [ ! -f "$list" ]; then

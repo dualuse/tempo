@@ -1,0 +1,60 @@
+name: Release
+
+# Builds the library jar in this repository, so its Tempo-Link base is this repository's own viewer
+# (GITHUB_REPOSITORY gives https://<owner>.github.io/<repo>/, see README "Link base, and forks"), and
+# delivers it: as a workflow artifact on every run, and as a GitHub release on a pushed tag v<version>
+# (the tag must match `version` in build.gradle.kts). Nothing in it names an owner, so a fork's tags
+# release a jar that links to the fork's viewer. Run it by hand for an artifact without a release.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  jar:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      # LadderTest checks Java's values and links with the reference (python3) and the viewer's parser (node)
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Test and build the jar
+        run: ./gradlew test jar -Porg.gradle.java.installations.auto-download=false
+      # The manifest wraps lines at 72 bytes, so continuation lines are joined before the grep.
+      - name: The jar links to this repository's viewer
+        run: |
+          base=$(unzip -p build/libs/tempo-*.jar io/github/dualuse/tempo/link-base.txt)
+          echo "Tempo-Link base: $base"
+          case "$base" in "https://${GITHUB_REPOSITORY_OWNER,,}.github.io/"*) ;; *) exit 1 ;; esac
+          unzip -p build/libs/tempo-*.jar META-INF/MANIFEST.MF | tr -d '\r' \
+            | awk '/^ / { line = line substr($0, 2); next } { if (NR > 1) print line; line = $0 } END { print line }' \
+            | grep -Fx "Tempo-Link-Base: $base"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tempo-jar
+          path: build/libs/tempo-*.jar
+          if-no-files-found: error
+      - name: GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          jar="build/libs/tempo-${GITHUB_REF_NAME#v}.jar"
+          if [ ! -f "$jar" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the jar's version: $(ls build/libs)"
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" "$jar" --verify-tag --generate-notes \
+            --title "Tempo ${GITHUB_REF_NAME#v}"
