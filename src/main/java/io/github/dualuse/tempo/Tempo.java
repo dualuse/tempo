@@ -304,7 +304,11 @@ public final class Tempo {
          * Thread CPU time of each lane root (the trace's root and every task begun on another thread) and
          * of the spans that ask with {@link Span#cpu()}; see {@link SpanView#cpuNanos()}. By default it
          * is measured whenever the level is {@link #DETAIL} or above when the span opens, never at
-         * {@link #COARSE}. {@code true} measures at every level, {@code false} never.
+         * {@link #COARSE}. {@code true} measures at every level, {@code false} never. The first read in a
+         * JVM sets the clock up (it loads the management bean: milliseconds); a trace that measures CPU pays
+         * it on the thread that starts it, or raises it to measuring ({@link Trace#raise}), in the root's
+         * time, so no task's queue wait or run time ever includes it. A task reads the clock before its CPU
+         * time: the read is run time, not queue wait.
          */
         public Options cpu(boolean on) {
             this.cpu = on ? CPU_ON : CPU_OFF;
@@ -1131,9 +1135,9 @@ public final class Tempo {
                 if (root) idle();
                 return null;
             }
-            if (run && root && ctx.cpu()) sampleCpu(0); // before the start, so the read is not timed
+            long now = ctx.now(); // the queue wait ends here: what follows is the task's own time
+            if (run && root && ctx.cpu()) sampleCpu(0); // after the start: the read is run time, not queue wait
             Rows c = rows[r >>> CHUNK_BITS];
-            long now = ctx.now();
             c.start[r & MASK] = now;
             if (!run) DUR.setOpaque(c.dur, r & MASK, 0L);
             append(r, XPARENT, (long) h.lane.id << 32 | hr);
@@ -1168,8 +1172,8 @@ public final class Tempo {
                 if (root) idle();
                 return id < 0 ? NOOP : null; // released, or past the aggregate cap (counted)
             }
-            if (run && root && ctx.cpu()) sampleCpu(0); // before the start, so the read is not timed
-            long now = ctx.now(), wait = Math.max(0, now - h.submit);
+            long now = ctx.now(), wait = Math.max(0, now - h.submit); // as in task(): the clock first
+            if (run && root && ctx.cpu()) sampleCpu(0);
             aggs.submit(e, h.submit);
             if (!run) {
                 aggs.add(e, h.submit, 0, wait, -1, CANCELLED | UNRUN, true);
@@ -3745,22 +3749,31 @@ public final class Tempo {
 
         /**
          * Raises the level, once, before any detail span exists. Asking for the current level or a lower
-         * one changes nothing. Returns whether the trace now records at {@code level} or above.
+         * one changes nothing. Returns whether the trace now records at {@code level} or above. A raise that
+         * turns on CPU time ({@link Options#cpu}) reads the CPU clock once on the calling thread, so the
+         * JVM's one-time setup of that clock (milliseconds) is paid here, never inside a pool task.
          */
         public boolean raise(int level) {
             int to = clampLevel(level);
-            String refused;
+            String refused = null;
+            boolean cpuOn = false;
             synchronized (ctx) {
                 if (to <= ctx.level) return true;
-                if (!ctx.raised && !ctx.detailSeen) {
+                if (ctx.raised || ctx.detailSeen) {
+                    refused = ctx.raised ? "level raised twice" : "level raised after a detail span was recorded";
+                } else {
+                    boolean before = ctx.cpu();
                     ctx.raised = true;
                     ctx.level = to;
-                    return true;
+                    cpuOn = !before && ctx.cpu();
                 }
-                refused = ctx.raised ? "level raised twice" : "level raised after a detail span was recorded";
             }
-            ctx.misuse(refused);
-            return false;
+            if (refused != null) {
+                ctx.misuse(refused);
+                return false;
+            }
+            if (cpuOn) ctx.cpuNow(); // the result is not needed: the read sets the clock up on this thread
+            return true;
         }
 
         /** Wall time of the root span: running time while open, its duration once closed, 0 after release. */

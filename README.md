@@ -169,7 +169,10 @@ if (s.detailed()) s.set(KEYS, keys.size());   // guard work done only for detail
 
 Thread CPU time is measured for each lane root (the trace's root and every task on a pool
 thread) from `DETAIL` up, or as `Options.cpu(true|false)` says; `span.cpu()` asks for it on
-one more span.
+one more span. The first CPU read in a JVM sets the clock up, which takes milliseconds: a
+trace pays it on the thread that starts it at such a level, or raises it there, so the first
+such trace of a JVM shows it in its root's time, never in a task's queue wait. A task reads
+its start before its CPU time, so its queue wait is time in the queue only.
 
 ### Budget and folding
 

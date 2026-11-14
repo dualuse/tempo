@@ -1,5 +1,6 @@
 package io.github.dualuse.tempo;
 
+import io.github.dualuse.tempo.Tempo.Handoff;
 import io.github.dualuse.tempo.Tempo.Name;
 import io.github.dualuse.tempo.Tempo.Options;
 import io.github.dualuse.tempo.Tempo.Span;
@@ -8,6 +9,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
@@ -16,15 +18,18 @@ import static io.github.dualuse.tempo.Tempo.COARSE;
 import static io.github.dualuse.tempo.Tempo.DETAIL;
 import static io.github.dualuse.tempo.Tempo.NOOP;
 import static io.github.dualuse.tempo.TempoTest.lines;
+import static io.github.dualuse.tempo.TempoTest.onThread;
+import static io.github.dualuse.tempo.TempoTest.tree;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Where Tempo's own setup time goes: the root starts at the trace's zero point, so the setup (and the
- * JVM's one-time CPU-clock setup) is the root's own time, never hidden.
+ * JVM's one-time CPU-clock setup) is the root's own time, never hidden and never a task's queue wait.
  */
 class SetupTimeTest {
 
-    static final Name SEARCH = TempoTest.SEARCH, DECODE = TempoTest.DECODE, LOAD = TempoTest.LOAD;
+    static final Name SEARCH = TempoTest.SEARCH, DECODE = TempoTest.DECODE, LOAD = TempoTest.LOAD,
+            MATCH = TempoTest.MATCH;
 
     @AfterEach
     void noTraceLeftOnThread() {
@@ -131,5 +136,92 @@ class SetupTimeTest {
         List<String> got = new ArrayList<>();
         t.forEachSpan(v -> got.add(v.name() + " " + v.startNanos() + "+" + v.durationNanos() + " cpu=" + v.cpuNanos()));
         assertEquals(List.of("search 0+50 cpu=40"), got);
+    }
+
+    /** A CPU clock that records the thread of each read. */
+    static final class Recording implements LongSupplier {
+        final List<String> threads = Collections.synchronizedList(new ArrayList<>());
+
+        @Override
+        public long getAsLong() {
+            threads.add(Thread.currentThread().getName());
+            return 0;
+        }
+    }
+
+    @Test
+    void theFirstCpuReadIsOnTheThreadThatStartsOrRaisesTheTrace() throws Exception {
+        String me = Thread.currentThread().getName();
+
+        Recording started = new Recording(); // DETAIL from the start: the start reads it
+        Trace a = Tempo.start(SEARCH, new Options().cpuClock(started).level(DETAIL));
+        assertEquals(List.of(me), started.threads);
+        Handoff h = a.root().handoff(MATCH);
+        assertNull(onThread("worker", () -> h.begin().close()));
+        a.close();
+        assertEquals(List.of(me, "worker", "worker", me), started.threads);
+
+        Recording raised = new Recording(); // COARSE, then raised by the handler: the raise reads it
+        Trace b = Tempo.start(SEARCH, new Options().cpuClock(raised));
+        Handoff early = b.root().handoff(MATCH); // submitted before the raise, begun after it
+        assertEquals(List.of(), raised.threads);
+        assertTrue(b.raise(DETAIL));
+        assertEquals(List.of(me), raised.threads);
+        assertNull(onThread("worker", () -> early.begin().close()));
+        b.close();
+        assertEquals(me, raised.threads.get(0));
+        assertEquals(List.of(me, "worker", "worker"), raised.threads); // the root was not measured: COARSE at its open
+
+        Recording off = new Recording(); // CPU off, or already measured: a raise reads nothing
+        Trace c = Tempo.start(SEARCH, new Options().cpuClock(off).cpu(false));
+        assertTrue(c.raise(DETAIL));
+        c.close();
+        Trace d = Tempo.start(SEARCH, new Options().cpuClock(off).cpu(true));
+        assertTrue(d.raise(DETAIL));
+        d.close();
+        assertEquals(List.of(me, me), off.threads); // d's root: at the start and at the close
+
+        Recording coarse = new Recording(); // COARSE throughout: never
+        Trace e = Tempo.start(SEARCH, new Options().cpuClock(coarse));
+        Handoff g = e.root().handoff(MATCH);
+        assertNull(onThread("worker", () -> g.begin().close()));
+        e.close();
+        assertEquals(List.of(), coarse.threads);
+    }
+
+    @Test
+    void aTasksQueueWaitEndsBeforeItsCpuRead() throws Exception {
+        for (int budget : new int[] {512, 0}) { // a recorded handoff, and one folded past the budget
+            TempoTest.Clock clock = new TempoTest.Clock();
+            long[] cpu = {0};
+            LongSupplier costly = () -> { // every CPU read costs 7 ns of wall time
+                clock.add(7);
+                return cpu[0];
+            };
+            Trace t = Tempo.start(SEARCH, new Options().clock(clock).cpuClock(costly).level(DETAIL).budget(budget));
+            clock.add(10);
+            Handoff h = t.root().handoff(MATCH); // submitted at 17: the root's CPU read came first
+            clock.add(30);
+            assertNull(onThread("worker", () -> {
+                Span m = h.begin();              // begins at 47, then reads CPU: 54
+                cpu[0] += 3;
+                clock.add(5);
+                m.close();                       // ends at 59, then reads CPU: 66
+            }));
+            t.close();                           // 66
+            Tempo.Aggregate a = t.aggregate(MATCH);
+            assertEquals(30, a.waitSumNanos(), "budget " + budget + ": the wait is the time in the queue, no read in it");
+            assertEquals(12, a.sumNanos(), "budget " + budget + ": the start's CPU read is the task's run time");
+            if (budget > 0) {
+                assertEquals(lines(
+                        "search 0+66",
+                        "  match 17+12 handoff~30 @worker"), tree(t));
+            }
+            List<Long> cpus = new ArrayList<>();
+            t.forEachSpan(v -> {
+                if (v.name() == MATCH) cpus.add(v.cpuNanos());
+            });
+            assertEquals(List.of(3L), cpus);
+        }
     }
 }
