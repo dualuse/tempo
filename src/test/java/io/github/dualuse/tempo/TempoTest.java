@@ -2223,6 +2223,31 @@ class TempoTest {
         assertSame(NOOP, Tempo.current());
     }
 
+    @Test
+    void timeNeverLetsAThrowingSinkReachTheCaller() throws Exception {
+        LongConsumer bad = nanos -> {
+            throw new IllegalStateException("sink");
+        };
+        IOException e = assertThrows(IOException.class, () -> Tempo.time(bad, () -> {
+            throw new IOException("body");
+        }));
+        assertEquals("body", e.getMessage());
+        assertEquals(1, e.getSuppressed().length);
+        assertEquals("sink", e.getSuppressed()[0].getMessage());
+
+        IOException r = assertThrows(IOException.class, () -> Tempo.time(bad, (Tempo.ThrowingRunnable<IOException>) () -> {
+            throw new IOException("body");
+        }));
+        assertEquals("sink", r.getSuppressed()[0].getMessage());
+
+        assertEquals(7, (int) Tempo.time(bad, () -> 7));
+        int[] ran = {0};
+        Tempo.time(bad, () -> {
+            ran[0]++;
+        });
+        assertEquals(1, ran[0]);
+    }
+
     // ---- CPU time -------------------------------------------------------------------------------------
 
     /** {@code name=cpu} per span in visiting order. */

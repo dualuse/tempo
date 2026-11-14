@@ -112,24 +112,43 @@ public final class Tempo {
 
     /**
      * Runs {@code body} and passes its wall time in nanoseconds to {@code sink}, also when it throws; the
-     * throwable is rethrown unwrapped. Needs no trace: two clock reads, nothing recorded.
+     * body's throwable is rethrown unwrapped. Needs no trace: two clock reads, nothing recorded. A
+     * throwing sink never reaches the caller: its throwable is added as suppressed to the body's, or
+     * dropped when the body completed.
      */
     public static <T, E extends Exception> T time(LongConsumer sink, ThrowingSupplier<T, E> body) throws E {
         long start = SYSTEM_CLOCK.getAsLong();
+        Throwable failed = null;
         try {
             return body.get();
+        } catch (Throwable t) {
+            failed = t;
+            throw t;
         } finally {
-            if (sink != null) sink.accept(SYSTEM_CLOCK.getAsLong() - start);
+            report(sink, start, failed);
         }
     }
 
     /** Like {@link #time(LongConsumer, ThrowingSupplier)} for a body without a result. */
     public static <E extends Exception> void time(LongConsumer sink, ThrowingRunnable<E> body) throws E {
         long start = SYSTEM_CLOCK.getAsLong();
+        Throwable failed = null;
         try {
             body.run();
+        } catch (Throwable t) {
+            failed = t;
+            throw t;
         } finally {
-            if (sink != null) sink.accept(SYSTEM_CLOCK.getAsLong() - start);
+            report(sink, start, failed);
+        }
+    }
+
+    private static void report(LongConsumer sink, long start, Throwable failed) {
+        if (sink == null) return;
+        try {
+            sink.accept(SYSTEM_CLOCK.getAsLong() - start);
+        } catch (Throwable t) {
+            if (failed != null && failed != t) failed.addSuppressed(t);
         }
     }
 
