@@ -25,7 +25,7 @@ import java.util.TreeMap;
  * <p>Rendering the 300-span trace of {@code Rendered} is held to ceilings: the encoder alone
  * ({@code snapshotToHeader}) to its one output String (3,440 characters, 3.5 KB) plus about 2 KB of
  * per-render tables and walk state, measured 5.2 KB; {@code toHeader} adds the copy of the trace that
- * {@code snapshot()} takes, measured 22.6 KB.
+ * {@code snapshot()} takes, measured 22.6 KB. BENCHMARKS.md records the numbers.
  */
 public final class AllocationGate {
 
@@ -34,7 +34,7 @@ public final class AllocationGate {
     static final double HANDOFF = 32;    // B per handoff: exactly one small object
     static final double ENCODE = 6 * 1024, RENDER = 24 * 1024; // B per render of the 300-span trace
     static final String GATED = "span|spanNotInlined|phase|done|setLong|detailDisabled|traceLifecycle"
-            + "|handoff|handoffInline|currentDetailNoTrace|currentDetailCoarse|waited|alwaysOn|folded"
+            + "|handoff|handoffInline|handoffFolded|currentDetailNoTrace|currentDetailCoarse|waited|alwaysOn|folded"
             + "|snapshotToHeader|toHeader";
 
     public static void main(String[] args) throws RunnerException {
@@ -70,7 +70,7 @@ public final class AllocationGate {
                 double gate = e.getKey().equals("toHeader") ? RENDER : ENCODE;
                 ok &= check(e.getKey(), byCycle.get(0), gate, " B/render");
             } else {
-                ok &= check(e.getKey(), byCycle.get(0), PER_OP, " B/op");
+                ok &= check(e.getKey(), byCycle.get(0), e.getKey().startsWith("handoff") ? HANDOFF + PER_OP : PER_OP, " B/op");
             }
         }
         int expected = GATED.split("\\|").length;

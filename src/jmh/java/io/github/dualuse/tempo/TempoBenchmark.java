@@ -36,6 +36,8 @@ public class TempoBenchmark {
 
     static final Tempo.Name ROOT = Tempo.name("bench"), CHILD = Tempo.name("child"), KEY = Tempo.name("key"),
             ALWAYS = Tempo.name("always").aggregate();
+    /** Handoffs count against the budget; the cycling benchmarks record every one of theirs. */
+    static final Tempo.Options UNBUDGETED = new Tempo.Options().budget(Integer.MAX_VALUE);
 
     @State(Scope.Thread)
     public static class Cycling {
@@ -47,7 +49,7 @@ public class TempoBenchmark {
 
         @Setup(Level.Trial)
         public void setUp() {
-            trace = Tempo.start(ROOT);
+            trace = Tempo.start(ROOT, UNBUDGETED);
             root = trace.root();
         }
 
@@ -61,7 +63,7 @@ public class TempoBenchmark {
             if (++used == cycle) {
                 trace.close();
                 trace.release();
-                trace = Tempo.start(ROOT);
+                trace = Tempo.start(ROOT, UNBUDGETED);
                 root = trace.root();
                 used = 0;
             }
@@ -80,7 +82,7 @@ public class TempoBenchmark {
 
         @Setup(Level.Trial)
         public void setUp() {
-            trace = Tempo.start(ROOT);
+            trace = Tempo.start(ROOT, UNBUDGETED);
             root = trace.root();
         }
 
@@ -94,7 +96,7 @@ public class TempoBenchmark {
             if (++used == cycle) {
                 trace.close();
                 trace.release();
-                trace = Tempo.start(ROOT);
+                trace = Tempo.start(ROOT, UNBUDGETED);
                 root = trace.root();
                 used = 0;
             }
@@ -109,7 +111,7 @@ public class TempoBenchmark {
 
         @Setup(Level.Trial)
         public void setUp() {
-            trace = Tempo.start(ROOT);
+            trace = Tempo.start(ROOT, UNBUDGETED);
             root = trace.root();
         }
 
@@ -196,6 +198,15 @@ public class TempoBenchmark {
         s.root().handoff(CHILD).begin().close();
     }
 
+    /**
+     * A handoff past the budget begun and closed on the submitting thread: no row, the one {@code Handoff}
+     * object, the submit counted in its aggregate and the task folded into the lane's share of it.
+     */
+    @Benchmark
+    public void handoffFolded(Folding s) {
+        s.root.handoff(CHILD).begin().close();
+    }
+
     /** Explicit handle, always-on name, COARSE trace: an aggregate-only span (two clock reads, no row). */
     @Benchmark
     public Tempo.Span alwaysOn(Coarse s) {
@@ -261,7 +272,7 @@ public class TempoBenchmark {
                 p.trace.close();
                 p.trace.release();
             }
-            p.trace = Tempo.start(ROOT);
+            p.trace = Tempo.start(ROOT, UNBUDGETED);
             p.used = 0;
         }
         Tempo.Handoff h = p.trace.root().handoff(CHILD);
@@ -329,7 +340,7 @@ public class TempoBenchmark {
 
     @Benchmark
     public void traceLifecycle() {
-        Tempo.Trace t = Tempo.start(ROOT);
+        Tempo.Trace t = Tempo.start(ROOT, UNBUDGETED);
         t.close();
         t.release();
     }

@@ -49,6 +49,7 @@ public final class Tempo {
     static final int PHASE = 1, RETRO = 1 << 1, HANDOFF = 1 << 2, WAIT = 1 << 3, FAILED = 1 << 4,
             CANCELLED = 1 << 5, HEALED = 1 << 6, MISUSE = 1 << 7, DETAIL_ROW = 1 << 8, DEEP_ROW = 1 << 9,
             LEGACY = 1 << 10, TASK = 1 << 11, UNRUN = 1 << 12; // UNRUN: a task cancelled before it began
+    static final int NEVER = 1 << 13; // in an aggregate's flags only: no handoff of it started
 
     // Event kinds, in the low KIND_BITS of an event's key; the rest is a Name id for attributes.
     static final int KIND_BITS = 4, KIND_MASK = (1 << KIND_BITS) - 1,
@@ -279,9 +280,10 @@ public final class Tempo {
         }
 
         /**
-         * {@link #DETAIL} and {@link #DEEP} spans recorded individually per trace, default 512; past it they
-         * fold into aggregates ({@link SpanView#aggregate()}). Lanes take the budget in blocks of
-         * {@code max(1, budget / 64)} and give back what they did not use when their task ends.
+         * {@link #DETAIL} and {@link #DEEP} spans and handoffs recorded individually per trace, default 512;
+         * past it they fold into aggregates ({@link SpanView#aggregate()}), handoffs with their queue waits.
+         * Lanes take the budget in blocks of {@code max(1, budget / 64)} and give back what they did not use
+         * when their task ends.
          */
         public Options budget(int detailSpans) {
             this.budget = Math.max(0, detailSpans);
@@ -382,7 +384,7 @@ public final class Tempo {
         private volatile Totals totals; // created with the first lane-less record
         private volatile int dropped;   // tasks left unrecorded at the lane cap
         private volatile int credits;   // detail budget not handed out to a lane
-        private long[] lost;            // guarded by this: (laneId << 32 | row) of handoffs whose task has no record
+        private long[] lost;            // guarded by this: (laneId << 32 | row, submit) of handoffs whose task has no record
         private int lostCount;
 
         private Context() {
@@ -566,13 +568,21 @@ public final class Tempo {
                     }
                     Aggs a = (Aggs) Lane.AGGS.getAcquire(l);
                     for (int e = 0, n = a == null ? 0 : a.size(); e < n; e++) {
-                        int k = e * Aggs.KEY, b = e * Aggs.CELLS;
+                        int k = e * Aggs.KEY, b = e * Aggs.CELLS, kind = a.keys[k + Aggs.KIND];
                         // as in Shape: not ended yet, or moved under a lap row past the rows read
-                        if (a.keys[k + Aggs.NAME] != id || a.cells[b + Aggs.COUNT] == 0 || a.keys[k] >= rows) continue;
-                        count += a.cells[b + Aggs.COUNT];
-                        sum += a.cells[b + Aggs.SUM];
-                        min = Math.min(min, a.cells[b + Aggs.MIN]);
-                        max = Math.max(max, a.cells[b + Aggs.MAX_DUR]);
+                        if (a.keys[k + Aggs.NAME] != id || a.cells[b + Aggs.COUNT] == 0 || kind == Aggs.TASKS
+                                || kind == Aggs.SPANS && a.keys[k] >= rows) continue;
+                        if (kind != Aggs.UNRUN) { // a folded task that ran, or a span
+                            count += a.cells[b + Aggs.COUNT];
+                            sum += a.cells[b + Aggs.SUM];
+                            min = Math.min(min, a.cells[b + Aggs.MIN]);
+                            max = Math.max(max, a.cells[b + Aggs.MAX_DUR]);
+                        }
+                        if (kind != Aggs.SPANS) { // folded tasks, run or cancelled, waited
+                            waits += a.cells[b + Aggs.COUNT];
+                            waitSum += a.cells[b + Aggs.WAIT_SUM];
+                            waitMax = Math.max(waitMax, a.cells[b + Aggs.WAIT_MAX]);
+                        }
                     }
                 }
             } catch (RuntimeException e) {
@@ -615,21 +625,24 @@ public final class Tempo {
         }
 
         /**
-         * A handoff whose task gets no record: at the lane cap ({@code count}), or at a lane's row, depth or
-         * event cap (counted there). Its row is left out of the tree and its queue wait goes to the aggregate.
+         * A handoff whose task gets no record: at the lane cap ({@code count}), or at a lane's row, depth,
+         * event or aggregate cap (counted there). Its row is left out of the tree, a folded one out of its
+         * aggregate, and its queue wait goes to the trace's aggregate of its name.
          */
         void lost(Handoff h, boolean count) {
             if (count) DROPPED.getAndAdd(this, 1);
-            int name = h.lane.nameAt(h.row);
+            int name = h.row < 0 ? h.lane.taskName(~h.row) : h.lane.nameAt(h.row);
             if (name < 0 || released) return;
             totals().add(name, true, Math.max(0, now() - h.submit));
             synchronized (this) {
                 if (lost == null) lost = new long[8];
                 else if (lostCount == lost.length) lost = Arrays.copyOf(lost, 2 * lostCount);
-                lost[lostCount++] = (long) h.lane.id << 32 | h.row;
+                lost[lostCount++] = (long) h.lane.id << 32 | h.row & 0xFFFF_FFFFL;
+                lost[lostCount++] = h.submit;
             }
         }
 
+        /** Pairs of {@code (laneId << 32 | row, submit)}; a folded handoff's row is {@code ~entry}. */
         synchronized long[] lost() {
             return lost == null ? new long[0] : Arrays.copyOf(lost, lostCount);
         }
@@ -984,10 +997,23 @@ public final class Tempo {
             return (s & KIND) == IDLE && STATE.compareAndSet(this, s, s + EPOCH + ACTIVE);
         }
 
-        /** Writes a closed handoff row under the innermost open span at the submit time. */
+        /**
+         * Writes a closed handoff row under the innermost open span at the submit time, against the budget.
+         * Past it, or inside a folded task (no recorded span to hang from), it writes no row: the submit is
+         * counted in a TASKS aggregate, which the handoff's task folds into.
+         */
         Handoff handoff(Name n, int flags) {
+            if (rowAt[depth - 1] < 0 || credit == 0 && (credit = ctx.credits()) == 0) {
+                int e = entry(n, Aggs.TASKS);
+                if (e < 0) return Handoff.NOOP;
+                long now = ctx.now();
+                aggs.submit(e, now);
+                folded++;
+                return new Handoff(this, ~e, now);
+            }
             int r = row(n, flags | HANDOFF, rowAt[depth - 1]);
             if (r < 0) return Handoff.NOOP;
+            credit--;
             long now = ctx.now();
             closed(r, now, 0);
             publish();
@@ -1002,6 +1028,7 @@ public final class Tempo {
          * null when a cap leaves no room.
          */
         Span task(Handoff h, boolean run) {
+            if (h.row < 0) return foldedTask(h, run);
             boolean root = depth == 0;
             if (root && !activate()) return NOOP;
             int id = h.lane.nameAt(h.row);
@@ -1041,6 +1068,49 @@ public final class Tempo {
             return s;
         }
 
+        /**
+         * The task of a folded handoff, whose TASKS entry is {@code ~h.row} in the submitter's lane. It writes
+         * no row: begun, it is a frame whose occurrence (with its queue wait) ends into this lane's RAN entry
+         * of that TASKS entry; cancelled, a zero-length UNRUN occurrence. Only the owner writes either, and a
+         * render merges them into the TASKS entry. {@link #NOOP} when cancelled or retired, null at a cap.
+         */
+        private Span foldedTask(Handoff h, boolean run) {
+            int d = depth, target = ~h.row;
+            if (d == MAX_DEPTH) {
+                dropped++;
+                return null;
+            }
+            boolean root = d == 0;
+            if (root && !activate()) return NOOP;
+            int id = h.lane.taskName(target);
+            int e = id < 0 ? -1 : aggregate(target, h.lane.id, -1, id, run ? Aggs.RAN : Aggs.UNRUN);
+            if (e < 0) {
+                if (root) idle();
+                return id < 0 ? NOOP : null; // released, or past the aggregate cap (counted)
+            }
+            if (run && root && ctx.cpu()) sampleCpu(0); // before the start, so the read is not timed
+            long now = ctx.now(), wait = Math.max(0, now - h.submit);
+            aggs.submit(e, h.submit);
+            if (!run) {
+                aggs.add(e, h.submit, 0, wait, -1, CANCELLED | UNRUN, true);
+                if (root) idle();
+                return NOOP;
+            }
+            Span s = openFrame(Name.byId(id), e, wait, now);
+            s.folded = true;
+            if (root) {
+                saved = slot.current;
+                slot.current = this;
+            }
+            return s;
+        }
+
+        /** The name id of TASKS entry {@code e} of this lane, from any thread; -1 once the lane is retired. */
+        int taskName(int e) {
+            Aggs a = (Aggs) AGGS.getAcquire(this);
+            return a == null ? -1 : a.keys[e * Aggs.KEY + Aggs.NAME];
+        }
+
         Span openRoot(Name n, int flags) {
             if (!activate()) return NOOP;
             Span h = stack(n, flags);
@@ -1055,7 +1125,9 @@ public final class Tempo {
             return h;
         }
 
+        /** A child span; inside a folded task, which has no row to hang it from, aggregate-only. */
         Span push(Name n, int flags) {
+            if (rowAt[depth - 1] < 0) return frame(n);
             Span h = stack(n, flags);
             if (h != NOOP) start(h);
             return h;
@@ -1066,6 +1138,7 @@ public final class Tempo {
          * a time from the trace; once the trace's budget is spent, folded into the lane's aggregates.
          */
         Span budgeted(Name n, int flags) {
+            if (rowAt[depth - 1] < 0) return frame(n);
             if (credit == 0 && (credit = ctx.credits()) == 0) {
                 Span h = frame(n);
                 if (h != NOOP && h.agg >= 0) { // past the aggregate cap the frame counted a drop
@@ -1090,15 +1163,19 @@ public final class Tempo {
          * (-1 when that is the anchor, else the name of the enclosing aggregate-only span) and its name.
          */
         Span frame(Name n) {
-            int d = depth;
-            if (d == MAX_DEPTH) {
+            if (depth == MAX_DEPTH) {
                 dropped++;
                 return NOOP;
             }
-            int a = d - 1;
-            while (handles[a].row == FRAME) a--;
-            int agg = aggregate(rowAt[d - 1], lapOrdinal(a), a == d - 1 ? -1 : handles[d - 1].frame.id, n.id);
-            rowAt[d] = rowAt[d - 1];
+            Span h = openFrame(n, entry(n, Aggs.SPANS), 0, 0);
+            h.time = ctx.now(); // read last: the bookkeeping is not timed
+            return h;
+        }
+
+        /** Pushes frame {@code n} into aggregate {@code agg}; it started at {@code now}, after a queue wait of {@code wait}. */
+        private Span openFrame(Name n, int agg, long wait, long now) {
+            int d = depth;
+            rowAt[d] = d == 0 ? -1 : rowAt[d - 1]; // -1: a folded task's root, no row below
             depth = d + 1;
             framed = true;
             Span h = handles[d];
@@ -1107,22 +1184,34 @@ public final class Tempo {
             h.frame = n;
             h.agg = agg;
             h.folded = false;
-            h.time = ctx.now();
+            h.flags = 0;
+            h.wait = wait;
+            h.time = now;
             return h;
         }
 
+        /**
+         * The aggregate entry for {@code n} folded on top of the stack: anchored at the nearest recorded span
+         * (-1 in a folded task without one) and its lap, parented by the enclosing aggregate-only span, if any.
+         */
+        private int entry(Name n, int kind) {
+            int d = depth, a = d - 1;
+            while (a >= 0 && handles[a].row == FRAME) a--;
+            return aggregate(rowAt[d - 1], a < 0 ? 0 : lapOrdinal(a), a == d - 1 ? -1 : handles[d - 1].frame.id, n.id, kind);
+        }
+
         /** The entry of an aggregate key, created if new; -1 past {@link Aggs#MAX} entries (counted as a drop). */
-        private int aggregate(int anchor, int lap, int parent, int name) {
+        private int aggregate(int anchor, int lap, int parent, int name, int kind) {
             Aggs a = aggs;
             if (a == null) AGGS.setRelease(this, a = new Aggs(8));
-            int e = a.find(anchor, lap, parent, name);
+            int e = a.find(anchor, lap, parent, name, kind);
             if (e >= 0) return e;
             if (a.size() == Aggs.MAX) {
                 dropped++;
                 return -1;
             }
             if (a.full()) AGGS.setRelease(this, a = a.grow());
-            return a.create(anchor, lap, parent, name);
+            return a.create(anchor, lap, parent, name, kind);
         }
 
         int aggregates() {
@@ -1239,7 +1328,7 @@ public final class Tempo {
             if (h.row == FRAME) {
                 long start = h.time, dur = Math.max(0, now - start), cpu = cpuSince(k);
                 h.time = dur;
-                if (h.agg >= 0) aggs.add(h.agg, start, dur, cpu, h.folded);
+                if (h.agg >= 0) aggs.add(h.agg, start - h.wait, dur, h.wait, cpu, h.flags, h.folded);
                 return heal;
             }
             int r = h.row;
@@ -1576,15 +1665,24 @@ public final class Tempo {
     }
 
     /**
-     * The aggregates of one lane: its folded and aggregate-only spans, keyed by (anchor row, lap ordinal,
-     * parent, name) where the parent is -1 for the anchor itself or the name of an enclosing aggregate-only
-     * span. The owner appends entries and updates them in place; a reader takes the size with acquire and
-     * reads the entries below it, exact once the lane is idle and best effort while it records.
+     * The aggregates of one lane, keyed by (anchor row, lap ordinal, parent, name, kind) where the parent is
+     * -1 for the anchor itself or the name of an enclosing aggregate-only span. {@code SPANS} hold folded
+     * and aggregate-only spans. A handoff past the budget is a {@code TASKS} entry where it was submitted,
+     * which counts the submits; its tasks are occurrences in the lane that runs ({@code RAN}) or cancels
+     * ({@code UNRUN}) them, in an entry keyed by the {@code TASKS} entry instead: ANCHOR is its index, LAP
+     * its lane. So every entry has one writer, the owner, and a render merges the occurrences into their
+     * {@code TASKS} entry. The owner appends entries and updates them in place; a reader takes the size
+     * with acquire and reads the entries below it, exact once the lane is idle and best effort while it records.
      */
     static final class Aggs {
-        static final int MAX = 4096, KEY = 4, ANCHOR = 0, LAP = 1, PARENT = 2, NAME = 3;
-        static final int CELLS = 9, COUNT = 0, SUM = 1, MIN = 2, MAX_DUR = 3, FIRST = 4, LAST = 5, MAX_AT = 6, CPU = 7,
-                FOLDED = 8; // occurrences folded for want of budget; the rest were aggregate-only
+        static final int MAX = 4096, KEY = 5, ANCHOR = 0, LAP = 1, PARENT = 2, NAME = 3, KIND = 4;
+        static final int SPANS = 0, TASKS = 1, RAN = 2, UNRUN = 3;
+        // Over the ended occurrences; a handoff's starts at its submit and ends at submit + wait + duration.
+        static final int CELLS = 15, COUNT = 0, SUM = 1, MIN = 2, MAX_DUR = 3, FIRST = 4, LAST = 5, MAX_AT = 6, CPU = 7,
+                FOLDED = 8,     // occurrences folded for want of budget; the rest were aggregate-only
+                WAIT_SUM = 9, WAIT_MAX = 10,
+                FLAGS = 11,     // the flags every occurrence has
+                SUBMITS = 12, SUBMIT_SUM = 13, SUBMIT_FIRST = 14; // handoffs submitted (TASKS), begun (RAN) or cancelled (UNRUN)
         private static final VarHandle SIZE;
 
         static {
@@ -1615,23 +1713,26 @@ public final class Tempo {
             return size == keys.length / KEY;
         }
 
-        int find(int anchor, int lap, int parent, int name) {
+        int find(int anchor, int lap, int parent, int name, int kind) {
             int mask = index.length - 1;
-            for (int i = hash(anchor, lap, parent, name) & mask; ; i = (i + 1) & mask) {
+            for (int i = hash(anchor, lap, parent, name, kind) & mask; ; i = (i + 1) & mask) {
                 int e = index[i] - 1, k = e * KEY;
                 if (e < 0) return -1;
-                if (keys[k] == anchor && keys[k + LAP] == lap && keys[k + PARENT] == parent && keys[k + NAME] == name) return e;
+                if (keys[k] == anchor && keys[k + LAP] == lap && keys[k + PARENT] == parent && keys[k + NAME] == name
+                        && keys[k + KIND] == kind) return e;
             }
         }
 
-        int create(int anchor, int lap, int parent, int name) {
-            int e = size, k = e * KEY, b = e * CELLS;
+        int create(int anchor, int lap, int parent, int name, int kind) {
+            int e = size, k = e * KEY;
             keys[k] = anchor;
             keys[k + LAP] = lap;
             keys[k + PARENT] = parent;
             keys[k + NAME] = name;
-            cells[b + COUNT] = cells[b + SUM] = cells[b + MAX_AT] = cells[b + FOLDED] = 0;
-            cells[b + MIN] = cells[b + FIRST] = Long.MAX_VALUE;
+            keys[k + KIND] = kind;
+            int b = e * CELLS;
+            Arrays.fill(cells, b, b + CELLS, 0L);
+            cells[b + MIN] = cells[b + FIRST] = cells[b + SUBMIT_FIRST] = Long.MAX_VALUE;
             cells[b + MAX_DUR] = cells[b + LAST] = Long.MIN_VALUE;
             cells[b + CPU] = -1;
             index(e);
@@ -1640,7 +1741,8 @@ public final class Tempo {
         }
 
         private void index(int e) {
-            int k = e * KEY, mask = index.length - 1, i = hash(keys[k], keys[k + LAP], keys[k + PARENT], keys[k + NAME]) & mask;
+            int k = e * KEY, mask = index.length - 1;
+            int i = hash(keys[k], keys[k + LAP], keys[k + PARENT], keys[k + NAME], keys[k + KIND]) & mask;
             while (index[i] != 0) i = (i + 1) & mask;
             index[i] = e + 1;
         }
@@ -1655,9 +1757,11 @@ public final class Tempo {
             return a;
         }
 
-        void add(int e, long start, long dur, long cpu, boolean folded) {
+        /** One occurrence: from {@code start} (a handoff's submit), it waited {@code wait} and ran {@code dur}. */
+        void add(int e, long start, long dur, long wait, long cpu, int flags, boolean folded) {
             long[] c = cells;
             int b = e * CELLS;
+            c[b + FLAGS] = c[b + COUNT] == 0 ? flags : c[b + FLAGS] & flags;
             c[b + SUM] += dur;
             if (dur < c[b + MIN]) c[b + MIN] = dur;
             if (dur > c[b + MAX_DUR]) {
@@ -1665,10 +1769,40 @@ public final class Tempo {
                 c[b + MAX_AT] = start;
             }
             if (start < c[b + FIRST]) c[b + FIRST] = start;
-            if (start + dur > c[b + LAST]) c[b + LAST] = start + dur;
+            if (start + wait + dur > c[b + LAST]) c[b + LAST] = start + wait + dur;
             if (cpu >= 0) c[b + CPU] = c[b + CPU] < 0 ? cpu : c[b + CPU] + cpu;
             if (folded) c[b + FOLDED]++;
+            c[b + WAIT_SUM] += wait;
+            if (wait > c[b + WAIT_MAX]) c[b + WAIT_MAX] = wait;
             c[b + COUNT]++;
+        }
+
+        /** A handoff submitted (TASKS), begun (RAN) or cancelled (UNRUN) at {@code submit}. */
+        void submit(int e, long submit) {
+            long[] c = cells;
+            int b = e * CELLS;
+            c[b + SUBMITS]++;
+            c[b + SUBMIT_SUM] += submit;
+            if (submit < c[b + SUBMIT_FIRST]) c[b + SUBMIT_FIRST] = submit;
+        }
+
+        /** Adds the occurrences of the entry at {@code a} in {@code q} to the one at {@code b} in {@code c}. */
+        static void combine(long[] c, int b, long[] q, int a) {
+            if (q[a + COUNT] == 0) return;
+            c[b + FLAGS] = c[b + COUNT] == 0 ? q[a + FLAGS] : c[b + FLAGS] & q[a + FLAGS];
+            c[b + COUNT] += q[a + COUNT];
+            c[b + SUM] += q[a + SUM];
+            c[b + MIN] = Math.min(c[b + MIN], q[a + MIN]);
+            if (q[a + MAX_DUR] > c[b + MAX_DUR] || q[a + MAX_DUR] == c[b + MAX_DUR] && q[a + MAX_AT] < c[b + MAX_AT]) {
+                c[b + MAX_DUR] = q[a + MAX_DUR];
+                c[b + MAX_AT] = q[a + MAX_AT];
+            }
+            c[b + FIRST] = Math.min(c[b + FIRST], q[a + FIRST]);
+            c[b + LAST] = Math.max(c[b + LAST], q[a + LAST]);
+            if (q[a + CPU] >= 0) c[b + CPU] = c[b + CPU] < 0 ? q[a + CPU] : c[b + CPU] + q[a + CPU];
+            c[b + FOLDED] += q[a + FOLDED];
+            c[b + WAIT_SUM] += q[a + WAIT_SUM];
+            c[b + WAIT_MAX] = Math.max(c[b + WAIT_MAX], q[a + WAIT_MAX]);
         }
 
         /**
@@ -1677,12 +1811,12 @@ public final class Tempo {
          */
         void reanchor(int from, int anchor, int lap, int row) {
             for (int e = from, k = from * KEY; e < size; e++, k += KEY) {
-                if (keys[k] == anchor && keys[k + LAP] == lap) keys[k] = row;
+                if (keys[k] == anchor && keys[k + LAP] == lap && keys[k + KIND] <= TASKS) keys[k] = row;
             }
         }
 
-        private static int hash(int anchor, int lap, int parent, int name) {
-            int h = ((anchor * 31 + lap) * 31 + parent) * 31 + name;
+        private static int hash(int anchor, int lap, int parent, int name, int kind) {
+            int h = (((anchor * 31 + lap) * 31 + parent) * 31 + name) * 31 + kind;
             h *= 0x9E3779B9;
             return h ^ (h >>> 16);
         }
@@ -1707,8 +1841,10 @@ public final class Tempo {
         String[] label;             // by row; null in a lane without labels
         long[] link, wait;          // XPARENT and QWAIT by row; null in a lane without tasks
         long[] cpu;                 // CPU by row, -1 where not measured; null in a lane without
-        final int[] aggKey;         // Aggs.KEY ints per aggregate that has ended at least once
-        final long[] aggCell;       // Aggs.CELLS longs per aggregate
+        static final int NONE = -1, MIXED = -2;
+        final int[] aggKey;         // Aggs.KEY ints per aggregate entry of the lane
+        final long[] aggCell;       // Aggs.CELLS longs per entry; a TASKS entry's with its occurrences merged
+        int[] aggThread;            // by TASKS entry: the lane that ran its occurrences, NONE or MIXED; null if none ran
         int[] bodyLane, bodyRow;    // by handoff row: the task row linked to it, or -1
         boolean[] hidden;           // not in its parent's child list: a task drawn at its handoff, or a lost handoff
         int[] first, next;          // child lists over the nodes: rows, a virtual parent of the lane roots, aggregates
@@ -1788,18 +1924,73 @@ public final class Tempo {
             }
 
             Aggs a = (Aggs) Lane.AGGS.getAcquire(l);
-            int n = a == null ? 0 : a.size(), kept = 0;
-            aggKey = new int[n * Aggs.KEY];
-            aggCell = new long[n * Aggs.CELLS];
-            for (int e = 0; e < n; e++) {
-                int k = e * Aggs.KEY, b = e * Aggs.CELLS;
-                // not ended yet, or (in a live copy) moved under a lap row this copy does not have
-                if (a.cells[b + Aggs.COUNT] == 0 || a.keys[k] >= rows) continue;
-                System.arraycopy(a.keys, k, aggKey, kept * Aggs.KEY, Aggs.KEY);
-                System.arraycopy(a.cells, b, aggCell, kept * Aggs.CELLS, Aggs.CELLS);
-                kept++;
+            aggs = a == null ? 0 : a.size(); // all of them, so a RAN or UNRUN entry finds its TASKS entry by index
+            aggKey = new int[aggs * Aggs.KEY];
+            aggCell = new long[aggs * Aggs.CELLS];
+            if (aggs > 0) {
+                System.arraycopy(a.keys, 0, aggKey, 0, aggKey.length);
+                System.arraycopy(a.cells, 0, aggCell, 0, aggCell.length);
             }
-            aggs = kept;
+        }
+
+        /**
+         * Whether aggregate {@code e} is a node of the tree: a SPANS or TASKS entry with an occurrence, not
+         * (in a live copy) moved under a lap row this copy does not have. RAN and UNRUN entries are merged.
+         */
+        boolean shown(int e) {
+            int k = e * Aggs.KEY;
+            return aggKey[k + Aggs.KIND] <= Aggs.TASKS && aggCell[e * Aggs.CELLS + Aggs.COUNT] > 0 && aggKey[k] < rows;
+        }
+
+        /** The lane that ran the occurrences of aggregate {@code e}: its own for spans, else NONE or MIXED. */
+        int threadOf(int e) {
+            return aggKey[e * Aggs.KEY + Aggs.KIND] != Aggs.TASKS ? lane : aggThread == null ? NONE : aggThread[e];
+        }
+
+        /** Takes a handoff submitted at {@code submit} whose task has no record out of TASKS entry {@code t}. */
+        void unsubmit(int t, long submit) {
+            aggCell[t * Aggs.CELLS + Aggs.SUBMITS]--;
+            aggCell[t * Aggs.CELLS + Aggs.SUBMIT_SUM] -= submit;
+        }
+
+        /** Adds the occurrences of RAN or UNRUN entry {@code e} of {@code from} to TASKS entry {@code t} of this. */
+        void merge(int t, Shape from, int e) {
+            int b = t * Aggs.CELLS, a = e * Aggs.CELLS;
+            long[] c = aggCell, q = from.aggCell;
+            c[b + Aggs.SUBMITS] -= q[a + Aggs.SUBMITS]; // what is left never started
+            c[b + Aggs.SUBMIT_SUM] -= q[a + Aggs.SUBMIT_SUM];
+            if (q[a + Aggs.COUNT] == 0) return; // begun, still open
+            Aggs.combine(c, b, q, a);
+            if (from.aggKey[e * Aggs.KEY + Aggs.KIND] != Aggs.RAN) return;
+            if (aggThread == null) Arrays.fill(aggThread = new int[aggs], NONE);
+            aggThread[t] = aggThread[t] == NONE || aggThread[t] == from.lane ? from.lane : MIXED;
+        }
+
+        /**
+         * Adds the handoffs of each TASKS entry that never started: no duration, waiting from their submit
+         * until {@code now}. Their submit times are known as a sum only, so the longest wait, and the start
+         * if it is the aggregate's, are those of the first submit of the entry: exact when none of its
+         * handoffs started, at most that otherwise.
+         */
+        void settle(long now) {
+            for (int t = 0; t < aggs; t++) {
+                int b = t * Aggs.CELLS;
+                long[] c = aggCell;
+                long n = c[b + Aggs.SUBMITS], first = c[b + Aggs.SUBMIT_FIRST];
+                if (aggKey[t * Aggs.KEY + Aggs.KIND] != Aggs.TASKS || n <= 0) continue;
+                c[b + Aggs.FLAGS] = c[b + Aggs.COUNT] == 0 ? UNRUN | NEVER : c[b + Aggs.FLAGS] & (UNRUN | NEVER);
+                c[b + Aggs.COUNT] += n;
+                c[b + Aggs.FOLDED] += n;
+                c[b + Aggs.MIN] = 0;
+                if (c[b + Aggs.MAX_DUR] < 0) {
+                    c[b + Aggs.MAX_DUR] = 0;
+                    c[b + Aggs.MAX_AT] = first;
+                }
+                c[b + Aggs.FIRST] = Math.min(c[b + Aggs.FIRST], first);
+                c[b + Aggs.LAST] = Math.max(c[b + Aggs.LAST], now);
+                c[b + Aggs.WAIT_SUM] += n * now - c[b + Aggs.SUBMIT_SUM];
+                c[b + Aggs.WAIT_MAX] = Math.max(c[b + Aggs.WAIT_MAX], now - first);
+            }
         }
 
         /** Start of a row (of an inline handoff, its task's), or the first start of an aggregate node. */
@@ -1871,22 +2062,24 @@ public final class Tempo {
                 else first[p] = r;
                 last[p] = r;
             }
-            for (int e = 0; e < aggs; e++) attach(rows + 1 + e, aggregateParent(e));
+            for (int e = 0; e < aggs; e++) if (shown(e)) attach(rows + 1 + e, aggregateParent(e));
         }
 
         /**
          * The anchor row, or for an aggregate nested in another aggregate-only span the earlier aggregate
          * of that name under the same anchor and lap (created when that span opened, so before this one).
+         * Without an anchor (folded in a folded task) it is a top-level node of the lane.
          */
         private int aggregateParent(int e) {
             int k = e * Aggs.KEY, outer = aggKey[k + Aggs.PARENT];
             for (int f = 0; outer >= 0 && f < e; f++) {
                 int j = f * Aggs.KEY;
-                if (aggKey[j + Aggs.NAME] == outer && aggKey[j] == aggKey[k] && aggKey[j + Aggs.LAP] == aggKey[k + Aggs.LAP]) {
+                if (aggKey[j + Aggs.NAME] == outer && aggKey[j] == aggKey[k] && aggKey[j + Aggs.LAP] == aggKey[k + Aggs.LAP]
+                        && shown(f)) {
                     return rows + 1 + f;
                 }
             }
-            return aggKey[k];
+            return aggKey[k] < 0 ? rows : aggKey[k];
         }
 
         private void attach(int x, int p) {
@@ -1957,11 +2150,17 @@ public final class Tempo {
             totals = ctx.frozenTotals();
             misuses = ctx.misuses.get();
             dropped = ctx.dropped();
-            folded = ctx.folded();
-            for (long x : ctx.lost()) {
-                Shape s = shape(x);
-                if (s != null && (int) x < s.rows) s.hide((int) x);
+            int lostFolded = 0;
+            long[] lost = ctx.lost();
+            for (int i = 0; i < lost.length; i += 2) {
+                Shape s = shape(lost[i]);
+                int r = (int) lost[i];
+                if (r < 0) lostFolded++; // counted as dropped, not folded
+                if (s == null) continue;
+                if (r >= 0 && r < s.rows) s.hide(r);
+                else if (r < 0 && ~r < s.aggs) s.unsubmit(~r, lost[i + 1]);
             }
+            folded = ctx.folded() - lostFolded;
             // A task whose handoff row is not visible (a live render racing the submit) is left out.
             for (Shape s : shapes) {
                 if (s == null || s.link == null) continue;
@@ -1974,7 +2173,20 @@ public final class Tempo {
                     if (t != null && h < t.rows && (t.flags[h] & HANDOFF) != 0) t.link(h, s.lane, r);
                 }
             }
-            for (Shape s : shapes) if (s != null) s.tree();
+            // The tasks of folded handoffs, kept where they ran or were cancelled, join their TASKS entry.
+            for (Shape s : shapes) {
+                for (int e = 0; s != null && e < s.aggs; e++) {
+                    int k = e * Aggs.KEY, target = s.aggKey[k];
+                    if (s.aggKey[k + Aggs.KIND] < Aggs.RAN) continue;
+                    Shape t = shape((long) s.aggKey[k + Aggs.LAP] << 32);
+                    if (t != null && target < t.aggs && t.aggKey[target * Aggs.KEY + Aggs.KIND] == Aggs.TASKS) t.merge(target, s, e);
+                }
+            }
+            for (Shape s : shapes) {
+                if (s == null) continue;
+                s.settle(now);
+                s.tree();
+            }
         }
 
         /**
@@ -1988,8 +2200,10 @@ public final class Tempo {
 
         /**
          * Visits every span in pre-order with a reused, read-only view: the lane roots of each lane, by
-         * lane id, are the top level. Spans open when the snapshot was taken are clamped to that instant.
-         * Aggregates ({@link SpanView#aggregate()}) come among their parent's children in start order.
+         * lane id, are the top level, with the aggregates of spans folded in a folded task begun outside
+         * the trace, which have no recorded span to hang from. Spans open when the snapshot was taken are
+         * clamped to that instant. Aggregates ({@link SpanView#aggregate()}) come among their parent's
+         * children in start order; those of folded handoffs gather the tasks from every thread.
          */
         public void forEachSpan(SpanVisitor visitor) {
             SpanView v = new SpanView();
@@ -2045,18 +2259,23 @@ public final class Tempo {
             v.attrFrom = v.attrTo = v.subFrom = v.subTo = 0;
             v.shape = v.subShape = s;
             v.live = s.live;
-            v.inline = false;
+            v.inline = v.mixed = false;
             v.row = r > s.rows ? -1 : r;
             if (r > s.rows) {
-                int k = (r - s.rows - 1) * Aggs.KEY, b = (r - s.rows - 1) * Aggs.CELLS;
+                int e = r - s.rows - 1, k = e * Aggs.KEY, b = e * Aggs.CELLS, t = s.threadOf(e), f;
                 long[] c = s.aggCell;
                 v.name = Name.byId(s.aggKey[k + Aggs.NAME]);
                 v.start = c[b + Aggs.FIRST];
                 v.duration = c[b + Aggs.SUM];
                 v.cpu = c[b + Aggs.CPU];
-                v.open = v.handoff = v.begun = false;
-                v.flags = 0;
-                v.wait = 0;
+                v.open = false;
+                v.handoff = s.aggKey[k + Aggs.KIND] == Aggs.TASKS;
+                v.flags = (f = (int) c[b + Aggs.FLAGS]) & ~NEVER;
+                v.begun = v.handoff && (f & NEVER) == 0;
+                if (t >= 0) v.shape = shapes[t];
+                v.mixed = t == Shape.MIXED;
+                v.wait = c[b + Aggs.WAIT_SUM];
+                v.waitMax = c[b + Aggs.WAIT_MAX];
                 v.aggregate = true;
                 v.count = c[b + Aggs.COUNT];
                 v.folded = c[b + Aggs.FOLDED];
@@ -2082,7 +2301,7 @@ public final class Tempo {
             v.handoff = handoff;
             v.begun = begun;
             v.inline = begun && s.inline(r);
-            v.wait = begun ? (b.wait == null ? 0 : b.wait[br]) : handoff ? Math.max(0, now - v.start) : 0;
+            v.wait = v.waitMax = begun ? (b.wait == null ? 0 : b.wait[br]) : handoff ? Math.max(0, now - v.start) : 0;
             v.cpu = b.cpu == null || handoff && !begun ? -1 : b.cpu[br];
             v.label = b.label == null ? null : b.label[br];
             v.attrFrom = b.from[br];
@@ -2126,13 +2345,21 @@ public final class Tempo {
                     min = Math.min(min, d);
                     max = Math.max(max, d);
                 }
-                for (int e = 0; e < s.aggs; e++) {
-                    if (s.aggKey[e * Aggs.KEY + Aggs.NAME] != id) continue;
-                    int b = e * Aggs.CELLS;
-                    count += s.aggCell[b + Aggs.COUNT];
-                    sum += s.aggCell[b + Aggs.SUM];
-                    min = Math.min(min, s.aggCell[b + Aggs.MIN]);
-                    max = Math.max(max, s.aggCell[b + Aggs.MAX_DUR]);
+                for (int e = 0; e < s.aggs; e++) { // as Trace.aggregate: never-started tasks have no wait yet
+                    int k = e * Aggs.KEY, b = e * Aggs.CELLS, kind = s.aggKey[k + Aggs.KIND];
+                    if (s.aggKey[k + Aggs.NAME] != id || s.aggCell[b + Aggs.COUNT] == 0 || kind == Aggs.TASKS
+                            || kind == Aggs.SPANS && s.aggKey[k] >= s.rows) continue;
+                    if (kind != Aggs.UNRUN) {
+                        count += s.aggCell[b + Aggs.COUNT];
+                        sum += s.aggCell[b + Aggs.SUM];
+                        min = Math.min(min, s.aggCell[b + Aggs.MIN]);
+                        max = Math.max(max, s.aggCell[b + Aggs.MAX_DUR]);
+                    }
+                    if (kind != Aggs.SPANS) {
+                        waits += s.aggCell[b + Aggs.COUNT];
+                        waitSum += s.aggCell[b + Aggs.WAIT_SUM];
+                        waitMax = Math.max(waitMax, s.aggCell[b + Aggs.WAIT_MAX]);
+                    }
                 }
             }
             return Totals.merge(totals, id, count, sum, min, max, waits, waitSum, waitMax);
@@ -2319,10 +2546,12 @@ public final class Tempo {
     /**
      * Writes a {@link Snapshot} as a {@code Tempo-Timing} v1 value in the canonical form of FORMAT.md §7.
      * Two walks over the stitched tree: the first numbers the threads and names the records use, the
-     * second writes the records into the one builder. Records deeper than {@link #maxDepth}, and the
-     * aggregates of aggregate-only spans nested in others (the wire has no children under an aggregate),
-     * are left out with their subtrees and counted as dropped, like a non-finite attribute value. Every
-     * occurrence in an aggregate on the wire counts as folded (FORMAT.md §4), as do folded spans still open.
+     * second writes the records into the one builder. Records deeper than {@link #maxDepth}, the
+     * aggregates of aggregate-only spans nested in others (the wire has no children under an aggregate)
+     * and the lane-level nodes besides the root (aggregates of a folded task that had no recorded span to
+     * hang them from) are left out with their subtrees and counted as dropped, like a non-finite attribute
+     * value. Every occurrence in an aggregate on the wire counts as folded (FORMAT.md §4), as do folded
+     * spans and tasks still open.
      */
     static final class Header implements SpanVisitor {
         static final int MAX_DEPTH = 35, MIN_BYTES = 256;
@@ -2459,7 +2688,7 @@ public final class Tempo {
             } else {
                 written += v.count;
             }
-            if (!unrun(v)) laneIndex[v.shape.lane] = 1;
+            if (!unrun(v) && !v.mixed) laneIndex[v.shape.lane] = 1;
             if (nameIndex[v.name.id] <= 0) number(v.name.id);
             for (int i = 0, n = attributes ? v.attributes() : 0; i < n; i++) {
                 if (!first(v, i)) continue;
@@ -2488,10 +2717,14 @@ public final class Tempo {
             long start = us(v.start + (v.inline ? v.wait : 0) - rootStart), delta = Math.max(0, start - cur[d]);
             cur[d] = cur[d + 1] = cur[d] + delta;
             b36(b36(b36(b.append(DIGITS[d]), nameIndex[v.name.id] - 1).append('.'), delta).append('.'), us(v.duration));
-            int thread = d == 0 ? 0 : unrun(v) ? threadAt[d - 1] : laneIndex[v.shape.lane] - 1;
+            int thread = d == 0 ? 0 : unrun(v) || v.mixed ? threadAt[d - 1] : laneIndex[v.shape.lane] - 1;
             threadAt[d] = thread;
-            if (d > 0 && thread != threadAt[d - 1]) b36(b.append('@'), thread);
-            if (v.handoff && !v.aggregate && !v.inline) b36(b.append('~'), us(v.wait));
+            if (v.mixed) b.append("@_");
+            else if (d > 0 && thread != threadAt[d - 1]) b36(b.append('@'), thread);
+            if (v.aggregate ? v.handoff : v.handoff && !v.inline) {
+                b36(b.append('~'), us(v.wait));
+                if (v.aggregate) b36(b.append('.'), us(v.waitMax));
+            }
             if (v.cpu >= 0) b36(b.append('*'), us(v.cpu));
             if (v.aggregate) {
                 b36(b36(b36(b.append('+'), v.count).append('.'), us(v.min)).append('.'), us(v.max));
@@ -2517,7 +2750,10 @@ public final class Tempo {
             }
         }
 
-        /** A task cancelled before it began: no thread ran it, so it sits on its parent's (FORMAT.md §6.5). */
+        /**
+         * A task cancelled before it began, or an aggregate of such tasks and tasks never started: no thread
+         * ran it, so it sits on its parent's (FORMAT.md §6.5).
+         */
         private static boolean unrun(SpanView v) {
             return (v.flags & UNRUN) != 0;
         }
@@ -2885,10 +3121,12 @@ public final class Tempo {
         final Context ctx;
         final Thread owner;
         final int depth;
-        int row;    // Lane.FRAME for an aggregate-only span, which has the next three
+        int row;    // Lane.FRAME for an aggregate-only span, which has the next six
         Name frame;
         int agg;    // its entry in the lane's aggregates, or -1
         boolean folded; // folded for want of budget, not aggregate-only
+        int flags;  // flags set while open, kept where every occurrence of the aggregate has them
+        long wait;  // the queue wait of a folded task
         long time;  // start while open, then duration
 
         Span(Lane lane, Context ctx, int depth) {
@@ -2898,7 +3136,10 @@ public final class Tempo {
             this.depth = depth;
         }
 
-        /** Opens a child span; always recorded. Its parent is the innermost open span of this lane. */
+        /**
+         * Opens a child span; always recorded, but in a folded task begun outside the trace, which has no
+         * row to hang it from, aggregate-only. Its parent is the innermost open span of this lane.
+         */
         public Span span(Name name) {
             return open(name, 0);
         }
@@ -2918,8 +3159,9 @@ public final class Tempo {
          * always-on ({@link Name#aggregate()}, {@link Name#sink}, {@link Trace#on}): then aggregate-only.
          * A folded or aggregate-only span writes no row: it times itself into an aggregate of its lane
          * (see {@link SpanView#aggregate()}), {@link Trace#aggregate(Name)} and the listeners. Spans opened
-         * inside it are recorded under its nearest recorded ancestor; flags, attributes and phases on it
-         * are ignored, {@link #cpu()} adds to the aggregate's CPU time.
+         * inside it are recorded under its nearest recorded ancestor; attributes and phases on it are
+         * ignored, flags set while it is open show on the aggregate if every occurrence has them, and
+         * {@link #cpu()} adds to the aggregate's CPU time.
          */
         public Span detail(Name name) {
             if (ctx.level < DETAIL) return name != null && (name.marked || ctx.on != null) ? below(name) : NOOP;
@@ -3090,7 +3332,10 @@ public final class Tempo {
         /**
          * Records the submit of a task to another thread: a handoff entry under the innermost open span,
          * and the handle the task {@link Handoff#begin() begins} with. Allocates that one small object.
-         * Always recorded, whatever the level; guard with {@link #detailed()} where handoffs are detail.
+         * Recorded whatever the level (guard with {@link #detailed()} where handoffs are detail), but against
+         * the budget ({@link Options#budget}): past it the handoff writes no entry and its task, wherever it
+         * runs, folds into an aggregate under this span that keeps the queue waits, the thread or that there
+         * were several, and the flags all its tasks share. Attributes on a folded handoff are ignored.
          */
         public Handoff handoff(Name name) {
             if (!live()) return Handoff.NOOP;
@@ -3118,7 +3363,9 @@ public final class Tempo {
         }
 
         private Span flag(int bits) {
-            if (owned() && row != Lane.FRAME) lane.flag(row, bits);
+            if (!owned()) return this;
+            if (row != Lane.FRAME) lane.flag(row, bits);
+            else if (depth < lane.depth) flags |= bits; // an open frame: its aggregate shows what all occurrences had
             return this;
         }
 
@@ -3182,9 +3429,9 @@ public final class Tempo {
         int id, parent, depth, flags, attrFrom, attrTo, subFrom, subTo;
         Name name;
         String label;
-        long start, duration, wait, cpu, count, min, max, extent, maxAt;
+        long start, duration, wait, waitMax, cpu, count, min, max, extent, maxAt;
         long folded; // of count, the occurrences folded for want of budget
-        boolean open, live, handoff, begun, aggregate;
+        boolean open, live, handoff, begun, aggregate, mixed;
         // A handoff run inline (caller-runs): begun on the submitting thread under the handoff's parent before
         // that thread recorded anything else; never a task cancelled or rejected before it began.
         boolean inline;
@@ -3211,8 +3458,10 @@ public final class Tempo {
         public long durationNanos() { return duration; }
 
         /**
-         * Spans of one name folded into one entry: aggregate-only spans and detail spans past the budget,
-         * per lane, anchor and lap. Its start is the first occurrence's; it has no flags and no attributes.
+         * Spans of one name folded into one entry, per parent and lap: aggregate-only spans and detail spans
+         * past the budget, per lane; or the tasks of handoffs past the budget, from whichever threads ran
+         * them, which make it a {@link #handoff()} with queue waits. Its start is the first occurrence's (a
+         * handoff's submit), its flags those every occurrence has; it has no attributes.
          */
         public boolean aggregate() { return aggregate; }
 
@@ -3236,11 +3485,17 @@ public final class Tempo {
          */
         public boolean handoff() { return handoff; }
 
-        /** A handoff whose task has not begun (yet): no thread ran it, nor cancelled it. */
+        /** A handoff whose task has not begun (yet): no thread ran it, nor cancelled it; for an aggregate, none. */
         public boolean neverStarted() { return handoff && !begun; }
 
-        /** Queue wait of a handoff, submit to begin (or cancel); still counting if it never started. 0 for other spans. */
+        /**
+         * Queue wait of a handoff, submit to begin (or cancel); still counting if it never started. For an
+         * aggregate of handoffs the sum over its occurrences. 0 for other spans.
+         */
         public long waitNanos() { return wait; }
+
+        /** The longest queue wait of an aggregate of handoffs; for a handoff its wait. */
+        public long waitMaxNanos() { return waitMax; }
 
         public boolean open() { return open; }
 
@@ -3284,8 +3539,14 @@ public final class Tempo {
             return (flags & DEEP_ROW) != 0 ? DEEP : (flags & DETAIL_ROW) != 0 ? DETAIL : COARSE;
         }
 
-        /** The thread that ran the span; for a handoff that never started, the submitting thread. */
-        public String thread() { return shape.thread; }
+        /**
+         * The thread that ran the span; for a handoff that never started, the submitting thread; null for an
+         * aggregate whose occurrences ran on several threads ({@link #mixedThreads()}).
+         */
+        public String thread() { return mixed ? null : shape.thread; }
+
+        /** An aggregate whose occurrences ran on more than one thread. */
+        public boolean mixedThreads() { return mixed; }
 
         /** Attributes; a handoff has those set at submit ({@link Handoff#set}) first, then its task's. */
         public int attributes() { return (subTo - subFrom) + (attrTo - attrFrom); }
@@ -3360,8 +3621,11 @@ public final class Tempo {
          * Starts the task on the calling thread and returns its span, which the task closes; the queue
          * wait since the submit is recorded with it. On a thread already inside the trace (the task runs
          * inline) the span is a child of that thread's innermost open span, otherwise the root of the
-         * thread's lane, and {@link Tempo#current()} returns it until it closes. {@link Tempo#NOOP} after
-         * release, past the lane cap, and on a second begin or a begin after cancel (both misuse).
+         * thread's lane, and {@link Tempo#current()} returns it until it closes. For a handoff past the budget
+         * it is aggregate-only (see {@link Span#detail}): its duration and wait go to the handoff's aggregate,
+         * and spans opened in it, with no row to hang from on a thread outside the trace, are aggregate-only
+         * too. {@link Tempo#NOOP} after release, past the lane cap, and on a second begin or a begin after
+         * cancel (both misuse).
          */
         public Span begin() {
             if (!claim(BEGUN)) return Tempo.NOOP;
@@ -3380,7 +3644,7 @@ public final class Tempo {
 
         /** Attaches a number to the handoff at submit, e.g. the executor's queue length. Submitting thread only. */
         public Handoff set(Name key, long value) {
-            if (lane == null) return this;
+            if (lane == null || row < 0) return this; // folded: no entry to attach it to
             if (Thread.currentThread() == lane.owner) lane.event(row, lane.ctx.key(key) << KIND_BITS | ATTR_LONG, value);
             else lane.ctx.misuse("handoff set on a foreign thread");
             return this;

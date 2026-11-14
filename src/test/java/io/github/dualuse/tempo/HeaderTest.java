@@ -322,6 +322,39 @@ class HeaderTest {
         assertEquals(10L, WireDecoder.decode(h).get("folded"));
     }
 
+    /** A folded task still open at the render is in no aggregate yet, but folded all the same. */
+    @Test
+    void anOpenFoldedTaskCountsAsFolded() {
+        Trace t = Tempo.start(SEARCH, opts().budget(0));
+        Handoff h = t.root().handoff(LOAD);
+        clock.add(1000);
+        Span x = h.begin(); // caller-runs, past the budget
+        clock.add(1000);
+        String main = name(Thread.currentThread().getName());
+        assertEquals("v1;w=mwevdy2z;x=1.0;l=0;T=" + main + ";N=search;S=00.0.2^o;e=1", t.toHeader()); // rendered while recording
+        clock.add(1000);
+        x.close();
+        t.close();
+        assertEquals("v1;w=mwevdy2z;x=1.0;T=" + main + ";N=search:load;S=00.0.3/11.0.2~1.1+1.2.2.3.0;e=2", t.toHeader());
+    }
+
+    /**
+     * FORMAT.md §7.1: a value that fits is returned as it is, also under a limit below 256 bytes; only one
+     * that does not fit becomes the fallback, which below 256 bytes may itself be longer than the limit.
+     */
+    @Test
+    void aValueThatFitsIsKeptAlsoBelow256Bytes() {
+        Trace t = Tempo.start(SEARCH, opts().headerBytes(100));
+        clock.add(1500);
+        t.close();
+        String v = t.toHeader();
+        assertEquals("v1;w=mwevdy2z;T=" + name(Thread.currentThread().getName()) + ";N=search;S=00.0.1;e=1", v);
+        Snapshot snap = t.snapshot();
+        assertEquals(v, Tempo.Header.of(snap, v.length()));
+        assertEquals("v1;x=0.0;T=%3F;N=%3F;S=00.0.1;e=1", Tempo.Header.of(snap, v.length() - 1));
+        assertEquals("v1;x=0.0;T=%3F;N=%3F;S=00.0.1;e=1", Tempo.Header.of(snap, 10));
+    }
+
     /** Counts of the aggregate records of a value, in order. */
     private static List<Integer> aggregates(String header) {
         List<Integer> counts = new ArrayList<>();
@@ -366,7 +399,8 @@ class HeaderTest {
         SplittableRandom rnd = new SplittableRandom(20261113);
         Map<String, Integer> seen = new TreeMap<>();
         for (int round = 0; round < 300; round++) roundTrip(rnd, round, seen);
-        for (String what : new String[] {"records", "agg", "wait", "inline", "@", "cpu", "attrs", "f", "c", "o", "n", "w", "m", "live", "dropped"}) {
+        for (String what : new String[] {"records", "agg", "agg~", "@_", "wait", "inline", "@", "cpu", "attrs", "f", "c", "o", "n",
+                "w", "m", "live", "dropped"}) {
             assertTrue(seen.getOrDefault(what, 0) > 10, () -> "too few " + seen);
         }
     }
@@ -411,6 +445,7 @@ class HeaderTest {
                 Span h = stack.get(i);
                 boolean frame = h.row == Tempo.Lane.FRAME;
                 Name n = NAMES[rnd.nextInt(NAMES.length)], key = KEYS[rnd.nextInt(KEYS.length)];
+                Name task = NAMES[rnd.nextInt(2)]; // few task names, so folded handoffs share aggregates
                 Span opened = s.at(k, () -> {
                     switch (op) {
                         case 0: return h.span(n);
@@ -441,7 +476,7 @@ class HeaderTest {
                             stack.subList(i + 1, stack.size()).clear();
                             return null;
                         default:
-                            Handoff x = h.handoff(n);
+                            Handoff x = h.handoff(task);
                             if (rnd.nextBoolean()) x.set(key, rnd.nextInt(100));
                             pending.add(x);
                             return null;
@@ -492,6 +527,8 @@ class HeaderTest {
             Map<?, ?> span = (Map<?, ?>) o;
             seen.merge("records", 1, Integer::sum);
             for (String key : new String[] {"agg", "wait", "cpu", "attrs"}) if (span.containsKey(key)) seen.merge(key, 1, Integer::sum);
+            if (span.containsKey("agg") && ((Map<?, ?>) span.get("agg")).containsKey("waitSum")) seen.merge("agg~", 1, Integer::sum);
+            if ((Long) span.get("thread") < 0) seen.merge("@_", 1, Integer::sum);
             Object flags = span.get("flags");
             if (flags != null) for (char f : ((String) flags).toCharArray()) seen.merge(String.valueOf(f), 1, Integer::sum);
             long parent = (Long) span.get("parent");
@@ -548,8 +585,8 @@ class HeaderTest {
     static final class Seen {
         int depth, lane, flags;
         String name;
-        long start, dur, wait, cpu, count, min, max, extent, maxAt;
-        boolean unrun, aggregate, waits, open, never;
+        long start, dur, wait, waitMax, cpu, count, min, max, extent, maxAt;
+        boolean unrun, aggregate, waits, open, never, mixed;
         final Map<String, Object> attrs = new LinkedHashMap<>();
         int nonFinite;
     }
@@ -575,7 +612,7 @@ class HeaderTest {
             aggregate[d] = v.aggregate();
             occurrences[0] += v.aggregate() ? v.count() : 0;
             occurrences[1] += v.folded;
-            boolean caller = v.handoff() && inline.contains((long) v.subShape.lane << 32 | v.row);
+            boolean caller = v.handoff() && !v.aggregate() && inline.contains((long) v.subShape.lane << 32 | v.row);
             Seen x = new Seen();
             x.depth = d;
             x.name = v.name().toString();
@@ -585,8 +622,11 @@ class HeaderTest {
             x.start = v.startNanos() + (caller ? v.waitNanos() : 0);
             x.dur = v.durationNanos();
             x.aggregate = v.aggregate();
-            x.waits = v.handoff() && !v.aggregate() && !caller;
+            x.waits = v.handoff() && !caller;
             x.wait = v.waitNanos();
+            x.waitMax = v.waitMaxNanos();
+            x.mixed = v.mixedThreads();
+            assertEquals(x.mixed, v.thread() == null);
             x.cpu = v.cpuNanos();
             x.open = v.open();
             x.never = v.neverStarted();
@@ -623,7 +663,7 @@ class HeaderTest {
         doc.put("folded", occurrences[0] + Math.max(0, snap.folded() - occurrences[1]));
         doc.put("dropped", snap.dropped() + left[0] + nonFinite);
         TreeMap<Integer, Integer> lanes = new TreeMap<>();
-        for (Seen x : seen) if (!x.unrun) lanes.put(x.lane, 0);
+        for (Seen x : seen) if (!x.unrun && !x.mixed) lanes.put(x.lane, 0);
         List<String> threads = new ArrayList<>();
         List<Long> live = new ArrayList<>();
         for (Map.Entry<Integer, Integer> e : lanes.entrySet()) {
@@ -642,14 +682,14 @@ class HeaderTest {
             Seen x = seen.get(i);
             Map<String, Object> s = new LinkedHashMap<>();
             ids[x.depth] = i;
-            thread[x.depth] = x.depth == 0 ? 0 : x.unrun ? thread[x.depth - 1] : lanes.get(x.lane);
+            thread[x.depth] = x.depth == 0 ? 0 : x.mixed ? -1 : x.unrun ? thread[x.depth - 1] : lanes.get(x.lane);
             s.put("id", (long) i);
             s.put("parent", x.depth == 0 ? -1L : ids[x.depth - 1]);
             s.put("name", x.name);
             s.put("start", (x.start - root) / 1000);
             s.put("dur", x.dur / 1000);
             s.put("thread", thread[x.depth]);
-            if (x.waits) s.put("wait", x.wait / 1000);
+            if (x.waits && !x.aggregate) s.put("wait", x.wait / 1000);
             if (x.cpu >= 0) s.put("cpu", x.cpu / 1000);
             StringBuilder f = new StringBuilder();
             if ((x.flags & Tempo.FAILED) != 0) f.append('f');
@@ -667,6 +707,10 @@ class HeaderTest {
                 g.put("max", x.max / 1000);
                 g.put("extent", x.extent / 1000);
                 g.put("maxAt", x.maxAt / 1000);
+                if (x.waits) {
+                    g.put("waitSum", x.wait / 1000);
+                    g.put("waitMax", x.waitMax / 1000);
+                }
                 s.put("agg", g);
             }
             spans.add(s);

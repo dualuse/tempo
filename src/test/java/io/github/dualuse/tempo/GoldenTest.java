@@ -35,15 +35,14 @@ import static org.junit.jupiter.api.Assertions.*;
  * JSON and rejects every invalid one with its code; and each canonical vector is recorded through the
  * public API on a fake clock and rendered by {@link Trace#toHeader()}, byte for byte.
  *
- * <p>Seven canonical vectors describe traces the recorder cannot produce: they were written for the wire,
- * not for a recorder. For those the test asserts the closest trace it can record instead, given below
- * as a header value that {@code tools/tempo_ref.py} encodes from the vector's JSON with the stated
- * changes, so the expectation does not come from the encoder under test. The reasons, all from the
- * recording model: a thread records one stack, so it cannot start a span while an earlier sibling is
- * open on it, and the parent of what it opens or submits is its innermost open span; a lane holds 35
- * open spans; work reaches another thread only through a handoff, which always carries its queue wait;
- * a render has one instant and measures CPU time of ended spans only; and only detail spans of one lane
- * fold, so an aggregate has no wait, thread, flags or attributes of its own.
+ * <p>Six canonical vectors are wire-only (testdata/README.md): they describe traces the recorder cannot
+ * produce by design. For those the test asserts the closest trace it can record instead, given below as
+ * a header value that {@code tools/tempo_ref.py} encodes from the vector's JSON with the stated changes,
+ * so the expectation does not come from the encoder under test. The reasons, all from the recording
+ * model: a thread records one stack, so it runs one task at a time and cannot start a span while an
+ * earlier sibling is open on it; a lane holds 35 open spans; work reaches another thread only through a
+ * handoff, which always carries its queue wait; a render has one instant and measures CPU time of ended
+ * spans only; and an aggregate is one per parent, lap and name, without attributes.
  */
 class GoldenTest {
 
@@ -412,15 +411,16 @@ class GoldenTest {
 
     /**
      * Closest: a render has one instant, 75050, at which every open span ends; and CPU time is measured
-     * when a span ends, so the open spans have none. The 48 folded and 3 dropped spans are aggregate-only
-     * detail spans still open in two of the tasks: an aggregate is written once an occurrence has ended.
+     * when a span ends, so the open spans have none. The 48 folded and 3 dropped spans are detail spans
+     * past the budget (spent on the four handoffs) still open in two of the tasks: an aggregate is written
+     * once an occurrence has ended.
      */
     @Test
     void liveAndFolded() {
         String closest = "v1;w=mwevdy39;x=1c.3;l=1.2.3;T=http-4:cpu-1:cpu-2:io-1;N=search:rerank:match:load;"
                 + "S=00.0.1lvc/11.2s.1l3k/22.2s.1lps@1~1e^o/22.2s.1i1u@2~3mk^o/23.2s.2bc@3~5/23.2e4.1j7i@3~0^o;e=6";
         try (Script s = new Script("live-and-folded")) {
-            Trace t = s.on(0, 0, () -> Tempo.start(SEARCH, s.options().level(DETAIL).budget(0)));
+            Trace t = s.on(0, 0, () -> Tempo.start(SEARCH, s.options().level(DETAIL).budget(4))); // the four handoffs
             Span rerank = s.on(0, 100, () -> t.root().span(RERANK));
             Handoff m1 = s.on(0, 200, () -> rerank.handoff(MATCH)), m2 = s.on(0, 300, () -> rerank.handoff(MATCH)),
                     l1 = s.on(0, 400, () -> rerank.handoff(LOAD)), l2 = s.on(0, 3500, () -> rerank.handoff(LOAD));
@@ -448,29 +448,53 @@ class GoldenTest {
     }
 
     /**
-     * Closest: the three aggregates of handoffs (with queue waits, a thread, mixed threads, a flag) have no
-     * recording: handoffs never fold. The {@code score} aggregate folds 400 detail spans of the request
-     * thread, without its attribute, which a folded span ignores. The second {@code load} waits 1960
-     * instead of 1950, so it starts when the first ends on {@code io-1} instead of 10 earlier.
+     * Closest: a thread runs one task at a time, so the second {@code load} waits 1960 instead of 1950 and
+     * starts when the first ends on {@code io-1}; the {@code score} aggregate has no attribute, which a
+     * folded span ignores; and the {@code match} of count 1 is left out, as a second aggregate of the
+     * same name under {@code rerank} cannot be recorded (one per parent, lap and name), so {@code cpu-1}
+     * and {@code cpu-2} are in no record and leave the thread table.
      */
     @Test
     void aggregates() {
-        String closest = "v1;w=mwevdy36;x=b4.0;T=http-2:io-1;N=search:rerank:load:score:encode;"
-                + "S=00.0.4abk/11.dw.42ls/22.2s.1jk@1~a/22.1e.2bc@1~1ig/23.3ie.m8+b4.1.9.3uw0.3u48/14.42zo.668;e=6";
+        String closest = "v1;w=mwevdy36;x=dc.0;T=http-2:io-1;N=search:rerank:load:match:score:encode;S=00.0.4abk/11.dw.42ls"
+                + "/22.2s.1jk@1~a/22.1e.2bc@1~1ig/22.3cu.1i0g@1~6y0.jg*334+14.p0.3h0.1xg0.vmw"
+                + "/23.2s.37qo@_~n5c.1xg*3674+14.1jk.6y0.2klc.5eg^f/24.2s.m8+b4.1.9.3uw0.3u48/15.42zo.668;e=8";
         try (Script s = new Script("aggregates")) {
-            Trace t = s.on(0, 0, () -> Tempo.start(SEARCH, s.options().level(DETAIL).budget(0)));
+            Trace t = s.on(0, 0, () -> Tempo.start(SEARCH, s.options().level(DETAIL).budget(2).cpu(true)));
             Span rerank = s.on(0, 500, () -> t.root().span(RERANK));
             Handoff a = s.on(0, 600, () -> rerank.handoff(LOAD)), b = s.on(0, 650, () -> rerank.handoff(LOAD));
             Span la = s.on(3, 610, a::begin);
             s.run(3, 2610, la::close);
             Span lb = s.on(3, 2610, b::begin);
             s.run(3, 5610, lb::close);
-            // 400 occurrences: sum 800, min 1 (first), max 9 at +179000, the last ending at +180000
+            // 40 loads past the budget, one after another on io-1: submitted every 2050 from 5000, the slowest
+            // (4500) at 46000, then every 2300 from 50600, the last at 93050; mostly 1700 long after 200 waiting
+            for (int i = 0; i < 40; i++) {
+                long submit = i <= 20 ? 5000 + 2050 * i : i < 39 ? 50600 + 2300 * (i - 21) : 93050;
+                long wait = i == 0 ? 650 : i == 1 ? 700 : i == 39 ? 250 : 200;
+                long dur = i == 1 ? 900 : i == 20 ? 4500 : 1700, cpu = i == 0 ? 1700 : i == 1 ? 900 : i == 2 ? 1400 : -1;
+                Handoff h = s.on(0, submit, () -> rerank.handoff(LOAD));
+                Span l = s.cpu(cpu < 0 ? -1 : 0).on(3, submit + wait, h::begin);
+                s.cpu(cpu).run(3, submit + wait + dur, l::close);
+            }
+            // 40 failed matches, 20 on cpu-1 submitted every 5500 from 5100, 20 on cpu-2: the slowest (9000)
+            // at 12100, then every 5300 from 21800, the last at 118950 waiting 2500; mostly 3650 after 700
+            for (int i = 0; i < 40; i++) {
+                int thread = i < 20 ? 1 : 2, k = i % 20;
+                long submit = thread == 1 ? 5100 + 5500 * k : k == 0 ? 12100 : k < 19 ? 21800 + 5300 * (k - 1) : 118950;
+                long wait = thread == 1 && k == 1 ? 900 : thread == 2 && k == 19 ? 2500 : 700;
+                long dur = thread == 1 ? (k == 0 ? 2000 : k == 1 ? 3950 : 3650) : k == 0 ? 9000 : 3650;
+                Handoff h = s.on(0, submit, () -> rerank.handoff(MATCH));
+                Span m = s.cpu(0).on(thread, submit + wait, () -> h.begin().fail());
+                s.cpu(thread == 1 && k == 1 ? 1950 : dur).run(thread, submit + wait + dur, m::close);
+            }
+            // 400 scores: sum 800, min 1 (first), max 9 at +179000, the last ending at +180000
             List<long[]> score = new ArrayList<>();
             score.add(new long[] {5200, 1});
             for (int k = 0; k < 397; k++) score.add(new long[] {5600 + 400 * k, k < 6 ? 1 : 2});
             score.add(new long[] {184200, 9});
             score.add(new long[] {185198, 2});
+            s.cpu(-1);
             for (long[] o : score) {
                 Span x = s.on(0, o[0], () -> rerank.detail(SCORE));
                 s.run(0, o[0] + o[1], x::close);
@@ -484,27 +508,24 @@ class GoldenTest {
     }
 
     /**
-     * The worked example of FORMAT.md, closest: {@code fingerprint} is submitted while {@code describe}
-     * is open on the request thread, so it is a child of {@code describe} (depth 2, and {@code index}
-     * counts from {@code describe}); and the 72 handoffs folded into two aggregates are left out, with
-     * {@code x=}: the recorder folds only detail spans of one lane, never handoffs.
+     * The worked example of FORMAT.md, byte for byte. {@code fingerprint} is a child of the root submitted
+     * while {@code describe} runs: a thread submits under its innermost open span, so the script ends
+     * {@code describe} first and then submits at the earlier time on the fake clock. With a budget of five
+     * the handoffs past {@code match2} fold: 36 {@code load} tasks one after another on {@code io-1}, and
+     * 36 {@code match} tasks spread over {@code cpu-1} and {@code cpu-2}.
      */
     @Test
     void searchExample() {
-        String closest = "v1;w=mwevdy2z;T=http-7:cpu-1:cpu-2:io-1;N=GET_%2Fsearch:decode:describe:fingerprint:index:"
-                + "rerank:load:match:encode:k:bytes:score;S=00.0.3y4o/11.3c.6ek/12.6fe.vsg*uxw/23.a.ho4@1~8m*gz4"
-                + "/14.vtu.nj8:9=40/15.nkm.26js/26.1e.4pg@3~19:a=48213/26.a.5pk@3~4s8^f/27.4ry.794@1~k*77q:b=0.83"
-                + "/27.5sc.6sg@2~f*6po:b=0.41/18.26l6.1jk;e=b";
         try (Script s = new Script("search-example")) {
-            Trace t = s.cpu(-1).on(0, 0, () -> Tempo.start(GET_SEARCH, s.options().cpu(true)));
+            Trace t = s.cpu(-1).on(0, 0, () -> Tempo.start(GET_SEARCH, s.options().cpu(true).budget(5)));
             Span root = t.root();
             Span decode = s.on(0, 120, () -> root.span(DECODE));
             s.run(0, 8420, decode::close);
             Span describe = s.cpu(0).on(0, 8450, () -> root.span(DESCRIBE).cpu());
-            Handoff fingerprint = s.on(0, 8460, () -> describe.handoff(FINGERPRINT));
+            s.cpu(40100).run(0, 49650, describe::close);
+            Handoff fingerprint = s.on(0, 8460, () -> root.handoff(FINGERPRINT));
             Span f = s.cpu(0).on(1, 8770, fingerprint::begin);
             s.cpu(22000).run(1, 31670, f::close);
-            s.cpu(40100).run(0, 49650, describe::close);
             Span index = s.cpu(-1).on(0, 49700, () -> root.span(INDEX).set(K, 40));
             s.run(0, 80200, index::close);
             Span rerank = s.on(0, 80250, () -> root.span(RERANK));
@@ -519,13 +540,35 @@ class GoldenTest {
             s.run(3, 86445, l1::close);
             Span l2 = s.on(3, 86510, () -> load2.begin().fail());
             s.run(3, 93910, l2::close);
-            s.run(0, 182050, rerank::close);
+
+            // load, folded: begins every 1500 from 94440 to the slowest (4100) submitted at 124400, then
+            // every 1850 from 128900 to the fastest (600) at 154800; waits of 40, the last 400; CPU on the first
+            for (int i = 0; i < 36; i++) {
+                long begin = i <= 20 ? 94440 + 1500 * i : 128900 + 1850 * (i - 21), wait = i == 35 ? 400 : 40;
+                long dur = i == 20 ? 4100 : i == 35 ? 600 : 1450;
+                Handoff h = s.on(0, begin - wait, () -> rerank.handoff(LOAD));
+                Span l = s.cpu(i == 0 ? 0 : -1).on(3, begin, h::begin);
+                s.cpu(i == 0 ? 2100 : -1).run(3, begin + dur, l::close);
+            }
+            // match, folded: 18 on cpu-1 from 100400 (the slowest, 9400, submitted at 152400; the fastest,
+            // 2100, last), 18 on cpu-2 from 102800 (wait 60, CPU 700 under its run time); other waits 24
+            long[] cpu1 = {100424, 104424, 108424, 112424, 116424, 120424, 124424, 128424, 132424, 136424, 140424,
+                    144424, 148424, 152424, 162400, 167000, 171600, 176300};
+            for (int i = 0; i < 36; i++) {
+                int thread = i < 18 ? 1 : 2, k = i % 18;
+                long begin = thread == 1 ? cpu1[k] : k == 0 ? 102860 : 107000 + 4100 * (k - 1);
+                long wait = thread == 2 && k == 0 ? 60 : 24;
+                long dur = thread == 1 ? (k == 13 ? 9400 : k == 17 ? 2100 : 4000) : k == 0 ? 4100 : 4000;
+                Handoff h = s.on(0, begin - wait, () -> rerank.handoff(MATCH));
+                Span m = s.cpu(0).on(thread, begin, h::begin);
+                s.cpu(thread == 2 && k == 0 ? dur - 700 : dur).run(thread, begin + dur, m::close);
+            }
+            s.cpu(-1).run(0, 182050, rerank::close);
             Span encode = s.on(0, 182100, () -> root.span(ENCODE));
             s.run(0, 184100, encode::close);
             s.run(0, 184200, t::close);
-            String header = s.on(0, 184200, t::toHeader);
-            assertHeader("search-example", closest, header);
-            assertEquals(319, header.length());
+            assertHeader("search-example", golden("search-example"), s.on(0, 184200, t::toHeader));
+            assertEquals(415, golden("search-example").length());
         }
     }
 

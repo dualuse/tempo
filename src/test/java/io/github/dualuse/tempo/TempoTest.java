@@ -111,8 +111,10 @@ class TempoTest {
             if (s.aggregate()) b.append(" agg*").append(s.count()).append(" min=").append(s.minNanos())
                     .append(" max=").append(s.maxNanos()).append(" maxAt=").append(s.maxAtNanos()).append(" extent=").append(s.extentNanos());
             if (s.handoff()) b.append(" handoff~").append(s.waitNanos());
+            if (s.handoff() && s.aggregate()) b.append('/').append(s.waitMaxNanos());
             if (s.neverStarted()) b.append(" unstarted");
-            if (!s.thread().equals(rootThread[0])) b.append(" @").append(s.thread());
+            if (s.mixedThreads()) b.append(" @_");
+            else if (!s.thread().equals(rootThread[0])) b.append(" @").append(s.thread());
             for (int i = 0; i < s.attributes(); i++) {
                 b.append(' ').append(s.attributeKey(i)).append('=');
                 if (s.attributeIsDouble(i)) b.append(s.doubleAttribute(i));
@@ -1600,7 +1602,7 @@ class TempoTest {
     @Test
     void renderingWhileNewLanesHandOffNeverThrows() throws Exception {
         int n = 1000;
-        Trace t = Tempo.start(SEARCH, opts().lanes(n + 2));
+        Trace t = Tempo.start(SEARCH, opts().lanes(n + 2).budget(Integer.MAX_VALUE)); // no handoff folds
         for (int i = 0; i < 8000; i++) t.root().set(BYTES, i); // a slow first shape widens the window
         AtomicBoolean stop = new AtomicBoolean();
         AtomicReference<Throwable> thrown = new AtomicReference<>();
@@ -1731,7 +1733,7 @@ class TempoTest {
     void tasksPastALanesCapAreLeftOutButNotNeverStarted() throws Exception {
         ExecutorService pool = worker("worker-1");
         try {
-            Trace t = Tempo.start(SEARCH, opts());
+            Trace t = Tempo.start(SEARCH, opts().budget(Integer.MAX_VALUE)); // no handoff folds
             int n = Tempo.Lane.MAX_EVENTS / 2 + 1; // a task takes two events (link and queue wait)
             Handoff[] hs = handoffs(t.root(), n);
             clock.add(3);
@@ -1819,13 +1821,13 @@ class TempoTest {
         int n = 2_000;
         try {
             for (int round = 0; round < 3; round++) { // fills the chunk pool and loads every class on the path
-                Trace warm = Tempo.start(SEARCH, opts());
+                Trace warm = Tempo.start(SEARCH, opts().budget(Integer.MAX_VALUE));
                 Handoff[] hs = handoffs(warm.root(), 2 * n);
                 pool.submit(() -> run(hs)).get();
                 warm.close();
                 warm.release();
             }
-            Trace t = Tempo.start(SEARCH, opts());
+            Trace t = Tempo.start(SEARCH, opts().budget(Integer.MAX_VALUE));
             try (t) {
                 Handoff[] first = handoffs(t.root(), 1);
                 pool.submit(() -> run(first)).get(); // creates the worker's lane for the trace
@@ -1836,6 +1838,39 @@ class TempoTest {
                 assertTrue(submit > 0 && submit % n == 0 && submit / n <= 32, "handoff() allocated " + submit + " B for " + n);
                 assertEquals(0, pool.submit(() -> allocatedBy(() -> run(hs))).get(), "bytes the tasks allocated");
             }
+            assertEquals(0, t.misuses() + t.dropped());
+            t.release();
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    /** Past the budget a handoff still allocates its one object, and its task, folded, nothing. */
+    @Test
+    void foldedHandoffAllocatesOneSmallObjectAndTheTaskNothing() throws Exception {
+        ExecutorService pool = worker("worker-1");
+        int n = 2_000;
+        try {
+            for (int round = 0; round < 3; round++) { // loads every class on the path
+                Trace warm = Tempo.start(SEARCH, opts().budget(0));
+                Handoff[] hs = handoffs(warm.root(), n);
+                pool.submit(() -> run(hs)).get();
+                warm.close();
+                warm.release();
+            }
+            Trace t = Tempo.start(SEARCH, opts().budget(0));
+            try (t) {
+                Handoff[] first = handoffs(t.root(), 1);
+                pool.submit(() -> run(first)).get(); // creates the aggregates of both lanes
+                Handoff[] hs = new Handoff[n];
+                long submit = allocatedBy(() -> {
+                    for (int i = 0; i < n; i++) hs[i] = t.root().handoff(MATCH);
+                });
+                assertTrue(submit > 0 && submit % n == 0 && submit / n <= 32, "handoff() allocated " + submit + " B for " + n);
+                assertEquals(0, pool.submit(() -> allocatedBy(() -> run(hs))).get(), "bytes the tasks allocated");
+            }
+            assertEquals(n + 1, t.folded());
+            assertEquals(n + 1, t.aggregate(MATCH).count());
             assertEquals(0, t.misuses() + t.dropped());
             t.release();
         } finally {

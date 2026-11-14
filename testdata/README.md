@@ -42,6 +42,24 @@ fragment wins over one in the query.
 All but `lenient`, `whitespace` and the four `truncated-*` vectors are in canonical form:
 the reference encoder reproduces them byte for byte from their JSON.
 
+### Wire-only vectors
+
+Six canonical vectors are **wire-only**: they were written for the format and describe
+traces the Java recorder cannot produce by design. Decoders and the reference encoder
+must match them like any other vector; the Java encoder's test (`GoldenTest`) records the
+closest trace it can and checks that byte for byte instead. The other six canonical
+vectors, the worked example among them, are recorded through the public API and rendered
+byte for byte.
+
+| Vector | Why the recorder cannot produce it |
+|---|---|
+| `names` | Two children on other threads without `~`. Work reaches another thread only through a handoff, which always carries its queue wait. |
+| `threads` | The same: children on other threads without `~`, among them a child back on the root's thread (`@0`). |
+| `deep-nesting` | Depth 35 recorded by one thread: a thread's lane holds 35 open spans, depths 0 to 34. |
+| `failed-open` | New children of the root after `rerank`, which stays open on the same thread until the render: one stack per thread. |
+| `live-and-folded` | Open spans ending at different instants, and CPU time on open spans: a render has one instant, and CPU time is measured when a span ends. |
+| `aggregates` | Two `load` tasks overlapping on `io-1` (a thread runs one task at a time), an aggregate with an attribute (a folded span keeps none), and two `match` aggregates under one parent (one per parent, lap and name). |
+
 ## `invalid/`
 
 Values (`*.header`) and links (`*.link`) that must be rejected, one defect each;

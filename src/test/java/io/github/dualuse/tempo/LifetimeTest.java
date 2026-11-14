@@ -77,7 +77,7 @@ class LifetimeTest {
                 "  decode 0+2 lap legacy 'Decode #1'",
                 "    load 0+0 detail",
                 "    load 2+0 agg*1 min=0 max=0 maxAt=0 extent=0",
-                "  match 2+4 handoff~1 @worker-1 score=3 bytes=9",
+                "  match 2+4 agg*1 min=4 max=4 maxAt=0 extent=5 handoff~1/1 @worker-1", // folded: past the budget too
                 "  load 7+5");
         assertEquals(expected, tree(snap));
         assertEquals(lines(
@@ -85,7 +85,7 @@ class LifetimeTest {
                 "  decode 0+2 lap legacy 'Decode #1'",
                 "    load 0+0 detail",
                 "    load 2+0 agg*1 min=0 max=0 maxAt=0 extent=0",
-                "  match 2+4 handoff~1 @worker-1 score=3 bytes=9",
+                "  match 2+4 agg*1 min=4 max=4 maxAt=0 extent=5 handoff~1/1 @worker-1",
                 "  load 7+0 open"), tree(early));
         t.release();
         t.release();
@@ -100,7 +100,7 @@ class LifetimeTest {
         assertEquals(expected, tree(snap));
         assertEquals(12, snap.elapsedNanos());
         assertEquals("count=3 sum=5 min=0 max=5 waits=0 waitSum=0 waitMax=0", snap.aggregate(LOAD).toString());
-        assertEquals(1, snap.folded());
+        assertEquals(2, snap.folded());
         other.release();
     }
 

@@ -125,9 +125,12 @@ class BudgetTest {
         Trace t = Tempo.start(SEARCH, opts(128)); // blocks of 2
         Span s = t.root();
         int lanes = 10;
+        Handoff[] hs = new Handoff[lanes];
+        for (int i = 0; i < lanes; i++) hs[i] = s.handoff(MATCH);
+        assertEquals(128 - lanes, t.ctx.unspent()); // a handoff counts against the budget too
         for (int i = 0; i < lanes; i++) {
-            int before = 128 - i;
-            Handoff h = s.handoff(MATCH);
+            int before = 128 - lanes - i;
+            Handoff h = hs[i];
             assertNull(onThread("worker-" + i, () -> {
                 try (Span w = h.begin()) {
                     w.detail(LOAD).close();
@@ -135,7 +138,7 @@ class BudgetTest {
                 }
             }));
         }
-        assertEquals(128 - lanes, t.ctx.unspent()); // one credit used per lane, the rest returned when idle
+        assertEquals(128 - 2 * lanes, t.ctx.unspent()); // one credit used per lane, the rest returned when idle
         for (int i = 0; i < 200; i++) s.detail(LOAD).close();
         t.close();
         int[] rows = {0}, folded = {0};
@@ -143,8 +146,8 @@ class BudgetTest {
             if (v.aggregate()) folded[0] += v.count();
             else if (v.level() == DETAIL) rows[0]++;
         });
-        assertEquals(128, rows[0]);
-        assertEquals(200 + lanes - 128, folded[0]);
+        assertEquals(128 - lanes, rows[0]);
+        assertEquals(200 + 2 * lanes - 128, folded[0]);
         assertEquals(folded[0], t.folded());
         assertEquals(0, t.ctx.unspent());
     }
@@ -179,8 +182,9 @@ class BudgetTest {
             });
             assertEquals(tasks * perTask, rows[0] + folded[0]);
             assertEquals(t.folded(), folded[0]);
-            assertEquals(budget, rows[0] + t.ctx.unspent()); // every lane is idle: nothing is held
-            assertTrue(rows[0] >= budget - threads * (block - 1), "recorded " + rows[0]);
+            assertEquals(budget, tasks + rows[0] + t.ctx.unspent()); // every lane is idle: nothing is held
+            // the handoffs took theirs first; the workers and the request thread each hold less than a block
+            assertTrue(rows[0] >= budget - tasks - (threads + 1) * (block - 1), "recorded " + rows[0]);
             assertEquals(tasks * perTask, t.aggregate(LOAD).count());
             assertEquals(0, t.misuses() + t.dropped());
             t.release();
@@ -246,7 +250,7 @@ class BudgetTest {
 
     @Test
     void traceAggregateSumsInPlaceWhatTheSnapshotSums() {
-        Trace t = Tempo.start(SEARCH, opts(1));
+        Trace t = Tempo.start(SEARCH, opts(3)); // the two handoffs and one span
         Span s = t.root();
         Span a = s.span(MATCH);
         clock.add(3);
@@ -316,5 +320,259 @@ class BudgetTest {
         t.close();
         assertEquals(80_000, t.folded());
         assertEquals(40_000, t.aggregate(LOAD).count());
+    }
+
+    // ---- handoffs past the budget -------------------------------------------------------------------
+
+    /**
+     * Past the budget a handoff's task folds wherever it runs: on two workers or the submitting thread
+     * (caller-runs), the occurrences meet in one aggregate under the submitting span with their queue
+     * waits, mixed threads ({@code @_}) and the flags they all have; on one worker, its thread.
+     */
+    @Test
+    void foldedHandoffsKeepTheirWaitsThreadsAndSharedFlags() throws Exception {
+        Trace t = Tempo.start(SEARCH, opts(1));
+        Span s = t.root();
+        Handoff first = s.handoff(MATCH); // the budget
+        Handoff[] load = new Handoff[3];
+        for (int i = 0; i < 3; i++) {
+            clock.add(10);
+            load[i] = s.handoff(LOAD);    // submitted at 10, 20, 30
+        }
+        clock.add(10);
+        assertNull(onThread("w1", () -> {
+            clock.add(5);
+            Span x = load[0].begin();     // waited 35
+            clock.add(15);
+            x.fail().close();
+        }));
+        assertNull(onThread("w2", () -> {
+            Span x = load[1].begin();     // waited 40
+            clock.add(5);
+            x.fail().close();
+        }));
+        Span x = load[2].begin();         // caller-runs, waited 35
+        clock.add(10);
+        x.fail().close();
+        Span rerank = s.span(RERANK);
+        Handoff m1 = rerank.handoff(MATCH), m2 = rerank.handoff(MATCH);
+        clock.add(2);
+        assertNull(onThread("w1", () -> {
+            m1.begin().fail().close();    // waited 2
+            clock.add(3);
+            Span y = m2.begin();          // waited 5
+            clock.add(4);
+            y.close();
+        }));
+        rerank.close();
+        assertNull(onThread("w1", () -> first.runnable(() -> clock.add(1)).run()));
+        t.close();
+        assertEquals(lines(
+                "search 0+85",
+                "  match 0+1 handoff~84 @w1",
+                "  load 10+30 failed agg*3 min=5 max=15 maxAt=0 extent=65 handoff~110/40 @_",
+                "  rerank 75+9",
+                "    match 75+4 agg*2 min=0 max=4 maxAt=0 extent=9 handoff~7/5 @w1"), tree(t));
+        assertEquals("count=3 sum=30 min=5 max=15 waits=3 waitSum=110 waitMax=40", t.aggregate(LOAD).toString());
+        assertEquals(t.aggregate(LOAD).toString(), t.snapshot().aggregate(LOAD).toString());
+        assertEquals(5, t.folded());
+        assertEquals(0, t.misuses() + t.dropped());
+    }
+
+    /**
+     * Folded handoffs that never ran sit on the submitting thread with no duration: all cancelled or
+     * rejected ({@code ^c}, waits until then), all never started ({@code ^n}, waits until the render),
+     * or some of each (no flag in common). Only their waits reach {@link Trace#aggregate}, as for rows.
+     */
+    @Test
+    void foldedHandoffsThatNeverRanAreCancelledOrNeverStarted() throws Exception {
+        Trace t = Tempo.start(SEARCH, opts(0).cpu(false));
+        Span rerank = t.root().span(RERANK);
+        clock.add(10_000);
+        Handoff a = rerank.handoff(LOAD);
+        clock.add(10_000);
+        Handoff b = rerank.handoff(LOAD);
+        clock.add(10_000);
+        a.cancel();                                    // waited 20
+        clock.add(20_000);
+        assertNull(onThread("canceller", b::reject));  // waited 30
+        clock.add(10_000);
+        rerank.handoff(MATCH);                         // never started: 60 and 70
+        clock.add(10_000);
+        rerank.handoff(MATCH);
+        clock.add(5_000);
+        rerank.handoff(DECODE);                        // never started, the first of its aggregate: exact
+        clock.add(5_000);
+        Handoff e = rerank.handoff(DECODE);
+        clock.add(5_000);
+        e.cancel();                                    // waited 5
+        clock.add(5_000);
+        rerank.close();
+        clock.add(10_000);
+        t.close();
+        assertEquals(lines(
+                "search 0+100000",
+                "  rerank 0+90000",
+                "    load 10000+0 cancelled agg*2 min=0 max=0 maxAt=0 extent=40000 handoff~50000/30000",
+                "    match 60000+0 agg*2 min=0 max=0 maxAt=0 extent=40000 handoff~70000/40000 unstarted",
+                "    decode 75000+0 agg*2 min=0 max=0 maxAt=5000 extent=25000 handoff~30000/25000"), tree(t));
+        String h = t.toHeader();
+        assertTrue(h.endsWith(";x=6.0;T=" + HeaderTest.name(Thread.currentThread().getName()) + ";N=search:rerank:load:match:decode;"
+                + "S=00.0.2s/11.0.2i/22.a.0~1e.u+2.0.0.14.0^c/23.1e.0~1y.14+2.0.0.14.0^n/24.f.0~u.p+2.0.0.p.5;e=5"), h);
+        assertEquals("count=0 sum=0 min=0 max=0 waits=2 waitSum=50000 waitMax=30000", t.aggregate(LOAD).toString());
+        assertEquals("count=0 sum=0 min=0 max=0 waits=0 waitSum=0 waitMax=0", t.aggregate(MATCH).toString());
+        assertEquals("count=0 sum=0 min=0 max=0 waits=1 waitSum=5000 waitMax=5000", t.snapshot().aggregate(DECODE).toString());
+        assertEquals(6, t.folded());
+        assertEquals(0, t.misuses() + t.dropped());
+    }
+
+    /**
+     * A folded task begun on a thread outside the trace has no recorded span to hang its spans from: they
+     * are aggregate-only, its handoffs fold, and their aggregates are top-level nodes of the lane, which
+     * the header leaves out as dropped.
+     */
+    @Test
+    void spansInAFoldedTaskOutsideTheTraceAreAggregateOnly() throws Exception {
+        Trace t = Tempo.start(SEARCH, opts(0).cpu(false));
+        Handoff h = t.root().handoff(MATCH);
+        Handoff[] g = new Handoff[1];
+        assertNull(onThread("w1", () -> {
+            clock.add(10_000);
+            try (Span x = h.begin()) {
+                Span d = x.span(DECODE);
+                assertEquals(Tempo.Lane.FRAME, d.row);
+                clock.add(5_000);
+                d.close();
+                Span l = x.detail(LOAD);
+                clock.add(3_000);
+                l.close();
+                g[0] = x.handoff(LOAD);
+            }
+        }));
+        assertNull(onThread("w2", () -> {
+            clock.add(2_000);
+            Span y = g[0].begin();
+            clock.add(4_000);
+            y.close();
+        }));
+        clock.add(6_000);
+        t.close();
+        assertEquals(lines(
+                "search 0+30000",
+                "  match 0+8000 agg*1 min=8000 max=8000 maxAt=0 extent=18000 handoff~10000/10000 @w1",
+                "decode 10000+5000 agg*1 min=5000 max=5000 maxAt=0 extent=5000 @w1",
+                "load 15000+3000 agg*1 min=3000 max=3000 maxAt=0 extent=3000 @w1",
+                "load 18000+4000 agg*1 min=4000 max=4000 maxAt=0 extent=6000 handoff~2000/2000 @w2"), tree(t));
+        String v = t.toHeader();
+        assertTrue(v.contains(";x=1.3;") && v.endsWith(":w1;N=search:match;S=00.0.u/11.0.8@1~a.a+1.8.8.i.0;e=2"), v);
+        assertEquals(1, t.aggregate(DECODE).count());
+        assertEquals(2, t.folded());
+        assertEquals(0, t.misuses() + t.dropped());
+    }
+
+    /**
+     * Folded handoffs of a label-after lap move under it with their aggregate; the occurrence run inline
+     * on the submitting thread, kept in that lane by the index of its aggregate, stays with it.
+     */
+    @Test
+    void foldedHandoffsOfALapLandUnderTheLap() throws Exception {
+        Trace t = Tempo.start(SEARCH, opts(0));
+        Span s = t.root();
+        Handoff h1 = s.handoff(LOAD);
+        clock.add(5);
+        Span x = h1.begin(); // caller-runs
+        clock.add(5);
+        x.close();
+        Handoff h2 = s.handoff(LOAD);
+        assertNull(onThread("w1", () -> {
+            clock.add(2);
+            Span y = h2.begin();
+            clock.add(8);
+            y.close();
+        }));
+        s.done(DECODE);
+        Handoff h3 = s.handoff(LOAD);
+        assertNull(onThread("w1", () -> {
+            clock.add(1);
+            h3.begin().close();
+        }));
+        clock.add(1);
+        t.close();
+        assertEquals(lines(
+                "search 0+22",
+                "  decode 0+20 lap",
+                "    load 0+13 agg*2 min=5 max=8 maxAt=10 extent=20 handoff~7/5 @_",
+                "  load 20+0 agg*1 min=0 max=0 maxAt=0 extent=1 handoff~1/1 @w1"), tree(t));
+        assertEquals("count=3 sum=13 min=0 max=8 waits=3 waitSum=8 waitMax=5", t.aggregate(LOAD).toString());
+        assertEquals(0, t.misuses() + t.dropped());
+    }
+
+    /** Pool threads run handoffs past the budget while a render loops: each task is counted once, nothing is lost. */
+    @Test
+    void contendedFoldedHandoffsAreCountedOnce() throws Exception {
+        int threads = 8, tasks = 2000, budget = 100;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        try {
+            Trace t = Tempo.start(SEARCH, new Options().budget(budget));
+            java.util.concurrent.atomic.AtomicBoolean stop = new java.util.concurrent.atomic.AtomicBoolean();
+            java.util.concurrent.atomic.AtomicReference<Throwable> thrown = new java.util.concurrent.atomic.AtomicReference<>();
+            Thread renderer = new Thread(() -> {
+                try {
+                    while (!stop.get()) {
+                        TempoTest.assertWellFormed(t);
+                        WireDecoder.decode(t.toHeader());
+                    }
+                } catch (Throwable e) {
+                    thrown.set(e);
+                }
+            }, "renderer");
+            renderer.start();
+            List<Future<?>> fs = new ArrayList<>();
+            for (int i = 0; i < tasks; i++) {
+                Runnable task = t.root().handoff(MATCH).runnable(() -> Tempo.current().span(LOAD).close());
+                fs.add(pool.submit(task));
+            }
+            for (Future<?> f : fs) f.get();
+            stop.set(true);
+            renderer.join();
+            t.close();
+            if (thrown.get() != null) throw new AssertionError(thrown.get());
+            long[] handoffs = {0, 0}; // recorded, folded
+            t.forEachSpan(v -> {
+                if (v.handoff()) handoffs[v.aggregate() ? 1 : 0] += v.count();
+            });
+            assertEquals(budget, handoffs[0]);
+            assertEquals(tasks - budget, handoffs[1]);
+            assertEquals(tasks - budget, t.folded());
+            assertEquals(tasks, t.aggregate(MATCH).count());
+            assertEquals(tasks, t.aggregate(MATCH).waitCount());
+            assertEquals(tasks, t.aggregate(LOAD).count()); // aggregate-only inside the folded tasks
+            assertEquals((long) tasks - budget, WireDecoder.decode(t.toHeader()).get("folded"));
+            assertEquals(0, t.misuses());
+            t.release();
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    /** A folded task past the lane cap is dropped, not left as never started; its wait still counts. */
+    @Test
+    void foldedTasksPastTheLaneCapAreDropped() throws Exception {
+        Trace t = Tempo.start(SEARCH, opts(0).lanes(2).cpu(false));
+        Span root = t.root();
+        Handoff a = root.handoff(MATCH), b = root.handoff(MATCH), c = root.handoff(MATCH);
+        clock.add(4_000);
+        assertNull(onThread("w1", () -> a.begin().close()));
+        clock.add(3_000);
+        assertNull(onThread("w2", () -> assertSame(NOOP, b.begin())));
+        c.begin().close(); // caller-runs
+        t.close();
+        assertEquals(lines(
+                "search 0+7000",
+                "  match 0+0 agg*2 min=0 max=0 maxAt=0 extent=7000 handoff~11000/7000 @_"), tree(t));
+        assertEquals(1, t.dropped());
+        assertEquals("count=2 sum=0 min=0 max=0 waits=3 waitSum=18000 waitMax=7000", t.aggregate(MATCH).toString());
+        assertTrue(t.toHeader().contains(";x=2.1;"), t.toHeader());
+        assertEquals(0, t.misuses());
     }
 }

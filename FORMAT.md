@@ -287,6 +287,11 @@ the same name:
 | `@_` | The occurrences ran on more than one thread. |
 | `^flags` | Flags shared by every occurrence (for instance a group of cancelled handoffs, `^c`). |
 
+For handoffs the occurrences include tasks that did not run, as single records would
+show them (§6.5): cancelled or rejected before start, or never started, each with `dur` 0
+and its wait until the cancellation or the render. A group of only such tasks is written
+like one of them: `^c` when all were cancelled, `^n` when none started, and no `@`.
+
 `dur / extent` is the effective parallelism of the group. An aggregate has no children.
 
 ## 7. Encoding rules (canonical form)
@@ -319,9 +324,11 @@ that fits:
 4. Keep only the root and its direct children, with `T` and `N` reduced to what those
    records use.
 
-The value is never cut mid-record, and `length <= headerBytes` holds for every
-`headerBytes >= 256`. Below 256, or if step 4 still does not fit, the value is the
-**fallback**:
+The ladder applies only to a value that does not fit: a value within `headerBytes` is
+written as it is, whatever the limit, also below 256. The value is never cut mid-record,
+and `length <= headerBytes` holds for every `headerBytes >= 256`. When the value does not
+fit and the limit is below 256, or step 4 still does not fit, the value is the
+**fallback**, which under a limit below 256 may itself be longer than the limit:
 
 ```
 v1;x=0.<n>;T=%3F;N=%3F;S=00.0.<dur>;e=1
@@ -601,3 +608,9 @@ padded or wrapped yields it too. Other implementations SHOULD run the same check
 decode equality for every golden vector and link, and the listed error code for every
 invalid one. See
 [`testdata/README.md`](testdata/README.md) for what each vector covers.
+
+Some canonical vectors are **wire-only**: written for the format, they describe traces a
+recorder cannot produce by design, such as two tasks at once on one thread or an
+aggregate with attributes. They bind every decoder and the reference encoder; an encoder
+fed by a recorder is checked against the closest trace it can record instead.
+`testdata/README.md` marks them and gives the reason for each.
