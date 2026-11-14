@@ -114,13 +114,13 @@ for (const p of samples) {
 const example = P.stripWs(read("testdata/golden/search-example.header"));
 const exampleDoc = JSON.parse(read("testdata/golden/search-example.json"));
 const wrap = (s, w) => s.match(new RegExp(".{1," + w + "}", "g")).join("\n");
-const curl = "HTTP/2 200 \r\ncontent-type: application/json\r\ntempo-trace: " + wrap(example, 37).replace(/\n/g, "\r\n") + "\r\nserver-timing: total;dur=184.2\r\n\r\n{\"ok\":true}\n";
+const curl = "HTTP/2 200 \r\ncontent-type: application/json\r\ntempo-timing: " + wrap(example, 37).replace(/\n/g, "\r\n") + "\r\nserver-timing: total;dur=184.2\r\n\r\n{\"ok\":true}\n";
 const cases = [
   ["bare value", example, [example]],
   ["bare value wrapped", wrap(example, 50), [example]],
   ["bare value with surrounding blank lines", "\n\n  " + example + "  \n\n", [example]],
   ["curl -i, wrapped, CRLF, lowercase name", curl, [example]],
-  ["curl -v", "> GET /search HTTP/1.1\n> Host: localhost\n>\n< HTTP/1.1 200 OK\n< Tempo-Trace: " + example + "\n< Content-Length: 2\n<\n{}", [example]],
+  ["curl -v", "> GET /search HTTP/1.1\n> Host: localhost\n>\n< HTTP/1.1 200 OK\n< Tempo-Timing: " + example + "\n< Content-Length: 2\n<\n{}", [example]],
   ["two curl outputs", curl + "\n" + curl, [example, example]],
   ["three bare values, one per line", [example, example, example].join("\n"), [example, example, example]],
   ["wrapped inside e= digits", example.slice(0, -1) + "\n" + example.slice(-1), [example]],
@@ -149,22 +149,22 @@ for (const [label, input, n] of jsonCases) {
 const small = P.stripWs(read("samples/small.header"));
 const smallCut = small.slice(0, Math.floor(small.length * 0.7));
 const cutCases = [
-  ["cut header, then lowercase header (HTTP/2)", "HTTP/2 200 \r\ntempo-trace: " + smallCut + "\r\ncontent-type: application/json\r\n\r\n{}\n"],
-  ["cut header, then Content-Type (HTTP/1.1)", "HTTP/1.1 200 OK\nTempo-Trace: " + smallCut + "\nContent-Type: application/json\n\n{}\n"],
-  ["cut wrapped header, then header", "HTTP/1.1 200 OK\nTempo-Trace: " + wrap(smallCut, 41) + "\nx-request-id: 7f3a\nContent-Length: 2\n\n{}\n"],
-  ["cut header, then header (curl -v)", "< HTTP/1.1 200 OK\n< Tempo-Trace: " + smallCut + "\n< Content-Type: application/json\n<\n{}"],
-  ["cut header as the last header", "HTTP/1.1 200 OK\nTempo-Trace: " + smallCut + "\n\n{}\n"],
+  ["cut header, then lowercase header (HTTP/2)", "HTTP/2 200 \r\ntempo-timing: " + smallCut + "\r\ncontent-type: application/json\r\n\r\n{}\n"],
+  ["cut header, then Content-Type (HTTP/1.1)", "HTTP/1.1 200 OK\nTempo-Timing: " + smallCut + "\nContent-Type: application/json\n\n{}\n"],
+  ["cut wrapped header, then header", "HTTP/1.1 200 OK\nTempo-Timing: " + wrap(smallCut, 41) + "\nx-request-id: 7f3a\nContent-Length: 2\n\n{}\n"],
+  ["cut header, then header (curl -v)", "< HTTP/1.1 200 OK\n< Tempo-Timing: " + smallCut + "\n< Content-Type: application/json\n<\n{}"],
+  ["cut header as the last header", "HTTP/1.1 200 OK\nTempo-Timing: " + smallCut + "\n\n{}\n"],
   // no space after the colon (legal HTTP): line shape cannot tell it from a wrapped name table,
   // so the decoder decides and the glued header is dropped again
-  ["cut header, then Content-Type without a space", "HTTP/1.1 200 OK\nTempo-Trace: " + smallCut + "\nContent-Type:application/json\n\n{}\n"],
-  ["cut wrapped header, then two headers without a space", "HTTP/1.1 200 OK\nTempo-Trace: " + wrap(smallCut, 41) + "\nx-request-id:7f3a\nContent-Type:application/json\n\n{}\n"],
-  ["cut header, then header without a space (curl -v)", "< HTTP/1.1 200 OK\n< Tempo-Trace: " + smallCut + "\n< Content-Type:application/json\n<\n{}"]
+  ["cut header, then Content-Type without a space", "HTTP/1.1 200 OK\nTempo-Timing: " + smallCut + "\nContent-Type:application/json\n\n{}\n"],
+  ["cut wrapped header, then two headers without a space", "HTTP/1.1 200 OK\nTempo-Timing: " + wrap(smallCut, 41) + "\nx-request-id:7f3a\nContent-Type:application/json\n\n{}\n"],
+  ["cut header, then header without a space (curl -v)", "< HTTP/1.1 200 OK\n< Tempo-Timing: " + smallCut + "\n< Content-Type:application/json\n<\n{}"]
 ];
 const healthy = P.stripWs(read("samples/find-healthy.header"));
 const healthyCut = healthy.slice(0, Math.floor(healthy.length * 0.6));
 const cutRuns = cutCases.map(([label, input]) => [label, input, smallCut]).concat([
-  ["cut find-healthy at 60%, then Content-Type without a space", "HTTP/1.1 200 OK\ntempo-trace: " + healthyCut + "\nContent-Type:application/json\n\n{}\n", healthyCut],
-  ["cut wrapped find-healthy at 60%, then Content-Type without a space", "HTTP/1.1 200 OK\nTempo-Trace: " + wrap(healthyCut, 80) + "\nContent-Type:application/json\n\n{}\n", healthyCut]
+  ["cut find-healthy at 60%, then Content-Type without a space", "HTTP/1.1 200 OK\ntempo-timing: " + healthyCut + "\nContent-Type:application/json\n\n{}\n", healthyCut],
+  ["cut wrapped find-healthy at 60%, then Content-Type without a space", "HTTP/1.1 200 OK\nTempo-Timing: " + wrap(healthyCut, 80) + "\nContent-Type:application/json\n\n{}\n", healthyCut]
 ]);
 for (const [label, input, want] of cutRuns) {
   let got;
@@ -176,10 +176,10 @@ for (const [label, input, want] of cutRuns) {
 }
 // a complete wrapped value is never shortened by the retry, even when a header without a space follows
 check("extract complete value, then Content-Type without a space",
-  same(P.extractTraces("HTTP/1.1 200 OK\nTempo-Trace: " + wrap(example, 37) + "\nContent-Type:application/json\n\n{}\n").map((t) => t.header), [example]));
+  same(P.extractTraces("HTTP/1.1 200 OK\nTempo-Timing: " + wrap(example, 37) + "\nContent-Type:application/json\n\n{}\n").map((t) => t.header), [example]));
 // a wrapped piece that ends in ":" with trailing terminal padding still continues the value
 const colonAt = example.indexOf(":", 40) + 1;
-const colonWrapped = "Tempo-Trace: " + example.slice(0, 30) + "\n" + example.slice(30, colonAt) + "   \n" + example.slice(colonAt) + "\n";
+const colonWrapped = "Tempo-Timing: " + example.slice(0, 30) + "\n" + example.slice(30, colonAt) + "   \n" + example.slice(colonAt) + "\n";
 check("extract wrap ending in a colon plus padding", colonAt > 30 && same(P.extractTraces(colonWrapped).map((t) => t.header), [example]));
 
 check("extract empty input",P.extractTraces("  \n ").length === 0);

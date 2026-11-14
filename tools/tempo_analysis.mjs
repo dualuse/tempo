@@ -388,7 +388,7 @@ const TempoAnalysis = (function (P) {
         flow++;
       }
     }
-    const meta = { source: "tempo-trace v1", folded: m.doc.folded, dropped: m.doc.dropped, truncated: m.doc.truncated };
+    const meta = { source: "tempo-timing v1", folded: m.doc.folded, dropped: m.doc.dropped, truncated: m.doc.truncated };
     if (m.doc.wall !== undefined) meta.wall_ms = m.doc.wall;
     return { traceEvents: ev, displayTimeUnit: "ms", otherData: meta };
   }

@@ -1,7 +1,7 @@
 # Sample traces
 
 Synthetic traces with invented names, produced by `tools/gen_traces.py`. Each trace
-comes as `NAME.header` (the `Tempo-Trace` value) and `NAME.json` (the same trace in the
+comes as `NAME.header` (the `Tempo-Timing` value) and `NAME.json` (the same trace in the
 JSON form of [`../FORMAT.md`](../FORMAT.md)). All headers fit 3,000 bytes.
 
 | File | Shape |

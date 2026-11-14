@@ -1,4 +1,4 @@
-# Invalid Tempo-Trace values
+# Invalid Tempo-Timing values
 
 Every `*.header` file here must be rejected by a decoder. The expected error code
 (see FORMAT.md, "Errors") is listed per file; `tests/run_golden.py` reads this table.

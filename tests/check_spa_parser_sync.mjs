@@ -22,7 +22,7 @@ const MODULES = [
   {
     tag: "TEMPO PARSER",
     file: join(ROOT, "tools", "tempo_parse.mjs"),
-    head: "// Tempo-Trace v1 parser as an ES module for Node and other tools.\n" +
+    head: "// Tempo-Timing v1 parser as an ES module for Node and other tools.\n" +
           "// GENERATED from site/index.html by `node tests/check_spa_parser_sync.mjs --write`. Do not edit.\n\n",
     foot: "\nexport default TempoParse;\n" +
           "export const {\n  ALPHABET_CHARS, FLAG_ORDER, FLAG_NAMES, MAX_DEPTH, RECORD_RE, ERRORS,\n" +

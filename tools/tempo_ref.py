@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reference decoder and encoder for the Tempo-Trace v1 header (see FORMAT.md).
+"""Reference decoder and encoder for the Tempo-Timing v1 header (see FORMAT.md).
 
 This file exists to validate the golden vectors in testdata/ and to round-trip
 them. It is deliberately small and strict; it is not the end-user CLI.
@@ -134,7 +134,7 @@ def encode_number(v):
 # ---------------------------------------------------------------- decoder
 
 def decode(value):
-    """Decode a Tempo-Trace value (whitespace allowed) into the JSON form (a dict)."""
+    """Decode a Tempo-Timing value (whitespace allowed) into the JSON form (a dict)."""
     v = strip_ws(value)
     if not v.startswith("v1;"):
         raise TempoFormatError("E_VERSION", "value does not start with 'v1;'")

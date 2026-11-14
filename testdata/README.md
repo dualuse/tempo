@@ -1,6 +1,6 @@
-# Tempo-Trace test vectors
+# Tempo-Timing test vectors
 
-The contract for every Tempo-Trace parser and encoder; the format is specified in
+The contract for every Tempo-Timing parser and encoder; the format is specified in
 [`../FORMAT.md`](../FORMAT.md). Run `python3 tests/run_golden.py` from the repository root.
 
 ## `golden/`

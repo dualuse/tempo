@@ -8,8 +8,8 @@
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
-<meta name="description" content="Tempo trace viewer: paste a Tempo-Trace header, curl -i output or JSON and see lanes, queue waits, critical path, diff and statistics. Runs offline; nothing is sent anywhere.">
-<title>Tempo trace viewer</title>
+<meta name="description" content="Tempo Timeline: paste a Tempo-Timing header, curl -i output or JSON and see lanes, queue waits, critical path, diff and statistics. Runs offline; nothing is sent anywhere.">
+<title>Tempo Timeline</title>
 <script>
   // Theme before first paint: #theme=… (for links and screenshots), else the stored choice, else the system.
   (function () {
@@ -354,8 +354,8 @@ footer { padding: 24px 16px 40px; text-align: center; }
 <header class="top">
   <div class="brand">
     <span class="iris-slot" data-iris="26"></span>
-    <span class="wordmark">Tempo</span>
-    <span class="eyebrow">trace viewer · enrichment center</span>
+    <span class="wordmark">Tempo Timeline</span>
+    <span class="eyebrow">enrichment center</span>
   </div>
   <div class="top-actions">
     <span class="theme-label" id="themeLabel">auto</span>
@@ -396,7 +396,7 @@ footer { padding: 24px 16px 40px; text-align: center; }
   <section class="empty anim-fade-in" id="empty">
     <span class="iris-slot" data-iris="112"></span>
     <h2>No test subject loaded</h2>
-    <p>Paste a Tempo-Trace value, the output of <code>curl -i</code> or a JSON body into the box above, drop a file, or pick a demo trace.</p>
+    <p>Paste a Tempo-Timing value, the output of <code>curl -i</code> or a JSON body into the box above, drop a file, or pick a demo trace.</p>
     <p>Testing begins when a subject is provided. This page has no network access and will not report the results to anyone.</p>
     <div class="row">
       <button class="btn-ghost" type="button" data-demo="find-saturated">Load a saturated search</button>
@@ -418,7 +418,7 @@ footer { padding: 24px 16px 40px; text-align: center; }
             <button type="button" data-export="json" role="menuitem">Decoded JSON<small>the JSON form · .json</small></button>
             <button type="button" data-export="chrome" role="menuitem">Chrome trace<small>Perfetto, chrome://tracing · .json</small></button>
             <button type="button" data-export="folded" role="menuitem">Folded stacks<small>flame graphs, self time · .txt</small></button>
-            <button type="button" data-export="header" role="menuitem">Header value<small>Tempo-Trace v1 · .txt</small></button>
+            <button type="button" data-export="header" role="menuitem">Header value<small>Tempo-Timing v1 · .txt</small></button>
           </div>
         </details>
       </div>
@@ -480,13 +480,13 @@ footer { padding: 24px 16px 40px; text-align: center; }
     </div>
   </section>
 </main>
-<footer><p class="micro">Tempo-Trace v1 viewer · one file, no build, no network (content security policy default-src 'none') · all demo traces are synthetic</p></footer>
+<footer><p class="micro">Tempo-Timing v1 viewer · one file, no build, no network (content security policy default-src 'none') · all demo traces are synthetic</p></footer>
 <div class="drop-overlay" id="dropOverlay" hidden><div id="dropText">Drop to load</div></div>
 <div class="toast" id="toast" hidden></div>
 
 <script id="tempo-parser">
 // ==== BEGIN TEMPO PARSER ====
-// Tempo-Trace v1: decoder, canonical encoder and input extraction (see FORMAT.md).
+// Tempo-Timing v1: decoder, canonical encoder and input extraction (see FORMAT.md).
 // This block is copied verbatim into tools/tempo_parse.mjs; tests/check_spa_parser_sync.mjs
 // fails when the two differ and `node tests/check_spa_parser_sync.mjs --write` re-copies it.
 const TempoParse = (function () {
@@ -874,13 +874,13 @@ const TempoParse = (function () {
 
   // ------------------------------------------------------------ input extraction
   //
-  // Accepts what the CLI accepts: `curl -i` / `curl -v` output (the Tempo-Trace line, case-insensitive,
+  // Accepts what the CLI accepts: `curl -i` / `curl -v` output (the Tempo-Timing line, case-insensitive,
   // with terminal-wrapped continuation lines), bare header values starting with "v1;" (several, one
   // after another, each possibly wrapped), or JSON (a body, an array or NDJSON) holding objects with
   // "v": 1 and "spans" anywhere, or a header string under a "tempo" key.
   // Returns [{source: "header"|"value"|"json", header?: string, doc?: object}].
 
-  const HEADER_LINE_RE = /^\s*(?:[<>]\s*)?tempo-trace\s*:(.*)$/i;
+  const HEADER_LINE_RE = /^\s*(?:[<>]\s*)?tempo-timing\s*:(.*)$/i;
   const COMPLETE_RE = /;e=[0-9a-z]+$/;
   // The next HTTP header after a cut value ("content-type: application/json", "< Server: x"):
   // a token, a colon, a space, then the field value. Terminal wraps never put a space inside a
@@ -1361,7 +1361,7 @@ const TempoAnalysis = (function (P) {
         flow++;
       }
     }
-    const meta = { source: "tempo-trace v1", folded: m.doc.folded, dropped: m.doc.dropped, truncated: m.doc.truncated };
+    const meta = { source: "tempo-timing v1", folded: m.doc.folded, dropped: m.doc.dropped, truncated: m.doc.truncated };
     if (m.doc.wall !== undefined) meta.wall_ms = m.doc.wall;
     return { traceEvents: ev, displayTimeUnit: "ms", otherData: meta };
   }

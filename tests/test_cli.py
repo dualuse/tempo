@@ -182,16 +182,16 @@ class InputForms(unittest.TestCase):
 
     def test_curl_i_output_case_insensitive_crlf(self):
         text = ("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                "tEmPo-TrAcE: %s\r\nServer-Timing: total;dur=1\r\n\r\n{\"ok\":true}\n" % self.value)
+                "tEmPo-TiMiNg: %s\r\nServer-Timing: total;dur=1\r\n\r\n{\"ok\":true}\n" % self.value)
         self.assertEqual(self.decoded(text), self.expected)
 
     def test_curl_i_output_wrapped_lines(self):
-        text = ("HTTP/2 200\r\ncontent-type: text/plain\r\nTempo-Trace: " + "\r\n".join(self.wrapped())
+        text = ("HTTP/2 200\r\ncontent-type: text/plain\r\nTempo-Timing: " + "\r\n".join(self.wrapped())
                 + "\r\nx-request-id: 7\r\n\r\nbody\n")
         self.assertEqual(self.decoded(text), self.expected)
 
     def test_curl_i_output_folded_continuation(self):
-        text = ("HTTP/1.1 200 OK\nTempo-Trace:\n " + "\n\t".join(self.wrapped(40))
+        text = ("HTTP/1.1 200 OK\nTempo-Timing:\n " + "\n\t".join(self.wrapped(40))
                 + "\nVia: proxy\n\n")
         self.assertEqual(self.decoded(text), self.expected)
 
@@ -201,7 +201,7 @@ class InputForms(unittest.TestCase):
 
     def test_curl_i_with_json_body_prefers_the_body(self):
         body = json.dumps({"info": {"tempo": self.expected}})
-        text = ("HTTP/1.1 200 OK\r\nTempo-Trace: v1;T=a;N=b;S=00.0.1;e=1\r\n\r\n" + body + "\n")
+        text = ("HTTP/1.1 200 OK\r\nTempo-Timing: v1;T=a;N=b;S=00.0.1;e=1\r\n\r\n" + body + "\n")
         self.assertEqual(self.decoded(text), self.expected)
 
     def test_json_with_tempo_header_string(self):

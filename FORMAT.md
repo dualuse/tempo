@@ -1,8 +1,8 @@
-# Tempo-Trace format, version 1
+# Tempo-Timing format, version 1
 
 This document specifies the two wire forms of a Tempo trace:
 
-- the **header value** carried in the `Tempo-Trace` HTTP response header, a single line
+- the **header value** carried in the `Tempo-Timing` HTTP response header, a single line
   of at most a few kilobytes, and
 - the **JSON form**, which is what a header value decodes to and what a response body
   can carry directly when there is no size limit.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the Tempo-Trace golden vectors against the reference decoder/encoder.
+"""Run the Tempo-Timing golden vectors against the reference decoder/encoder.
 
   * testdata/golden/NAME.header must decode to testdata/golden/NAME.json
     (structural JSON equality; key order inside objects does not matter).

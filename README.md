@@ -1,7 +1,7 @@
 # Tempo
 
 Tempo is a small phase-profiling library for Java. A trace travels in the
-`Tempo-Trace` response header or as JSON in a response body; the format is specified
+`Tempo-Timing` response header or as JSON in a response body; the format is specified
 in [FORMAT.md](FORMAT.md).
 
 ## Command-line viewer: `tools/tempo`
@@ -11,7 +11,7 @@ needs Python 3.8 or newer and nothing outside the standard library: copy it anyw
 on your `PATH`.
 
 ```
-curl -si "$URL" | tempo                  # the Tempo-Trace line of curl -i output
+curl -si "$URL" | tempo                  # the Tempo-Timing line of curl -i output
 pbpaste | tempo --tree                   # a value copied from a log or a terminal
 tempo response.json                      # JSON with a tempo object anywhere (e.g. under "info")
 tempo before.header --diff after.header  # what changed between two requests
@@ -20,7 +20,7 @@ tempo --stats traces/*.header            # p50/p95/max per path over many reques
 
 **Input.** Files or stdin, in any of three forms:
 
-- `curl -i` output. The `Tempo-Trace:` line is found case-insensitively, and a value
+- `curl -i` output. The `Tempo-Timing:` line is found case-insensitively, and a value
   that a proxy folded or a terminal wrapped over several lines is joined again.
 - A bare header value starting with `v1;`, also embedded in a log line. Whitespace
   and line breaks inside the value are ignored.

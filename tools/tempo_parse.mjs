@@ -1,8 +1,8 @@
-// Tempo-Trace v1 parser as an ES module for Node and other tools.
+// Tempo-Timing v1 parser as an ES module for Node and other tools.
 // GENERATED from site/index.html by `node tests/check_spa_parser_sync.mjs --write`. Do not edit.
 
 // ==== BEGIN TEMPO PARSER ====
-// Tempo-Trace v1: decoder, canonical encoder and input extraction (see FORMAT.md).
+// Tempo-Timing v1: decoder, canonical encoder and input extraction (see FORMAT.md).
 // This block is copied verbatim into tools/tempo_parse.mjs; tests/check_spa_parser_sync.mjs
 // fails when the two differ and `node tests/check_spa_parser_sync.mjs --write` re-copies it.
 const TempoParse = (function () {
@@ -390,13 +390,13 @@ const TempoParse = (function () {
 
   // ------------------------------------------------------------ input extraction
   //
-  // Accepts what the CLI accepts: `curl -i` / `curl -v` output (the Tempo-Trace line, case-insensitive,
+  // Accepts what the CLI accepts: `curl -i` / `curl -v` output (the Tempo-Timing line, case-insensitive,
   // with terminal-wrapped continuation lines), bare header values starting with "v1;" (several, one
   // after another, each possibly wrapped), or JSON (a body, an array or NDJSON) holding objects with
   // "v": 1 and "spans" anywhere, or a header string under a "tempo" key.
   // Returns [{source: "header"|"value"|"json", header?: string, doc?: object}].
 
-  const HEADER_LINE_RE = /^\s*(?:[<>]\s*)?tempo-trace\s*:(.*)$/i;
+  const HEADER_LINE_RE = /^\s*(?:[<>]\s*)?tempo-timing\s*:(.*)$/i;
   const COMPLETE_RE = /;e=[0-9a-z]+$/;
   // The next HTTP header after a cut value ("content-type: application/json", "< Server: x"):
   // a token, a colon, a space, then the field value. Terminal wraps never put a space inside a

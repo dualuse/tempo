@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""tempo - read Tempo-Trace values in the terminal.
+"""tempo - read Tempo-Timing values in the terminal.
 
-Reads a trace from files or stdin: `curl -i` output (the Tempo-Trace header line,
+Reads a trace from files or stdin: `curl -i` output (the Tempo-Timing header line,
 also folded or wrapped over several lines), a bare header value starting with
 `v1;`, or a JSON document holding a tempo object anywhere (for example under
 "info"). The format is specified in FORMAT.md.
@@ -95,7 +95,7 @@ def decode_number(text):
 
 
 def decode(value):
-    """Decode a Tempo-Trace value (whitespace allowed) into the JSON form (a dict)."""
+    """Decode a Tempo-Timing value (whitespace allowed) into the JSON form (a dict)."""
     v = strip_ws(value)
     if not v.startswith("v1;"):
         raise TempoFormatError("E_VERSION", "value does not start with 'v1;'")
@@ -373,7 +373,7 @@ def normalize_doc(obj):
 # ======================================================================
 
 VALUE_CHARS = frozenset(ALPHABET | frozenset(WHITESPACE))
-HEADER_RE = re.compile(r"^[ \t]*tempo-trace[ \t]*:(.*)$", re.I)
+HEADER_RE = re.compile(r"^[ \t]*tempo-timing[ \t]*:(.*)$", re.I)
 FIELD_LINE_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+:[ \t]+\S")
 COMPLETE_RE = re.compile(r";e=[0-9a-z]+$")
 VALUE_START_RE = re.compile(r"(?m)^[ \t]*(?=v1;)")
@@ -387,7 +387,7 @@ class InputError(Exception):
 
 
 def _header_values(lines):
-    """Values of Tempo-Trace header lines, with folded or wrapped continuation lines."""
+    """Values of Tempo-Timing header lines, with folded or wrapped continuation lines."""
     out = []
     i = 0
     while i < len(lines):
@@ -492,7 +492,7 @@ def load_text(text, label):
     """All traces of one input as a list of (label, Trace or TempoFormatError)."""
     cands = extract(text)
     if not cands:
-        return [(label, InputError("E_INPUT", "no Tempo-Trace value or tempo JSON found"))]
+        return [(label, InputError("E_INPUT", "no Tempo-Timing value or tempo JSON found"))]
     out = []
     for k, (kind, payload) in enumerate(cands):
         lab = label if len(cands) == 1 else "%s#%d" % (label, k + 1)
@@ -2165,7 +2165,7 @@ class UsageError(Exception):
 
 EPILOG = """\
 input:
-  curl -si "$URL" | tempo            the Tempo-Trace line of curl -i output
+  curl -si "$URL" | tempo            the Tempo-Timing line of curl -i output
   pbpaste | tempo --tree             a bare value (v1;...), wrapped lines are fine
   tempo response.json                JSON with a tempo object anywhere
   Quote a value on the command line or pipe it: ; * ~ ^ are shell syntax.
@@ -2187,7 +2187,7 @@ exit status: 0 ok, 1 malformed or (with --check) truncated input, 2 usage error.
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="tempo", formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="Read Tempo-Trace values in the terminal (format: FORMAT.md).",
+        description="Read Tempo-Timing values in the terminal (format: FORMAT.md).",
         epilog=EPILOG)
     ap.add_argument("inputs", nargs="*", metavar="FILE",
                     help="input files; none or '-' reads stdin")
