@@ -73,7 +73,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - python: "3.8"
+          - python: "3.x"
             node: 20
           - python: "3.x"
             node: 22
@@ -101,6 +101,20 @@ jobs:
       - name: Web viewer in headless Chrome
         if: matrix.node == 22
         run: node tests/check_site_headless.mjs
+
+  # The CLI promises Python 3.8. Current runner images no longer offer 3.8 through setup-python, so
+  # this job runs the Python suites in the python:3.8 image (which has git, for the check script).
+  python-floor:
+    name: Python 3.8 (the CLI's oldest)
+    runs-on: ubuntu-latest
+    container: python:3.8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Golden vectors, command-line viewer, private-term check script
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          python tests/run_golden.py
+          python -m unittest tests.test_cli tests.test_check_private
 
   # Greps the tree and the full history for the deny-list in the TEMPO_DENYLIST secret (one extended
   # regular expression per line), see tools/check-private.sh. Only on pushes to master: secrets are
