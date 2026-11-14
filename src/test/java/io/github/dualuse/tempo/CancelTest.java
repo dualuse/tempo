@@ -163,7 +163,8 @@ class CancelTest {
             assertTrue(running.await(10, TimeUnit.SECONDS));
             int cancelled = 0;
             for (int i = 0; i < 4; i++) {
-                if (handoffs.get(i).cancel()) {
+                Handoff h = handoffs.get(i);
+                if (h.cancel() || h == Handoff.NOOP) {
                     futures.get(i).cancel(false);
                     cancelled++;
                 }
@@ -183,6 +184,51 @@ class CancelTest {
                     "  match 0+0 cancelled handoff~0 index=1",
                     "  match 0+0 cancelled handoff~0 index=2",
                     "  match 0+0 cancelled handoff~0 index=3"), tree(t));
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    /**
+     * The documented early exit stops the work also where Tempo takes no part: a NOOP handoff (no live
+     * trace, or past the lane's cap) returns the task itself from its wrappers and loses every cancel, so
+     * {@code h.cancel()} alone would let it run; the pattern's second test cancels its future.
+     */
+    @Test
+    void theEarlyExitPatternStopsTheWorkWithoutATraceToo() throws Exception {
+        Trace closed = Tempo.start(SEARCH, new Options().clock(clock)); // not strict: the use after close below is misuse
+        closed.close();
+        List<Handoff> noops = List.of(
+                Tempo.current().handoff(MATCH),                     // no trace on this thread
+                NOOP.handoff(MATCH),
+                closed.root().handoff(MATCH));                      // not live
+        for (Handoff h : noops) assertSame(Handoff.NOOP, h);
+        closed.release();
+
+        ExecutorService pool = Executors.newSingleThreadExecutor(r -> new Thread(r, "worker"));
+        try {
+            CountDownLatch busy = new CountDownLatch(1), finish = new CountDownLatch(1);
+            pool.execute(() -> {
+                busy.countDown();
+                try {
+                    finish.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            assertTrue(busy.await(10, TimeUnit.SECONDS));
+            AtomicInteger ran = new AtomicInteger();
+            Handoff h = Handoff.NOOP;
+            FutureTask<Integer> pattern = new FutureTask<>(h.callable(ran::incrementAndGet));
+            FutureTask<Integer> cancelOnly = new FutureTask<>(h.callable(ran::incrementAndGet));
+            pool.execute(pattern);
+            pool.execute(cancelOnly);
+            if (h.cancel() || h == Handoff.NOOP) pattern.cancel(false);
+            if (h.cancel()) cancelOnly.cancel(false);               // h.cancel() alone: never true for NOOP
+            finish.countDown();
+            assertEquals(1, cancelOnly.get(10, TimeUnit.SECONDS));  // ran: nothing stopped it
+            assertThrows(CancellationException.class, pattern::get);
+            assertEquals(1, ran.get());                             // the pattern's task did not run
         } finally {
             pool.shutdownNow();
         }

@@ -87,9 +87,11 @@ public final class BatchUpload {
                 // an io thread for at least 16 ms (11 ms for the corrupt one), so no thread starts a fourth
                 // item before 43 ms: at most 12 items start before the 40 ms deadline. If the request thread
                 // cancelled the item first, this cancel loses, and callable() throws CancellationException.
+                // Handoff.NOOP (an untraced request) takes no part in the race: its cancel() is always false,
+                // so the deadline is checked for it on its own.
                 Item it = new Item(index, h);
                 it.task = io.submit(() -> {
-                    if (System.nanoTime() - deadline > 0 && h.cancel()) {
+                    if (System.nanoTime() - deadline > 0 && (h.cancel() || h == Tempo.Handoff.NOOP)) {
                         it.cancelled = true;
                         throw new CancellationException("not started by the deadline");
                     }
@@ -117,9 +119,10 @@ public final class BatchUpload {
             // exactly one cancel or begin wins, so the two paths never both handle one item. A won cancel
             // means the item never runs (callable() skips it); a lost one, that it began, or that its worker
             // cancelled it already. The cancelled items stay in the io queue, where they cost a worker
-            // nothing: ThreadPoolExecutor.remove would only free the slots of a bounded queue sooner.
+            // nothing: ThreadPoolExecutor.remove would only free the slots of a bounded queue sooner. A NOOP
+            // handoff (untraced) never wins, so its future is cancelled regardless.
             for (Item it : items) {
-                if (it.handoff.cancel()) {
+                if (it.handoff.cancel() || it.handoff == Tempo.Handoff.NOOP) {
                     it.cancelled = true;      // the trace: cancelled before it began (^c)
                     it.task.cancel(false);    // the result: cancelled, for whoever waits on it
                 }

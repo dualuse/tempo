@@ -4534,14 +4534,23 @@ public final class Tempo {
      *
      * <pre>{@code
      * for (Pending p : pending) {
-     *     if (p.handoff.cancel()) p.future.cancel(false); // won: the body will not run; completes the future
+     *     Tempo.Handoff h = p.handoff;
+     *     if (h.cancel() || h == Tempo.Handoff.NOOP) p.future.cancel(false); // the body will not run
      * }
      * }</pre>
      *
-     * A lost cancel means the task began: it runs, and is recorded as it runs. {@code h.cancel()} alone on
-     * every pending handoff is enough for the trace and the work, since a task whose handoff was cancelled
-     * costs nothing when a worker takes it; {@code Future.cancel} completes the future for whoever waits on
-     * it, and {@code ThreadPoolExecutor.remove} is only needed to free the queue's slots at once.
+     * A {@code false} from a recording handoff means the task began: it runs, and is recorded as it runs.
+     * {@link #NOOP} (no live trace, e.g. an untraced request, or past the lane's cap) takes no part in the
+     * race: its {@code cancel()} returns {@code false} and its wrappers return the task itself, so only
+     * {@code Future.cancel} stops that work, hence the second test. The same holds after {@link
+     * Trace#release()}, so cancel pending work before releasing the trace.
+     *
+     * <p>On a recording handoff, {@code h.cancel()} alone on every pending handoff is enough for the trace
+     * and the work if the task is wrapped ({@link #runnable}, {@link #callable}, {@link #supplier}) or
+     * starts with {@link #tryBegin()}: such a task costs nothing when a worker takes it after a won cancel.
+     * A hand-written task that calls {@link #begin()} runs its body anyway, unrecorded. {@code
+     * Future.cancel} completes the future for whoever waits on it, and {@code ThreadPoolExecutor.remove} is
+     * only needed to free the queue's slots at once.
      */
     public static final class Handoff {
         private static final int NEW = 0, BEGUN = 1, ENDED = 2, STATES = 3, ROW = 2; // ENDED: cancelled or rejected
@@ -4583,8 +4592,9 @@ public final class Tempo {
          * it is aggregate-only (see {@link Span#detail}): its duration and wait go to the handoff's aggregate,
          * and spans opened in it, with no row to hang from on a thread outside the trace, are aggregate-only
          * too. {@link Tempo#NOOP} after release, past the lane cap, when the handoff was cancelled or
-         * rejected first (a race {@link #cancel()} won, not misuse; {@link #tryBegin()} tells it apart), and
-         * on a second begin (misuse).
+         * rejected first (a race {@link #cancel()} won, not misuse), and on a second begin (misuse). A task
+         * that can be cancelled should start with {@link #tryBegin()} instead, which tells a won cancel apart
+         * so the task can skip its work; after {@code begin()} it runs unrecorded.
          */
         public Span begin() {
             Span s = tryBegin();
@@ -4620,8 +4630,9 @@ public final class Tempo {
          * began, a later begin returns {@link Tempo#NOOP} ({@link #tryBegin()}: {@code null}), and a wrapped
          * task ({@link #runnable}, {@link #callable}, {@link #supplier}) skips its body. {@code false} if
          * it changed nothing: the task has begun (it runs and is recorded as it runs), the handoff was
-         * cancelled or rejected already, the trace was released (then nothing is recorded any more, and a
-         * wrapped task that runs runs its body), or this is {@link #NOOP}.
+         * cancelled or rejected already, or Tempo takes no part: this is {@link #NOOP} (no live trace, or
+         * past a cap) or the trace was released. Then nothing is recorded and a wrapped task that runs runs
+         * its body, so the caller cancels its future itself; see {@link Handoff} for the pattern.
          */
         public boolean cancel() {
             if (lane == null || lane.ctx.released) return false;

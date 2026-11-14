@@ -100,10 +100,12 @@ public final class WorkerPool {
         // cancelled before it began (flag c), with no run time. false means it is running: it is left to
         // finish, past the join, before the response. Future.cancel completes the future for anyone who
         // waits on it. The cancelled tasks stay in the queue at no cost; ThreadPoolExecutor.remove would only
-        // free the slots of a bounded queue sooner.
+        // free the slots of a bounded queue sooner. Handoff.NOOP (an untraced request) takes no part in the
+        // race and its cancel() is always false, so there the future alone stops the task.
         int skipped = 0;
         for (int n = hit + 1; n < SHARDS; n++) {
-            if (handoffs.get(n).cancel()) {
+            Tempo.Handoff h = handoffs.get(n);
+            if (h.cancel() || h == Tempo.Handoff.NOOP) {
                 tasks.get(n).cancel(false);
                 skipped++;
             }
