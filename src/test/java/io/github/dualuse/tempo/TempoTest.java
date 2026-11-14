@@ -640,6 +640,30 @@ class TempoTest {
         assertEquals(0, t.misuses());
     }
 
+    /**
+     * As the Span Javadoc says: a span folded past the budget has no row, so it keeps no attributes, and
+     * flags only while it is open; a flag after close (as in a catch block) is dropped, without misuse.
+     */
+    @Test
+    void aFoldedSpanTakesFlagsOnlyWhileOpenAndNoAttributes() {
+        Trace t = Tempo.start(SEARCH, strict().level(DETAIL).budget(0));
+        Span open = t.root().detail(LOAD);
+        open.fail().set(BYTES, 7);       // open: the flag shows on the aggregate, the attribute is dropped
+        open.close();
+        Span late = t.root().detail(DECODE);
+        late.close();
+        late.fail();                     // closed: dropped
+        t.close();
+        assertEquals(0, t.misuses());
+        String tree = tree(t);
+        assertTrue(tree.contains("load") && tree.contains("decode"), tree);
+        for (String line : tree.split("\n")) {
+            assertFalse(line.contains("bytes"), tree);
+            if (line.contains("load")) assertTrue(line.contains("failed"), tree);
+            if (line.contains("decode")) assertFalse(line.contains("failed"), tree);
+        }
+    }
+
     // ---- phases and laps ------------------------------------------------------------------------------
 
     @Test

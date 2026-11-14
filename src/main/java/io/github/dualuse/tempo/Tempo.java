@@ -4048,9 +4048,10 @@ public final class Tempo {
      * only until the next span opens at the same depth on that thread; from then on it is that span, and
      * every call through it acts on the new one, undetected, even under {@link Options#strict}. Keep a
      * handle inside the block that opened it. Until the next span opens there, {@link #set}, {@link #fail},
-     * {@link #cancel} and {@link #waiting} work after close too, as in the catch block right after; the
-     * other calls after close, and every call on a foreign thread, are ignored and counted as misuse, and
-     * methods that open spans then return {@link #NOOP}.
+     * {@link #cancel} and {@link #waiting} work after close too, as in the catch block right after, on a
+     * span with a row: a folded or aggregate-only one ({@link #detail}) keeps no attributes, and flags only
+     * while it is open. The other calls after close, and every call on a foreign thread, are ignored and
+     * counted as misuse, and methods that open spans then return {@link #NOOP}.
      */
     public static final class Span implements AutoCloseable {
         final Lane lane;
@@ -4253,6 +4254,7 @@ public final class Tempo {
         /**
          * Attaches a number to this span. Also after it closed (e.g. in the catch block right after), until
          * the next span opens at the same depth on this thread: from then on the handle is that span.
+         * Ignored on a folded or aggregate-only span, which has no row to keep it ({@link #detail}).
          */
         public Span set(Name key, long value) {
             if (owned() && row != Lane.FRAME) lane.event(row, key(key) << KIND_BITS | ATTR_LONG, value);
@@ -4281,7 +4283,10 @@ public final class Tempo {
             return name != null ? lane.handoff(name, 0) : lane.handoff(nullName(), MISUSE);
         }
 
-        /** Marks the span failed. Also after close, until the next span opens at this depth, like {@link #set(Name, long)}. */
+        /**
+         * Marks the span failed. Also after close, until the next span opens at this depth, like {@link
+         * #set(Name, long)}; on a folded or aggregate-only span ({@link #detail}) only while it is open.
+         */
         public Span fail() {
             return flag(FAILED);
         }
@@ -4291,7 +4296,7 @@ public final class Tempo {
             return flag(FAILED);
         }
 
-        /** Marks the span cancelled or rejected. Also after close, like {@link #set(Name, long)}. */
+        /** Marks the span cancelled or rejected. Also after close, like {@link #fail()}. */
         public Span cancel() {
             return flag(CANCELLED);
         }

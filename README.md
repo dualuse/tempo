@@ -180,7 +180,8 @@ try {
 
 `set`, `fail()` and `cancel()` also work after the span closed, as in the catch block right
 after it, until the next span opens at the same depth on the thread: from then on the handle
-is that span, and a late call lands there. `waiting()` marks a blocking wait (a join, a
+is that span, and a late call lands there. (A detail span folded past the budget has no row:
+it keeps no attributes, and flags only while it is open.) `waiting()` marks a blocking wait (a join, a
 `take`, a `get`), which the viewers draw apart from run time and follow across threads on the
 critical path.
 
