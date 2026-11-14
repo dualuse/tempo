@@ -6,16 +6,16 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
-<meta name="description" content="Tempo Timeline: paste a Tempo-Timing header, curl -i output or JSON and see lanes, queue waits, critical path, diff and statistics. Runs offline; nothing is sent anywhere.">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#161616" media="(prefers-color-scheme: dark)">
+<meta name="description" content="Tempo Timeline: open a Tempo-Link or paste a Tempo-Timing header, curl -i output or JSON and see lanes, queue waits, critical path, diff and statistics. Runs offline; nothing is sent anywhere.">
 <title>Tempo Timeline</title>
 <script>
   // Theme before first paint: #theme=… (for links and screenshots), else the stored choice, else the system.
   (function () {
     var pref = "auto";
     try { pref = localStorage.getItem("tempo:theme") || "auto"; } catch (e) {}
-    var m = /(?:^#|&)theme=(light|dark|auto)(?:&|$)/.exec(location.hash);
+    var m = /(?:^|&)theme=(light|dark|auto)(?:&|$)/.exec(location.hash.slice(1) + "&" + location.search.slice(1));
     if (m) pref = m[1];
     var dark = pref === "dark" || (pref === "auto" && window.matchMedia("(prefers-color-scheme: dark)").matches);
     document.documentElement.classList.toggle("dark", dark);
@@ -24,53 +24,55 @@
   })();
 </script>
 <style>
-/* Tokens copied from ztyle (tokens/ztyle.css): neutral HSL triplets, type, motion, elevation.
-   Portal orange and portal blue are this viewer's own, the only hues besides destructive red:
-   orange = queue wait, blue = off-CPU / blocking wait, red = failed. */
+/* Tokens follow ztyle (tokens/ztyle.css): neutral HSL triplets, type, motion, elevation.
+   Two accents are this viewer's own, the only hues besides destructive red:
+   --wait (warm) = queue wait, --off (cool) = off-CPU and blocking wait, red = failed. */
 :root, .light {
-  --background: 0 0% 98%;
-  --foreground: 0 0% 5%;
+  --background: 0 0% 97.5%;
+  --foreground: 0 0% 8%;
   --card: 0 0% 100%;
-  --card-foreground: 0 0% 5%;
-  --muted: 0 0% 96%;
-  --muted-foreground: 0 0% 45%;
-  --accent: 0 0% 90%;
-  --destructive: 0 72% 51%;
+  --card-foreground: 0 0% 8%;
+  --muted: 0 0% 95.5%;
+  --muted-foreground: 0 0% 44%;
+  --accent: 0 0% 92%;
+  --destructive: 0 72% 50%;
   --destructive-foreground: 0 0% 98%;
-  --border: 0 0% 85%;
-  --ring: 0 0% 5%;
-  --portal-orange: 24 96% 50%;
-  --portal-blue: 204 92% 44%;
-  --radius: 0.5rem;
-  --font-mono: "Fira Code", "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  --border: 0 0% 88.5%;
+  --ring: 0 0% 8%;
+  --wait: 26 95% 50%;
+  --off: 210 85% 50%;
+  --radius: 0.625rem;
+  --font-sans: "Inter", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
   --tracking-mark: 0.3em;
   --tracking-widest: 0.1em;
-  --tracking-wider: 0.05em;
+  --tracking-wider: 0.06em;
   --tracking-wide: 0.025em;
   --dur-instant: 100ms;
   --dur-fast: 150ms;
   --dur-base: 200ms;
   --dur-chrome: 300ms;
   --ease: cubic-bezier(0, 0, 0.2, 1);
-  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
-  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
-  --shadow-xl: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.04);
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.08), 0 4px 6px -4px rgb(0 0 0 / 0.06);
+  --shadow-xl: 0 1px 2px rgb(0 0 0 / 0.04), 0 24px 56px -16px rgb(0 0 0 / 0.16);
   color-scheme: light;
 }
 .dark {
-  --background: 0 0% 5%;
-  --foreground: 0 0% 95%;
-  --card: 0 0% 8%;
-  --card-foreground: 0 0% 95%;
+  --background: 0 0% 5.5%;
+  --foreground: 0 0% 94%;
+  --card: 0 0% 8.5%;
+  --card-foreground: 0 0% 94%;
   --muted: 0 0% 12%;
-  --muted-foreground: 0 0% 55%;
-  --accent: 0 0% 18%;
-  --destructive: 0 62% 50%;
+  --muted-foreground: 0 0% 58%;
+  --accent: 0 0% 16%;
+  --destructive: 0 70% 56%;
   --destructive-foreground: 0 0% 98%;
-  --border: 0 0% 20%;
-  --ring: 0 0% 80%;
-  --portal-orange: 26 100% 56%;
-  --portal-blue: 199 95% 58%;
+  --border: 0 0% 17%;
+  --ring: 0 0% 85%;
+  --wait: 30 100% 57%;
+  --off: 207 92% 63%;
+  --shadow-xl: 0 1px 2px rgb(0 0 0 / 0.3), 0 24px 56px -16px rgb(0 0 0 / 0.7);
   color-scheme: dark;
 }
 
@@ -79,32 +81,26 @@ html, body {
   margin: 0;
   background-color: hsl(var(--background));
   color: hsl(var(--foreground));
-  font-family: var(--font-mono);
-  font-variant-ligatures: none;
+  font-family: var(--font-sans);
   font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   min-height: 100%;
 }
-body {
-  background-image: radial-gradient(circle, hsl(var(--foreground) / 0.03) 1px, transparent 1px);
-  background-size: 8px 8px;
-  overflow-x: hidden;
-  font-size: 14px;
-  line-height: 1.5;
-}
+body { overflow-x: hidden; font-size: 14px; line-height: 1.5; }
 :focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: 2px; }
-::selection { background: hsl(var(--foreground) / .15); }
+::selection { background: hsl(var(--foreground) / .14); }
 button, select, input, textarea { font: inherit; color: inherit; }
+code, kbd, textarea, .mono { font-family: var(--font-mono); font-variant-ligatures: none; }
+code { font-size: .92em; padding: .05em .35em; border-radius: 4px; background: hsl(var(--foreground) / .06); }
 [hidden] { display: none !important; }
 a { color: inherit; }
 
 /* type roles (ztyle) */
-.eyebrow { font-size: 10px; line-height: 1rem; text-transform: uppercase; letter-spacing: var(--tracking-wider); color: hsl(var(--muted-foreground)); font-weight: 400; margin: 0; }
+.eyebrow { font-size: 11px; line-height: 1rem; text-transform: uppercase; letter-spacing: var(--tracking-wider); color: hsl(var(--muted-foreground)); font-weight: 500; margin: 0; }
 .meta { font-size: .75rem; line-height: 1rem; color: hsl(var(--muted-foreground)); }
-.whisper { font-size: .75rem; line-height: 1rem; color: hsl(var(--muted-foreground) / .7); text-transform: lowercase; }
-.micro { font-size: 10px; color: hsl(var(--muted-foreground) / .6); }
-.stat-value { font-size: .875rem; line-height: 1.25rem; letter-spacing: var(--tracking-widest); }
+.micro { font-size: 11px; color: hsl(var(--muted-foreground) / .8); }
+.stat-value { font-size: .9375rem; line-height: 1.35; font-weight: 500; }
 
 /* buttons (ztyle) */
 .btn-primary, .btn-ghost, .icon-button, .pill-sm {
@@ -112,381 +108,444 @@ a { color: inherit; }
   display: inline-flex; align-items: center; justify-content: center; gap: .5rem;
   transition: all var(--dur-base) var(--ease); user-select: none; white-space: nowrap;
 }
-.btn-primary:active, .btn-ghost:active, .icon-button:active, .pill-sm:active { transform: scale(.95); }
+.btn-primary:active, .btn-ghost:active, .icon-button:active, .pill-sm:active { transform: scale(.97); }
 .btn-primary {
-  padding: .5rem 1.5rem; border-radius: 9999px; background: hsl(var(--foreground)); color: hsl(var(--background));
-  border: 2px solid hsl(var(--foreground)); font-size: .75rem; line-height: 1rem; text-transform: uppercase; letter-spacing: var(--tracking-wider);
+  padding: .5rem 1.25rem; border-radius: 9999px; background: hsl(var(--foreground)); color: hsl(var(--background));
+  border: 1px solid hsl(var(--foreground)); font-size: 13px; line-height: 1.25rem; font-weight: 500;
 }
-.btn-primary:hover { opacity: .9; }
+.btn-primary:hover { opacity: .88; }
 .btn-ghost {
-  padding: .5rem 1rem; border-radius: 9999px; background: transparent; color: hsl(var(--foreground));
-  border: 1px solid hsl(var(--foreground) / .2); font-size: .75rem; line-height: 1rem; text-transform: uppercase; letter-spacing: var(--tracking-wider);
+  padding: .375rem .875rem; border-radius: 9999px; background: hsl(var(--card)); color: hsl(var(--foreground));
+  border: 1px solid hsl(var(--border)); font-size: 13px; line-height: 1.25rem; font-weight: 500;
 }
-.btn-ghost:hover { background: hsl(var(--foreground) / .05); }
-.btn-ghost[aria-pressed="true"] { background: hsl(var(--foreground) / .1); border-color: hsl(var(--foreground) / .4); }
+.btn-ghost:hover { background: hsl(var(--muted)); border-color: hsl(var(--foreground) / .2); }
+.btn-ghost[aria-pressed="true"] { background: hsl(var(--foreground) / .08); border-color: hsl(var(--foreground) / .3); }
 .btn-ghost:disabled { opacity: .35; cursor: not-allowed; }
 .icon-button { padding: .5rem; border-radius: 9999px; border: 0; background: transparent; color: hsl(var(--foreground) / .7); transition-duration: var(--dur-fast); }
-.icon-button:hover { color: hsl(var(--foreground)); background: hsl(var(--foreground) / .1); }
+.icon-button:hover { color: hsl(var(--foreground)); background: hsl(var(--foreground) / .07); }
 .icon-button svg { width: 20px; height: 20px; display: block; }
 @media (pointer: coarse) { .icon-button { padding: .625rem; } }
-.pill-sm { padding: .375rem .75rem; border-radius: 9999px; border: 1px solid hsl(var(--border)); background: hsl(var(--card) / .8); font-size: .75rem; letter-spacing: var(--tracking-wide); color: hsl(var(--muted-foreground)); }
-.pill-sm:hover { color: hsl(var(--foreground)); background: hsl(var(--muted)); }
-.linkish { background: none; border: 0; padding: 0; cursor: pointer; text-decoration: underline; text-decoration-color: hsl(var(--foreground) / .3); text-underline-offset: 3px; text-align: left; }
+.linkish { background: none; border: 0; padding: 0; cursor: pointer; color: inherit; text-decoration: underline; text-decoration-color: hsl(var(--foreground) / .25); text-underline-offset: 3px; text-align: left; }
 .linkish:hover { text-decoration-color: hsl(var(--foreground)); }
 
 .card { background: hsl(var(--card)); color: hsl(var(--card-foreground)); border: 1px solid hsl(var(--border)); border-radius: var(--radius); }
 .anim-fade-in { animation: z-fade-in var(--dur-chrome) var(--ease) both; }
 @keyframes z-fade-in { from { opacity: 0 } to { opacity: 1 } }
+@keyframes z-rise { from { opacity: 0; transform: translateY(8px) } to { opacity: 1; transform: none } }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; transition-duration: 150ms !important; }
 }
 
-/* ---------------------------------------------------------------- layout */
+/* ---------------------------------------------------------------- top bar */
 .top {
-  position: sticky; top: 0; z-index: 30; height: 52px;
-  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  position: sticky; top: 0; z-index: 50; height: 56px;
+  display: flex; align-items: center; gap: 16px;
   padding: 0 max(16px, env(safe-area-inset-right)) 0 max(16px, env(safe-area-inset-left));
-  background: hsl(var(--background) / .92); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+  background: hsl(var(--card) / .9); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
   border-bottom: 1px solid hsl(var(--border));
 }
-.brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.brand .iris { width: 26px; height: 26px; flex: none; }
-.wordmark { font-weight: 300; letter-spacing: var(--tracking-mark); text-transform: uppercase; font-size: 1.1rem; }
-.brand .eyebrow { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-@media (max-width: 520px) { .brand .eyebrow { display: none; } }
-.top-actions { display: flex; align-items: center; gap: 4px; }
-.theme-label { font-size: 10px; text-transform: uppercase; letter-spacing: var(--tracking-wider); color: hsl(var(--muted-foreground)); min-width: 3.5em; text-align: right; }
+.brand { display: flex; align-items: center; gap: 10px; flex: none; }
+.mark { width: 22px; height: 22px; flex: none; color: hsl(var(--foreground)); }
+.mark .q { stroke: hsl(var(--wait)); }
+.wordmark { font-size: 14px; font-weight: 600; letter-spacing: -.005em; white-space: nowrap; }
+.trace-id { display: flex; align-items: baseline; gap: 12px; min-width: 0; flex: 1 1 auto; padding-left: 16px; border-left: 1px solid hsl(var(--border)); height: 24px; align-self: center; }
+.trace-name { font-family: var(--font-mono); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; line-height: 24px; }
+.trace-dur { font-size: 13px; color: hsl(var(--muted-foreground)); white-space: nowrap; line-height: 24px; }
+.top-actions { display: flex; align-items: center; gap: 8px; flex: none; margin-left: auto; }
+@media (max-width: 760px) { .wide-only { display: none !important; } body.loaded .wordmark { display: none; } .trace-id { padding-left: 12px; } }
+@media (min-width: 761px) { .narrow-only { display: none !important; } }
 
-.wrap { max-width: 1440px; margin: 0 auto; padding: 16px; }
-@media (min-width: 768px) { .wrap { padding: 20px 24px; } }
-section + section, .gap-top { margin-top: 16px; }
-
-/* inputs */
-.inputs { padding: 14px; }
-.in-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
-@media (min-width: 900px) { .in-grid { grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); } }
-.field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-.field-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-textarea {
-  width: 100%; min-height: 84px; max-height: 40vh; resize: vertical; padding: 10px 12px;
-  font-size: 12px; line-height: 1.45; background: hsl(var(--background)); color: hsl(var(--foreground));
-  border: 1px solid hsl(var(--border)); border-radius: var(--radius); outline: none;
-  word-break: break-all; transition: border-color var(--dur-fast) var(--ease), background-color var(--dur-fast) var(--ease);
-}
-textarea:focus { border-color: hsl(var(--foreground) / .5); }
-textarea::placeholder { color: hsl(var(--muted-foreground) / .8); }
-.drop-target { border-color: hsl(var(--foreground) / .6) !important; background-color: hsl(var(--foreground) / .04) !important; }
-.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.in-actions { margin-top: 12px; }
-select.pill-sm { appearance: none; -webkit-appearance: none; padding-right: 1.8rem; background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%); background-position: calc(100% - 14px) 55%, calc(100% - 9px) 55%; background-size: 5px 5px; background-repeat: no-repeat; max-width: 100%; }
-.file-btn input { display: none; }
-.msg { margin-top: 10px; font-size: 12px; line-height: 1.5; min-height: 0; }
-.msg:empty { display: none; }
-.msg .err { color: hsl(var(--destructive)); }
-.msg .code { letter-spacing: var(--tracking-wider); font-weight: 600; }
-
-/* empty state */
-.empty { text-align: center; padding: 56px 16px 64px; }
-.empty .iris { width: 112px; height: 112px; color: hsl(var(--foreground) / .85); }
-.empty h2 { margin: 20px 0 6px; font-size: .875rem; font-weight: 400; text-transform: uppercase; letter-spacing: var(--tracking-widest); }
-.empty p { margin: 4px auto; max-width: 560px; font-size: 13px; color: hsl(var(--muted-foreground)); }
-.empty .row { justify-content: center; margin-top: 18px; }
-
-/* summary tiles */
-.summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: var(--radius); overflow: hidden; }
-.tile { background: hsl(var(--card)); padding: 10px 12px; min-width: 0; outline: 1px solid hsl(var(--border)); }
-.tile .stat-value { display: block; overflow-wrap: anywhere; }
-.subject-line { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 10px; }
-.subject-line h1 { margin: 0; font-size: 1.125rem; font-weight: 300; letter-spacing: var(--tracking-wider); word-break: break-all; }
-
-/* menus */
+/* menu */
 .menu { position: relative; }
 .menu > summary { list-style: none; }
 .menu > summary::-webkit-details-marker { display: none; }
-.menu-panel { position: absolute; right: 0; top: calc(100% + 6px); z-index: 20; min-width: 250px; padding: 6px; display: flex; flex-direction: column; gap: 2px; box-shadow: var(--shadow-xl); }
-.menu-panel button { text-align: left; padding: 8px 10px; border: 0; border-radius: 6px; background: none; cursor: pointer; font-size: 12px; }
-.menu-panel button:hover { background: hsl(var(--foreground) / .06); }
-.menu-panel button small { display: block; color: hsl(var(--muted-foreground)); font-size: 10px; letter-spacing: var(--tracking-wider); text-transform: uppercase; }
-@media (max-width: 520px) { .menu-panel { position: fixed; left: 16px; right: 16px; top: auto; min-width: 0; } }
-.share { padding: 12px; margin-top: 12px; }
-.share input { width: 100%; padding: 8px 10px; font-size: 12px; border: 1px solid hsl(var(--border)); border-radius: var(--radius); background: hsl(var(--background)); }
+.menu-panel { position: absolute; right: 0; top: calc(100% + 8px); z-index: 60; width: 280px; padding: 6px; display: flex; flex-direction: column; box-shadow: var(--shadow-xl); max-height: calc(100vh - 80px); overflow: auto; }
+.menu-sect { display: flex; flex-direction: column; gap: 1px; padding: 4px 0; }
+.menu-sect + .menu-sect { border-top: 1px solid hsl(var(--border)); }
+.menu-sect > .eyebrow { padding: 6px 10px 2px; }
+.menu-panel button.item { text-align: left; padding: 7px 10px; border: 0; border-radius: 6px; background: none; cursor: pointer; font-size: 13px; }
+.menu-panel button.item:hover { background: hsl(var(--foreground) / .06); }
+.menu-panel button.item small { display: block; color: hsl(var(--muted-foreground)); font-size: 11px; }
+.seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; margin: 4px 8px 6px; padding: 2px; border-radius: 8px; background: hsl(var(--foreground) / .06); }
+.seg button { border: 0; background: none; border-radius: 6px; padding: 5px 0; font-size: 12px; cursor: pointer; color: hsl(var(--muted-foreground)); }
+.seg button[aria-pressed="true"] { background: hsl(var(--card)); color: hsl(var(--foreground)); box-shadow: var(--shadow-sm); }
+@media (max-width: 520px) { .menu-panel { position: fixed; left: 12px; right: 12px; top: 64px; width: auto; } .menu-panel button.item small { display: none; } .menu-panel button.item { padding: 8px 10px; } }
 
-/* findings: the test report */
-.report { padding: 12px 14px; }
-.report-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 12px; align-items: baseline; }
-.report-head h2 { margin: 0; font-size: .875rem; font-weight: 400; text-transform: uppercase; letter-spacing: var(--tracking-wider); }
-.report ol { list-style: none; margin: 10px 0 0; padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 2px; }
-@media (min-width: 1000px) { .report ol { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 24px; } }
-.report li { display: grid; grid-template-columns: 9.5em minmax(0, 1fr); gap: 8px; align-items: baseline; padding: 4px 0; border-top: 1px solid hsl(var(--border) / .6); font-size: 12px; }
-.report li .what { overflow-wrap: anywhere; }
-.report li .what .linkish { font-size: 12px; }
-.report li .detail { color: hsl(var(--muted-foreground)); }
-.kind { display: inline-flex; align-items: center; gap: 6px; font-size: 10px; text-transform: uppercase; letter-spacing: var(--tracking-wider); color: hsl(var(--muted-foreground)); }
-.dot { width: 8px; height: 8px; border-radius: 2px; flex: none; background: hsl(var(--foreground) / .35); }
-.dot.wait { background: hsl(var(--portal-orange)); }
-.dot.off { background: hsl(var(--portal-blue)); }
+/* notices under the top bar */
+.notice { max-width: 1440px; margin: 12px auto 0; padding: 0 16px; display: flex; gap: 8px; }
+@media (min-width: 768px) { .notice { padding: 0 24px; } }
+.notice-body { flex: 1 1 auto; min-width: 0; display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px 10px 14px; border-radius: var(--radius); border: 1px solid hsl(var(--border)); background: hsl(var(--card)); font-size: 13px; line-height: 1.5; }
+.notice-body .msg { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.notice-body .icon-button { padding: 2px; margin: -1px -4px 0 0; }
+.notice-body .icon-button svg { width: 16px; height: 16px; }
+.msg .err { color: hsl(var(--destructive)); }
+.msg .code { font-family: var(--font-mono); font-size: 12px; font-weight: 600; }
+.share-body { flex: 1 1 auto; min-width: 0; padding: 12px 14px; }
+.share-body input { flex: 1 1 auto; min-width: 0; padding: 7px 10px; font-family: var(--font-mono); font-size: 12px; border: 1px solid hsl(var(--border)); border-radius: 8px; background: hsl(var(--background)); }
+.share-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+
+/* ---------------------------------------------------------------- loaded view */
+.wrap { max-width: 1440px; margin: 0 auto; padding: 20px 16px 16px; }
+@media (min-width: 768px) { .wrap { padding: 24px 24px 20px; } }
+#viewer { transition: opacity var(--dur-chrome) var(--ease), filter var(--dur-chrome) var(--ease); }
+#viewer.ghost { filter: grayscale(1); opacity: .42; pointer-events: none; user-select: none; }
+.dark #viewer.ghost { opacity: .42; }
+
+/* summary: big numerals, hairline dividers */
+.summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: var(--radius); overflow: hidden; }
+.tile { padding: 14px 18px 15px; min-width: 0; box-shadow: -1px 0 0 hsl(var(--border)), 0 -1px 0 hsl(var(--border)); }
+.tile .big { display: block; margin-top: 6px; font-size: 30px; line-height: 1.1; font-weight: 300; letter-spacing: -.025em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile .big .u { font-size: 15px; font-weight: 400; letter-spacing: 0; color: hsl(var(--muted-foreground)); margin-left: 3px; }
+.tile .big.word { font-size: 22px; font-weight: 400; letter-spacing: -.01em; line-height: 33px; }
+.tile .sub { display: block; margin-top: 5px; font-size: 12px; color: hsl(var(--muted-foreground)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile .sub.err { color: hsl(var(--destructive)); }
+.tile .eyebrow { display: flex; align-items: center; gap: 6px; }
+button.tile { font: inherit; text-align: left; border: 0; background: none; cursor: pointer; color: inherit; }
+button.tile:hover { background: hsl(var(--foreground) / .025); }
+@media (max-width: 520px) { .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } .tile { padding: 12px 14px; } .tile .big { font-size: 24px; } .tile .big.word { font-size: 18px; line-height: 26px; } .tile .sub { white-space: normal; } }
+
+/* findings */
+.findings { padding: 6px 18px 14px; }
+.findings ol { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 1000px) { .findings ol { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 32px; } }
+.findings li { display: grid; grid-template-columns: 10.5em minmax(0, 1fr); gap: 10px; align-items: baseline; padding: 9px 0; border-bottom: 1px solid hsl(var(--border) / .7); font-size: 13px; }
+@media (max-width: 520px) { .findings li { grid-template-columns: minmax(0, 1fr); gap: 2px; } }
+.findings li .what { overflow-wrap: anywhere; }
+.findings li .what .linkish { font-family: var(--font-mono); font-size: 12.5px; }
+.findings li .detail { color: hsl(var(--muted-foreground)); }
+.findings .none { margin: 12px 0 4px; font-size: 13px; color: hsl(var(--muted-foreground)); }
+.findings .more { margin-top: 10px; }
+.kind { display: inline-flex; align-items: center; gap: 7px; font-size: 11px; text-transform: uppercase; letter-spacing: var(--tracking-wider); color: hsl(var(--muted-foreground)); font-weight: 500; }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; display: inline-block; background: hsl(var(--foreground) / .3); }
+.dot.wait { background: hsl(var(--wait)); }
+.dot.off { background: hsl(var(--off)); }
 .dot.fail { background: hsl(var(--destructive)); }
-.dot.hollow { background: transparent; box-shadow: inset 0 0 0 1.5px hsl(var(--foreground) / .6); }
-.report .none { margin: 8px 0 0; font-size: 12px; color: hsl(var(--muted-foreground)); }
-.report .more { margin-top: 8px; }
+.dot.hollow { background: transparent; box-shadow: inset 0 0 0 1.5px hsl(var(--foreground) / .55); }
 
 /* tabs */
-.tabs { display: flex; gap: 2px; overflow-x: auto; scrollbar-width: none; border-bottom: 1px solid hsl(var(--border)); margin-top: 16px; }
+.tabs { display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none; border-bottom: 1px solid hsl(var(--border)); margin-top: 20px; }
 .tabs::-webkit-scrollbar { display: none; }
-@media (max-width: 520px) { .tabs { flex-wrap: wrap; overflow-x: visible; } .tab { padding: 9px 9px 8px; } }
-.tab { flex: none; padding: 10px 12px 9px; border: 0; background: none; cursor: pointer; font-size: 11px; text-transform: uppercase; letter-spacing: var(--tracking-wider); color: hsl(var(--muted-foreground)); border-bottom: 2px solid transparent; margin-bottom: -1px; transition: color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease); }
+@media (max-width: 520px) { .tabs { flex-wrap: wrap; overflow-x: visible; gap: 0 2px; } .tab { padding: 9px 8px 8px; } }
+.tab { flex: none; padding: 10px 12px 9px; border: 0; background: none; cursor: pointer; font-size: 13px; font-weight: 500; color: hsl(var(--muted-foreground)); border-bottom: 2px solid transparent; margin-bottom: -1px; transition: color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease); }
 .tab:hover { color: hsl(var(--foreground)); }
 .tab[aria-selected="true"] { color: hsl(var(--foreground)); border-bottom-color: hsl(var(--foreground)); }
-.tab .n { color: hsl(var(--muted-foreground) / .7); margin-left: 4px; }
+.tab .n { color: hsl(var(--muted-foreground) / .8); margin-left: 5px; font-weight: 400; }
 
-.main-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; margin-top: 12px; }
-@media (min-width: 1100px) { .main-grid { grid-template-columns: minmax(0, 1fr) 320px; } }
+.main-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; margin-top: 14px; }
+@media (min-width: 1100px) { .main-grid { grid-template-columns: minmax(0, 1fr) 300px; } }
 .pane { min-width: 0; }
-.pane-tools { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
+.pane-tools { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px 12px; margin-bottom: 10px; }
 
 /* legend */
-.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 10px; text-transform: uppercase; letter-spacing: var(--tracking-wider); color: hsl(var(--muted-foreground)); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12px; color: hsl(var(--muted-foreground)); }
 .legend span { display: inline-flex; align-items: center; gap: 6px; }
-.sw { width: 18px; height: 9px; border-radius: 2px; display: inline-block; }
-.sw.run { background: hsl(var(--foreground) / .6); }
-.sw.wait { background: hsl(var(--portal-orange)); }
-.sw.off { background: hsl(var(--portal-blue)); }
-.sw.block { background: repeating-linear-gradient(135deg, hsl(var(--portal-blue) / .9) 0 2px, hsl(var(--portal-blue) / .25) 2px 5px); }
+.sw { width: 16px; height: 8px; border-radius: 2px; display: inline-block; }
+.sw.run { background: hsl(var(--foreground) / .5); }
+.sw.wait { background: hsl(var(--wait)); }
+.sw.off { background: hsl(var(--off)); }
+.sw.block { background: repeating-linear-gradient(135deg, hsl(var(--off) / .9) 0 2px, hsl(var(--off) / .22) 2px 5px); }
 .sw.fail { background: hsl(var(--destructive)); }
-.sw.agg { background: repeating-linear-gradient(90deg, hsl(var(--foreground) / .55) 0 3px, hsl(var(--foreground) / .2) 3px 6px); }
-.sw.open { background: linear-gradient(90deg, hsl(var(--foreground) / .6) 60%, transparent 60%); box-shadow: inset -2px 0 0 hsl(var(--foreground)); }
-.zoom-ctl { display: flex; gap: 4px; align-items: center; }
-.zoom-ctl .btn-ghost { padding: .35rem .7rem; }
+.sw.agg { background: repeating-linear-gradient(90deg, hsl(var(--foreground) / .5) 0 3px, hsl(var(--foreground) / .16) 3px 6px); }
+.sw.open { background: linear-gradient(90deg, hsl(var(--foreground) / .5) 60%, transparent 60%); box-shadow: inset -2px 0 0 hsl(var(--foreground)); }
+.zoom-ctl { display: flex; gap: 6px; align-items: center; }
+.zoom-ctl .btn-ghost { padding: .25rem .7rem; min-width: 2.1rem; }
 
 /* lanes */
 .lanes-box { position: relative; overflow: hidden; background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: var(--radius); }
 .lanes-box canvas { display: block; width: 100%; touch-action: none; cursor: default; outline: none; }
 .lanes-box canvas.grab { cursor: grabbing; }
 .lanes-box canvas.hand { cursor: pointer; }
-.hint { margin-top: 6px; }
+.hint { margin-top: 8px; }
 .tooltip {
   position: absolute; z-index: 5; pointer-events: none; max-width: 300px; min-width: 180px;
-  background: hsl(var(--card) / .96); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
-  border: 1px solid hsl(var(--border)); border-radius: .75rem; box-shadow: var(--shadow-xl);
-  padding: 8px 10px; font-size: 11px; line-height: 1.45; opacity: 0; transition: opacity var(--dur-instant) var(--ease);
+  background: hsl(var(--card) / .97); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  border: 1px solid hsl(var(--border)); border-radius: 10px; box-shadow: var(--shadow-xl);
+  padding: 9px 11px; font-size: 12px; line-height: 1.45; opacity: 0; transition: opacity var(--dur-instant) var(--ease);
 }
 .tooltip.on { opacity: 1; }
-.tooltip b { font-weight: 500; font-size: 12px; display: block; overflow-wrap: anywhere; }
-.tooltip .kv { display: grid; grid-template-columns: auto 1fr; gap: 0 10px; margin-top: 4px; }
-.tooltip .kv span:nth-child(odd) { color: hsl(var(--muted-foreground)); font-size: 10px; text-transform: uppercase; letter-spacing: var(--tracking-wider); }
+.tooltip b { font-family: var(--font-mono); font-weight: 500; font-size: 12px; display: block; overflow-wrap: anywhere; }
+.tooltip .kv { display: grid; grid-template-columns: auto 1fr; gap: 1px 12px; margin-top: 5px; }
+.tooltip .kv span:nth-child(odd) { color: hsl(var(--muted-foreground)); }
+.tooltip .wait { color: hsl(var(--wait)); }
 
 /* tables */
 .tbl-wrap { overflow-x: auto; border: 1px solid hsl(var(--border)); border-radius: var(--radius); background: hsl(var(--card)); max-height: 72vh; overflow-y: auto; }
-table.tbl { border-collapse: collapse; width: 100%; font-size: 12px; }
-.tbl th { position: sticky; top: 0; z-index: 1; background: hsl(var(--card)); font-weight: 400; font-size: 10px; text-transform: uppercase; letter-spacing: var(--tracking-wider); color: hsl(var(--muted-foreground)); text-align: right; padding: 8px 10px; border-bottom: 1px solid hsl(var(--border)); white-space: nowrap; }
+table.tbl { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+.tbl th { position: sticky; top: 0; z-index: 1; background: hsl(var(--card)); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: var(--tracking-wider); color: hsl(var(--muted-foreground)); text-align: right; padding: 9px 12px; border-bottom: 1px solid hsl(var(--border)); white-space: nowrap; }
 .tbl th.l, .tbl td.l { text-align: left; }
 .tbl th.sortable { cursor: pointer; user-select: none; }
 .tbl th.sortable:hover { color: hsl(var(--foreground)); }
 .tbl th[aria-sort] { color: hsl(var(--foreground)); }
-.tbl td { padding: 5px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid hsl(var(--border) / .5); }
+.tbl td { padding: 6px 12px; text-align: right; white-space: nowrap; border-bottom: 1px solid hsl(var(--border) / .6); }
+.tbl td.name { font-family: var(--font-mono); font-size: 12px; max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
 .tbl tbody tr { cursor: pointer; transition: background-color var(--dur-instant) var(--ease); }
 .tbl tbody tr:hover { background: hsl(var(--foreground) / .03); }
 .tbl tbody tr.sel { background: hsl(var(--foreground) / .07); }
-.tbl td.name { max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
-.tbl .tog { display: inline-block; width: 1.2em; color: hsl(var(--muted-foreground)); background: none; border: 0; padding: 0; cursor: pointer; }
+.tbl .tog { display: inline-block; width: 1.3em; color: hsl(var(--muted-foreground)); background: none; border: 0; padding: 0; cursor: pointer; }
 .tbl .dim { color: hsl(var(--muted-foreground)); }
-.tbl .wait { color: hsl(var(--portal-orange)); }
-.tbl .off { color: hsl(var(--portal-blue)); }
+.tbl .wait { color: hsl(var(--wait)); }
+.tbl .off { color: hsl(var(--off)); }
 .tbl .fail { color: hsl(var(--destructive)); }
-.flags { letter-spacing: var(--tracking-wider); }
+.flags { font-family: var(--font-mono); }
 .bar-cell { width: 90px; min-width: 70px; }
 .dbar { position: relative; height: 8px; background: hsl(var(--foreground) / .06); border-radius: 2px; }
-.dbar i { position: absolute; top: 0; bottom: 0; border-radius: 2px; background: hsl(var(--foreground) / .55); }
-.dbar.wait i { background: hsl(var(--portal-orange)); }
+.dbar i { position: absolute; top: 0; bottom: 0; border-radius: 2px; background: hsl(var(--foreground) / .5); }
+.dbar.wait i { background: hsl(var(--wait)); }
 .dbar::after { content: ""; position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px; background: hsl(var(--foreground) / .3); }
 .rbar { position: relative; height: 8px; background: hsl(var(--foreground) / .06); border-radius: 2px; min-width: 90px; }
-.rbar i { position: absolute; top: 0; bottom: 0; background: hsl(var(--foreground) / .5); border-radius: 2px; }
+.rbar i { position: absolute; top: 0; bottom: 0; background: hsl(var(--foreground) / .45); border-radius: 2px; }
 .rbar b { position: absolute; top: -2px; bottom: -2px; width: 2px; background: hsl(var(--foreground)); }
 
 /* detail panel */
-.detail { padding: 14px; align-self: start; position: sticky; top: 64px; max-height: calc(100vh - 80px); overflow: auto; }
+.detail { padding: 16px 18px; align-self: start; position: sticky; top: 72px; max-height: calc(100vh - 88px); overflow: auto; }
 @media (max-width: 1099px) { .detail { position: static; max-height: none; } }
-.detail h3 { margin: 4px 0 2px; font-size: 1rem; font-weight: 500; overflow-wrap: anywhere; }
-.detail .path { font-size: 12px; color: hsl(var(--muted-foreground)); overflow-wrap: anywhere; }
-.detail dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; margin: 12px 0 0; font-size: 12px; }
-.detail dt { font-size: 10px; text-transform: uppercase; letter-spacing: var(--tracking-wider); color: hsl(var(--muted-foreground)); padding-top: 2px; }
+.detail h3 { margin: 6px 0 2px; font-family: var(--font-mono); font-size: 15px; font-weight: 500; overflow-wrap: anywhere; }
+.detail .path { font-family: var(--font-mono); font-size: 11.5px; color: hsl(var(--muted-foreground)); overflow-wrap: anywhere; }
+.detail dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 5px 12px; margin: 14px 0 0; font-size: 13px; }
+.detail dt { color: hsl(var(--muted-foreground)); }
+.detail dt .linkish { font-family: var(--font-mono); font-size: 12px; color: hsl(var(--foreground)); }
 .detail dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
-.detail .sect { grid-column: 1 / -1; margin-top: 10px; padding-top: 8px; border-top: 1px solid hsl(var(--border)); }
-.detail .row { margin-top: 14px; }
-.chip { display: inline-block; padding: 1px 6px; margin: 1px 0 1px 4px; border-radius: 4px; font-size: 10px; text-transform: uppercase; letter-spacing: var(--tracking-wider); border: 1px solid hsl(var(--foreground) / .25); }
+.detail dd.wait { color: hsl(var(--wait)); }
+.detail dd.off { color: hsl(var(--off)); }
+.detail .sect { grid-column: 1 / -1; margin-top: 10px; padding-top: 10px; border-top: 1px solid hsl(var(--border)); }
+.detail .row { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { display: inline-block; padding: 1px 7px; margin: 2px 4px 2px 0; border-radius: 9999px; font-size: 11px; border: 1px solid hsl(var(--foreground) / .2); }
 .chip.fail { border-color: hsl(var(--destructive)); color: hsl(var(--destructive)); }
-.chip.off { border-color: hsl(var(--portal-blue)); color: hsl(var(--portal-blue)); }
-.chip.wait { border-color: hsl(var(--portal-orange)); color: hsl(var(--portal-orange)); }
+.chip.off { border-color: hsl(var(--off)); color: hsl(var(--off)); }
+.chip.wait { border-color: hsl(var(--wait)); color: hsl(var(--wait)); }
 
 /* critical path, pools, stats */
-.stack { display: flex; height: 14px; border-radius: 3px; overflow: hidden; background: hsl(var(--foreground) / .06); margin: 8px 0; }
+.stack { display: flex; height: 12px; border-radius: 3px; overflow: hidden; background: hsl(var(--foreground) / .06); margin: 12px 0 10px; }
 .stack i { display: block; height: 100%; }
-.stack .run { background: hsl(var(--foreground) / .6); }
-.stack .wait { background: hsl(var(--portal-orange)); }
-.stack .block { background: repeating-linear-gradient(135deg, hsl(var(--portal-blue) / .9) 0 2px, hsl(var(--portal-blue) / .3) 2px 5px); }
-.stack .agg { background: repeating-linear-gradient(90deg, hsl(var(--foreground) / .55) 0 3px, hsl(var(--foreground) / .2) 3px 6px); }
-.kv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px 16px; margin: 8px 0 12px; }
+.stack .run { background: hsl(var(--foreground) / .5); }
+.stack .wait { background: hsl(var(--wait)); }
+.stack .block { background: repeating-linear-gradient(135deg, hsl(var(--off) / .9) 0 2px, hsl(var(--off) / .25) 2px 5px); }
+.stack .agg { background: repeating-linear-gradient(90deg, hsl(var(--foreground) / .5) 0 3px, hsl(var(--foreground) / .16) 3px 6px); }
+.kv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px 20px; margin: 12px 0 14px; }
 .kv-grid > div { min-width: 0; }
-.pool-card { padding: 12px 14px; margin-bottom: 12px; }
-.pool-card h3 { margin: 0; font-size: .875rem; font-weight: 400; text-transform: uppercase; letter-spacing: var(--tracking-wider); }
+.kv-grid .stat-value { display: block; margin-top: 2px; }
+.stat-value.wait { color: hsl(var(--wait)); }
+.panel-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 12px; align-items: baseline; }
+.panel-head h3 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -.005em; }
+.pool-card { padding: 16px 18px; margin-bottom: 12px; }
 .pool-card canvas { display: block; width: 100%; height: 132px; }
-.peak-note { display: inline-block; margin-left: 6px; font-size: 11px; letter-spacing: normal; color: hsl(var(--muted-foreground)); }
-.note { font-size: 12px; color: hsl(var(--muted-foreground)); margin: 6px 0 10px; max-width: 760px; }
-.panel { padding: 12px 14px; margin-bottom: 12px; }
-.pane-empty { padding: 40px 16px; text-align: center; }
-.pane-empty h3 { margin: 0 0 6px; font-size: .875rem; font-weight: 400; text-transform: uppercase; letter-spacing: var(--tracking-widest); }
-.pane-empty p { margin: 4px auto 14px; max-width: 520px; font-size: 12px; color: hsl(var(--muted-foreground)); }
-.batch-list { font-size: 11px; color: hsl(var(--muted-foreground)); overflow-wrap: anywhere; }
+.peak-note { display: inline-block; margin-left: 6px; font-size: 12px; font-weight: 400; color: hsl(var(--muted-foreground)); }
+.note { font-size: 13px; color: hsl(var(--muted-foreground)); margin: 8px 0 12px; max-width: 780px; }
+.panel { padding: 16px 18px; margin-bottom: 12px; }
+.pane-empty { padding: 48px 20px; text-align: center; }
+.pane-empty h3 { margin: 0 0 6px; font-size: 17px; font-weight: 600; letter-spacing: -.01em; }
+.pane-empty p { margin: 4px auto 18px; max-width: 520px; font-size: 13px; color: hsl(var(--muted-foreground)); }
+.pane-empty .row { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.batch-list { font-family: var(--font-mono); font-size: 11px; color: hsl(var(--muted-foreground)); overflow-wrap: anywhere; }
+.file-btn input { display: none; }
 
-/* drag overlay */
-.drop-overlay { position: fixed; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center; pointer-events: none; background: hsl(var(--background) / .8); backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px); }
-.drop-overlay div { padding: 18px 26px; border: 1px dashed hsl(var(--foreground) / .5); border-radius: 1rem; background: hsl(var(--card)); font-size: 12px; text-transform: uppercase; letter-spacing: var(--tracking-widest); }
-.toast { position: fixed; left: 50%; bottom: max(16px, env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 70; padding: .6rem 1rem; border-radius: .75rem; background: hsl(var(--card)); border: 1px solid hsl(var(--border)); box-shadow: var(--shadow-lg); font-size: 12px; max-width: calc(100vw - 32px); }
+/* ---------------------------------------------------------------- landing prompt over the greyed demo */
+.prompt-layer {
+  position: fixed; inset: 56px 0 0 0; z-index: 40; overflow-y: auto;
+  display: flex; align-items: flex-start; justify-content: center; padding: max(40px, 11vh) 16px 40px;
+  background: radial-gradient(120% 90% at 50% 30%, hsl(var(--background) / .82) 0%, hsl(var(--background) / .55) 45%, hsl(var(--background) / .2) 100%);
+}
+.prompt { width: min(600px, 100%); padding: 36px 40px 26px; border-radius: 16px; box-shadow: var(--shadow-xl); animation: z-rise var(--dur-chrome) var(--ease) both; }
+.prompt h1 { margin: 0 0 10px; font-size: 27px; line-height: 1.2; font-weight: 600; letter-spacing: -.022em; }
+.prompt .lede { margin: 0 0 18px; font-size: 14px; color: hsl(var(--muted-foreground)); }
+.paste-box {
+  display: block; width: 100%; min-height: 116px; max-height: 40vh; resize: vertical; padding: 14px 16px;
+  font-size: 12px; line-height: 1.5; background: hsl(var(--background)); color: hsl(var(--foreground));
+  border: 1px dashed hsl(var(--foreground) / .22); border-radius: 12px; outline: none; word-break: break-all;
+  transition: border-color var(--dur-fast) var(--ease), background-color var(--dur-fast) var(--ease);
+}
+.paste-box:focus { border-style: solid; border-color: hsl(var(--foreground) / .45); background: hsl(var(--card)); }
+.paste-box::placeholder { color: hsl(var(--muted-foreground) / .85); }
+.drop-target { border-color: hsl(var(--foreground) / .6) !important; background-color: hsl(var(--foreground) / .04) !important; }
+.prompt .msg { margin-top: 10px; font-size: 13px; overflow-wrap: anywhere; }
+.prompt .msg:empty { display: none; }
+.prompt-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin-top: 14px; }
+.prompt-row .linkish { font-size: 13px; }
+.prompt-row .grow { flex: 1 1 auto; }
+.prompt .hint { margin: 18px 0 0; padding-top: 16px; border-top: 1px solid hsl(var(--border)); font-size: 13px; color: hsl(var(--muted-foreground)); }
+.prompt-foot { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 6px 16px; margin-top: 12px; font-size: 13px; }
+.prompt-foot .linkish { color: hsl(var(--foreground)); }
+@media (max-width: 520px) {
+  .prompt-layer { padding-top: 20px; }
+  .prompt { padding: 24px 20px 20px; border-radius: 14px; }
+  .prompt h1 { font-size: 22px; }
+  .paste-box { min-height: 96px; }
+}
 
-footer { padding: 24px 16px 40px; text-align: center; }
+/* compare / add-traces dialog */
+dialog.side { width: min(560px, calc(100vw - 32px)); padding: 24px 26px 20px; border-radius: 14px; box-shadow: var(--shadow-xl); }
+dialog.side::backdrop { background: hsl(var(--background) / .6); backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px); }
+dialog.side h2 { margin: 0 0 6px; font-size: 19px; font-weight: 600; letter-spacing: -.015em; }
+dialog.side .lede { margin: 0 0 14px; font-size: 13px; color: hsl(var(--muted-foreground)); }
+dialog.side .msg { margin-top: 10px; font-size: 13px; }
+dialog.side .msg:empty { display: none; }
 
-/* aperture iris mark (drawn for this page) */
-.iris .blade { fill: currentColor; stroke: hsl(var(--background)); stroke-width: 2.4; stroke-linejoin: round; }
-.iris .ring { fill: none; stroke: currentColor; stroke-width: 3; }
+/* drag overlay, toast */
+.drop-overlay { position: fixed; inset: 0; z-index: 80; display: flex; align-items: center; justify-content: center; pointer-events: none; background: hsl(var(--background) / .8); backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px); }
+.drop-overlay div { padding: 18px 28px; border: 1px dashed hsl(var(--foreground) / .45); border-radius: 14px; background: hsl(var(--card)); font-size: 14px; font-weight: 500; }
+.toast { position: fixed; left: 50%; bottom: max(16px, env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 90; padding: .6rem 1rem; border-radius: 10px; background: hsl(var(--foreground)); color: hsl(var(--background)); box-shadow: var(--shadow-lg); font-size: 13px; max-width: calc(100vw - 32px); }
+
+footer { padding: 28px 16px 40px; text-align: center; }
+body.prompting footer { display: none; }
 </style>
 </head>
 <body>
 <header class="top">
   <div class="brand">
-    <span class="iris-slot" data-iris="26"></span>
+    <svg class="mark" viewBox="0 0 24 24" fill="none" stroke-linecap="round" aria-hidden="true">
+      <rect x="1" y="1" width="22" height="22" rx="6" stroke="currentColor" stroke-width="1.5"/>
+      <path d="M6 8.5h8" stroke="currentColor" stroke-width="2"/>
+      <path class="q" d="M6 12h3" stroke-width="2"/>
+      <path d="M11 12h7" stroke="currentColor" stroke-width="2"/>
+      <path d="M9 15.5h6" stroke="currentColor" stroke-width="2"/>
+    </svg>
     <span class="wordmark">Tempo Timeline</span>
-    <span class="eyebrow">enrichment center</span>
   </div>
+  <div class="trace-id" id="traceId" hidden><span class="trace-name" id="traceName"></span><span class="trace-dur" id="traceDur"></span></div>
   <div class="top-actions">
-    <span class="theme-label" id="themeLabel">auto</span>
-    <button class="icon-button" id="themeBtn" type="button" aria-label="Theme"></button>
+    <button class="btn-ghost wide-only" id="compareBtn" type="button" hidden>Compare…</button>
+    <button class="btn-ghost wide-only" id="addBtn" type="button" hidden>Add traces…</button>
+    <details class="menu" id="mainMenu">
+      <summary class="icon-button" aria-label="Menu" title="Menu"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg></summary>
+      <div class="menu-panel card" role="menu">
+        <div class="menu-sect" data-when="loaded">
+          <button class="item" type="button" data-act="open" role="menuitem">Open another trace…<small>or press ⌘V / Ctrl+V anywhere</small></button>
+          <button class="item narrow-only" type="button" data-act="compare" role="menuitem">Compare…<small>a second trace, for the diff tab</small></button>
+          <button class="item narrow-only" type="button" data-act="add" role="menuitem">Add traces…<small>several traces, for the stats tab</small></button>
+          <button class="item" type="button" data-act="share" role="menuitem">Copy share link<small>the trace travels in the # fragment</small></button>
+        </div>
+        <div class="menu-sect" data-when="loaded">
+          <p class="eyebrow">Export</p>
+          <button class="item" type="button" data-export="json" role="menuitem">Decoded JSON<small>the JSON form · .json</small></button>
+          <button class="item" type="button" data-export="chrome" role="menuitem">Chrome trace<small>Perfetto, chrome://tracing · .json</small></button>
+          <button class="item" type="button" data-export="folded" role="menuitem">Folded stacks<small>flame graphs, self time · .txt</small></button>
+          <button class="item" type="button" data-export="header" role="menuitem">Header value<small>Tempo-Timing v1 · .txt</small></button>
+        </div>
+        <div class="menu-sect">
+          <p class="eyebrow">Demo traces</p>
+          <button class="item" type="button" data-demo="find-saturated" role="menuitem">Search, saturated cpu pool</button>
+          <button class="item" type="button" data-demo="find-healthy" role="menuitem">Search, healthy pools</button>
+          <button class="item" type="button" data-demo="pipeline" role="menuitem">Video pipeline</button>
+          <button class="item" type="button" data-demo="small" role="menuitem">Small search</button>
+          <button class="item" type="button" data-demo="diff" role="menuitem">Diff pair<small>shared vs split pool</small></button>
+          <button class="item" type="button" data-demo="batch" role="menuitem">Batch of 30<small>for the stats tab</small></button>
+        </div>
+        <div class="menu-sect">
+          <p class="eyebrow">Theme</p>
+          <div class="seg" role="group" aria-label="Theme">
+            <button type="button" data-theme="auto">Auto</button><button type="button" data-theme="light">Light</button><button type="button" data-theme="dark">Dark</button>
+          </div>
+        </div>
+      </div>
+    </details>
   </div>
 </header>
 
-<main class="wrap">
-  <section class="inputs card" aria-label="Input">
-    <div class="in-grid">
-      <div class="field" id="fieldA">
-        <div class="field-head"><label class="eyebrow" for="inA">Test subject · trace A</label><span class="micro">header, curl -i, json · several go to stats</span></div>
-        <textarea id="inA" spellcheck="false" autocomplete="off" placeholder="v1;w=…;T=…;N=…;S=…;e=…&#10;or the output of: curl -si &quot;$URL&quot;&#10;or a JSON body with a &quot;tempo&quot; object"></textarea>
-      </div>
-      <div class="field" id="fieldB">
-        <div class="field-head"><label class="eyebrow" for="inB">Control subject · trace B</label><span class="micro">optional · for the diff tab</span></div>
-        <textarea id="inB" spellcheck="false" autocomplete="off" placeholder="a second trace to compare with"></textarea>
-      </div>
-    </div>
-    <div class="row in-actions">
-      <button class="btn-primary" id="loadBtn" type="button">Load</button>
-      <select class="pill-sm" id="demoSel" aria-label="Demo traces">
-        <option value="">Demo traces…</option>
-        <option value="find-healthy">find · healthy pools</option>
-        <option value="find-saturated">find · saturated cpu pool</option>
-        <option value="pipeline">video pipeline</option>
-        <option value="small">small search</option>
-        <option value="diff">diff pair · shared vs split pool</option>
-        <option value="batch">batch · 30 searches (stats)</option>
-      </select>
-      <label class="btn-ghost file-btn">Open files<input type="file" id="fileIn" multiple accept=".header,.txt,.json,.log,text/plain,application/json"></label>
-      <button class="btn-ghost" id="clearBtn" type="button">Clear</button>
-      <span class="whisper">drop files anywhere · nothing leaves this page</span>
-    </div>
-    <div class="msg" id="msg" role="status" aria-live="polite"></div>
-  </section>
+<div class="notice" id="notice" hidden>
+  <div class="notice-body"><div class="msg" id="msg" role="status" aria-live="polite"></div><button class="icon-button" type="button" id="noticeClose" aria-label="Dismiss"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
+</div>
+<div class="notice" id="sharePanel" hidden>
+  <div class="share-body card">
+    <div class="panel-head"><span class="eyebrow">Share link</span><span class="micro" id="shareInfo"></span></div>
+    <div class="share-row"><input id="shareUrl" readonly aria-label="Share link"><button class="btn-ghost" id="copyShare" type="button">Copy</button><button class="icon-button" type="button" id="shareClose" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" style="width:16px;height:16px"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
+    <p class="note" style="margin-bottom:0">Same shape as a <code>Tempo-Link</code> header. The trace travels in the <code>#</code> fragment, which browsers never send to a server; this page makes no requests.</p>
+  </div>
+</div>
 
-  <section class="empty anim-fade-in" id="empty">
-    <span class="iris-slot" data-iris="112"></span>
-    <h2>No test subject loaded</h2>
-    <p>Paste a Tempo-Timing value, the output of <code>curl -i</code> or a JSON body into the box above, drop a file, or pick a demo trace.</p>
-    <p>Testing begins when a subject is provided. This page has no network access and will not report the results to anyone.</p>
-    <div class="row">
-      <button class="btn-ghost" type="button" data-demo="find-saturated">Load a saturated search</button>
-      <button class="btn-ghost" type="button" data-demo="find-healthy">Load a healthy search</button>
-    </div>
-  </section>
+<main class="wrap" id="viewer" hidden>
+  <div class="summary" id="summary"></div>
 
-  <section id="viewer" hidden>
-    <div class="subject-line">
-      <div>
-        <p class="eyebrow">Test subject</p>
-        <h1 id="subjectName"></h1>
-      </div>
-      <div class="row">
-        <button class="btn-ghost" id="shareBtn" type="button">Share link</button>
-        <details class="menu" id="exportMenu">
-          <summary class="btn-ghost">Export</summary>
-          <div class="menu-panel card" role="menu">
-            <button type="button" data-export="json" role="menuitem">Decoded JSON<small>the JSON form · .json</small></button>
-            <button type="button" data-export="chrome" role="menuitem">Chrome trace<small>Perfetto, chrome://tracing · .json</small></button>
-            <button type="button" data-export="folded" role="menuitem">Folded stacks<small>flame graphs, self time · .txt</small></button>
-            <button type="button" data-export="header" role="menuitem">Header value<small>Tempo-Timing v1 · .txt</small></button>
+  <nav class="tabs" role="tablist" id="tabs">
+    <button class="tab" role="tab" data-tab="lanes">Lanes</button>
+    <button class="tab" role="tab" data-tab="findings">Findings</button>
+    <button class="tab" role="tab" data-tab="tree">Tree</button>
+    <button class="tab" role="tab" data-tab="aggregates">Aggregates</button>
+    <button class="tab" role="tab" data-tab="pools">Pools</button>
+    <button class="tab" role="tab" data-tab="critical">Critical path</button>
+    <button class="tab" role="tab" data-tab="diff">Diff</button>
+    <button class="tab" role="tab" data-tab="stats">Stats</button>
+  </nav>
+
+  <div class="main-grid">
+    <div class="pane-host">
+      <div class="pane" id="pane-lanes" role="tabpanel">
+        <div class="pane-tools">
+          <div class="legend" aria-label="Legend">
+            <span><i class="sw run"></i>run</span>
+            <span><i class="sw wait"></i>queue wait</span>
+            <span><i class="sw off"></i>off-cpu</span>
+            <span><i class="sw block"></i>blocking wait</span>
+            <span><i class="sw fail"></i>failed</span>
+            <span><i class="sw agg"></i>aggregate</span>
+            <span><i class="sw open"></i>open</span>
           </div>
-        </details>
-      </div>
-    </div>
-    <div class="share card" id="sharePanel" hidden>
-      <div class="field-head"><span class="eyebrow">Share link</span><span class="micro" id="shareInfo"></span></div>
-      <div class="row" style="margin-top:6px;flex-wrap:nowrap"><input id="shareUrl" readonly aria-label="Share link"><button class="btn-ghost" id="copyShare" type="button">Copy</button></div>
-      <p class="note" style="margin-bottom:0">The trace travels in the <code>#</code> fragment of the link. Browsers do not send the fragment to any server, and this page makes no requests of its own.</p>
-    </div>
-
-    <div class="summary gap-top" id="summary"></div>
-
-    <section class="report card" id="report" aria-labelledby="reportTitle"></section>
-
-    <nav class="tabs" role="tablist" id="tabs">
-      <button class="tab" role="tab" data-tab="lanes">Lanes</button>
-      <button class="tab" role="tab" data-tab="tree">Tree</button>
-      <button class="tab" role="tab" data-tab="aggregates">Aggregates</button>
-      <button class="tab" role="tab" data-tab="pools">Pools</button>
-      <button class="tab" role="tab" data-tab="critical">Critical path</button>
-      <button class="tab" role="tab" data-tab="diff">Diff</button>
-      <button class="tab" role="tab" data-tab="stats">Stats</button>
-    </nav>
-
-    <div class="main-grid">
-      <div class="pane-host">
-        <div class="pane" id="pane-lanes" role="tabpanel">
-          <div class="pane-tools">
-            <div class="legend" aria-label="Legend">
-              <span><i class="sw run"></i>run</span>
-              <span><i class="sw wait"></i>queue wait</span>
-              <span><i class="sw off"></i>off-cpu</span>
-              <span><i class="sw block"></i>blocking wait</span>
-              <span><i class="sw fail"></i>failed</span>
-              <span><i class="sw agg"></i>aggregate</span>
-              <span><i class="sw open"></i>open</span>
-            </div>
-            <div class="zoom-ctl">
-              <button class="btn-ghost" id="cpToggle" type="button" aria-pressed="true" title="Show the critical path track">Path</button>
-              <button class="btn-ghost" id="zoomOut" type="button" aria-label="Zoom out">−</button>
-              <button class="btn-ghost" id="zoomIn" type="button" aria-label="Zoom in">+</button>
-              <button class="btn-ghost" id="zoomFit" type="button">Fit</button>
-            </div>
+          <div class="zoom-ctl">
+            <button class="btn-ghost" id="cpToggle" type="button" aria-pressed="true" title="Show the critical path track">Path</button>
+            <button class="btn-ghost" id="zoomOut" type="button" aria-label="Zoom out">−</button>
+            <button class="btn-ghost" id="zoomIn" type="button" aria-label="Zoom in">+</button>
+            <button class="btn-ghost" id="zoomFit" type="button">Fit</button>
           </div>
-          <div class="lanes-box" id="lanesBox">
-            <canvas id="lanes" tabindex="0" aria-label="Timeline lanes per thread, grouped by pool"></canvas>
-            <div class="tooltip" id="tip" role="tooltip"></div>
-          </div>
-          <p class="micro hint">wheel: zoom · shift+wheel: pan · alt+wheel: scroll · drag: pan · click: select · click again or double-click: zoom to span · pool header: collapse · keys: ← → + − 0 enter esc</p>
         </div>
-        <div class="pane" id="pane-tree" role="tabpanel" hidden></div>
-        <div class="pane" id="pane-aggregates" role="tabpanel" hidden></div>
-        <div class="pane" id="pane-pools" role="tabpanel" hidden></div>
-        <div class="pane" id="pane-critical" role="tabpanel" hidden></div>
-        <div class="pane" id="pane-diff" role="tabpanel" hidden></div>
-        <div class="pane" id="pane-stats" role="tabpanel" hidden></div>
+        <div class="lanes-box" id="lanesBox">
+          <canvas id="lanes" tabindex="0" aria-label="Timeline lanes per thread, grouped by pool"></canvas>
+          <div class="tooltip" id="tip" role="tooltip"></div>
+        </div>
+        <p class="micro hint">wheel: zoom · shift+wheel: pan · alt+wheel: scroll · drag: pan · click: select · click again or double-click: zoom to span · pool header: collapse · keys: ← → + − 0 enter esc</p>
       </div>
-      <aside class="detail card" id="detail" aria-label="Selected span"></aside>
+      <div class="pane" id="pane-findings" role="tabpanel" hidden></div>
+      <div class="pane" id="pane-tree" role="tabpanel" hidden></div>
+      <div class="pane" id="pane-aggregates" role="tabpanel" hidden></div>
+      <div class="pane" id="pane-pools" role="tabpanel" hidden></div>
+      <div class="pane" id="pane-critical" role="tabpanel" hidden></div>
+      <div class="pane" id="pane-diff" role="tabpanel" hidden></div>
+      <div class="pane" id="pane-stats" role="tabpanel" hidden></div>
+    </div>
+    <aside class="detail card" id="detail" aria-label="Selected span"></aside>
+  </div>
+</main>
+<footer id="footer" hidden><p class="micro">Tempo Timeline · Tempo-Timing v1 · one file, no build, no network (content security policy default-src 'none') · demo traces are synthetic</p></footer>
+
+<div class="prompt-layer" id="prompt" hidden>
+  <section class="prompt card" role="dialog" aria-labelledby="promptTitle">
+    <h1 id="promptTitle">Paste a Tempo-Timing header<br> or open a Tempo-Link</h1>
+    <p class="lede">Press <kbd>⌘V</kbd> anywhere on this page, drop a file, or paste into the box. The trace stays in this page.</p>
+    <textarea class="paste-box" id="pasteBox" spellcheck="false" autocomplete="off" aria-label="Paste a trace" placeholder="Tempo-Timing: v1;w=…;T=…;N=…;S=…;e=…&#10;Tempo-Link: https://…/#t=z.…&#10;or curl -i output, or a JSON body"></textarea>
+    <div class="msg" id="promptMsg" role="status" aria-live="polite"></div>
+    <div class="prompt-row">
+      <button class="btn-primary" id="openBtn" type="button">Open</button>
+      <label class="linkish file-btn">Choose files…<input type="file" id="fileIn" multiple accept=".header,.txt,.json,.log,text/plain,application/json"></label>
+      <span class="grow"></span>
+      <button class="linkish" id="promptCancel" type="button" hidden>Cancel</button>
+    </div>
+    <p class="hint">Get one with <code>curl -si URL | grep -i tempo-</code>, or click the Tempo-Link in your terminal.</p>
+    <div class="prompt-foot">
+      <button class="linkish" type="button" data-demo="find-saturated">or explore a demo trace →</button>
+      <span class="micro">offline · nothing leaves this page</span>
     </div>
   </section>
-</main>
-<footer><p class="micro">Tempo-Timing v1 viewer · one file, no build, no network (content security policy default-src 'none') · all demo traces are synthetic</p></footer>
+</div>
+
+<dialog class="side card" id="sideDlg" aria-labelledby="sideTitle">
+  <h2 id="sideTitle"></h2>
+  <p class="lede" id="sideLede"></p>
+  <textarea class="paste-box" id="sideBox" spellcheck="false" autocomplete="off" aria-label="Paste traces"></textarea>
+  <div class="msg" id="sideMsg" role="status" aria-live="polite"></div>
+  <div class="prompt-row">
+    <button class="btn-primary" id="sideGo" type="button"></button>
+    <label class="linkish file-btn">Choose files…<input type="file" id="sideFiles" multiple accept=".header,.txt,.json,.log,text/plain,application/json"></label>
+    <span class="grow"></span>
+    <button class="linkish" id="sideExtra" type="button"></button>
+    <button class="linkish" id="sideCancel" type="button">Cancel</button>
+  </div>
+</dialog>
+
 <div class="drop-overlay" id="dropOverlay" hidden><div id="dropText">Drop to load</div></div>
 <div class="toast" id="toast" hidden></div>
 
 <script id="tempo-parser">
 // ==== BEGIN TEMPO PARSER ====
-// Tempo-Timing v1: decoder, canonical encoder and input extraction (see FORMAT.md).
+// Tempo-Timing v1: decoder, canonical encoder, input extraction and Tempo-Link fragments (see FORMAT.md).
 // This block is copied verbatim into tools/tempo_parse.mjs; tests/check_spa_parser_sync.mjs
 // fails when the two differ and `node tests/check_spa_parser_sync.mjs --write` re-copies it.
 const TempoParse = (function () {
@@ -518,7 +577,8 @@ const TempoParse = (function () {
     E_FLAG: "Unknown flag",
     E_AGG: "Aggregate rules broken",
     E_INPUT: "No Tempo trace found in the input",
-    E_JSON: "JSON form is not a valid trace"
+    E_JSON: "JSON form is not a valid trace",
+    E_LINK: "Tempo-Link or share link that cannot be decoded"
   };
 
   class TempoFormatError extends Error {
@@ -872,15 +932,122 @@ const TempoParse = (function () {
     return lines.join("\n") + "\n";
   }
 
+  // ------------------------------------------------------------ links
+  //
+  // A Tempo-Link header and the viewer's share link are the same URL: the header value travels in
+  // the fragment, which browsers never send, so opening the link fetches nothing.
+  //   <base>#t=<packed>[&c=<packed>][&tab=<view>]
+  //   packed = "z." + base64url without padding (deflate-raw (UTF-8 bytes of the value))
+  //          | the plain value with every "%" written as "%25"
+  // c= is a second trace to compare with (the diff tab), tab= the view to open.
+
+  const LINK_INFLATE_MAX = 16 << 20;   // a link never inflates to more than this many bytes
+  let utf8Strict = null;
+
+  function linkParams(url) {
+    const s = String(url);
+    const i = s.indexOf("#");
+    if (i < 0) return null;
+    const p = Object.create(null);
+    for (const part of s.slice(i + 1).split("&")) {
+      const eq = part.indexOf("=");
+      if (eq > 0) p[part.slice(0, eq)] = part.slice(eq + 1);
+    }
+    if (!p.t) return null;
+    const out = { t: p.t };
+    if (p.c) out.c = p.c;
+    if (p.tab) out.tab = p.tab;
+    return out;
+  }
+
+  function bytesToB64url(bytes) {
+    let s = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function b64urlToBytes(s) {
+    const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  // Runs bytes through a (De)CompressionStream; stops with a RangeError past `cap` output bytes.
+  async function transformBytes(bytes, transform, cap) {
+    const reader = new Blob([bytes]).stream().pipeThrough(transform).getReader();
+    const chunks = [];
+    let n = 0;
+    for (;;) {
+      const r = await reader.read();
+      if (r.done) break;
+      n += r.value.length;
+      if (cap && n > cap) { reader.cancel().catch(function () {}); throw new RangeError("more than " + cap + " bytes"); }
+      chunks.push(r.value);
+    }
+    const out = new Uint8Array(n);
+    let o = 0;
+    for (const c of chunks) { out.set(c, o); o += c.length; }
+    return out;
+  }
+
+  // packed fragment value -> header value. Rejects with E_LINK.
+  async function unpackValue(packed) {
+    const raw = String(packed);
+    if (!raw.startsWith("z.")) return raw.indexOf("%25") >= 0 ? raw.replace(/%25/g, "%") : raw;
+    const b64 = raw.slice(2);
+    if (!/^[A-Za-z0-9_-]+$/.test(b64) || b64.length % 4 === 1) fail("E_LINK", "the z. payload is not base64url");
+    if (typeof DecompressionStream !== "function") fail("E_LINK", "this browser has no DecompressionStream, so it cannot inflate a z. link; open it in a current browser or paste the Tempo-Timing header instead");
+    let ds;
+    try { ds = new DecompressionStream("deflate-raw"); } catch (e) { fail("E_LINK", "this browser cannot inflate deflate-raw, so it cannot read a z. link; open it in a current browser or paste the Tempo-Timing header instead"); }
+    let bytes;
+    try { bytes = await transformBytes(b64urlToBytes(b64), ds, LINK_INFLATE_MAX); } catch (e) {
+      fail("E_LINK", e instanceof RangeError ? "the z. payload inflates to " + e.message : "the z. payload is corrupt or truncated" + (e && e.message ? " (" + e.message + ")" : ""));
+    }
+    if (!utf8Strict) utf8Strict = new TextDecoder("utf-8", { fatal: true });
+    try { return utf8Strict.decode(bytes); } catch (e) { return fail("E_LINK", "the z. payload is not UTF-8 text"); }
+  }
+
+  // header value -> packed fragment value: z. when that is shorter (and CompressionStream exists).
+  async function packValue(value) {
+    const v = String(value);
+    const plain = v.replace(/%/g, "%25");
+    if (typeof CompressionStream === "function") {
+      try {
+        const z = "z." + bytesToB64url(await transformBytes(new TextEncoder().encode(v), new CompressionStream("deflate-raw")));
+        if (z.length < plain.length) return z;
+      } catch (e) { /* plain */ }
+    }
+    return plain;
+  }
+
+  // The link for a trace (and an optional second one to compare with) on a viewer at `base`.
+  async function makeLink(base, value, compare, tab) {
+    let url = String(base).split("#")[0] + "#t=" + await packValue(value);
+    if (compare) url += "&c=" + await packValue(compare);
+    if (tab) url += "&tab=" + tab;
+    return url;
+  }
+
+  function unpackParam(params, key) {
+    if (!params || !params[key]) fail("E_LINK", "the link has no #" + key + "= fragment");
+    return unpackValue(params[key]);
+  }
+
   // ------------------------------------------------------------ input extraction
   //
   // Accepts what the CLI accepts: `curl -i` / `curl -v` output (the Tempo-Timing line, case-insensitive,
   // with terminal-wrapped continuation lines), bare header values starting with "v1;" (several, one
   // after another, each possibly wrapped), or JSON (a body, an array or NDJSON) holding objects with
   // "v": 1 and "spans" anywhere, or a header string under a "tempo" key.
-  // Returns [{source: "header"|"value"|"json", header?: string, doc?: object}].
+  // Also links: Tempo-Link header lines and bare URLs with a #t= fragment (each possibly wrapped).
+  // A Tempo-Timing and a Tempo-Link of the same response are one trace (see loadAsync).
+  // Returns [{source: "header"|"value"|"json"|"link", header?: string, doc?: object, link?: {t, c?, tab?}}].
 
   const HEADER_LINE_RE = /^\s*(?:[<>]\s*)?tempo-timing\s*:(.*)$/i;
+  const LINK_LINE_RE = /^\s*(?:[<>]\s*)?tempo-link\s*:(.*)$/i;
+  const LINK_TOKEN_RE = /[^\s<>"'()[\]{}]*#[^\s<>"'()[\]{}]+/g;
+  const STATUS_LINE_RE = /^\s*(?:<\s*)?HTTP\/\d(?:\.\d)?\s+\d{3}\b/;
   const COMPLETE_RE = /;e=[0-9a-z]+$/;
   // The next HTTP header after a cut value ("content-type: application/json", "< Server: x"):
   // a token, a colon, a space, then the field value. Terminal wraps never put a space inside a
@@ -925,6 +1092,41 @@ const TempoParse = (function () {
     try { for (const l of lines) collectJson(JSON.parse(l), out); return out; } catch (e) { return null; }
   }
 
+  // A link wrapped by the terminal: the next line continues it when it is one unbroken run of the
+  // characters the link can hold at that point (base64url for a z. payload) and is not a header.
+  function linkContinues(value, line) {
+    const s = line.trim();
+    if (!s || /\s/.test(s) || HEADER_FIELD_RE.test(line) || s.startsWith("v1;")) return false;
+    if (value.indexOf("#") < 0) return /^[A-Za-z0-9._~:/?#@!$&'*+,;=%-]+$/.test(s);
+    if (s.indexOf("#") >= 0) return false;
+    const tail = value.slice(value.lastIndexOf("&") + 1);
+    if (/^[a-z]+=z\./.test(tail) || /^[a-z]+=?$/.test(tail)) return /^[A-Za-z0-9_.&=-]+$/.test(s);
+    return /^[0-9A-Za-z./:;=@~*+^_%&-]+$/.test(s);
+  }
+
+  // Sentence punctuation after a pasted URL is not part of it (a z. payload never ends in . , ! ?).
+  function trimLinkToken(u) { return u.replace(/(=z\.[A-Za-z0-9_-]+)[.,!?]+$/, "$1"); }
+
+  // Tempo-Timing and Tempo-Link headers of the same response (between two HTTP status lines) are
+  // one trace: the k-th of each pair up when a response holds as many of one as of the other.
+  function pairLinks(items) {
+    const blocks = new Map();
+    for (const it of items) {
+      if (it.source !== "header" && !(it.source === "link" && it.fromHeader)) continue;
+      if (!blocks.has(it.block)) blocks.set(it.block, { h: [], l: [] });
+      blocks.get(it.block)[it.source === "header" ? "h" : "l"].push(it);
+    }
+    for (const b of blocks.values()) {
+      if (!b.h.length || b.h.length !== b.l.length) continue;
+      b.h.forEach(function (h, k) { h.link = b.l[k].link || {}; b.l[k].paired = true; });
+    }
+    return items.filter(function (it) { return !it.paired; }).map(function (it) {
+      const o = { source: it.source };
+      for (const k of ["header", "doc", "link", "url"]) if (it[k] !== undefined) o[k] = it[k];
+      return o;
+    });
+  }
+
   function extractTraces(input) {
     const text = String(input || "").replace(/^﻿/, "");
     if (!text.trim()) return [];
@@ -934,21 +1136,35 @@ const TempoParse = (function () {
       return asJson;
     }
     const out = [];
-    let cur = null;
-    const flush = function () { if (cur) { out.push({ source: cur.source, header: settle(cur) }); cur = null; } };
+    let cur = null, link = null, block = 0;
+    const flush = function () { if (cur) { out.push({ source: cur.source, header: settle(cur), block: cur.block }); cur = null; } };
+    const flushLink = function () { if (link) { out.push({ source: "link", link: linkParams(link.value), url: link.value, block: link.block, fromHeader: link.fromHeader }); link = null; } };
     for (const line of text.split(/\r\n|\n|\r/)) {
+      if (STATUS_LINE_RE.test(line)) { flush(); flushLink(); block++; continue; }
       const m = HEADER_LINE_RE.exec(line);
-      if (m) { flush(); cur = { source: "header", value: stripWs(m[1]), glued: [] }; continue; }
+      if (m) { flush(); flushLink(); cur = { source: "header", value: stripWs(m[1]), glued: [], block: block }; continue; }
+      const lm = LINK_LINE_RE.exec(line);
+      if (lm) { flush(); flushLink(); link = { value: lm[1].trim(), fromHeader: true, block: block }; continue; }
+      if (link) {
+        if (linkContinues(link.value, line)) { link.value += line.trim(); continue; }
+        flushLink();
+      }
       const s = stripWs(line);
       if (cur) {
         const done = COMPLETE_RE.test(cur.value);
         if (s && PURE_RE.test(s) && !s.startsWith("v1;") && !HEADER_FIELD_RE.test(line) && (!done || /^[0-9a-z]+$/.test(s))) { cur.value += s; cur.glued.push(s); continue; }
         flush();
       }
-      if (s.startsWith("v1;")) cur = { source: "value", value: s, glued: [] };
+      const urls = line.indexOf("#") >= 0 ? (line.match(LINK_TOKEN_RE) || []).map(trimLinkToken).filter(linkParams) : [];
+      if (urls.length) {
+        for (const u of urls) { flushLink(); link = { value: u, fromHeader: false, block: block }; }
+        continue;
+      }
+      if (s.startsWith("v1;")) cur = { source: "value", value: s, glued: [], block: block };
     }
     flush();
-    if (out.length) return out;
+    flushLink();
+    if (out.length) return pairLinks(out);
     // curl -i output without the header: look for a JSON body after the blank line
     const blank = text.search(/\r?\n\r?\n/);
     if (blank >= 0) {
@@ -960,6 +1176,7 @@ const TempoParse = (function () {
 
   // One extracted item -> {doc, header}. header is the raw value (or the canonical encoding of JSON input).
   function load(item) {
+    if (item.source === "link" && item.header === undefined) fail("E_LINK", "a link is inflated asynchronously; use loadAsync");
     if (item.header !== undefined) return { doc: decode(item.header), header: item.header, source: item.source };
     const doc = normalizeJson(item.doc);
     let header = null;
@@ -967,10 +1184,43 @@ const TempoParse = (function () {
     return { doc: doc, header: header, source: item.source };
   }
 
+  // Like load(), for every kind of item: inflates links (adding compare and tab when the link has
+  // c= and tab=) and settles a Tempo-Timing that has a Tempo-Link beside it. When the two agree the
+  // header is used; when they differ the header is used unless it does not decode or was cut and the
+  // link holds a complete trace. Either way `note` says what happened.
+  async function loadAsync(item) {
+    if (item.source === "link") {
+      const r = load({ source: "link", header: await unpackParam(item.link, "t") });
+      if (item.link.c) r.compare = await unpackParam(item.link, "c");
+      if (item.link.tab) r.tab = item.link.tab;
+      return r;
+    }
+    if (!item.link) return load(item);
+    let linked = null, linkErr = null;
+    try { linked = stripWs(await unpackParam(item.link, "t")); } catch (e) { linkErr = e; }
+    const plain = { source: item.source, header: item.header };
+    if (linked !== null && linked === stripWs(item.header)) return load(plain);
+    let r = null, err = null;
+    try { r = load(plain); } catch (e) { err = e; }
+    if (linked !== null && (err || r.doc.truncated)) {
+      let l = null;
+      try { l = load({ source: "link", header: linked }); } catch (e) { l = null; }
+      if (l && (err || !l.doc.truncated)) {
+        l.note = "Tempo-Timing " + (err ? "does not decode (" + err.code + ")" : "was cut") + "; the Tempo-Link beside it was used";
+        return l;
+      }
+    }
+    if (err) throw err;
+    r.note = linkErr ? "the Tempo-Link beside it does not decode (" + linkErr.message + "); Tempo-Timing was used"
+                     : "the Tempo-Link beside it holds a different trace; Tempo-Timing was used";
+    return r;
+  }
+
   return {
     ALPHABET_CHARS, FLAG_ORDER, FLAG_NAMES, MAX_DEPTH, RECORD_RE, ERRORS,
     TempoFormatError, stripWs, decode, decodeName, encodeName, encodeNumber, encode,
-    normalizeJson, dumpJson, extractTraces, load
+    normalizeJson, dumpJson, extractTraces, load,
+    linkParams, packValue, unpackValue, makeLink, loadAsync
   };
 })();
 // ==== END TEMPO PARSER ====
@@ -1431,7 +1681,7 @@ const TempoAnalysis = (function (P) {
 <!-- END DEMO TRACES -->
 <script id="tempo-app">
 // ==== TEMPO VIEWER APP ====
-// Everything below is presentation: inputs, lanes canvas, tabs, detail panel, exports, share links.
+// Everything below is presentation: landing prompt, lanes canvas, tabs, detail panel, exports, links.
 (function () {
   "use strict";
   const P = TempoParse, A = TempoAnalysis;
@@ -1440,7 +1690,7 @@ const TempoAnalysis = (function (P) {
   try { DEMOS = JSON.parse($("tempo-demos").textContent); } catch (e) { DEMOS = {}; }
 
   const state = {
-    A: null, B: null, batch: [], sel: null, tab: "lanes", showCp: true,
+    A: null, B: null, ghost: false, batch: [], sel: null, tab: "lanes", showCp: true,
     collapsed: new Set(), treeCollapsed: new Set(),
     sort: { aggregates: ["sum", -1], diff: ["dSum", -1], stats: ["", 0] },
     showAllFindings: false
@@ -1462,32 +1712,13 @@ const TempoAnalysis = (function (P) {
   function fmtDn(n) { return !n ? "±0" : (n > 0 ? "+" : "−") + fmtN(Math.abs(n)); }
   function pct(x) { return (x * 100).toFixed(x < 0.1 ? 1 : 0) + "%"; }
   function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c])); }
-  function chamberNo(i) { return String(i + 1).padStart(2, "0"); }
-  function threadLabel(tr, t) { return t >= 0 ? "CHAMBER " + chamberNo(t) + " · " + tr.doc.threads[t] : "mixed threads"; }
+  function threadLabel(tr, t) { return t >= 0 ? tr.doc.threads[t] : "mixed threads"; }
   function flagWords(flags) { return flags.split("").map((f) => P.FLAG_NAMES[f] || f); }
   function plural(n, one, many) { return n + " " + (n === 1 ? one : many || one + "s"); }
   function isoWall(ms) { try { return new Date(ms).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z"); } catch (e) { return String(ms); } }
   function slug(s) { return String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "trace"; }
 
-  // ---------------------------------------------------------------- iris mark
-  function irisSvg(size) {
-    const N = 7, R = 44, r = 15, phi = 50;
-    const pt = (rad, deg) => { const a = (deg - 90) * Math.PI / 180; return (50 + rad * Math.cos(a)).toFixed(2) + " " + (50 + rad * Math.sin(a)).toFixed(2); };
-    let d = "";
-    for (let k = 0; k < N; k++) {
-      const a0 = k * 360 / N, a1 = a0 + 360 / N;
-      d += "<path class=\"blade\" d=\"M" + pt(r, a0) + " L" + pt(r, a1) + " L" + pt(R, a1 + phi) + " A" + R + " " + R + " 0 0 0 " + pt(R, a0 + phi) + " Z\"/>";
-    }
-    return "<svg class=\"iris\" viewBox=\"0 0 100 100\" width=\"" + size + "\" height=\"" + size + "\" aria-hidden=\"true\">" + d + "<circle class=\"ring\" cx=\"50\" cy=\"50\" r=\"47.5\"/></svg>";
-  }
-  document.querySelectorAll("[data-iris]").forEach((el) => { el.outerHTML = irisSvg(Number(el.dataset.iris)); });
-
   // ---------------------------------------------------------------- theme
-  const ICONS = {
-    auto: "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"><rect x=\"3\" y=\"4\" width=\"18\" height=\"12\" rx=\"2\"/><path d=\"M8 20h8M12 16v4\"/></svg>",
-    light: "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"><circle cx=\"12\" cy=\"12\" r=\"4\"/><path d=\"M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4\"/></svg>",
-    dark: "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"><path d=\"M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z\"/></svg>"
-  };
   const mq = window.matchMedia("(prefers-color-scheme: dark)");
   function applyTheme(pref, persist) {
     const dark = pref === "dark" || (pref === "auto" && mq.matches);
@@ -1495,18 +1726,13 @@ const TempoAnalysis = (function (P) {
     root.classList.toggle("dark", dark);
     root.classList.toggle("light", !dark);
     root.dataset.themePref = pref;
-    $("themeLabel").textContent = pref;
-    $("themeBtn").innerHTML = ICONS[pref];
-    $("themeBtn").setAttribute("aria-label", "Theme: " + pref + " (click to change)");
+    document.querySelectorAll("[data-theme]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.theme === pref)));
     if (persist) { try { localStorage.setItem("tempo:theme", pref); } catch (e) { /* private mode */ } }
     palette = null;
+    if (state.A && state.tab === "pools") renderPools();
     redraw();
   }
-  $("themeBtn").addEventListener("click", () => {
-    const order = ["auto", "light", "dark"];
-    const cur = document.documentElement.dataset.themePref || "auto";
-    applyTheme(order[(order.indexOf(cur) + 1) % 3], true);
-  });
+  document.querySelectorAll("[data-theme]").forEach((b) => b.addEventListener("click", () => applyTheme(b.dataset.theme, true)));
   mq.addEventListener("change", () => { if ((document.documentElement.dataset.themePref || "auto") === "auto") applyTheme("auto", false); });
 
   // ---------------------------------------------------------------- colours for canvas
@@ -1518,14 +1744,16 @@ const TempoAnalysis = (function (P) {
     const col = (n, a) => { const t = trip(n); return "hsla(" + t[0] + ", " + t[1] + ", " + t[2] + ", " + (a === undefined ? 1 : a) + ")"; };
     const fgL = parseFloat(trip("--foreground")[2]), cardL = parseFloat(trip("--card")[2]);
     const mix = (k) => "hsl(0, 0%, " + (cardL + (fgL - cardL) * k).toFixed(1) + "%)";
-    const ks = [0.72, 0.56, 0.44, 0.35, 0.28, 0.23];
+    const ks = [0.62, 0.47, 0.37, 0.3, 0.25, 0.21];
     palette = {
       fg: col("--foreground"), card: col("--card"), bg: col("--background"), muted: col("--muted-foreground"),
-      faint: col("--foreground", 0.06), grid: col("--border", 0.7), border: col("--border"),
+      faint: col("--foreground", 0.035), grid: col("--border", 0.75), border: col("--border"),
       red: col("--destructive"), redFg: col("--destructive-foreground"),
-      orange: col("--portal-orange"), orangeSoft: col("--portal-orange", 0.35), blue: col("--portal-blue"), blueSoft: col("--portal-blue", 0.22),
+      orange: col("--wait"), orangeSoft: col("--wait", 0.3), blue: col("--off"), blueSoft: col("--off", 0.18),
       ramp: ks.map(mix), rampText: ks.map((k) => (k >= 0.5 ? col("--card") : col("--foreground"))),
-      ring: col("--foreground"), font: (cs.getPropertyValue("--font-mono").trim() || "monospace")
+      ring: col("--foreground"),
+      font: (cs.getPropertyValue("--font-sans").trim() || "sans-serif"),
+      mono: (cs.getPropertyValue("--font-mono").trim() || "monospace")
     };
     return palette;
   }
@@ -1539,17 +1767,24 @@ const TempoAnalysis = (function (P) {
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => { t.hidden = true; }, 2600);
   }
-  function setMsg(html) { $("msg").innerHTML = html || ""; }
+  function promptOpen() { return !$("prompt").hidden; }
+  // Messages go into the prompt while it is open, else into the notice under the top bar.
+  function setMsg(html) {
+    if (promptOpen()) { $("promptMsg").innerHTML = html || ""; return; }
+    $("msg").innerHTML = html || "";
+    $("notice").hidden = !html;
+  }
+  $("noticeClose").addEventListener("click", () => setMsg(""));
   function errHtml(where, e) {
-    if (e && e.code) return "<span class=\"err\"><span class=\"code\">" + esc(e.code) + "</span> " + esc(where) + ": " + esc(P.ERRORS[e.code] || "") + " — " + esc(e.message.replace(/^E_[A-Z]+: /, "")) + "</span>";
+    if (e && e.code) return "<span class=\"err\"><span class=\"code\">" + esc(e.code) + "</span> " + esc(where) + ": " + esc(P.ERRORS[e.code] || "") + " — " + esc(String(e.message).replace(/^E_[A-Z]+: /, "")) + "</span>";
     return "<span class=\"err\">" + esc(where) + ": " + esc(e && e.message ? e.message : String(e)) + "</span>";
   }
 
   // ---------------------------------------------------------------- loading
-  function makeTrace(item, name) {
-    const r = P.load(item);
+  // r: what P.load / P.loadAsync return ({doc, header, source, compare?, tab?, note?})
+  function makeTrace(r, name) {
     const m = A.model(r.doc);
-    const tr = { name: name || (m.root ? m.root.name : "trace"), header: r.header, source: r.source, doc: r.doc, m: m };
+    const tr = { name: name || (m.root ? m.root.name : "trace"), header: r.header, source: r.source, doc: r.doc, m: m, compare: r.compare, tab: r.tab };
     tr.findings = A.findings(m);
     tr.cp = A.criticalPath(m);
     tr.pools = A.pools(m);
@@ -1558,118 +1793,268 @@ const TempoAnalysis = (function (P) {
     return tr;
   }
 
-  // Parses text into traces; returns {traces, error}.
-  function parseText(text, label) {
+  // Parses text into traces; returns {traces, error, notes}. Async because links are inflated
+  // with DecompressionStream; everything else resolves within the same task.
+  async function parseText(text, label) {
     let items;
-    try { items = P.extractTraces(text); } catch (e) { return { traces: [], error: errHtml(label, e) }; }
-    const traces = [];
+    try { items = P.extractTraces(text); } catch (e) { return { traces: [], error: errHtml(label, e), notes: [] }; }
+    if (!items.length) return { traces: [], error: "<span class=\"err\">" + esc(label) + ": nothing to read</span>", notes: [] };
+    const done = await Promise.all(items.map((it) => P.loadAsync(it).then((r) => ({ r: r }), (e) => ({ e: e }))));
+    const traces = [], notes = [];
     let error = "";
-    items.forEach((it, i) => {
-      try { traces.push(makeTrace(it, null)); } catch (e) { error += (error ? "<br>" : "") + errHtml(label + (items.length > 1 ? " #" + (i + 1) : ""), e); }
+    done.forEach((x, i) => {
+      const where = label + (items.length > 1 ? " #" + (i + 1) : "");
+      try {
+        if (x.e) throw x.e;
+        traces.push(makeTrace(x.r, null));
+        if (x.r.note) notes.push(where + ": " + x.r.note + ".");
+      } catch (e) { error += (error ? "<br>" : "") + errHtml(where, e); }
     });
-    return { traces: traces, error: error };
+    return { traces: traces, error: error, notes: notes };
+  }
+  const cutNote = (t, label) => (t && t.doc.truncated ? ["<span class=\"err\">" + esc(label + " was cut in transit: the last record was discarded.") + "</span>"] : []);
+
+  const src = { a: "", b: "" };
+  let loadSeq = 0;
+  function resetView() {
+    state.sel = state.A && state.A.m.root ? 0 : null;
+    state.collapsed = new Set();
+    state.treeCollapsed = new Set();
+    state.showAllFindings = false;
+    view.fitted = false;
   }
 
-  function loadFromBoxes(note) {
-    const ta = $("inA").value, tb = $("inB").value;
+  // Opens text as the trace (A). b: text of a trace to compare with; when omitted, the c= of a
+  // single pasted link. Returns true when a trace opened; otherwise the current view stays and
+  // the error is shown (in the prompt when there is no real trace yet).
+  async function openText(text, b, note) {
+    const seq = ++loadSeq;
+    if (!String(text || "").trim()) { failOpen("<span class=\"err\">Nothing pasted yet.</span>"); return false; }
+    const a = await parseText(text, "Trace");
+    if (seq !== loadSeq) return false;
+    if (!a.traces.length) { failOpen(a.error); return false; }
+    const first = a.traces[0];
+    if (b === undefined) b = a.traces.length === 1 && first.compare ? first.compare : "";
+    const r = b ? await parseText(b, "Compare with") : null;
+    if (seq !== loadSeq) return false;
     const msgs = [];
-    if (note) msgs.push(esc(note));
-    let a = { traces: [], error: "" }, b = { traces: [], error: "" };
-    if (ta.trim()) a = parseText(ta, "Trace A");
-    if (tb.trim()) b = parseText(tb, "Trace B");
     if (a.error) msgs.push(a.error);
-    if (b.error) msgs.push(b.error);
-    const prevA = state.A;
-    state.A = a.traces[0] || null;
-    state.B = b.traces[0] || null;
+    if (r && r.error) msgs.push(r.error);
+    for (const n of a.notes.concat(r ? r.notes : [])) msgs.push(esc(n));
+    state.A = first;
+    state.ghost = false;
+    state.B = r && r.traces[0] ? r.traces[0] : null;
+    src.a = text;
+    src.b = state.B ? b : "";
     if (a.traces.length > 1) {
       state.batch = a.traces.map((t, i) => Object.assign(t, { name: "#" + (i + 1) + " " + t.name }));
-      msgs.push(esc(a.traces.length + " traces found in A: the first is the test subject, all " + a.traces.length + " went to the Stats tab."));
+      msgs.push(esc(a.traces.length + " traces found: the first is shown, all " + a.traces.length + " went to the Stats tab."));
     }
-    if (b.traces.length > 1) msgs.push(esc(b.traces.length + " traces found in B: the first is the control."));
-    for (const t of [state.A, state.B]) if (t && t.doc.truncated) msgs.push("<span class=\"err\">" + esc((t === state.A ? "Trace A" : "Trace B") + " was cut in transit: the last record was discarded.") + "</span>");
+    if (r && r.traces.length > 1) msgs.push(esc(r.traces.length + " traces found to compare with: the first is used."));
+    msgs.push(...cutNote(state.A, "The trace"), ...cutNote(state.B, "The trace to compare with"));
+    resetView();
+    hidePrompt();
+    $("sharePanel").hidden = true;
     setMsg(msgs.join("<br>"));
-    if (state.A !== prevA) {
-      state.sel = state.A && state.A.m.root ? 0 : null;
-      state.collapsed = new Set();
-      state.treeCollapsed = new Set();
-      state.showAllFindings = false;
-      view.fitted = false;
-    }
+    if (note) toast(note);
     render();
+    if (a.traces.length === 1 && linkTab(first.tab)) setTab(linkTab(first.tab));
+    return true;
+  }
+  function failOpen(html) {
+    if (!state.A || state.ghost) showLanding(html);
+    else setMsg(html);
   }
 
-  function setBoxes(a, b) { $("inA").value = a; $("inB").value = b === undefined ? $("inB").value : b; }
+  // A second trace for the diff tab. Returns "" on success, else the error (HTML).
+  async function compareText(text, label) {
+    const r = await parseText(text, label || "Compare with");
+    if (!r.traces.length) return r.error;
+    state.B = r.traces[0];
+    src.b = text;
+    const msgs = (r.error ? [r.error] : []).concat(r.notes.map(esc), cutNote(state.B, "The trace to compare with"));
+    if (r.traces.length > 1) msgs.push(esc(r.traces.length + " traces found to compare with: the first is used."));
+    setMsg(msgs.join("<br>"));
+    render();
+    setTab("diff");
+    return "";
+  }
 
-  function loadDemo(name) {
+  // Traces for the stats tab. list: [{name, text}]. Returns {added, error}.
+  async function addTexts(list) {
+    const traces = [], errs = [];
+    for (const f of list) {
+      const r = await parseText(f.text, f.name || "Trace");
+      r.traces.forEach((t, i) => { t.name = f.name ? f.name + (r.traces.length > 1 ? " #" + (i + 1) : "") : "#" + (state.batch.length + traces.length + 1) + " " + t.name; traces.push(t); });
+      if (r.error) errs.push(r.error);
+    }
+    state.batch = state.batch.concat(traces);
+    if (traces.length) { render(); setTab("stats"); }
+    return { added: traces.length, error: errs.join("<br>") };
+  }
+
+  function demoTrace(name) { return makeTrace(P.load({ header: DEMOS[name] }), null); }
+  async function loadDemo(name) {
+    $("mainMenu").open = false;
     if (name === "diff") {
-      setBoxes(DEMOS["diff-before"] || "", DEMOS["diff-after"] || "");
-      loadFromBoxes("Demo pair loaded: A shares one pool for loads and matches, B splits it. See the Diff tab.");
-      setTab("diff");
+      if (await openText(DEMOS["diff-before"] || "", DEMOS["diff-after"] || "", "Demo pair: A shares one pool for loads and matches, B splits it")) setTab("diff");
     } else if (name === "batch") {
       const list = DEMOS.batch || [];
-      state.batch = list.map((h, i) => { const t = makeTrace({ header: h }, null); t.name = "find-" + String(i + 1).padStart(2, "0"); return t; });
-      if (!state.A && list.length) { setBoxes(list[0], ""); loadFromBoxes("Demo batch loaded: 30 searches of the same shape. The first is the test subject."); }
-      else { render(); toast("Demo batch: 30 traces in the Stats tab"); }
+      if (!list.length) return;
+      if (!state.A || state.ghost) { if (!(await openText(list[0], ""))) return; }
+      state.batch = list.map((h, i) => { const t = makeTrace(P.load({ header: h }), null); t.name = "find-" + String(i + 1).padStart(2, "0"); return t; });
+      render();
       setTab("stats");
+      toast("Demo batch: 30 searches of the same shape in the Stats tab");
     } else if (DEMOS[name]) {
-      setBoxes(DEMOS[name], "");
-      loadFromBoxes();
+      await openText(DEMOS[name], "");
     }
   }
-
-  $("loadBtn").addEventListener("click", () => loadFromBoxes());
-  $("clearBtn").addEventListener("click", () => {
-    setBoxes("", "");
-    state.batch = [];
-    setMsg("");
-    loadFromBoxes();
-    try { history.replaceState(null, "", location.pathname + location.search); } catch (e) { /* file: */ }
+  document.addEventListener("click", (e) => {
+    const d = e.target.closest && e.target.closest("[data-demo]");
+    if (d) { e.preventDefault(); loadDemo(d.dataset.demo); }
   });
-  $("demoSel").addEventListener("change", (e) => { const v = e.target.value; e.target.value = ""; if (v) loadDemo(v); });
-  document.querySelectorAll("[data-demo]").forEach((b) => b.addEventListener("click", () => loadDemo(b.dataset.demo)));
-  for (const id of ["inA", "inB"]) {
-    $(id).addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); loadFromBoxes(); } });
-    $(id).addEventListener("paste", () => setTimeout(() => loadFromBoxes(), 0));
-  }
 
-  // files: open dialog and drag-and-drop
+  // ---------------------------------------------------------------- landing prompt
+  // Without a trace the page shows a demo trace greyed out behind one prompt; "Open another
+  // trace…" shows the same prompt over the current trace.
+  function showPrompt(cancelable) {
+    $("mainMenu").open = false;
+    $("notice").hidden = true;
+    $("sharePanel").hidden = true;
+    $("prompt").hidden = false;
+    document.body.classList.add("prompting");
+    $("promptCancel").hidden = !cancelable;
+    $("promptMsg").innerHTML = "";
+    $("pasteBox").value = "";
+    $("viewer").classList.add("ghost");
+    $("viewer").inert = true;
+    $("viewer").setAttribute("aria-hidden", "true");
+    updateChrome();
+    if (!window.matchMedia("(pointer: coarse)").matches) $("pasteBox").focus({ preventScroll: true });
+  }
+  function hidePrompt() {
+    $("prompt").hidden = true;
+    document.body.classList.remove("prompting");
+    $("viewer").classList.remove("ghost");
+    $("viewer").inert = false;
+    $("viewer").removeAttribute("aria-hidden");
+    updateChrome();
+    if (state.tab === "lanes") { sizeCanvas(); redraw(); }
+  }
+  function showLanding(html) {
+    if (!state.A && DEMOS["find-saturated"]) {
+      try { state.A = demoTrace("find-saturated"); state.ghost = true; state.tab = "lanes"; resetView(); } catch (e) { state.A = null; }
+    }
+    if (!promptOpen()) { render(); showPrompt(false); }
+    $("promptMsg").innerHTML = html || "";
+  }
+  function updateChrome() {
+    const loaded = !!state.A && !state.ghost && !promptOpen();
+    $("traceId").hidden = !loaded;
+    $("compareBtn").hidden = !loaded;
+    $("addBtn").hidden = !loaded;
+    $("footer").hidden = !loaded;
+    document.body.classList.toggle("loaded", loaded);
+    document.querySelectorAll("[data-when=loaded]").forEach((el) => { el.hidden = !loaded; });
+  }
+  $("openBtn").addEventListener("click", () => openText($("pasteBox").value));
+  $("promptCancel").addEventListener("click", () => hidePrompt());
+  $("pasteBox").addEventListener("paste", () => setTimeout(() => openText($("pasteBox").value), 0));
+  $("pasteBox").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); openText($("pasteBox").value); } });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && promptOpen() && !$("promptCancel").hidden) hidePrompt(); });
+  // Cmd/Ctrl+V anywhere (outside a text field) opens what was pasted.
+  document.addEventListener("paste", (e) => {
+    if ($("sideDlg").open) return;
+    const t = e.target;
+    if (t && t.closest && t.closest("textarea, input")) return;
+    const text = e.clipboardData ? e.clipboardData.getData("text/plain") : "";
+    if (!text || !text.trim()) return;
+    e.preventDefault();
+    if (promptOpen()) $("pasteBox").value = text;
+    openText(text);
+  });
+
+  // ---------------------------------------------------------------- compare / add traces dialog
+  let sideMode = "compare";
+  function openSide(mode) {
+    sideMode = mode;
+    $("mainMenu").open = false;
+    const cmp = mode === "compare";
+    $("sideTitle").textContent = cmp ? "Compare with a second trace" : "Add traces for statistics";
+    $("sideLede").textContent = cmp
+      ? "Paste a Tempo-Timing header, a Tempo-Link, curl -i output or JSON, or drop a file. The Diff tab aligns both traces by path."
+      : "Paste several traces: one per line, several curl -i outputs, Tempo-Links, a JSON array or NDJSON, or drop files. The Stats tab shows p50, p95 and max per path.";
+    $("sideGo").textContent = cmp ? "Compare" : "Add";
+    $("sideExtra").textContent = cmp ? (state.B ? "Remove the comparison" : "Use the demo pair") : (state.batch.length ? "Clear the set (" + state.batch.length + ")" : "Load the demo batch");
+    $("sideBox").value = cmp ? src.b : "";
+    $("sideBox").placeholder = cmp ? "Tempo-Timing: v1;…   or   Tempo-Link: https://…/#t=z.…" : "one trace per line, or several curl -i outputs";
+    $("sideMsg").innerHTML = "";
+    $("sideDlg").showModal();
+    $("sideBox").focus();
+  }
+  async function sideGo() {
+    const text = $("sideBox").value;
+    if (!text.trim()) { $("sideMsg").innerHTML = "<span class=\"err\">Nothing pasted yet.</span>"; return; }
+    if (sideMode === "compare") {
+      const err = await compareText(text);
+      if (err) $("sideMsg").innerHTML = err; else $("sideDlg").close();
+    } else {
+      const r = await addTexts([{ name: null, text: text }]);
+      if (!r.added) $("sideMsg").innerHTML = r.error;
+      else { $("sideDlg").close(); if (r.error) setMsg(r.error); toast(plural(r.added, "trace") + " added to the Stats tab"); }
+    }
+  }
+  $("compareBtn").addEventListener("click", () => openSide("compare"));
+  $("addBtn").addEventListener("click", () => openSide("add"));
+  $("sideGo").addEventListener("click", () => sideGo());
+  $("sideCancel").addEventListener("click", () => $("sideDlg").close());
+  $("sideBox").addEventListener("paste", () => setTimeout(() => sideGo(), 0));
+  $("sideBox").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); sideGo(); } });
+  $("sideExtra").addEventListener("click", () => {
+    $("sideDlg").close();
+    if (sideMode === "compare") {
+      if (state.B) { state.B = null; src.b = ""; render(); } else loadDemo("diff");
+    } else if (state.batch.length) { state.batch = []; render(); } else loadDemo("batch");
+  });
+  $("sideFiles").addEventListener("change", (e) => { takeFiles(e.target.files, sideMode === "compare" ? "B" : "stats"); e.target.value = ""; });
+
+  // ---------------------------------------------------------------- files: open dialog and drag-and-drop
   async function readFiles(files) {
     const out = [];
     for (const f of files) {
-      try { out.push({ name: f.name, text: await f.text() }); } catch (e) { out.push({ name: f.name, text: "", error: e }); }
+      try { out.push({ name: f.name, text: await f.text() }); } catch (e) { out.push({ name: f.name, text: "" }); }
     }
     return out;
   }
   async function takeFiles(files, target) {
     const list = await readFiles(Array.from(files));
     if (!list.length) return;
-    if (target === "B") { $("inB").value = list[0].text; loadFromBoxes(); return; }
-    if (target === "stats" || list.length > 1) {
-      const traces = [];
-      const errs = [];
-      for (const f of list) {
-        const r = parseText(f.text, f.name);
-        r.traces.forEach((t, i) => { t.name = f.name + (r.traces.length > 1 ? " #" + (i + 1) : ""); traces.push(t); });
-        if (r.error) errs.push(r.error);
-      }
-      if (target === "stats") state.batch = state.batch.concat(traces);
-      else state.batch = traces;
-      if (target !== "stats" && traces.length) {
-        $("inA").value = list[0].text;
-        loadFromBoxes(list.length + " files read: the first is the test subject, " + plural(traces.length, "trace") + " went to the Stats tab.");
-      } else render();
-      if (errs.length) setMsg(($("msg").innerHTML ? $("msg").innerHTML + "<br>" : "") + errs.join("<br>"));
-      if (target === "stats" || traces.length > 1) setTab("stats");
+    if (target === "B") {
+      const err = await compareText(list[0].text, list[0].name);
+      if (err) { if ($("sideDlg").open) $("sideMsg").innerHTML = err; else setMsg(err); } else if ($("sideDlg").open) $("sideDlg").close();
       return;
     }
-    $("inA").value = list[0].text;
-    loadFromBoxes();
+    if (target === "stats") {
+      const r = await addTexts(list);
+      if ($("sideDlg").open && r.added) $("sideDlg").close();
+      if (r.error) { if ($("sideDlg").open) $("sideMsg").innerHTML = r.error; else setMsg(r.error); }
+      return;
+    }
+    if (list.length > 1) {
+      // several files: the first opens, every trace of every file goes to the stats tab
+      if (!(await openText(list[0].text, "", list.length + " files read: the first is shown, all went to the Stats tab"))) return;
+      state.batch = [];
+      const r = await addTexts(list);
+      if (r.error) setMsg(r.error);
+      return;
+    }
+    openText(list[0].text);
   }
   $("fileIn").addEventListener("change", (e) => { takeFiles(e.target.files, "A"); e.target.value = ""; });
   let dragDepth = 0;
   function dropTarget(el) {
-    if (el && el.closest && el.closest("#fieldB")) return "B";
+    if ($("sideDlg").open) return sideMode === "compare" ? "B" : "stats";
     if (el && el.closest && el.closest("#pane-stats")) return "stats";
     return "A";
   }
@@ -1678,101 +2063,88 @@ const TempoAnalysis = (function (P) {
   window.addEventListener("dragover", (e) => {
     e.preventDefault();
     const t = dropTarget(e.target);
-    $("dropText").textContent = t === "B" ? "Drop: control subject (B)" : t === "stats" ? "Drop: add to the stats set" : "Drop: test subject (A) · several files go to stats";
-    $("fieldB").querySelector("textarea").classList.toggle("drop-target", t === "B");
-    $("fieldA").querySelector("textarea").classList.toggle("drop-target", t === "A");
+    $("dropText").textContent = t === "B" ? "Drop to compare with" : t === "stats" ? "Drop to add to the stats set" : "Drop to open · several files go to stats";
   });
   window.addEventListener("drop", (e) => {
     e.preventDefault();
     dragDepth = 0;
     $("dropOverlay").hidden = true;
-    document.querySelectorAll(".drop-target").forEach((x) => x.classList.remove("drop-target"));
     const t = dropTarget(e.target);
-    if (e.dataTransfer.files && e.dataTransfer.files.length) takeFiles(e.dataTransfer.files, t);
-    else {
-      const text = e.dataTransfer.getData("text/plain");
-      if (text) { (t === "B" ? $("inB") : $("inA")).value = text; loadFromBoxes(); }
-    }
+    if (e.dataTransfer.files && e.dataTransfer.files.length) { takeFiles(e.dataTransfer.files, t); return; }
+    const text = e.dataTransfer.getData("text/plain");
+    if (!text) return;
+    if (t === "B") compareText(text).then((err) => { if (err) $("sideMsg").innerHTML = err; else if ($("sideDlg").open) $("sideDlg").close(); });
+    else if (t === "stats") addTexts([{ name: null, text: text }]);
+    else openText(text);
   });
   // the overlay ignores pointer events, so the element under the cursor is the real target
 
-  // ---------------------------------------------------------------- share links (#t=…)
-  function bytesToB64url(bytes) {
-    let s = "";
-    for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  }
-  function b64urlToBytes(s) {
-    const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4));
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-  }
-  async function pipeThrough(bytes, stream) {
-    const res = new Response(new Blob([bytes]).stream().pipeThrough(stream));
-    return new Uint8Array(await res.arrayBuffer());
-  }
-  async function packValue(value) {
-    const plain = value.replace(/%/g, "%25");
-    if (typeof CompressionStream === "function") {
-      try {
-        const z = "z." + bytesToB64url(await pipeThrough(new TextEncoder().encode(value), new CompressionStream("deflate-raw")));
-        if (z.length < plain.length) return z;
-      } catch (e) { /* fall back to plain */ }
-    }
-    return plain;
-  }
-  async function unpackValue(raw) {
-    if (raw.startsWith("z.")) {
-      if (typeof DecompressionStream !== "function") throw new Error("this browser cannot decompress the link (no DecompressionStream)");
-      return new TextDecoder().decode(await pipeThrough(b64urlToBytes(raw.slice(2)), new DecompressionStream("deflate-raw")));
-    }
-    return raw.indexOf("%25") >= 0 ? raw.replace(/%25/g, "%") : raw;
-  }
-  function hashParams() {
+  // ---------------------------------------------------------------- links (#t=…, also ?t=…)
+  function paramsOf(s) {
     const out = {};
-    for (const part of location.hash.replace(/^#/, "").split("&")) {
+    for (const part of s.split("&")) {
       if (!part) continue;
       const i = part.indexOf("=");
       if (i > 0) out[part.slice(0, i)] = part.slice(i + 1);
     }
     return out;
   }
+  // The trace is read from the fragment, or from the query (?t=…&c=…&tab=…). A query reached
+  // the server, so it is moved into the fragment at once and does not live on in copied URLs.
+  function locationParams() {
+    const h = paramsOf(location.hash.replace(/^#/, ""));
+    if (h.t || h.demo) return h;
+    const qs = location.search.replace(/^\?/, "");
+    const q = paramsOf(qs);
+    if (!q.t) return h;
+    const keep = qs.split("&").filter((p) => p && !/^(?:t|c|tab)=/.test(p));
+    const frag = ["t", "c", "tab"].filter((k) => q[k]).map((k) => k + "=" + q[k]);
+    try { history.replaceState(null, "", location.pathname + (keep.length ? "?" + keep.join("&") : "") + "#" + frag.join("&")); } catch (e) { /* some file: URLs */ }
+    return { t: q.t, c: q.c, tab: q.tab };
+  }
+  async function loadFromLocation(first) {
+    const p = locationParams();
+    if (p.t) {
+      let a, c = "";
+      try {
+        a = await P.unpackValue(p.t);
+        if (p.c) c = await P.unpackValue(p.c);
+      } catch (e) { failOpen(errHtml("Link", e)); return; }
+      if (await openText(a, c) && linkTab(p.tab)) setTab(linkTab(p.tab));
+    } else if (p.demo) {
+      await loadDemo(p.demo);
+      if (linkTab(p.tab)) setTab(linkTab(p.tab));
+    } else if (first) {
+      showLanding();
+    } else if (linkTab(p.tab) && state.A && !state.ghost) setTab(linkTab(p.tab));
+  }
+  window.addEventListener("hashchange", () => { loadFromLocation(false); });
+
   async function makeShare() {
-    if (!state.A) return;
+    if (!state.A || state.ghost) return;
     if (!state.A.header) { toast("This trace cannot be written as a header value"); return; }
-    let hash = "#t=" + await packValue(state.A.header);
-    if (state.B && state.B.header) hash += "&c=" + await packValue(state.B.header);
-    try { history.replaceState(null, "", hash); } catch (e) { location.hash = hash; }
-    const url = location.href;
+    const url = await P.makeLink(location.href, state.A.header, state.B && state.B.header, tabForLink(state.tab));
+    try { history.replaceState(null, "", url.slice(url.indexOf("#"))); } catch (e) { /* the panel still shows the link */ }
+    $("notice").hidden = true;
     $("sharePanel").hidden = false;
     $("shareUrl").value = url;
-    $("shareInfo").textContent = url.length.toLocaleString("en-US") + " characters" + (hash.indexOf("z.") >= 0 ? " · deflate-raw + base64url" : " · plain");
+    $("shareInfo").textContent = url.length.toLocaleString("en-US") + " characters" + (url.indexOf("#t=z.") >= 0 ? " · deflate-raw + base64url" : " · plain");
     try { await navigator.clipboard.writeText(url); toast("Link copied. It holds the whole trace."); } catch (e) { $("shareUrl").select(); }
   }
-  $("shareBtn").addEventListener("click", () => { makeShare().catch((e) => toast("Share failed: " + e.message)); });
   $("copyShare").addEventListener("click", async () => {
-    try { await navigator.clipboard.writeText($("shareUrl").value); toast("Link copied"); } catch (e) { $("shareUrl").select(); document.execCommand && document.execCommand("copy"); toast("Link selected"); }
+    try { await navigator.clipboard.writeText($("shareUrl").value); toast("Link copied"); } catch (e) { $("shareUrl").select(); if (document.execCommand) document.execCommand("copy"); toast("Link selected"); }
   });
-  let ignoreHash = false;
-  async function loadFromHash() {
-    if (ignoreHash) return;
-    const p = hashParams();
-    if (p.tab) state.tab = p.tab;
-    if (p.t) {
-      try {
-        setBoxes(await unpackValue(p.t), p.c ? await unpackValue(p.c) : "");
-        loadFromBoxes("Loaded from the link fragment. Nothing was fetched.");
-      } catch (e) { setMsg(errHtml("Share link", e)); }
-    } else if (p.demo) {
-      loadDemo(p.demo);
-      if (p.demo === "batch" || p.demo === "diff") { if (p.tab) setTab(p.tab); }
-    }
-    if (p.tab) setTab(p.tab);
-  }
-  window.addEventListener("hashchange", () => { loadFromHash(); });
+  $("shareClose").addEventListener("click", () => { $("sharePanel").hidden = true; });
 
-  // ---------------------------------------------------------------- exports (Blob download, no network)
+  // ---------------------------------------------------------------- menu and exports (Blob download, no network)
+  document.querySelectorAll("[data-act]").forEach((b) => b.addEventListener("click", () => {
+    $("mainMenu").open = false;
+    const act = b.dataset.act;
+    if (act === "open") showPrompt(true);
+    else if (act === "compare") openSide("compare");
+    else if (act === "add") openSide("add");
+    else if (act === "share") makeShare().catch((e) => toast("Share failed: " + e.message));
+  }));
   function download(name, text, type) {
     const url = URL.createObjectURL(new Blob([text], { type: type }));
     const a = document.createElement("a");
@@ -1784,9 +2156,9 @@ const TempoAnalysis = (function (P) {
     setTimeout(() => URL.revokeObjectURL(url), 2000);
   }
   document.querySelectorAll("[data-export]").forEach((b) => b.addEventListener("click", () => {
-    $("exportMenu").open = false;
+    $("mainMenu").open = false;
     const tr = state.A;
-    if (!tr) return;
+    if (!tr || state.ghost) return;
     const base = "tempo-" + slug(tr.m.root ? tr.m.root.name : "trace") + (tr.doc.wall ? "-" + tr.doc.wall : "");
     const kind = b.dataset.export;
     if (kind === "json") download(base + ".json", P.dumpJson(tr.doc), "application/json");
@@ -1797,10 +2169,15 @@ const TempoAnalysis = (function (P) {
       download(base + ".header.txt", tr.header + "\n", "text/plain");
     }
   }));
-  document.addEventListener("click", (e) => { const m = $("exportMenu"); if (m.open && !m.contains(e.target)) m.open = false; });
+  document.addEventListener("click", (e) => { const m = $("mainMenu"); if (m.open && !m.contains(e.target)) m.open = false; });
 
   // ---------------------------------------------------------------- tabs
-  const TABS = ["lanes", "tree", "aggregates", "pools", "critical", "diff", "stats"];
+  const TABS = ["lanes", "findings", "tree", "aggregates", "pools", "critical", "diff", "stats"];
+  // tab= of a link (FORMAT.md: lanes|tree|agg|pools|critical|diff|stats); "aggregates" and this
+  // page's "findings" are accepted too. Anything else is ignored and the default view stays.
+  const LINK_TABS = { lanes: "lanes", tree: "tree", agg: "aggregates", aggregates: "aggregates", pools: "pools", critical: "critical", diff: "diff", stats: "stats", findings: "findings" };
+  function linkTab(name) { return name && Object.prototype.hasOwnProperty.call(LINK_TABS, name) ? LINK_TABS[name] : null; }
+  function tabForLink(tab) { return tab === "aggregates" ? "agg" : tab === "lanes" || tab === "findings" ? null : tab; }
   function setTab(tab) {
     if (TABS.indexOf(tab) < 0) return;
     state.tab = tab;
@@ -1834,32 +2211,47 @@ const TempoAnalysis = (function (P) {
   }
 
   // ---------------------------------------------------------------- render
+  function splitT(us) {
+    const s = fmtT(us), i = s.lastIndexOf(" ");
+    return i > 0 ? esc(s.slice(0, i)) + "<span class=\"u\">" + esc(s.slice(i + 1)) + "</span>" : esc(s);
+  }
   function render() {
     const has = !!state.A;
-    $("empty").hidden = has;
     $("viewer").hidden = !has;
-    if (!has) { $("sharePanel").hidden = true; return; }
-    const tr = state.A, m = tr.m, d = tr.doc;
-    $("subjectName").textContent = m.root ? m.root.name : "(no spans)";
-    const tiles = [
-      ["Total", m.root ? fmtT(m.root.dur) : "–"],
-      ["Spans" + (d.folded ? " · +folded" : ""), fmtN(m.spans.length) + (d.folded ? " +" + fmtN(d.folded) : "")],
-      ["Threads · pools", fmtN(d.threads.length) + " · " + new Set(d.threads.map(A.poolOf)).size],
-      ["Queue wait on path", tr.cp.total ? fmtT(tr.cp.byKind.wait) + " · " + pct(tr.cp.byKind.wait / tr.cp.total) : "–"],
-      ["Root CPU", m.root && m.root.cpu !== undefined ? fmtT(m.root.cpu) : "not measured"],
-      ["Started", d.wall !== undefined ? isoWall(d.wall) : "unknown"],
-      ["Status", d.truncated ? "TRUNCATED" : d.live.length ? "live lanes" : d.dropped ? fmtN(d.dropped) + " dropped" : "complete"]
-    ];
-    $("summary").innerHTML = tiles.map((t) => "<div class=\"tile\"><p class=\"eyebrow\">" + esc(t[0]) + "</p><span class=\"stat-value\" title=\"" + esc(t[1]) + "\">" + esc(t[1]) + "</span></div>").join("");
+    updateChrome();
+    if (!has) return;
+    const tr = state.A, m = tr.m, d = tr.doc, cp = tr.cp, root = m.root;
+    $("traceName").textContent = root ? root.name : "(no spans)";
+    $("traceName").title = root ? root.name : "";
+    $("traceDur").textContent = root ? fmtT(root.dur) : "";
+    const ofPath = (v) => (cp.total ? pct(v / cp.total) + " of the critical path" : "");
+    const pools = new Set(d.threads.map(A.poolOf)).size;
+    const f = tr.findings;
+    const serious = f.filter((x) => x.kind !== "budget" && x.kind !== "live" && x.kind !== "cancelled").length;
+    const status = d.truncated ? "truncated in transit" : d.live.length ? "complete · live lanes" : d.dropped ? fmtN(d.dropped) + " values dropped" : "complete";
+    const tile = (label, big, sub, o) => {
+      o = o || {};
+      return "<" + (o.button ? "button type=\"button\" class=\"tile\" " + o.button : "div class=\"tile\"") + "><p class=\"eyebrow\">" + (o.dot ? "<i class=\"dot " + o.dot + "\"></i>" : "") + esc(label) + "</p>" +
+        "<span class=\"big" + (o.word ? " word" : "") + "\">" + big + "</span><span class=\"sub" + (o.err ? " err" : "") + "\">" + esc(sub || " ") + "</span></" + (o.button ? "button" : "div") + ">";
+    };
+    $("summary").innerHTML = [
+      tile("Total", root ? splitT(root.dur) : "–", d.wall !== undefined ? isoWall(d.wall).replace(/Z$/, " UTC") : "start time not recorded"),
+      tile("Queue wait on path", cp.total ? splitT(cp.byKind.wait) : "–", ofPath(cp.byKind.wait), { dot: "wait" }),
+      tile("Blocked on path", cp.total ? splitT(cp.byKind.block) : "–", ofPath(cp.byKind.block), { dot: "off" }),
+      root && root.cpu !== undefined ? tile("Root CPU", splitT(root.cpu), root.dur ? pct(root.cpu / root.dur) + " of the total" : "") : tile("Root CPU", "not measured", "no cpu time recorded", { word: true }),
+      tile("Spans", esc(fmtN(m.spans.length)) + (d.folded ? "<span class=\"u\">+" + esc(fmtN(d.folded)) + " folded</span>" : ""), plural(d.threads.length, "thread") + " · " + plural(pools, "pool")),
+      tile("Findings", esc(String(serious)), status, { button: "data-goto=\"findings\" title=\"Show the findings\"", err: d.truncated })
+    ].join("");
+    document.querySelector(".tab[data-tab=findings]").innerHTML = "Findings<span class=\"n\">" + serious + "</span>";
     document.querySelector(".tab[data-tab=diff]").innerHTML = "Diff" + (state.B ? "" : "<span class=\"n\">–</span>");
     document.querySelector(".tab[data-tab=stats]").innerHTML = "Stats<span class=\"n\">" + (state.batch.length || "–") + "</span>";
-    renderFindings();
     setTab(state.tab);
     renderDetail();
   }
+  document.addEventListener("click", (e) => { const g = e.target.closest && e.target.closest("[data-goto]"); if (g) setTab(g.dataset.goto); });
 
   const KIND = {
-    truncated: ["Subject incomplete", "fail"], failed: ["Failed", "fail"], never: ["Never started", "wait"], open: ["Still running", "hollow"],
+    truncated: ["Truncated", "fail"], failed: ["Failed", "fail"], never: ["Never started", "wait"], open: ["Still running", "hollow"],
     straggler: ["Straggler", "hollow"], wait: ["Queue wait", "wait"], offcpu: ["Off-CPU, cpu pool", "off"], cancelled: ["Cancelled", ""],
     misuse: ["Misuse healed", ""], live: ["Live lanes", "hollow"], budget: ["Budget", ""]
   };
@@ -1868,11 +2260,11 @@ const TempoAnalysis = (function (P) {
     const tr = state.A;
     const f = tr.findings;
     const serious = f.filter((x) => x.kind !== "budget" && x.kind !== "live" && x.kind !== "cancelled").length;
-    let html = "<div class=\"report-head\"><h2 id=\"reportTitle\">Test report · " + esc(tr.m.root ? tr.m.root.name : "") + "</h2><span class=\"eyebrow\">" +
-      (serious ? plural(serious, "anomaly", "anomalies") + " recorded" : "no anomalies recorded") + "</span></div>";
-    if (!f.length) html += "<p class=\"none\">The subject completed the test within expected parameters. No further action is required.</p>";
+    let html = "<div class=\"findings card\"><div class=\"panel-head\" style=\"padding:12px 0 6px\"><h3>Findings</h3><span class=\"eyebrow\">" +
+      (serious ? plural(serious, "finding") : "nothing stands out") + (f.length > serious ? " · " + plural(f.length - serious, "note") : "") + "</span></div>";
+    if (!f.length) html += "<p class=\"none\">No failures, long queue waits, stragglers or truncation in this trace.</p>";
     else {
-      const LIMIT = 10;
+      const LIMIT = 16;
       const shown = state.showAllFindings ? f : f.slice(0, LIMIT);
       html += "<ol>" + shown.map((x) => {
         const k = KIND[x.kind] || [x.kind, ""];
@@ -1881,7 +2273,7 @@ const TempoAnalysis = (function (P) {
       }).join("") + "</ol>";
       if (f.length > LIMIT) html += "<div class=\"more\"><button class=\"linkish micro\" type=\"button\" id=\"moreFindings\">" + (state.showAllFindings ? "show fewer" : "show all " + f.length) + "</button></div>";
     }
-    $("report").innerHTML = html;
+    $("pane-findings").innerHTML = html + "</div>";
     const more = $("moreFindings");
     if (more) more.addEventListener("click", () => { state.showAllFindings = !state.showAllFindings; renderFindings(); });
   }
@@ -1895,6 +2287,7 @@ const TempoAnalysis = (function (P) {
   function renderPane() {
     if (!state.A) return;
     if (state.tab === "lanes") { sizeCanvas(); if (!view.fitted) fit(); redraw(); }
+    else if (state.tab === "findings") renderFindings();
     else if (state.tab === "tree") renderTree();
     else if (state.tab === "aggregates") renderAggregates();
     else if (state.tab === "pools") renderPools();
@@ -1911,7 +2304,7 @@ const TempoAnalysis = (function (P) {
     const m = tr.m;
     const s = state.sel !== null && state.sel >= 0 ? m.spans[state.sel] : null;
     if (!s) {
-      el.innerHTML = "<p class=\"eyebrow\">No span selected</p><p class=\"note\">Select a span in the lanes, the tree or the test report. Every span has a story.</p>";
+      el.innerHTML = "<p class=\"eyebrow\">No span selected</p><p class=\"note\">Select a span in the lanes, the tree or the findings to see its timing, CPU and children here.</p>";
       return;
     }
     const row = (k, v, cls) => "<dt>" + esc(k) + "</dt><dd" + (cls ? " class=\"" + cls + "\"" : "") + ">" + v + "</dd>";
@@ -1971,7 +2364,7 @@ const TempoAnalysis = (function (P) {
     const groups = new Map(), lanes = new Map();
     const group = (pool) => { if (!groups.has(pool)) groups.set(pool, { pool: pool, lanes: [], tasks: 0, cpu: A.isCpuPool(pool) }); return groups.get(pool); };
     m.threads.forEach((t, i) => {
-      const ln = { key: "t" + i, thread: i, title: "CHAMBER " + chamberNo(i), sub: t, live: m.live.has(i), spans: [], rows: 1 };
+      const ln = { key: "t" + i, thread: i, title: t, sub: "", live: m.live.has(i), spans: [], rows: 1 };
       group(A.poolOf(t)).lanes.push(ln);
       lanes.set(ln.key, ln);
     });
@@ -1981,7 +2374,7 @@ const TempoAnalysis = (function (P) {
       if (!ln) {
         const pool = s.pool || "?";
         const pname = pool === "?" ? "pool unknown" : pool;
-        ln = { key: k, thread: s.thread, title: s.notRun ? "QUEUE" : "CHAMBER ??", sub: s.notRun ? "never ran · " + pname : "mixed threads · " + pname, special: s.notRun ? "limbo" : "mixed", spans: [], rows: 1 };
+        ln = { key: k, thread: s.thread, title: s.notRun ? "never ran" : "mixed threads", sub: s.notRun ? "queued on " + pname : pname, special: s.notRun ? "limbo" : "mixed", spans: [], rows: 1 };
         group(pool).lanes.push(ln);
         lanes.set(k, ln);
       }
@@ -2131,7 +2524,7 @@ const TempoAnalysis = (function (P) {
   }
   function text(str, x, y, maxW, color, font) {
     if (maxW < 14) return;
-    ctx.font = font || ("10px " + pal().font);
+    ctx.font = font || ("11px " + pal().font);
     ctx.fillStyle = color;
     let s = str;
     if (ctx.measureText(s).width > maxW) {
@@ -2215,7 +2608,7 @@ const TempoAnalysis = (function (P) {
     ctx.beginPath(); ctx.moveTo(0, y + 0.5); ctx.lineTo(view.W, y + 0.5); ctx.stroke();
     setSpacing("0.5px");
     const threads = g.lanes.filter((l) => !l.special).length;
-    text((collapsed ? "▸ " : "▾ ") + (g.pool === "?" ? "POOL UNKNOWN · MIXED-THREAD WORK WITH NO NAMED SIBLING" : "POOL " + g.pool.toUpperCase() + " · " + threads + (threads === 1 ? " THREAD" : " THREADS") + (g.cpu ? " · CPU POOL" : "")), 8, y + L.GROUP / 2 + 1, view.W - 16, c.fg, "500 10px " + c.font);
+    text((collapsed ? "▸ " : "▾ ") + (g.pool === "?" ? "POOL UNKNOWN · MIXED-THREAD WORK WITH NO NAMED SIBLING" : "POOL " + g.pool.toUpperCase() + " · " + threads + (threads === 1 ? " THREAD" : " THREADS") + (g.cpu ? " · CPU POOL" : "")), 8, y + L.GROUP / 2 + 1, view.W - 16, c.fg, "600 10px " + c.font);
     setSpacing("0px");
   }
 
@@ -2233,13 +2626,12 @@ const TempoAnalysis = (function (P) {
 
   function drawLane(tr, ln, y, X) {
     const c = pal(), W = view.W;
-    setSpacing("0.5px");
-    ctx.font = "10px " + c.font;
-    ctx.fillStyle = c.muted;
+    ctx.font = "500 11px " + c.font;
+    ctx.fillStyle = ln.special ? c.muted : c.fg;
     ctx.fillText(ln.title, 8, y + L.LABEL / 2 + 1);
     const tw = ctx.measureText(ln.title + "  ").width;
-    setSpacing("0px");
-    text(ln.sub + (ln.live ? "  · LIVE" : ""), 8 + tw, y + L.LABEL / 2 + 1, W - 16 - tw, c.fg);
+    const sub = [ln.sub, ln.live ? "live" : ""].filter(Boolean).join(" · ");
+    if (sub) text(sub, 8 + tw, y + L.LABEL / 2 + 1, W - 16 - tw, c.muted, "11px " + c.font);
     const wy = y + L.LABEL, ry = wy + L.WAIT + 1;
     ctx.strokeStyle = c.grid;
     ctx.beginPath(); ctx.moveTo(0, y + laneH(ln) - L.GAP / 2 + 0.5); ctx.lineTo(W, y + laneH(ln) - L.GAP / 2 + 0.5); ctx.stroke();
@@ -2284,7 +2676,7 @@ const TempoAnalysis = (function (P) {
         if (xm >= x0 && xm <= x1) { ctx.fillStyle = c.fg; ctx.fillRect(xm - 1, ry - 2, 2, h + 4); }
         textColor = c.fg;
         if (w > 30) {
-          ctx.font = "10px " + c.font;
+          ctx.font = "11px " + c.font;
           const tw = Math.min(ctx.measureText(label).width + 8, w - 2);
           ctx.fillStyle = c.card; ctx.globalAlpha = 0.85; ctx.fillRect(Math.max(x0, 0) + 1, ry + 2, tw, h - 4); ctx.globalAlpha = 1;
         }
@@ -2321,7 +2713,7 @@ const TempoAnalysis = (function (P) {
     const c = pal(), W = view.W, cp = tr.cp;
     ctx.fillStyle = c.card; ctx.fillRect(0, y, W, L.CPL + L.CPB + L.CPG);
     setSpacing("0.5px");
-    ctx.font = "10px " + c.font; ctx.fillStyle = c.muted;
+    ctx.font = "600 10px " + c.font; ctx.fillStyle = c.muted;
     ctx.fillText("CRITICAL PATH", 8, y + L.CPL / 2 + 1);
     const tw = ctx.measureText("CRITICAL PATH  ").width;
     setSpacing("0px");
@@ -2559,8 +2951,7 @@ const TempoAnalysis = (function (P) {
       "Dots are the executor-wide gauges recorded at submit (queued, active), the only pool-wide signal. Aggregates contribute their mean parallelism over their extent, an estimate capped at the pool's threads; where they do, the peak is marked est. and the exact peak of individual spans is shown beside it.</p>";
     tr.pools.forEach((p, i) => {
       const k = (label, v, cls) => "<div><p class=\"eyebrow\">" + esc(label) + "</p><span class=\"stat-value" + (cls ? " " + cls : "") + "\">" + v + "</span></div>";
-      const chambers = p.threads.length ? "chambers " + chamberNo(p.threads[0]) + (p.threads.length > 1 ? "–" + chamberNo(p.threads[p.threads.length - 1]) : "") : "";
-      html += "<div class=\"pool-card card\"><div class=\"report-head\"><h3>Pool " + esc(p.name) + "</h3><span class=\"eyebrow\">" + plural(p.threads.length, "thread") + (chambers ? " · " + chambers : "") + (p.cpu ? " · cpu pool" : "") + "</span></div>" +
+      html += "<div class=\"pool-card card\"><div class=\"panel-head\"><h3>Pool " + esc(p.name) + "</h3><span class=\"eyebrow\">" + plural(p.threads.length, "thread") + (p.cpu ? " · cpu pool" : "") + "</span></div>" +
         "<div class=\"kv-grid\">" + k("Tasks", fmtN(p.tasks)) + k("Threads seen", p.distinct + " / " + p.threads.length) + (p.runEstimated
           ? k("Peak running (est.)", fmtPeak(p.peakRun) + " <span class=\"peak-note\">spans only " + fmtPeak(p.peakRunSpans) + "</span>")
           : k("Peak running", fmtPeak(p.peakRun))) +
@@ -2622,7 +3013,7 @@ const TempoAnalysis = (function (P) {
     const tr = state.A, m = tr.m, cp = tr.cp;
     const b = cp.byKind, tot = Math.max(1, cp.total);
     const KN = { run: "own work", wait: "queue wait", block: "blocked", agg: "aggregate" };
-    let html = "<div class=\"panel card\"><div class=\"report-head\"><h3 class=\"eyebrow\" style=\"color:inherit\">Critical path · " + fmtT(cp.total) + "</h3><span class=\"eyebrow\">" + plural(cp.segments.length, "segment") + "</span></div>" +
+    let html = "<div class=\"panel card\"><div class=\"panel-head\"><h3>Critical path · " + fmtT(cp.total) + "</h3><span class=\"eyebrow\">" + plural(cp.segments.length, "segment") + "</span></div>" +
       "<div class=\"stack\" role=\"img\" aria-label=\"Critical path by kind\">" + ["run", "wait", "block", "agg"].map((k) => "<i class=\"" + k + "\" style=\"width:" + (b[k] / tot * 100) + "%\" title=\"" + KN[k] + "\"></i>").join("") + "</div>" +
       "<div class=\"legend\"><span><i class=\"sw run\"></i>own work " + fmtT(b.run) + " · " + pct(b.run / tot) + "</span><span><i class=\"sw wait\"></i>queue wait " + fmtT(b.wait) + " · " + pct(b.wait / tot) + "</span>" +
       "<span><i class=\"sw block\"></i>blocked " + fmtT(b.block) + " · " + pct(b.block / tot) + "</span><span><i class=\"sw agg\"></i>aggregates " + fmtT(b.agg) + " · " + pct(b.agg / tot) + "</span></div>" +
@@ -2640,9 +3031,9 @@ const TempoAnalysis = (function (P) {
   function renderDiff() {
     const host = $("pane-diff");
     if (!state.B) {
-      host.innerHTML = "<div class=\"pane-empty card\"><h3>No control subject</h3><p>Paste a second trace into the control box (B) above, or drop a file on it. The diff aligns both traces by path and sorts by the largest change.</p>" +
-        "<button class=\"btn-ghost\" type=\"button\" data-demo-pair>Load the demo pair</button></div>";
-      host.querySelector("[data-demo-pair]").addEventListener("click", () => loadDemo("diff"));
+      host.innerHTML = "<div class=\"pane-empty card\"><h3>Nothing to compare with yet</h3><p>Add a second trace of the same request, for example before and after a change. The diff aligns both by path and sorts by the largest change.</p>" +
+        "<div class=\"row\"><button class=\"btn-primary\" type=\"button\" data-act-compare>Compare…</button><button class=\"btn-ghost\" type=\"button\" data-demo=\"diff\">Load the demo pair</button></div></div>";
+      host.querySelector("[data-act-compare]").addEventListener("click", () => openSide("compare"));
       return;
     }
     const a = state.A, b = state.B;
@@ -2657,8 +3048,8 @@ const TempoAnalysis = (function (P) {
       tc(fmtD(r.dSelf)) + tc(fmtD(r.dWait), r.dWait ? "wait" : "") + tc(bar(r.dWait, maxWait, "wait"), "bar-cell") + tc(fmtD(r.dCpu)) + "</tr>").join("");
     const total = (t) => t.m.root ? fmtT(t.m.root.dur) : "–";
     host.innerHTML = "<div class=\"panel card\"><div class=\"kv-grid\">" +
-      "<div><p class=\"eyebrow\">A · test subject</p><span class=\"stat-value\">" + esc(a.m.root ? a.m.root.name : "") + " · " + total(a) + "</span></div>" +
-      "<div><p class=\"eyebrow\">B · control</p><span class=\"stat-value\">" + esc(b.m.root ? b.m.root.name : "") + " · " + total(b) + "</span></div>" +
+      "<div><p class=\"eyebrow\">A · trace</p><span class=\"stat-value\">" + esc(a.m.root ? a.m.root.name : "") + " · " + total(a) + "</span></div>" +
+      "<div><p class=\"eyebrow\">B · compared with</p><span class=\"stat-value\">" + esc(b.m.root ? b.m.root.name : "") + " · " + total(b) + "</span></div>" +
       "<div><p class=\"eyebrow\">Δ total (B − A)</p><span class=\"stat-value\">" + fmtD((b.m.root ? b.m.root.dur : 0) - (a.m.root ? a.m.root.dur : 0)) + "</span></div>" +
       "<div><p class=\"eyebrow\">Δ queue wait on path</p><span class=\"stat-value wait\">" + fmtD(b.cp.byKind.wait - a.cp.byKind.wait) + "</span></div></div>" +
       "<p class=\"note\" style=\"margin-bottom:0\">Δ = B − A per path. Count, sum, self, wait and CPU include folded aggregates. Sorted by the absolute change; click a column to sort by another.</p></div>" +
@@ -2670,14 +3061,14 @@ const TempoAnalysis = (function (P) {
   function renderStats() {
     const host = $("pane-stats");
     const set = state.batch;
-    const intro = "<div class=\"panel card\"><div class=\"report-head\"><h3 class=\"eyebrow\" style=\"color:inherit\">Statistics over " + plural(set.length, "trace") + "</h3>" +
-      "<div class=\"row\"><button class=\"btn-ghost\" type=\"button\" id=\"statsDemo\">Load demo batch (30)</button><label class=\"btn-ghost file-btn\">Add files<input type=\"file\" id=\"statsFiles\" multiple></label>" +
-      (state.A ? "<button class=\"btn-ghost\" type=\"button\" id=\"statsAddA\">Add subject A</button>" : "") + (set.length ? "<button class=\"btn-ghost\" type=\"button\" id=\"statsClear\">Clear set</button>" : "") + "</div></div>" +
-      "<p class=\"note\">Paste several traces into the subject box (one per line, several <code>curl -i</code> outputs, a JSON array or NDJSON), drop several files anywhere, or drop files here. " +
+    const intro = "<div class=\"panel card\"><div class=\"panel-head\"><h3>Statistics over " + plural(set.length, "trace") + "</h3>" +
+      "<div class=\"row\"><button class=\"btn-ghost\" type=\"button\" id=\"statsAdd\">Add traces…</button><label class=\"btn-ghost file-btn\">Add files<input type=\"file\" id=\"statsFiles\" multiple></label>" +
+      (state.A ? "<button class=\"btn-ghost\" type=\"button\" id=\"statsAddA\">Add the open trace</button>" : "") + (set.length ? "<button class=\"btn-ghost\" type=\"button\" id=\"statsClear\">Clear set</button>" : "") + "</div></div>" +
+      "<p class=\"note\">Add traces (one per line, several <code>curl -i</code> outputs, Tempo-Links, a JSON array or NDJSON), drop several files anywhere, or drop files here. " +
       "Per path: p50, p95 and max of each trace's sum over that path (nearest rank, over the traces that contain the path).</p>" +
       (set.length ? "<div class=\"batch-list\">" + esc(set.slice(0, 40).map((t) => t.name).join(" · ")) + (set.length > 40 ? " · …" : "") + "</div>" : "") + "</div>";
     if (!set.length) {
-      host.innerHTML = intro + "<div class=\"pane-empty card\"><h3>Insufficient test subjects</h3><p>Statistics need more than one trace. The demo batch holds thirty searches of the same shape.</p></div>";
+      host.innerHTML = intro + "<div class=\"pane-empty card\"><h3>No traces in the set yet</h3><p>Statistics need several traces of the same request. The demo batch holds thirty searches of the same shape.</p><div class=\"row\"><button class=\"btn-ghost\" type=\"button\" data-demo=\"batch\">Load the demo batch</button></div></div>";
     } else {
       const rows0 = A.stats(set.map((t) => t.m));
       const [key, dir] = state.sort.stats;
@@ -2694,16 +3085,15 @@ const TempoAnalysis = (function (P) {
         th("Wait Σ p50", "wait.p50", "stats") + th("Wait Σ p95", "wait.p95", "stats") + th("Wait Σ max", "wait.max", "stats") + th("Self p50", "self.p50", "stats") + th("Self p95", "self.p95", "stats") + th("Count p50", "count.p50", "stats") +
         "</tr></thead><tbody>" + body + "</tbody></table></div>";
     }
-    $("statsDemo").addEventListener("click", () => loadDemo("batch"));
+    $("statsAdd").addEventListener("click", () => openSide("add"));
     $("statsFiles").addEventListener("change", (e) => { takeFiles(e.target.files, "stats"); e.target.value = ""; });
-    if ($("statsAddA")) $("statsAddA").addEventListener("click", () => { const t = makeTrace(state.A.header ? { header: state.A.header } : { doc: state.A.doc }, null); state.batch = state.batch.concat([t]); render(); });
+    if ($("statsAddA")) $("statsAddA").addEventListener("click", () => { const t = makeTrace(P.load(state.A.header ? { header: state.A.header } : { doc: state.A.doc }), null); state.batch = state.batch.concat([t]); render(); });
     if ($("statsClear")) $("statsClear").addEventListener("click", () => { state.batch = []; render(); });
   }
 
   // ---------------------------------------------------------------- start
   applyTheme(document.documentElement.dataset.themePref || "auto", false);
-  render();
-  loadFromHash();
+  loadFromLocation(true);
 })();
 </script>
 </body>

@@ -2,7 +2,7 @@
 // GENERATED from site/index.html by `node tests/check_spa_parser_sync.mjs --write`. Do not edit.
 
 // ==== BEGIN TEMPO PARSER ====
-// Tempo-Timing v1: decoder, canonical encoder and input extraction (see FORMAT.md).
+// Tempo-Timing v1: decoder, canonical encoder, input extraction and Tempo-Link fragments (see FORMAT.md).
 // This block is copied verbatim into tools/tempo_parse.mjs; tests/check_spa_parser_sync.mjs
 // fails when the two differ and `node tests/check_spa_parser_sync.mjs --write` re-copies it.
 const TempoParse = (function () {
@@ -34,7 +34,8 @@ const TempoParse = (function () {
     E_FLAG: "Unknown flag",
     E_AGG: "Aggregate rules broken",
     E_INPUT: "No Tempo trace found in the input",
-    E_JSON: "JSON form is not a valid trace"
+    E_JSON: "JSON form is not a valid trace",
+    E_LINK: "Tempo-Link or share link that cannot be decoded"
   };
 
   class TempoFormatError extends Error {
@@ -388,15 +389,122 @@ const TempoParse = (function () {
     return lines.join("\n") + "\n";
   }
 
+  // ------------------------------------------------------------ links
+  //
+  // A Tempo-Link header and the viewer's share link are the same URL: the header value travels in
+  // the fragment, which browsers never send, so opening the link fetches nothing.
+  //   <base>#t=<packed>[&c=<packed>][&tab=<view>]
+  //   packed = "z." + base64url without padding (deflate-raw (UTF-8 bytes of the value))
+  //          | the plain value with every "%" written as "%25"
+  // c= is a second trace to compare with (the diff tab), tab= the view to open.
+
+  const LINK_INFLATE_MAX = 16 << 20;   // a link never inflates to more than this many bytes
+  let utf8Strict = null;
+
+  function linkParams(url) {
+    const s = String(url);
+    const i = s.indexOf("#");
+    if (i < 0) return null;
+    const p = Object.create(null);
+    for (const part of s.slice(i + 1).split("&")) {
+      const eq = part.indexOf("=");
+      if (eq > 0) p[part.slice(0, eq)] = part.slice(eq + 1);
+    }
+    if (!p.t) return null;
+    const out = { t: p.t };
+    if (p.c) out.c = p.c;
+    if (p.tab) out.tab = p.tab;
+    return out;
+  }
+
+  function bytesToB64url(bytes) {
+    let s = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function b64urlToBytes(s) {
+    const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  // Runs bytes through a (De)CompressionStream; stops with a RangeError past `cap` output bytes.
+  async function transformBytes(bytes, transform, cap) {
+    const reader = new Blob([bytes]).stream().pipeThrough(transform).getReader();
+    const chunks = [];
+    let n = 0;
+    for (;;) {
+      const r = await reader.read();
+      if (r.done) break;
+      n += r.value.length;
+      if (cap && n > cap) { reader.cancel().catch(function () {}); throw new RangeError("more than " + cap + " bytes"); }
+      chunks.push(r.value);
+    }
+    const out = new Uint8Array(n);
+    let o = 0;
+    for (const c of chunks) { out.set(c, o); o += c.length; }
+    return out;
+  }
+
+  // packed fragment value -> header value. Rejects with E_LINK.
+  async function unpackValue(packed) {
+    const raw = String(packed);
+    if (!raw.startsWith("z.")) return raw.indexOf("%25") >= 0 ? raw.replace(/%25/g, "%") : raw;
+    const b64 = raw.slice(2);
+    if (!/^[A-Za-z0-9_-]+$/.test(b64) || b64.length % 4 === 1) fail("E_LINK", "the z. payload is not base64url");
+    if (typeof DecompressionStream !== "function") fail("E_LINK", "this browser has no DecompressionStream, so it cannot inflate a z. link; open it in a current browser or paste the Tempo-Timing header instead");
+    let ds;
+    try { ds = new DecompressionStream("deflate-raw"); } catch (e) { fail("E_LINK", "this browser cannot inflate deflate-raw, so it cannot read a z. link; open it in a current browser or paste the Tempo-Timing header instead"); }
+    let bytes;
+    try { bytes = await transformBytes(b64urlToBytes(b64), ds, LINK_INFLATE_MAX); } catch (e) {
+      fail("E_LINK", e instanceof RangeError ? "the z. payload inflates to " + e.message : "the z. payload is corrupt or truncated" + (e && e.message ? " (" + e.message + ")" : ""));
+    }
+    if (!utf8Strict) utf8Strict = new TextDecoder("utf-8", { fatal: true });
+    try { return utf8Strict.decode(bytes); } catch (e) { return fail("E_LINK", "the z. payload is not UTF-8 text"); }
+  }
+
+  // header value -> packed fragment value: z. when that is shorter (and CompressionStream exists).
+  async function packValue(value) {
+    const v = String(value);
+    const plain = v.replace(/%/g, "%25");
+    if (typeof CompressionStream === "function") {
+      try {
+        const z = "z." + bytesToB64url(await transformBytes(new TextEncoder().encode(v), new CompressionStream("deflate-raw")));
+        if (z.length < plain.length) return z;
+      } catch (e) { /* plain */ }
+    }
+    return plain;
+  }
+
+  // The link for a trace (and an optional second one to compare with) on a viewer at `base`.
+  async function makeLink(base, value, compare, tab) {
+    let url = String(base).split("#")[0] + "#t=" + await packValue(value);
+    if (compare) url += "&c=" + await packValue(compare);
+    if (tab) url += "&tab=" + tab;
+    return url;
+  }
+
+  function unpackParam(params, key) {
+    if (!params || !params[key]) fail("E_LINK", "the link has no #" + key + "= fragment");
+    return unpackValue(params[key]);
+  }
+
   // ------------------------------------------------------------ input extraction
   //
   // Accepts what the CLI accepts: `curl -i` / `curl -v` output (the Tempo-Timing line, case-insensitive,
   // with terminal-wrapped continuation lines), bare header values starting with "v1;" (several, one
   // after another, each possibly wrapped), or JSON (a body, an array or NDJSON) holding objects with
   // "v": 1 and "spans" anywhere, or a header string under a "tempo" key.
-  // Returns [{source: "header"|"value"|"json", header?: string, doc?: object}].
+  // Also links: Tempo-Link header lines and bare URLs with a #t= fragment (each possibly wrapped).
+  // A Tempo-Timing and a Tempo-Link of the same response are one trace (see loadAsync).
+  // Returns [{source: "header"|"value"|"json"|"link", header?: string, doc?: object, link?: {t, c?, tab?}}].
 
   const HEADER_LINE_RE = /^\s*(?:[<>]\s*)?tempo-timing\s*:(.*)$/i;
+  const LINK_LINE_RE = /^\s*(?:[<>]\s*)?tempo-link\s*:(.*)$/i;
+  const LINK_TOKEN_RE = /[^\s<>"'()[\]{}]*#[^\s<>"'()[\]{}]+/g;
+  const STATUS_LINE_RE = /^\s*(?:<\s*)?HTTP\/\d(?:\.\d)?\s+\d{3}\b/;
   const COMPLETE_RE = /;e=[0-9a-z]+$/;
   // The next HTTP header after a cut value ("content-type: application/json", "< Server: x"):
   // a token, a colon, a space, then the field value. Terminal wraps never put a space inside a
@@ -441,6 +549,41 @@ const TempoParse = (function () {
     try { for (const l of lines) collectJson(JSON.parse(l), out); return out; } catch (e) { return null; }
   }
 
+  // A link wrapped by the terminal: the next line continues it when it is one unbroken run of the
+  // characters the link can hold at that point (base64url for a z. payload) and is not a header.
+  function linkContinues(value, line) {
+    const s = line.trim();
+    if (!s || /\s/.test(s) || HEADER_FIELD_RE.test(line) || s.startsWith("v1;")) return false;
+    if (value.indexOf("#") < 0) return /^[A-Za-z0-9._~:/?#@!$&'*+,;=%-]+$/.test(s);
+    if (s.indexOf("#") >= 0) return false;
+    const tail = value.slice(value.lastIndexOf("&") + 1);
+    if (/^[a-z]+=z\./.test(tail) || /^[a-z]+=?$/.test(tail)) return /^[A-Za-z0-9_.&=-]+$/.test(s);
+    return /^[0-9A-Za-z./:;=@~*+^_%&-]+$/.test(s);
+  }
+
+  // Sentence punctuation after a pasted URL is not part of it (a z. payload never ends in . , ! ?).
+  function trimLinkToken(u) { return u.replace(/(=z\.[A-Za-z0-9_-]+)[.,!?]+$/, "$1"); }
+
+  // Tempo-Timing and Tempo-Link headers of the same response (between two HTTP status lines) are
+  // one trace: the k-th of each pair up when a response holds as many of one as of the other.
+  function pairLinks(items) {
+    const blocks = new Map();
+    for (const it of items) {
+      if (it.source !== "header" && !(it.source === "link" && it.fromHeader)) continue;
+      if (!blocks.has(it.block)) blocks.set(it.block, { h: [], l: [] });
+      blocks.get(it.block)[it.source === "header" ? "h" : "l"].push(it);
+    }
+    for (const b of blocks.values()) {
+      if (!b.h.length || b.h.length !== b.l.length) continue;
+      b.h.forEach(function (h, k) { h.link = b.l[k].link || {}; b.l[k].paired = true; });
+    }
+    return items.filter(function (it) { return !it.paired; }).map(function (it) {
+      const o = { source: it.source };
+      for (const k of ["header", "doc", "link", "url"]) if (it[k] !== undefined) o[k] = it[k];
+      return o;
+    });
+  }
+
   function extractTraces(input) {
     const text = String(input || "").replace(/^﻿/, "");
     if (!text.trim()) return [];
@@ -450,21 +593,35 @@ const TempoParse = (function () {
       return asJson;
     }
     const out = [];
-    let cur = null;
-    const flush = function () { if (cur) { out.push({ source: cur.source, header: settle(cur) }); cur = null; } };
+    let cur = null, link = null, block = 0;
+    const flush = function () { if (cur) { out.push({ source: cur.source, header: settle(cur), block: cur.block }); cur = null; } };
+    const flushLink = function () { if (link) { out.push({ source: "link", link: linkParams(link.value), url: link.value, block: link.block, fromHeader: link.fromHeader }); link = null; } };
     for (const line of text.split(/\r\n|\n|\r/)) {
+      if (STATUS_LINE_RE.test(line)) { flush(); flushLink(); block++; continue; }
       const m = HEADER_LINE_RE.exec(line);
-      if (m) { flush(); cur = { source: "header", value: stripWs(m[1]), glued: [] }; continue; }
+      if (m) { flush(); flushLink(); cur = { source: "header", value: stripWs(m[1]), glued: [], block: block }; continue; }
+      const lm = LINK_LINE_RE.exec(line);
+      if (lm) { flush(); flushLink(); link = { value: lm[1].trim(), fromHeader: true, block: block }; continue; }
+      if (link) {
+        if (linkContinues(link.value, line)) { link.value += line.trim(); continue; }
+        flushLink();
+      }
       const s = stripWs(line);
       if (cur) {
         const done = COMPLETE_RE.test(cur.value);
         if (s && PURE_RE.test(s) && !s.startsWith("v1;") && !HEADER_FIELD_RE.test(line) && (!done || /^[0-9a-z]+$/.test(s))) { cur.value += s; cur.glued.push(s); continue; }
         flush();
       }
-      if (s.startsWith("v1;")) cur = { source: "value", value: s, glued: [] };
+      const urls = line.indexOf("#") >= 0 ? (line.match(LINK_TOKEN_RE) || []).map(trimLinkToken).filter(linkParams) : [];
+      if (urls.length) {
+        for (const u of urls) { flushLink(); link = { value: u, fromHeader: false, block: block }; }
+        continue;
+      }
+      if (s.startsWith("v1;")) cur = { source: "value", value: s, glued: [], block: block };
     }
     flush();
-    if (out.length) return out;
+    flushLink();
+    if (out.length) return pairLinks(out);
     // curl -i output without the header: look for a JSON body after the blank line
     const blank = text.search(/\r?\n\r?\n/);
     if (blank >= 0) {
@@ -476,6 +633,7 @@ const TempoParse = (function () {
 
   // One extracted item -> {doc, header}. header is the raw value (or the canonical encoding of JSON input).
   function load(item) {
+    if (item.source === "link" && item.header === undefined) fail("E_LINK", "a link is inflated asynchronously; use loadAsync");
     if (item.header !== undefined) return { doc: decode(item.header), header: item.header, source: item.source };
     const doc = normalizeJson(item.doc);
     let header = null;
@@ -483,10 +641,43 @@ const TempoParse = (function () {
     return { doc: doc, header: header, source: item.source };
   }
 
+  // Like load(), for every kind of item: inflates links (adding compare and tab when the link has
+  // c= and tab=) and settles a Tempo-Timing that has a Tempo-Link beside it. When the two agree the
+  // header is used; when they differ the header is used unless it does not decode or was cut and the
+  // link holds a complete trace. Either way `note` says what happened.
+  async function loadAsync(item) {
+    if (item.source === "link") {
+      const r = load({ source: "link", header: await unpackParam(item.link, "t") });
+      if (item.link.c) r.compare = await unpackParam(item.link, "c");
+      if (item.link.tab) r.tab = item.link.tab;
+      return r;
+    }
+    if (!item.link) return load(item);
+    let linked = null, linkErr = null;
+    try { linked = stripWs(await unpackParam(item.link, "t")); } catch (e) { linkErr = e; }
+    const plain = { source: item.source, header: item.header };
+    if (linked !== null && linked === stripWs(item.header)) return load(plain);
+    let r = null, err = null;
+    try { r = load(plain); } catch (e) { err = e; }
+    if (linked !== null && (err || r.doc.truncated)) {
+      let l = null;
+      try { l = load({ source: "link", header: linked }); } catch (e) { l = null; }
+      if (l && (err || !l.doc.truncated)) {
+        l.note = "Tempo-Timing " + (err ? "does not decode (" + err.code + ")" : "was cut") + "; the Tempo-Link beside it was used";
+        return l;
+      }
+    }
+    if (err) throw err;
+    r.note = linkErr ? "the Tempo-Link beside it does not decode (" + linkErr.message + "); Tempo-Timing was used"
+                     : "the Tempo-Link beside it holds a different trace; Tempo-Timing was used";
+    return r;
+  }
+
   return {
     ALPHABET_CHARS, FLAG_ORDER, FLAG_NAMES, MAX_DEPTH, RECORD_RE, ERRORS,
     TempoFormatError, stripWs, decode, decodeName, encodeName, encodeNumber, encode,
-    normalizeJson, dumpJson, extractTraces, load
+    normalizeJson, dumpJson, extractTraces, load,
+    linkParams, packValue, unpackValue, makeLink, loadAsync
   };
 })();
 // ==== END TEMPO PARSER ====
@@ -495,5 +686,6 @@ export default TempoParse;
 export const {
   ALPHABET_CHARS, FLAG_ORDER, FLAG_NAMES, MAX_DEPTH, RECORD_RE, ERRORS,
   TempoFormatError, stripWs, decode, decodeName, encodeName, encodeNumber, encode,
-  normalizeJson, dumpJson, extractTraces, load
+  normalizeJson, dumpJson, extractTraces, load,
+  linkParams, packValue, unpackValue, makeLink, loadAsync
 } = TempoParse;
