@@ -14,9 +14,10 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
@@ -43,6 +44,22 @@ class CancelTest {
     @AfterEach
     void noTraceLeftOnThread() {
         assertSame(NOOP, Tempo.current(), "a test left a span open on the test thread");
+    }
+
+    /**
+     * The early exit of the Handoff Javadoc and the README for one pending task: true if it will never run.
+     * Where Tempo takes no part ({@link Handoff#NOOP}) the executor decides the race: {@code remove} takes
+     * the task out of the queue only if no worker took it.
+     */
+    static boolean earlyExit(ThreadPoolExecutor pool, Handoff h, Future<?> future) {
+        boolean won = h == Handoff.NOOP ? pool.remove((Runnable) future) : h.cancel();
+        if (won) future.cancel(false); // the body will not run
+        return won;
+    }
+
+    static ThreadPoolExecutor pool(int threads) {
+        return new ThreadPoolExecutor(threads, threads, 0, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>(),
+                r -> new Thread(r, "worker"));
     }
 
     @Test
@@ -139,7 +156,7 @@ class CancelTest {
 
     @Test
     void theEarlyExitPatternCancelsQueuedTasksAndLeavesRunningOnesAlone() throws Exception {
-        ExecutorService pool = Executors.newSingleThreadExecutor(r -> new Thread(r, "worker"));
+        ThreadPoolExecutor pool = pool(1);
         try {
             Trace t = Tempo.start(SEARCH, strict());
             CountDownLatch running = new CountDownLatch(1), finish = new CountDownLatch(1);
@@ -163,11 +180,7 @@ class CancelTest {
             assertTrue(running.await(10, TimeUnit.SECONDS));
             int cancelled = 0;
             for (int i = 0; i < 4; i++) {
-                Handoff h = handoffs.get(i);
-                if (h.cancel() || h == Handoff.NOOP) {
-                    futures.get(i).cancel(false);
-                    cancelled++;
-                }
+                if (earlyExit(pool, handoffs.get(i), futures.get(i))) cancelled++;
             }
             assertEquals(3, cancelled);           // the first one runs: its cancel lost
             finish.countDown();
@@ -190,9 +203,11 @@ class CancelTest {
     }
 
     /**
-     * The documented early exit stops the work also where Tempo takes no part: a NOOP handoff (no live
-     * trace, or past the lane's cap) returns the task itself from its wrappers and loses every cancel, so
-     * {@code h.cancel()} alone would let it run; the pattern's second test cancels its future.
+     * The documented early exit stops the work also where Tempo takes no part, and says exactly which
+     * tasks it stopped: a NOOP handoff (no live trace, or past the lane's cap) returns the task itself from
+     * its wrappers and loses every cancel, so {@code h.cancel()} alone would let a queued task run. And
+     * {@code Future.cancel(false)} alone cannot tell: it succeeds on a running task too, whose body runs
+     * on. The executor's remove() decides it.
      */
     @Test
     void theEarlyExitPatternStopsTheWorkWithoutATraceToo() throws Exception {
@@ -205,30 +220,28 @@ class CancelTest {
         for (Handoff h : noops) assertSame(Handoff.NOOP, h);
         closed.release();
 
-        ExecutorService pool = Executors.newSingleThreadExecutor(r -> new Thread(r, "worker"));
+        ThreadPoolExecutor pool = pool(1);
         try {
             CountDownLatch busy = new CountDownLatch(1), finish = new CountDownLatch(1);
-            pool.execute(() -> {
-                busy.countDown();
-                try {
-                    finish.await();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            });
-            assertTrue(busy.await(10, TimeUnit.SECONDS));
             AtomicInteger ran = new AtomicInteger();
             Handoff h = Handoff.NOOP;
-            FutureTask<Integer> pattern = new FutureTask<>(h.callable(ran::incrementAndGet));
-            FutureTask<Integer> cancelOnly = new FutureTask<>(h.callable(ran::incrementAndGet));
-            pool.execute(pattern);
-            pool.execute(cancelOnly);
-            if (h.cancel() || h == Handoff.NOOP) pattern.cancel(false);
+            Future<Integer> running = pool.submit(h.callable(() -> {
+                busy.countDown();
+                finish.await();
+                return ran.incrementAndGet();
+            }));
+            assertTrue(busy.await(10, TimeUnit.SECONDS));
+            Future<Integer> pattern = pool.submit(h.callable(ran::incrementAndGet));
+            Future<Integer> cancelOnly = pool.submit(h.callable(ran::incrementAndGet));
+            assertFalse(earlyExit(pool, h, running));               // began: not counted as stopped, left to finish
+            assertFalse(running.isCancelled());
+            assertTrue(earlyExit(pool, h, pattern));                // queued: will never run
             if (h.cancel()) cancelOnly.cancel(false);               // h.cancel() alone: never true for NOOP
             finish.countDown();
-            assertEquals(1, cancelOnly.get(10, TimeUnit.SECONDS));  // ran: nothing stopped it
+            assertEquals(1, running.get(10, TimeUnit.SECONDS));     // its result arrives
+            assertEquals(2, cancelOnly.get(10, TimeUnit.SECONDS));  // ran: nothing stopped it
             assertThrows(CancellationException.class, pattern::get);
-            assertEquals(1, ran.get());                             // the pattern's task did not run
+            assertEquals(2, ran.get());                             // the pattern's task did not run
         } finally {
             pool.shutdownNow();
         }
@@ -256,22 +269,25 @@ class CancelTest {
     /**
      * Many tasks on a pool, and an early exit that cancels every one still pending while the workers take
      * them: every body that ran is recorded as run, every task recorded as cancelled never ran its body,
-     * each cancel's result says which, and strict mode finds no misuse.
+     * each cancel's result says which, and strict mode finds no misuse. Every fourth round is untraced
+     * (Handoff.NOOP throughout), where the documented pattern still says exactly which tasks it stopped.
      */
     @Test
     void anEarlyExitRacingTheWorkersKeepsTheRecordAndTheWorkInStep() throws Exception {
-        int tasks = 1_000, rounds = 20, won = 0, lost = 0;
-        ExecutorService pool = Executors.newFixedThreadPool(4);
+        int tasks = 1_000, rounds = 24, won = 0, lost = 0, untracedWon = 0, untracedLost = 0;
+        ThreadPoolExecutor pool = pool(4);
         try {
             for (int round = 0; round < rounds; round++) {
-                Trace t = Tempo.start(SEARCH, strict().clock(Tempo.SYSTEM_CLOCK).budget(2 * tasks));
+                boolean traced = round % 4 != 3;
+                Trace t = traced ? Tempo.start(SEARCH, strict().clock(Tempo.SYSTEM_CLOCK).budget(2 * tasks)) : null;
+                Span root = traced ? t.root() : Tempo.current();
                 AtomicIntegerArray ran = new AtomicIntegerArray(tasks), cancelled = new AtomicIntegerArray(tasks);
                 AtomicInteger started = new AtomicInteger();
                 List<Handoff> handoffs = new ArrayList<>();
                 List<FutureTask<?>> futures = new ArrayList<>();
                 for (int i = 0; i < tasks; i++) {
                     int n = i;
-                    Handoff h = t.root().handoff(MATCH).set(INDEX, n);
+                    Handoff h = root.handoff(MATCH).set(INDEX, n);
                     Runnable body = () -> {
                         ran.incrementAndGet(n);
                         started.incrementAndGet();
@@ -288,10 +304,7 @@ class CancelTest {
                 }
                 while (started.get() < tasks / 10) Thread.onSpinWait();
                 for (int i = 0; i < tasks; i++) {
-                    if (handoffs.get(i).cancel()) {
-                        cancelled.set(i, 1);
-                        futures.get(i).cancel(false);
-                    }
+                    if (earlyExit(pool, handoffs.get(i), futures.get(i))) cancelled.set(i, 1);
                 }
                 for (FutureTask<?> f : futures) {
                     try {
@@ -299,6 +312,15 @@ class CancelTest {
                     } catch (CancellationException | ExecutionException e) {
                         // a cancelled future, or a callable whose handoff was cancelled first: its body did not run
                     }
+                }
+                if (!traced) {
+                    for (int n = 0; n < tasks; n++) {
+                        assertTrue(ran.get(n) <= 1);
+                        assertEquals(ran.get(n) == 0, cancelled.get(n) == 1, "untraced round " + round + ", task " + n + ": stopped iff the body did not run");
+                        if (cancelled.get(n) == 1) untracedWon++;
+                        else untracedLost++;
+                    }
+                    continue;
                 }
                 t.close();
                 assertEquals(0, t.misuses(), "round " + round);
@@ -322,6 +344,7 @@ class CancelTest {
                 t.release();
             }
             assertTrue(won > 0 && lost > 0, won + " cancels won, " + lost + " lost"); // both sides of the race were taken
+            assertTrue(untracedWon > 0 && untracedLost > 0, untracedWon + " untraced tasks stopped, " + untracedLost + " ran");
         } finally {
             pool.shutdownNow();
         }

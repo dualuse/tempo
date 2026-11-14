@@ -88,7 +88,8 @@ public final class BatchUpload {
                 // item before 43 ms: at most 12 items start before the 40 ms deadline. If the request thread
                 // cancelled the item first, this cancel loses, and callable() throws CancellationException.
                 // Handoff.NOOP (an untraced request) takes no part in the race: its cancel() is always false,
-                // so the deadline is checked for it on its own.
+                // so the deadline is checked for it on its own; this check runs in the task itself, before its
+                // body, so for NOOP it is exact as it stands.
                 Item it = new Item(index, h);
                 it.task = io.submit(() -> {
                     if (System.nanoTime() - deadline > 0 && (h.cancel() || h == Tempo.Handoff.NOOP)) {
@@ -120,9 +121,12 @@ public final class BatchUpload {
             // means the item never runs (callable() skips it); a lost one, that it began, or that its worker
             // cancelled it already. The cancelled items stay in the io queue, where they cost a worker
             // nothing: ThreadPoolExecutor.remove would only free the slots of a bounded queue sooner. A NOOP
-            // handoff (untraced) never wins, so its future is cancelled regardless.
+            // handoff (untraced) takes no part in the race, so there remove() decides it: it takes the item out
+            // of the io queue only if no worker took it (Future.cancel alone would also succeed on a running
+            // item, whose body runs on, and the drain would report it as not started).
             for (Item it : items) {
-                if (it.handoff.cancel() || it.handoff == Tempo.Handoff.NOOP) {
+                boolean won = it.handoff == Tempo.Handoff.NOOP ? io.remove((Runnable) it.task) : it.handoff.cancel();
+                if (won) {
                     it.cancelled = true;      // the trace: cancelled before it began (^c)
                     it.task.cancel(false);    // the result: cancelled, for whoever waits on it
                 }

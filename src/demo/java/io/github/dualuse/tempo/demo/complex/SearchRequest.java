@@ -245,23 +245,25 @@ public final class SearchRequest {
             if (stopped) return;
             // The pool's queue length at submit: tools/tempo --pools draws it as the pool-wide signal.
             Tempo.Handoff h = parent.handoff(name).set(QUEUED, pool.getQueue().size());
-            tasks.add(new Queued(pool.submit(task.apply(h)), h));
+            tasks.add(new Queued(pool.submit(task.apply(h)), h, pool));
         }
 
         /**
          * Stops the fan-out and cancels every task that has not begun; returns how many. The handoff decides
          * the race with a worker: cancel() wins only if the task has not begun, and then the wrapper skips
          * its body even if a worker takes it right now, so the trace shows it cancelled before it began. A
-         * lost cancel means the task is running: it is left to finish (or, for Handoff.NOOP in an untraced
-         * request, that Tempo takes no part: then the future alone stops it). The cancelled tasks stay in the
+         * lost cancel means the task is running: it is left to finish. The cancelled tasks stay in the
          * queues, where they cost a worker nothing; ThreadPoolExecutor.remove would only free the slots of a
-         * bounded queue sooner, and these queues are unbounded.
+         * bounded queue sooner, and these queues are unbounded. Handoff.NOOP (an untraced request) takes no
+         * part in the race, so there remove() decides it: it takes the task out of its queue only if no
+         * worker took it (Future.cancel alone would also succeed on a running task, whose body runs on).
          */
         synchronized int stop() {
             stopped = true;
             int n = 0;
             for (Queued q : tasks) {
-                if (q.handoff.cancel() || q.handoff == Tempo.Handoff.NOOP) {
+                boolean won = q.handoff == Tempo.Handoff.NOOP ? q.pool.remove((Runnable) q.task) : q.handoff.cancel();
+                if (won) {
                     q.task.cancel(false); // completes the future for anyone who waits on it
                     n++;
                 }
@@ -282,10 +284,12 @@ public final class SearchRequest {
     static final class Queued {
         final Future<?> task;
         final Tempo.Handoff handoff;
+        final ThreadPoolExecutor pool;
 
-        Queued(Future<?> task, Tempo.Handoff handoff) {
+        Queued(Future<?> task, Tempo.Handoff handoff, ThreadPoolExecutor pool) {
             this.task = task;
             this.handoff = handoff;
+            this.pool = pool;
         }
     }
 

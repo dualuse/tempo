@@ -101,12 +101,16 @@ public final class WorkerPool {
         // finish, past the join, before the response. Future.cancel completes the future for anyone who
         // waits on it. The cancelled tasks stay in the queue at no cost; ThreadPoolExecutor.remove would only
         // free the slots of a bounded queue sooner. Handoff.NOOP (an untraced request) takes no part in the
-        // race and its cancel() is always false, so there the future alone stops the task.
+        // race and its cancel() is always false, so there remove() decides it: it takes the task out of the
+        // queue only if no worker took it. Future.cancel alone would succeed on a running shard too, whose
+        // body runs on, and count it as skipped.
         int skipped = 0;
         for (int n = hit + 1; n < SHARDS; n++) {
             Tempo.Handoff h = handoffs.get(n);
-            if (h.cancel() || h == Tempo.Handoff.NOOP) {
-                tasks.get(n).cancel(false);
+            Future<Boolean> task = tasks.get(n);
+            boolean won = h == Tempo.Handoff.NOOP ? work.remove((Runnable) task) : h.cancel();
+            if (won) {
+                task.cancel(false);
                 skipped++;
             }
         }

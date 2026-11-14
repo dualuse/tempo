@@ -140,25 +140,30 @@ task skips its body when a worker takes it (`runnable` returns, `callable` and `
 `CancellationException`). They return `false` if the task has begun (it runs, and is recorded
 as it runs), was cancelled already, or Tempo takes no part: the handoff is `Handoff.NOOP` (no
 live trace, as in an untraced request, or past a cap) or the trace was released. Then nothing
-is recorded, the wrappers run the task as it is, and only the future stops it. So an early exit
-needs neither a lock nor the executor's help, traced or not:
+is recorded and the wrappers run the task as it is. So an early exit needs neither a lock nor
+the executor's help where Tempo takes part, and asks the executor where it does not:
 
 ```java
 for (Pending p : pending) {
   Tempo.Handoff h = p.handoff;
-  if (h.cancel() || h == Tempo.Handoff.NOOP) p.future.cancel(false);   // the body will not run
+  boolean won = h == Tempo.Handoff.NOOP ? pool.remove((Runnable) p.future) : h.cancel();
+  if (won) p.future.cancel(false);   // the body will not run
 }
 ```
 
-Cancel pending work before releasing the trace. On a recording handoff, `h.cancel()` alone on
-every pending handoff is enough for the trace and the work if the task is wrapped or starts
-with `tryBegin()`: such a task costs nothing when a worker takes it after a won cancel.
-`future.cancel(false)` completes the future for whoever waits on it (if a worker took the task
-a moment before, the future may complete through the wrapper instead, so go by what `cancel()`
-returned), and `ThreadPoolExecutor.remove` is only needed to free the slots of a bounded queue
-at once. A hand-written task begins with `tryBegin()`, which returns `null` when the cancel
-won, and returns early; `begin()` returns `Tempo.NOOP` then, and the body runs unrecorded.
-Neither is misuse; beginning twice is.
+For `Handoff.NOOP`, `ThreadPoolExecutor.remove` decides the race: it takes the task out of the
+queue only if no worker took it (`submit` returns the very task it queues).
+`future.cancel(false)` alone cannot tell, since it also succeeds on a running task, whose body
+runs on and whose result is thrown away. Cancel pending work before releasing the trace.
+
+On a recording handoff, `h.cancel()` alone on every pending handoff is enough for the trace and
+the work if the task is wrapped or starts with `tryBegin()`: such a task costs nothing when a
+worker takes it after a won cancel. `future.cancel(false)` completes the future for whoever
+waits on it (if a worker took the task a moment before, the future may complete through the
+wrapper instead, so go by what `cancel()` returned), and `ThreadPoolExecutor.remove` is only
+needed there to free the slots of a bounded queue at once. A hand-written task begins with
+`tryBegin()`, which returns `null` when the cancel won, and returns early; `begin()` returns
+`Tempo.NOOP` then, and the body runs unrecorded. Neither is misuse; beginning twice is.
 
 On a thread without a trace, `t.submitted()` and `t.waited(name, token)` measure a queue
 wait into `t.aggregate(name)` with a single clock read each.
