@@ -233,6 +233,7 @@ select.pill-sm { appearance: none; -webkit-appearance: none; padding-right: 1.8r
 /* tabs */
 .tabs { display: flex; gap: 2px; overflow-x: auto; scrollbar-width: none; border-bottom: 1px solid hsl(var(--border)); margin-top: 16px; }
 .tabs::-webkit-scrollbar { display: none; }
+@media (max-width: 520px) { .tabs { flex-wrap: wrap; overflow-x: visible; } .tab { padding: 9px 9px 8px; } }
 .tab { flex: none; padding: 10px 12px 9px; border: 0; background: none; cursor: pointer; font-size: 11px; text-transform: uppercase; letter-spacing: var(--tracking-wider); color: hsl(var(--muted-foreground)); border-bottom: 2px solid transparent; margin-bottom: -1px; transition: color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease); }
 .tab:hover { color: hsl(var(--foreground)); }
 .tab[aria-selected="true"] { color: hsl(var(--foreground)); border-bottom-color: hsl(var(--foreground)); }
@@ -329,6 +330,7 @@ table.tbl { border-collapse: collapse; width: 100%; font-size: 12px; }
 .pool-card { padding: 12px 14px; margin-bottom: 12px; }
 .pool-card h3 { margin: 0; font-size: .875rem; font-weight: 400; text-transform: uppercase; letter-spacing: var(--tracking-wider); }
 .pool-card canvas { display: block; width: 100%; height: 132px; }
+.peak-note { display: inline-block; margin-left: 6px; font-size: 11px; letter-spacing: normal; color: hsl(var(--muted-foreground)); }
 .note { font-size: 12px; color: hsl(var(--muted-foreground)); margin: 6px 0 10px; max-width: 760px; }
 .panel { padding: 12px 14px; margin-bottom: 12px; }
 .pane-empty { padding: 40px 16px; text-align: center; }
@@ -883,8 +885,25 @@ const TempoParse = (function () {
   // The next HTTP header after a cut value ("content-type: application/json", "< Server: x"):
   // a token, a colon, a space, then the field value. Terminal wraps never put a space inside a
   // value, so a line of this shape always ends the value instead of continuing it. (A wrapped
-  // piece that merely ends in ":" plus trailing padding still continues.)
+  // piece that merely ends in ":" plus trailing padding still continues.) A header without the
+  // space ("Content-Type:application/json") looks like a wrapped piece of a name table, so line
+  // shape cannot tell; settle() lets the decoder decide instead.
   const HEADER_FIELD_RE = /^\s*(?:[<>]\s*)?[!#$%&'*+.^_`|~0-9A-Za-z-]+:[ \t]+\S/;
+
+  // A cut value (no ;e=) with glued continuation lines that does not decode: drop glued lines
+  // from the end until it does, so a header that followed the cut is not taken for its tail.
+  // If nothing decodes, keep everything and let load() report the error.
+  function settle(cur) {
+    if (!cur.glued.length || COMPLETE_RE.test(cur.value)) return cur.value;
+    const ok = function (v) { try { decode(v); return true; } catch (e) { return false; } };
+    if (ok(cur.value)) return cur.value;
+    let v = cur.value;
+    for (let k = cur.glued.length - 1; k >= 0; k--) {
+      v = v.slice(0, v.length - cur.glued[k].length);
+      if (ok(v)) return v;
+    }
+    return cur.value;
+  }
 
   function collectJson(x, out) {
     if (Array.isArray(x)) { for (const y of x) collectJson(y, out); return; }
@@ -916,17 +935,17 @@ const TempoParse = (function () {
     }
     const out = [];
     let cur = null;
-    const flush = function () { if (cur) { out.push({ source: cur.source, header: cur.value }); cur = null; } };
+    const flush = function () { if (cur) { out.push({ source: cur.source, header: settle(cur) }); cur = null; } };
     for (const line of text.split(/\r\n|\n|\r/)) {
       const m = HEADER_LINE_RE.exec(line);
-      if (m) { flush(); cur = { source: "header", value: stripWs(m[1]) }; continue; }
+      if (m) { flush(); cur = { source: "header", value: stripWs(m[1]), glued: [] }; continue; }
       const s = stripWs(line);
       if (cur) {
         const done = COMPLETE_RE.test(cur.value);
-        if (s && PURE_RE.test(s) && !s.startsWith("v1;") && !HEADER_FIELD_RE.test(line) && (!done || /^[0-9a-z]+$/.test(s))) { cur.value += s; continue; }
+        if (s && PURE_RE.test(s) && !s.startsWith("v1;") && !HEADER_FIELD_RE.test(line) && (!done || /^[0-9a-z]+$/.test(s))) { cur.value += s; cur.glued.push(s); continue; }
         flush();
       }
-      if (s.startsWith("v1;")) cur = { source: "value", value: s };
+      if (s.startsWith("v1;")) cur = { source: "value", value: s, glued: [] };
     }
     flush();
     if (out.length) return out;
@@ -1268,7 +1287,7 @@ const TempoAnalysis = (function (P) {
       if (s.cpu !== undefined) { p.cpuSum += s.cpu; p.offCpu += s.offCpu; }
       if (s.isAgg) {
         const ext = Math.max(1, s.agg.extent);
-        if (s.dur > 0) { p.events.push([s.start, "run", s.dur / ext]); p.events.push([s.start + ext, "run", -s.dur / ext]); }
+        if (s.dur > 0) { p.events.push([s.start, "run", s.dur / ext, true]); p.events.push([s.start + ext, "run", -s.dur / ext, true]); }
         if (s.wait) { p.events.push([s.start, "pend", s.wait / ext]); p.events.push([s.start + ext, "pend", -s.wait / ext]); }
       } else {
         if (s.isHandoff && s.runStart > s.start) { p.events.push([s.start, "pend", 1]); p.events.push([s.runStart, "pend", -1]); }
@@ -1285,14 +1304,23 @@ const TempoAnalysis = (function (P) {
     }
     return Array.from(byName.values()).filter(function (p) { return p.tasks > 0 || p.threads.length; }).map(function (p) {
       p.events.sort(function (x, y) { return x[0] - y[0]; });
+      // Aggregates are spread evenly over their extent, which can claim more parallelism than the
+      // pool has; the running line and its peak are capped at the pool's threads. peakRunSpans
+      // counts individual spans only (exact); runEstimated says whether aggregates contributed.
+      const cap = Math.max(p.threads.length, p.seen.size) || Infinity;
       const running = [[0, 0]], pending = [[0, 0]];
-      let run = 0, pend = 0, peakRun = 0, peakPend = 0;
+      let run = 0, spanRun = 0, pend = 0, peakRun = 0, peakRunSpans = 0, peakPend = 0, estimated = false;
       for (const e of p.events) {
-        if (e[1] === "run") { run += e[2]; if (Math.abs(run) < 1e-9) run = 0; running.push([e[0], run]); peakRun = Math.max(peakRun, run); }
-        else { pend += e[2]; if (Math.abs(pend) < 1e-9) pend = 0; pending.push([e[0], pend]); peakPend = Math.max(peakPend, pend); }
+        if (e[1] === "run") {
+          run += e[2]; if (Math.abs(run) < 1e-9) run = 0;
+          if (e[3]) estimated = true; else { spanRun += e[2]; peakRunSpans = Math.max(peakRunSpans, spanRun); }
+          const v = Math.min(cap, run);
+          running.push([e[0], v]); peakRun = Math.max(peakRun, v);
+        } else { pend += e[2]; if (Math.abs(pend) < 1e-9) pend = 0; pending.push([e[0], pend]); peakPend = Math.max(peakPend, pend); }
       }
       delete p.events;
       p.running = running; p.pending = pending; p.peakRun = peakRun; p.peakPend = peakPend;
+      p.peakRunSpans = peakRunSpans; p.runEstimated = estimated;
       p.distinct = p.seen.size;
       delete p.seen;
       return p;
@@ -2523,17 +2551,20 @@ const TempoAnalysis = (function (P) {
   }
 
   // ---------------------------------------------------------------- pools
+  const fmtPeak = (v) => v.toFixed(v % 1 ? 1 : 0);
   function renderPools() {
     const tr = state.A, m = tr.m;
     const host = $("pane-pools");
     let html = "<p class=\"note\">Each chart shows <b>this request's share</b> of a pool over time: its tasks running (grey) and submitted but not begun (orange). " +
-      "Dots are the executor-wide gauges recorded at submit (queued, active), the only pool-wide signal. Aggregates contribute their mean parallelism over their extent.</p>";
+      "Dots are the executor-wide gauges recorded at submit (queued, active), the only pool-wide signal. Aggregates contribute their mean parallelism over their extent, an estimate capped at the pool's threads; where they do, the peak is marked est. and the exact peak of individual spans is shown beside it.</p>";
     tr.pools.forEach((p, i) => {
       const k = (label, v, cls) => "<div><p class=\"eyebrow\">" + esc(label) + "</p><span class=\"stat-value" + (cls ? " " + cls : "") + "\">" + v + "</span></div>";
       const chambers = p.threads.length ? "chambers " + chamberNo(p.threads[0]) + (p.threads.length > 1 ? "–" + chamberNo(p.threads[p.threads.length - 1]) : "") : "";
       html += "<div class=\"pool-card card\"><div class=\"report-head\"><h3>Pool " + esc(p.name) + "</h3><span class=\"eyebrow\">" + plural(p.threads.length, "thread") + (chambers ? " · " + chambers : "") + (p.cpu ? " · cpu pool" : "") + "</span></div>" +
-        "<div class=\"kv-grid\">" + k("Tasks", fmtN(p.tasks)) + k("Threads seen", p.distinct + " / " + p.threads.length) + k("Peak running", p.peakRun.toFixed(p.peakRun % 1 ? 1 : 0)) +
-        k("Peak queued", p.peakPend.toFixed(p.peakPend % 1 ? 1 : 0)) + k("Run Σ", fmtT(p.runSum)) + k("Wait Σ", fmtT(p.waitSum)) + k("Wait max", fmtT(p.waitMax)) +
+        "<div class=\"kv-grid\">" + k("Tasks", fmtN(p.tasks)) + k("Threads seen", p.distinct + " / " + p.threads.length) + (p.runEstimated
+          ? k("Peak running (est.)", fmtPeak(p.peakRun) + " <span class=\"peak-note\">spans only " + fmtPeak(p.peakRunSpans) + "</span>")
+          : k("Peak running", fmtPeak(p.peakRun))) +
+        k("Peak queued", fmtPeak(p.peakPend)) + k("Run Σ", fmtT(p.runSum)) + k("Wait Σ", fmtT(p.waitSum)) + k("Wait max", fmtT(p.waitMax)) +
         k("CPU Σ", p.cpuSum ? fmtT(p.cpuSum) : "–") + k("Off-CPU Σ", p.cpuSum ? fmtT(p.offCpu) : "–") + k("Never started", fmtN(p.notStarted)) + "</div>" +
         "<canvas data-pool=\"" + i + "\"></canvas>" +
         "<div class=\"legend\" style=\"margin-top:6px\"><span><i class=\"sw run\"></i>running (this request)</span><span><i class=\"sw wait\"></i>queued (this request)</span><span><i class=\"dot wait\" style=\"border-radius:50%\"></i>gauge: queued</span><span><i class=\"dot hollow\" style=\"border-radius:50%\"></i>gauge: active</span><span>- - pool size</span></div></div>";
@@ -2559,7 +2590,13 @@ const TempoAnalysis = (function (P) {
     for (let v = 0; v <= ymax; v += ystep) { const y = Math.round(Y(v)) + 0.5; g.moveTo(padL, y); g.lineTo(W - 6, y); g.fillText(String(Math.round(v)), 2, y); }
     g.stroke();
     const tstep = niceStep(end, (W - padL) / 90);
-    for (let t = 0; t <= end; t += tstep) g.fillText(fmtTick(t, tstep), X(t) + 2, H - 8);
+    let tickEnd = -Infinity;   // right edge of the last label drawn; a label that would pass W-6 is right-aligned or skipped
+    for (let t = 0; t <= end; t += tstep) {
+      const label = fmtTick(t, tstep), w = g.measureText(label).width;
+      const x = Math.min(X(t) + 2, W - 6 - w);
+      if (x < tickEnd + 8) continue;
+      g.fillText(label, x, H - 8); tickEnd = x + w;
+    }
     if (p.threads.length) { g.strokeStyle = c.muted; g.setLineDash([4, 3]); g.beginPath(); g.moveTo(padL, Y(p.threads.length) + 0.5); g.lineTo(W - 6, Y(p.threads.length) + 0.5); g.stroke(); g.setLineDash([]); }
     const series = (pts, stroke, fill) => {
       g.beginPath(); g.moveTo(X(0), Y(0));

@@ -314,7 +314,7 @@ const TempoAnalysis = (function (P) {
       if (s.cpu !== undefined) { p.cpuSum += s.cpu; p.offCpu += s.offCpu; }
       if (s.isAgg) {
         const ext = Math.max(1, s.agg.extent);
-        if (s.dur > 0) { p.events.push([s.start, "run", s.dur / ext]); p.events.push([s.start + ext, "run", -s.dur / ext]); }
+        if (s.dur > 0) { p.events.push([s.start, "run", s.dur / ext, true]); p.events.push([s.start + ext, "run", -s.dur / ext, true]); }
         if (s.wait) { p.events.push([s.start, "pend", s.wait / ext]); p.events.push([s.start + ext, "pend", -s.wait / ext]); }
       } else {
         if (s.isHandoff && s.runStart > s.start) { p.events.push([s.start, "pend", 1]); p.events.push([s.runStart, "pend", -1]); }
@@ -331,14 +331,23 @@ const TempoAnalysis = (function (P) {
     }
     return Array.from(byName.values()).filter(function (p) { return p.tasks > 0 || p.threads.length; }).map(function (p) {
       p.events.sort(function (x, y) { return x[0] - y[0]; });
+      // Aggregates are spread evenly over their extent, which can claim more parallelism than the
+      // pool has; the running line and its peak are capped at the pool's threads. peakRunSpans
+      // counts individual spans only (exact); runEstimated says whether aggregates contributed.
+      const cap = Math.max(p.threads.length, p.seen.size) || Infinity;
       const running = [[0, 0]], pending = [[0, 0]];
-      let run = 0, pend = 0, peakRun = 0, peakPend = 0;
+      let run = 0, spanRun = 0, pend = 0, peakRun = 0, peakRunSpans = 0, peakPend = 0, estimated = false;
       for (const e of p.events) {
-        if (e[1] === "run") { run += e[2]; if (Math.abs(run) < 1e-9) run = 0; running.push([e[0], run]); peakRun = Math.max(peakRun, run); }
-        else { pend += e[2]; if (Math.abs(pend) < 1e-9) pend = 0; pending.push([e[0], pend]); peakPend = Math.max(peakPend, pend); }
+        if (e[1] === "run") {
+          run += e[2]; if (Math.abs(run) < 1e-9) run = 0;
+          if (e[3]) estimated = true; else { spanRun += e[2]; peakRunSpans = Math.max(peakRunSpans, spanRun); }
+          const v = Math.min(cap, run);
+          running.push([e[0], v]); peakRun = Math.max(peakRun, v);
+        } else { pend += e[2]; if (Math.abs(pend) < 1e-9) pend = 0; pending.push([e[0], pend]); peakPend = Math.max(peakPend, pend); }
       }
       delete p.events;
       p.running = running; p.pending = pending; p.peakRun = peakRun; p.peakPend = peakPend;
+      p.peakRunSpans = peakRunSpans; p.runEstimated = estimated;
       p.distinct = p.seen.size;
       delete p.seen;
       return p;
