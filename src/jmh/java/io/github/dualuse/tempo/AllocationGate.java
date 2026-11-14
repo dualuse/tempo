@@ -25,7 +25,9 @@ import java.util.TreeMap;
  * <p>Rendering the 300-span trace of {@code Rendered} is held to ceilings: the encoder alone
  * ({@code snapshotToHeader}) to its one output String (3,440 characters, 3.5 KB) plus about 2 KB of
  * per-render tables and walk state, measured 5.2 KB; {@code toHeader} adds the copy of the trace that
- * {@code snapshot()} takes, measured 22.6 KB. Its JSON form into a reused builder
+ * {@code snapshot()} takes, measured 22.6 KB. That copy is an accepted deviation from the plan's "one
+ * output String": a render runs once per request, and avoiding it would need a second walker over the
+ * live lanes. Its JSON form into a reused builder
  * ({@code snapshotWriteJson}) has no output String, only the tables and walk state. BENCHMARKS.md
  * records the numbers.
  */

@@ -41,7 +41,11 @@ The 300-span render writes a 3,440-character value. The encoder alone
 tables sized to the trace's own names and threads, plus walk state; its builder is reused
 per thread. `toHeader` also takes the snapshot, which copies the trace's rows, events and
 aggregates (about 17 KB here), so it is above the plan's "one output String". Rendering
-straight from the live lanes would avoid that copy, at the cost of a second walker.
+straight from the live lanes would avoid that copy, at the cost of a second walker that repeats
+the snapshot's consistency handling, including its race with `release()`.
+
+This is an accepted deviation (2026-11-14): a render happens once per request, not per span,
+and its ceiling is the 24,576 B gate above. The recording path stays at 0 B per span.
 
 `snapshotWriteJson` writes the JSON form into the caller's builder, so it allocates no
 output at all: only the encoder's tables and walk state (the same two walks as the header).
