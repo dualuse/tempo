@@ -301,6 +301,7 @@ public class TempoBenchmark {
     public static class Rendered {
         Tempo.Trace trace;
         Tempo.Snapshot snapshot;
+        final StringBuilder json = new StringBuilder(1 << 16);
 
         @Setup(Level.Trial)
         public void setUp() {
@@ -336,6 +337,14 @@ public class TempoBenchmark {
     @Benchmark
     public String snapshotToHeader(Rendered s) {
         return s.snapshot.toHeader();
+    }
+
+    /** The JSON form of a snapshot taken once, into a reused builder: the encoder's walks alone. */
+    @Benchmark
+    public int snapshotWriteJson(Rendered s) throws java.io.IOException {
+        s.json.setLength(0);
+        s.snapshot.writeJson(s.json);
+        return s.json.length();
     }
 
     /**

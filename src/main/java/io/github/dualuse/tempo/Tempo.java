@@ -2,6 +2,7 @@ package io.github.dualuse.tempo;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.lang.ref.WeakReference;
@@ -2186,6 +2187,11 @@ public final class Tempo {
      *
      * <p>A handoff row is drawn as one record with the task linked to it (submit time, queue wait, the
      * task's duration, thread and children); a handoff without a task is drawn never started.
+     *
+     * <p>A response object that carries the trace in its body ({@link #writeJson}, or {@code TempoJackson}
+     * for Jackson) holds a {@code Snapshot}, never a {@link Trace}: a body is often serialized after the
+     * request released its trace, or while its tasks still record, and would then find it empty or
+     * changing. Take the snapshot when the response is built.
      */
     public static final class Snapshot {
         static final Snapshot EMPTY = new Snapshot();
@@ -2487,6 +2493,19 @@ public final class Tempo {
             return Header.link(this, Link.base(base, linkBase), maxBytes);
         }
 
+        /**
+         * Writes the trace in the JSON form of {@code FORMAT.md} section 8 to {@code out}: what the whole
+         * {@link #toHeader()} value decodes to, with no size limit and no ladder, as one line of compact
+         * JSON (keys in the order of the format's tables, names as the wire decodes them). Needs no
+         * library; {@code TempoJackson} writes the same structure through Jackson. Taken after release,
+         * or without a root, it has no threads and no spans.
+         *
+         * <p>Writes into a {@link StringBuilder} directly; any other target receives the text in pieces.
+         */
+        public void writeJson(Appendable out) throws IOException {
+            JsonText.write(this, out);
+        }
+
         /** Like {@link Trace#forEachTop}, as the snapshot was taken. */
         public void forEachTop(TopVisitor visitor) {
             tops().forEach(visitor);
@@ -2659,7 +2678,8 @@ public final class Tempo {
      * task that had no recorded span to hang them from) are left out with their subtrees and counted as
      * dropped, like a non-finite attribute value: a record at depth 35 stands for its whole subtree. Every
      * occurrence in an aggregate on the wire counts as folded (FORMAT.md §4), as do folded spans and tasks
-     * still open. A value over its limit goes down the {@link Ladder}.
+     * still open. A value over its limit goes down the {@link Ladder}. The second walk can instead write
+     * the JSON form the whole value decodes to ({@link #json}), with the same rules and numbers.
      */
     static final class Header implements SpanVisitor {
         static final int MAX_DEPTH = 35, MIN_BYTES = 256;
@@ -2680,11 +2700,15 @@ public final class Tempo {
         private int names, nKeys;
         private final long[] cur = new long[MAX_DEPTH + 2];
         private final int[] threadAt = new int[MAX_DEPTH + 1];
+        private int[] idAt; // JSON form only: by depth, the current path's record ids
         private final boolean[] aggregateAt = new boolean[MAX_DEPTH + 1];
-        private StringBuilder out; // null during the first walk
+        private boolean second; // the second walk, which writes the records to out or json
+        private StringBuilder out;
+        private JsonSink json;
         private int records, skip, aggregates;
         private long rootStart, rootDur, left, nonFinite; // left: spans left out, aggregates by count
         private long aggregated, foldedSeen; // occurrences in the aggregates written; folded ones in all aggregates
+        private long folded, dropped; // x=
         private long unwritten; // what the fallback stands for: every span but the root, as folded and dropped
 
         private Header(Snapshot snap) {
@@ -2763,20 +2787,32 @@ public final class Tempo {
             return max + 1;
         }
 
-        /** Writes the whole value into {@code b}; false if the snapshot has no root. */
-        private boolean write(StringBuilder b) {
+        /**
+         * The first walk: numbers the threads and names the records use and counts what is folded and
+         * dropped; false if the snapshot has no root. The second walk follows with {@code records} reset.
+         */
+        private boolean prepare() {
             snap.forEachSpan(this);
             if (records == 0) return false;
             for (int i = 0; i < nKeys; i++) if (nameIndex[keys[i]] < 0) number(keys[i]);
             for (int l = 0, n = 0; l < laneIndex.length; l++) if (laneIndex[l] != 0) laneIndex[l] = ++n;
+            // aggregates left out count as dropped only; spans folded for want of budget that are still
+            // open are in no aggregate yet and count as folded
+            dropped = snap.dropped() + left + nonFinite;
+            folded = aggregated + Math.max(0, snap.folded() - foldedSeen);
+            unwritten = folded + dropped + records - 1 - aggregates;
+            second = true;
+            records = 0;
+            skip = -1;
+            return true;
+        }
 
+        /** Writes the whole value into {@code b}; false if the snapshot has no root. */
+        private boolean write(StringBuilder b) {
+            if (!prepare()) return false;
             b.setLength(0);
             b.append("v1");
             if (snap.wall > 0) b36(b.append(";w="), snap.wall);
-            // aggregates left out count as dropped only; spans folded for want of budget that are still
-            // open are in no aggregate yet and count as folded
-            long dropped = snap.dropped() + left + nonFinite, folded = aggregated + Math.max(0, snap.folded() - foldedSeen);
-            unwritten = folded + dropped + records - 1 - aggregates;
             if (folded > 0 || dropped > 0) b36(b36(b.append(";x="), folded).append('.'), dropped);
             boolean live = false;
             for (int l = 0; l < laneIndex.length; l++) {
@@ -2792,11 +2828,54 @@ public final class Tempo {
             for (int i = 0; i < names; i++) name(i == 0 ? b : b.append(':'), Name.byId(order[i]).text);
             b.append(";S=");
             out = b;
-            records = 0;
-            skip = -1;
             snap.forEachSpan(this);
             b36(b.append(";e="), records);
             return true;
+        }
+
+        /**
+         * Writes the JSON form of {@code s} (FORMAT.md §8) to {@code j}: what its whole value decodes to,
+         * with no size limit and no ladder. Without a root it has no threads and no spans.
+         */
+        static void json(Snapshot s, JsonSink j) throws IOException {
+            Header h = new Header(s);
+            boolean any = h.prepare();
+            j.begin('{');
+            j.key("v");
+            j.number(1);
+            j.key("unit");
+            j.string("us");
+            if (any && s.wall > 0) {
+                j.key("wall");
+                j.number(s.wall);
+            }
+            j.key("folded");
+            j.number(h.folded);
+            j.key("dropped");
+            j.number(h.dropped);
+            j.key("threads");
+            j.begin('[');
+            for (int l = 0; l < h.laneIndex.length; l++) if (h.laneIndex[l] != 0) j.string(text(s.shapes[l].thread));
+            j.end(']');
+            j.key("live");
+            j.begin('[');
+            for (int l = 0; l < h.laneIndex.length; l++) if (h.laneIndex[l] != 0 && s.shapes[l].live) j.number(h.laneIndex[l] - 1);
+            j.end(']');
+            j.key("truncated");
+            j.bool(false);
+            j.key("spans");
+            j.begin('[');
+            if (any) {
+                h.json = j;
+                h.idAt = new int[MAX_DEPTH + 1];
+                try {
+                    s.forEachSpan(h);
+                } catch (UncheckedIOException e) {
+                    throw e.getCause();
+                }
+            }
+            j.end(']');
+            j.end('}');
         }
 
         @Override
@@ -2804,7 +2883,7 @@ public final class Tempo {
             int d = v.depth;
             if (skip >= 0 && d > skip || d > MAX_DEPTH || d == 0 && records > 0 || d > 0 && aggregateAt[d - 1]) {
                 if (skip < 0 || d <= skip) skip = d; // left out with its subtree
-                if (out == null) {
+                if (!second) {
                     left += v.count;
                     foldedSeen += v.folded;
                 }
@@ -2812,15 +2891,21 @@ public final class Tempo {
             }
             skip = -1;
             aggregateAt[d] = v.aggregate;
-            if (out == null) {
+            if (!second) {
                 foldedSeen += v.folded;
                 if (v.aggregate) {
                     aggregated += v.count;
                     aggregates++;
                 }
                 count(v);
-            } else {
+            } else if (json == null) {
                 record(out, v);
+            } else {
+                try {
+                    span(json, v);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
             }
             records++;
         }
@@ -2856,15 +2941,12 @@ public final class Tempo {
         private void record(StringBuilder b, SpanView v) {
             int d = v.depth;
             if (records > 0) b.append('/');
-            // an inline handoff is a plain child from when it began (FORMAT.md §6.5)
-            long start = us(v.start + (v.inline ? v.wait : 0) - rootStart), delta = Math.max(0, start - cur[d]);
-            cur[d] = cur[d + 1] = cur[d] + delta;
-            b36(b36(b36(b.append(DIGITS[d]), nameIndex[v.name.id] - 1).append('.'), delta).append('.'), us(v.duration));
-            int thread = d == 0 ? 0 : unrun(v) || v.mixed ? threadAt[d - 1] : laneIndex[v.shape.lane] - 1;
-            threadAt[d] = thread;
+            long previous = cur[d], start = start(v);
+            b36(b36(b36(b.append(DIGITS[d]), nameIndex[v.name.id] - 1).append('.'), start - previous).append('.'), us(v.duration));
+            int thread = thread(v);
             if (v.mixed) b.append("@_");
             else if (d > 0 && thread != threadAt[d - 1]) b36(b.append('@'), thread);
-            if (v.aggregate ? v.handoff : v.handoff && !v.inline) {
+            if (waits(v)) {
                 b36(b.append('~'), us(v.wait));
                 if (v.aggregate) b36(b.append('.'), us(v.waitMax));
             }
@@ -2873,16 +2955,8 @@ public final class Tempo {
                 b36(b36(b36(b.append('+'), v.count).append('.'), us(v.min)).append('.'), us(v.max));
                 b36(b36(b.append('.'), us(v.extent)).append('.'), us(v.maxAt));
             }
-            int f = v.flags;
-            if ((f & SHOWN) != 0 || v.open || v.neverStarted()) {
-                b.append('^');
-                if ((f & FAILED) != 0) b.append('f');
-                if ((f & CANCELLED) != 0) b.append('c');
-                if (v.open) b.append('o');
-                if (v.neverStarted()) b.append('n');
-                if ((f & WAIT) != 0) b.append('w');
-                if ((f & (HEALED | MISUSE)) != 0) b.append('m');
-            }
+            int f = flags(v);
+            if (f != 0) b.append('^').append(FLAG_TEXT[f]);
             for (int i = 0, n = v.attributes(); i < n; i++) {
                 if (!first(v, i)) continue;
                 int j = last(v, i);
@@ -2891,6 +2965,139 @@ public final class Tempo {
                 if ((v.key(j) & KIND_MASK) == ATTR_DOUBLE) number(b, Double.longBitsToDouble(v.value(j)));
                 else b.append(v.value(j));
             }
+        }
+
+        /** Second walk, JSON form: the span object of the record {@link #record} would write, as decoded. */
+        private void span(JsonSink j, SpanView v) throws IOException {
+            long start = start(v);
+            int d = v.depth, thread = thread(v);
+            idAt[d] = records;
+            j.begin('{');
+            j.key("id");
+            j.number(records);
+            j.key("parent");
+            j.number(d == 0 ? -1 : idAt[d - 1]); // the view's ids count the records left out too
+            j.key("name");
+            j.string(text(v.name.text));
+            j.key("start");
+            j.number(start);
+            j.key("dur");
+            j.number(us(v.duration));
+            j.key("thread");
+            j.number(v.mixed ? -1 : thread);
+            if (waits(v) && !v.aggregate) {
+                j.key("wait");
+                j.number(us(v.wait));
+            }
+            if (v.cpu >= 0) {
+                j.key("cpu");
+                j.number(us(v.cpu));
+            }
+            int f = flags(v);
+            if (f != 0) {
+                j.key("flags");
+                j.string(FLAG_TEXT[f]);
+            }
+            boolean attrs = false;
+            for (int i = 0, n = v.attributes(); i < n; i++) {
+                if (!first(v, i)) continue;
+                int k = last(v, i);
+                if (!finite(v, k)) continue;
+                if (!attrs) {
+                    j.key("attrs");
+                    j.begin('{');
+                    attrs = true;
+                }
+                j.key(text(Name.byId(v.key(k) >>> KIND_BITS).text));
+                if ((v.key(k) & KIND_MASK) == ATTR_DOUBLE) j.decimal(Double.longBitsToDouble(v.value(k)));
+                else j.number(v.value(k));
+            }
+            if (attrs) j.end('}');
+            if (v.aggregate) {
+                j.key("agg");
+                j.begin('{');
+                j.key("count");
+                j.number(v.count);
+                j.key("min");
+                j.number(us(v.min));
+                j.key("max");
+                j.number(us(v.max));
+                j.key("extent");
+                j.number(us(v.extent));
+                j.key("maxAt");
+                j.number(us(v.maxAt));
+                if (waits(v)) {
+                    j.key("waitSum");
+                    j.number(us(v.wait));
+                    j.key("waitMax");
+                    j.number(us(v.waitMax));
+                }
+                j.end('}');
+            }
+            j.end('}');
+        }
+
+        /**
+         * The record's start in microseconds from the root's, as a decoder reads it: delta-coded against
+         * its previous sibling or its parent, so never before them. An inline handoff is a plain child from
+         * when it began (FORMAT.md §6.5).
+         */
+        private long start(SpanView v) {
+            int d = v.depth;
+            long start = Math.max(cur[d], us(v.start + (v.inline ? v.wait : 0) - rootStart));
+            cur[d] = cur[d + 1] = start;
+            return start;
+        }
+
+        /** The record's wire thread index; a mixed-thread aggregate's is its parent's, as the wire omits it. */
+        private int thread(SpanView v) {
+            int d = v.depth;
+            int thread = d == 0 ? 0 : unrun(v) || v.mixed ? threadAt[d - 1] : laneIndex[v.shape.lane] - 1;
+            threadAt[d] = thread;
+            return thread;
+        }
+
+        /** Whether the record carries a queue wait: a handoff not run inline, or an aggregate of handoffs. */
+        private static boolean waits(SpanView v) {
+            return v.aggregate ? v.handoff : v.handoff && !v.inline;
+        }
+
+        /** The record's flags, by bit in {@link #FLAG_TEXT}'s order {@code fconwm}. */
+        private static int flags(SpanView v) {
+            int f = v.flags;
+            return ((f & FAILED) != 0 ? 1 : 0) | ((f & CANCELLED) != 0 ? 2 : 0) | (v.open ? 4 : 0)
+                    | (v.neverStarted() ? 8 : 0) | ((f & WAIT) != 0 ? 16 : 0) | ((f & (HEALED | MISUSE)) != 0 ? 32 : 0);
+        }
+
+        /** The flag strings by {@link #flags} bits: {@code fconwm}, in that order. */
+        private static final String[] FLAG_TEXT = new String[64];
+
+        static {
+            for (int m = 0; m < 64; m++) {
+                StringBuilder b = new StringBuilder(6);
+                for (int i = 0; i < 6; i++) if ((m & 1 << i) != 0) b.append("fconwm".charAt(i));
+                FLAG_TEXT[m] = b.toString();
+            }
+        }
+
+        /**
+         * A name as a decoder reads it back from {@link #name}: {@code ?} for a null or empty one and for
+         * each unpaired surrogate; the string itself when it has none.
+         */
+        static String text(String s) {
+            if (s == null || s.isEmpty()) return "?";
+            char[] c = null;
+            for (int i = 0, n = s.length(); i < n; i++) {
+                char x = s.charAt(i);
+                if (!Character.isSurrogate(x)) continue;
+                if (Character.isHighSurrogate(x) && i + 1 < n && Character.isLowSurrogate(s.charAt(i + 1))) {
+                    i++;
+                    continue;
+                }
+                if (c == null) c = s.toCharArray();
+                c[i] = '?';
+            }
+            return c == null ? s : new String(c);
         }
 
         /**
@@ -3010,6 +3217,145 @@ public final class Tempo {
                 b.append((char) ('0' + f / m));
                 f %= m;
             }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * The tokens of the JSON form (FORMAT.md §8) in the order {@link Header#json} writes them:
+     * {@link JsonText} writes them as text, {@code TempoJackson} through a Jackson {@code JsonGenerator}.
+     */
+    abstract static class JsonSink {
+        /** Opens an object ({@code '{'}) or an array ({@code '['}). */
+        abstract void begin(char bracket) throws IOException;
+
+        /** Closes the innermost object ({@code '}'}) or array ({@code ']'}). */
+        abstract void end(char bracket) throws IOException;
+
+        abstract void key(String key) throws IOException;
+
+        abstract void string(String s) throws IOException;
+
+        abstract void number(long v) throws IOException;
+
+        /**
+         * A finite double attribute value, as the wire writes it ({@link Header#number}): rounded to six
+         * decimals, half to even, and an integral result as an integer.
+         */
+        abstract void decimal(double v) throws IOException;
+
+        abstract void bool(boolean v) throws IOException;
+    }
+
+    /**
+     * Compact JSON text, one line without spaces, keys in the order of FORMAT.md §8's tables. It goes
+     * straight into a {@link StringBuilder} target, else into the thread's builder, which is flushed to
+     * the target as it fills.
+     */
+    static final class JsonText extends JsonSink {
+        private static final int FLUSH = Header.KEEP / 2;
+        private static final char[] HEX = "0123456789ABCDEF".toCharArray(); // as Jackson writes them
+
+        private final Appendable out;
+        private final StringBuilder b;
+        private long used; // bit per nesting level: the level has an item, so the next one needs a comma
+        private int level;
+        private boolean keyed; // a key was just written, so its value needs no comma
+
+        private JsonText(Appendable out) {
+            this.out = out;
+            b = out instanceof StringBuilder ? (StringBuilder) out : Header.borrow(FLUSH);
+        }
+
+        static void write(Snapshot s, Appendable out) throws IOException {
+            JsonText j = new JsonText(Objects.requireNonNull(out, "out"));
+            if (j.b == out) {
+                Header.json(s, j);
+                return;
+            }
+            j.b.setLength(0);
+            try {
+                Header.json(s, j);
+                out.append(j.b);
+            } finally {
+                j.b.setLength(0);
+                Header.giveBack(j.b);
+            }
+        }
+
+        private void item() {
+            if (keyed) keyed = false;
+            else if ((used & 1L << level) != 0) b.append(',');
+            used |= 1L << level;
+        }
+
+        @Override
+        void begin(char bracket) {
+            item();
+            b.append(bracket);
+            used &= ~(1L << ++level);
+        }
+
+        @Override
+        void end(char bracket) throws IOException {
+            level--;
+            b.append(bracket);
+            if (b != out && b.length() >= FLUSH) {
+                out.append(b);
+                b.setLength(0);
+            }
+        }
+
+        @Override
+        void key(String key) {
+            item();
+            quote(key);
+            b.append(':');
+            keyed = true;
+        }
+
+        @Override
+        void string(String s) {
+            item();
+            quote(s);
+        }
+
+        @Override
+        void number(long v) {
+            item();
+            b.append(v);
+        }
+
+        @Override
+        void decimal(double v) {
+            item();
+            Header.number(b, v);
+        }
+
+        @Override
+        void bool(boolean v) {
+            item();
+            b.append(v);
+        }
+
+        /** A JSON string: {@code "} and {@code \} escaped, control characters as their short or {@code \}{@code u00XX} escape. */
+        private void quote(String s) {
+            int i = 0, n = s.length();
+            for (char c; i < n && (c = s.charAt(i)) >= 0x20 && c != '"' && c != '\\'; ) i++;
+            b.append('"').append(s, 0, i); // keys and most names: no escapes at all
+            for (; i < n; i++) {
+                char c = s.charAt(i);
+                if (c == '"' || c == '\\') b.append('\\').append(c);
+                else if (c >= 0x20) b.append(c);
+                else if (c == '\n') b.append("\\n");
+                else if (c == '\r') b.append("\\r");
+                else if (c == '\t') b.append("\\t");
+                else if (c == '\b') b.append("\\b");
+                else if (c == '\f') b.append("\\f");
+                else b.append("\\u00").append(HEX[c >> 4]).append(HEX[c & 15]);
+            }
+            b.append('"');
         }
     }
 
@@ -3549,6 +3895,16 @@ public final class Tempo {
          */
         public String toLink(String base, int maxBytes) {
             return snapshot().toLink(base, maxBytes);
+        }
+
+        /**
+         * Writes the trace in the JSON form of {@code FORMAT.md} section 8, from a {@link #snapshot()}: see
+         * {@link Snapshot#writeJson}. A response object that carries the trace in its body holds that
+         * {@link Snapshot}, taken before {@link #release()}, never the {@code Trace}. Writes no spans after
+         * release.
+         */
+        public void writeJson(Appendable out) throws IOException {
+            snapshot().writeJson(out);
         }
 
         /**

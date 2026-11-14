@@ -5,7 +5,8 @@ request or job goes — nested spans, phases and laps, work handed to other thre
 cheaply enough to stay switched on in production, and renders the result as a
 compact report.
 
-It is a single source file with no runtime dependencies and targets Java 11.
+It is a single source file with no runtime dependencies and targets Java 11. An optional
+second file, `TempoJackson.java`, serializes traces with Jackson.
 
 A trace travels in the `Tempo-Timing` response header or as JSON in a response body;
 the format is specified in [FORMAT.md](FORMAT.md). The web viewer, Tempo Timeline, runs at
@@ -57,6 +58,19 @@ t.release();                                    // optional: buffers go back to 
   the whole tree; `printOnClose(out, label)` prints the `Runtime` line when the trace closes.
   `toHeader()` gives the `Tempo-Timing` value and `toLink()` the `Tempo-Link` URL.
   `snapshot()` keeps a copy that stays readable after `release()`.
+- **JSON in a response body:** `writeJson(appendable)` writes the JSON form of
+  [FORMAT.md §8](FORMAT.md#8-json-form), what the whole header value decodes to, with no size
+  limit, as one line. A response object holds a `Snapshot`, taken while the response is built,
+  never the `Trace`, which may be released before the body is serialized. With Jackson,
+  register `TempoJackson.module()` (or put
+  `@JsonSerialize(using = TempoJackson.SnapshotSerializer.class)` on the field); it writes the
+  same structure through `JsonGenerator`, so CBOR, Smile and MessagePack work too:
+
+  ```java
+  class Response { public Tempo.Snapshot tempo; }          // a Snapshot, never a Trace
+  response.tempo = t.snapshot();
+  new ObjectMapper().registerModule(TempoJackson.module()).writeValueAsString(response);
+  ```
 - **Size limits:** `toHeader()` keeps to `Options.headerBytes` (3000 by default), and
   `toHeader(maxBytes)` to a limit per call. A trace that does not fit is folded down the ladder
   of [FORMAT.md §7.1](FORMAT.md): repeated siblings into aggregates (failed ones and the slowest

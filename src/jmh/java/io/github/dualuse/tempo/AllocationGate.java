@@ -25,17 +25,19 @@ import java.util.TreeMap;
  * <p>Rendering the 300-span trace of {@code Rendered} is held to ceilings: the encoder alone
  * ({@code snapshotToHeader}) to its one output String (3,440 characters, 3.5 KB) plus about 2 KB of
  * per-render tables and walk state, measured 5.2 KB; {@code toHeader} adds the copy of the trace that
- * {@code snapshot()} takes, measured 22.6 KB. BENCHMARKS.md records the numbers.
+ * {@code snapshot()} takes, measured 22.6 KB. Its JSON form into a reused builder
+ * ({@code snapshotWriteJson}) has no output String, only the tables and walk state. BENCHMARKS.md
+ * records the numbers.
  */
 public final class AllocationGate {
 
     static final double PER_OP = 0.01;   // B/op
     static final double SETUP = 1024;    // B per trace start + close + release
     static final double HANDOFF = 32;    // B per handoff: exactly one small object
-    static final double ENCODE = 6 * 1024, RENDER = 24 * 1024; // B per render of the 300-span trace
+    static final double ENCODE = 6 * 1024, RENDER = 24 * 1024, JSON = 2560; // B per render of the 300-span trace
     static final String GATED = "span|spanNotInlined|phase|done|setLong|detailDisabled|traceLifecycle"
             + "|handoff|handoffInline|handoffFolded|currentDetailNoTrace|currentDetailCoarse|waited|alwaysOn|folded"
-            + "|snapshotToHeader|toHeader";
+            + "|snapshotToHeader|toHeader|snapshotWriteJson";
 
     public static void main(String[] args) throws RunnerException {
         Iterable<RunResult> results = new Runner(new OptionsBuilder()
@@ -66,6 +68,8 @@ public final class AllocationGate {
                 ok &= check(e.getKey(), perOp, gate, String.format(" B/op net of %.0f B per trace", setup));
             } else if (e.getKey().equals("traceLifecycle")) {
                 ok &= check(e.getKey(), byCycle.get(0), SETUP, " B/trace");
+            } else if (e.getKey().equals("snapshotWriteJson")) {
+                ok &= check(e.getKey(), byCycle.get(0), JSON, " B/render");
             } else if (e.getKey().endsWith("oHeader")) {
                 double gate = e.getKey().equals("toHeader") ? RENDER : ENCODE;
                 ok &= check(e.getKey(), byCycle.get(0), gate, " B/render");

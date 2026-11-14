@@ -107,19 +107,25 @@ class GoldenTest {
     static final class Script implements AutoCloseable {
         final TempoTest.Clock clock = new TempoTest.Clock();
         final long base = clock.t, wall;
+        final String vector; // null for a recording of no vector
         final ExecutorService[] threads;
         volatile long cpu = -1;
 
         /** The vector's threads and wall clock. */
         Script(String vector) {
-            this(Json.object(read("golden/" + vector + ".json")));
+            this(vector, Json.object(read("golden/" + vector + ".json")));
         }
 
-        private Script(Map<String, Object> doc) {
-            this(doc.get("wall") == null ? 0 : (Long) doc.get("wall"), ((List<?>) doc.get("threads")).toArray(new String[0]));
+        private Script(String vector, Map<String, Object> doc) {
+            this(vector, doc.get("wall") == null ? 0 : (Long) doc.get("wall"), ((List<?>) doc.get("threads")).toArray(new String[0]));
         }
 
         Script(long wall, String... names) {
+            this(null, wall, names);
+        }
+
+        private Script(String vector, long wall, String... names) {
+            this.vector = vector;
             this.wall = wall;
             threads = new ExecutorService[names.length];
             for (int i = 0; i < threads.length; i++) {
@@ -154,16 +160,24 @@ class GoldenTest {
 
         /**
          * {@link Trace#toHeader()} on thread 0 at {@code us}; the trace's {@link Trace#toLink(String)} decodes
-         * to the same value.
+         * to the same value, and its JSON form (see {@link JsonTest#check}) is what the whole value decodes
+         * to: the vector's JSON when the value is the vector's and no ladder step or fallback.
          */
         String render(long us, Trace t) {
-            String[] r = on(0, us, () -> new String[] {t.toHeader(), t.toLink(Tempo.Link.DEFAULT_LINK_BASE)});
+            Object[] r = on(0, us, () -> new Object[] {t.toHeader(), t.toLink(Tempo.Link.DEFAULT_LINK_BASE), t.snapshot()});
+            String header = (String) r[0];
             try {
-                assertEquals(r[0], LinkTest.unpack(r[1], Tempo.Link.DEFAULT_LINK_BASE));
-            } catch (java.util.zip.DataFormatException e) {
-                throw new AssertionError(r[1], e);
+                assertEquals(header, LinkTest.unpack((String) r[1], Tempo.Link.DEFAULT_LINK_BASE));
+                Tempo.Snapshot snap = (Tempo.Snapshot) r[2];
+                assertEquals(header, snap.toHeader());
+                String json = JsonTest.check(snap);
+                if (vector != null && header.equals(golden(vector)) && header.equals(snap.toHeader(Integer.MAX_VALUE))) {
+                    assertTrue(Json.same(Json.parse(read("golden/" + vector + ".json")), Json.parse(json)), vector + ": " + json);
+                }
+            } catch (java.util.zip.DataFormatException | IOException e) {
+                throw new AssertionError(String.valueOf(r[1]), e);
             }
-            return r[0];
+            return header;
         }
 
         void run(int thread, long us, Runnable step) {

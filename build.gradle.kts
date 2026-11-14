@@ -28,8 +28,17 @@ val jcstress: SourceSet by sourceSets.creating {
 val jcstressImplementation: Configuration by configurations.getting
 val jcstressAnnotationProcessor: Configuration by configurations.getting
 
+// TempoJackson compiles against the Jackson 2.16 API; the library itself needs nothing.
+val jackson = "2.16.1"
+
 dependencies {
+    compileOnly("com.fasterxml.jackson.core:jackson-databind:$jackson")
+
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
+    testImplementation("com.fasterxml.jackson.core:jackson-databind:$jackson")
+    testImplementation("com.fasterxml.jackson.dataformat:jackson-dataformat-cbor:$jackson")
+    testImplementation("com.fasterxml.jackson.dataformat:jackson-dataformat-smile:$jackson")
+    testImplementation("org.msgpack:jackson-dataformat-msgpack:0.9.8")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 
     jmhImplementation("org.openjdk.jmh:jmh-core:1.37")

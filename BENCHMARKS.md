@@ -30,8 +30,9 @@ reports the per-trace setup apart.
 | `handoffInline` | 32.0004 B/op (1,296 B per trace) | 32.01 B/op |
 | `handoffFolded` | 32.0005 B/op | 32.01 B/op |
 | `traceLifecycle` | 960 B per trace | 1,024 B |
-| `snapshotToHeader` (300 spans) | 5,240 B per render | 6,144 B |
-| `toHeader` (300 spans) | 22,568 B per render | 24,576 B |
+| `snapshotToHeader` (300 spans) | 5,264 B per render | 6,144 B |
+| `toHeader` (300 spans) | 22,592 B per render | 24,576 B |
+| `snapshotWriteJson` (300 spans, into a reused builder) | 1,904 B per render | 2,560 B |
 | `snapshotToHeaderLadder` (300 spans, 1,000 bytes) | 57,712 B per render | reported |
 | `snapshotToLinkLadder` (300 spans, 1,000-byte link) | 64,259 B per render | reported |
 
@@ -41,6 +42,10 @@ tables sized to the trace's own names and threads, plus walk state; its builder 
 per thread. `toHeader` also takes the snapshot, which copies the trace's rows, events and
 aggregates (about 17 KB here), so it is above the plan's "one output String". Rendering
 straight from the live lanes would avoid that copy, at the cost of a second walker.
+
+`snapshotWriteJson` writes the JSON form into the caller's builder, so it allocates no
+output at all: only the encoder's tables and walk state (the same two walks as the header).
+Any other `Appendable` receives the text in pieces from the thread's reused builder.
 
 A value over its limit goes down the ladder of FORMAT.md §7.1, which reads the whole value
 back into per-record arrays (about 40 KB for 300 records) and re-encodes after every step
@@ -66,3 +71,4 @@ Apple M3 Max, macOS, Amazon Corretto 24.0.2, JMH 1.37, one fork, 3 × 1 s warm-u
 | `snapshotToHeaderLadder` | 47,513 ± 457 | the same under 1,000 bytes: the value read back, the largest group (the root's 30 children) folded, re-encoded (2026-11-14) |
 | `snapshotToLinkLadder` | 94,863 ± 2,273 | a link of at most 1,000 bytes: each step also compressed (2026-11-14) |
 | `toHeader` | 16,370 ± 118 | snapshot and encoder, 300 spans |
+| `snapshotWriteJson` | 45,586 ± 1,791 | the JSON form of the same snapshot: 23,964 characters, seven times the header value (2026-11-14) |

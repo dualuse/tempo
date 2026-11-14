@@ -8,7 +8,7 @@ import java.util.Map;
 
 /**
  * A small JSON reader for the test vectors: objects become {@link LinkedHashMap}s, arrays {@link List}s,
- * integers {@link Long}s and other numbers {@link Double}s. {@link #same} compares two values the way
+ * integers that fit {@link Long}s and other numbers {@link Double}s. {@link #same} compares two values the way
  * FORMAT.md §8 asks: structurally, key order ignored, numbers by value.
  */
 final class Json {
@@ -125,7 +125,14 @@ final class Json {
         while (i < s.length() && "+-0123456789.eE".indexOf(s.charAt(i)) >= 0) i++;
         String n = s.substring(from, i);
         if (n.isEmpty()) throw error("unexpected " + c);
-        return n.matches("-?\\d+") ? (Object) Long.parseLong(n) : (Object) Double.parseDouble(n);
+        if (n.matches("-?\\d+")) {
+            try {
+                return Long.parseLong(n);
+            } catch (NumberFormatException past) {
+                return Double.parseDouble(n);
+            }
+        }
+        return Double.parseDouble(n);
     }
 
     private String string() {
