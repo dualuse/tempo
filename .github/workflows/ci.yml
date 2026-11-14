@@ -41,7 +41,8 @@ jobs:
           -Porg.gradle.java.installations.auto-download=false
           -Porg.gradle.java.installations.fromEnv=JAVA_HOME_${{ matrix.java }}_X64
       # The jar links to the GitHub Pages viewer of the repository it is built in (GITHUB_REPOSITORY),
-      # so a fork's jar opens the fork's viewer; the second build checks that rule for a made-up fork.
+      # so a fork's jar opens the fork's viewer (deployed by pages.yml once the fork turns on Pages);
+      # the second build checks that rule for a made-up fork.
       - name: Library jar with this repository's Tempo-Link base
         if: matrix.java == 21
         run: |

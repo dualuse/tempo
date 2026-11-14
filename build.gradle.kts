@@ -38,7 +38,7 @@ dependencies {
 
 // The Tempo-Link base baked into the jar (Tempo.Link): the GitHub Pages site of the repository the build
 // runs in, from GITHUB_REPOSITORY=owner/repo as GitHub Actions sets it, so a fork's jar links to the fork's
-// viewer; the upstream viewer elsewhere. Options.linkBase and -Dtempo.linkBase override it at run time.
+// viewer (.github/workflows/pages.yml deploys it there once Pages is on); the upstream viewer elsewhere. Options.linkBase and -Dtempo.linkBase override it at run time.
 val upstreamLinkBase = "https://dualuse.github.io/tempo/"
 
 fun linkBaseOf(repository: String?): String {

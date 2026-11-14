@@ -59,9 +59,12 @@ t.release();                                    // optional: buffers go back to 
   `snapshot()` keeps a copy that stays readable after `release()`.
 - **Link base:** `toLink()` points at the viewer the jar was built for: the GitHub Pages site of the
   repository it was built in (`https://<owner>.github.io/<repo>/`, from `GITHUB_REPOSITORY` in
-  GitHub Actions), so a fork's jar opens the fork's viewer; any other build uses
-  `https://dualuse.github.io/tempo/`. `-Dtempo.linkBase=URL` overrides it for a JVM,
-  `Options.linkBase(url)` for one trace, for instance for a self-hosted copy of `site/index.html`.
+  GitHub Actions); any other build uses `https://dualuse.github.io/tempo/`. The viewer only
+  gets there when Pages is on: the `Pages` workflow deploys `site/` on every push to the default
+  branch, so a fork turns on Pages (Settings → Pages, Source: GitHub Actions) and pushes or runs
+  that workflow, or its links point at a page that does not exist. Without Pages,
+  `-Dtempo.linkBase=URL` sets the base for a JVM and `Options.linkBase(url)` for one trace, for
+  instance the upstream viewer or a self-hosted copy of `site/index.html`.
 
 ## Command-line viewer: `tools/tempo`
 
