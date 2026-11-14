@@ -257,11 +257,6 @@ public final class Tempo {
             return byId[id];
         }
 
-        /** More than the largest id so far. */
-        static int capacity() {
-            return byId.length;
-        }
-
         @Override
         public String toString() {
             return text;
@@ -774,6 +769,7 @@ public final class Tempo {
      */
     static final class ThreadSlot {
         Lane current;
+        StringBuilder text; // the header encoder's, reused while it stays small (Header.KEEP)
         @SuppressWarnings("unchecked")
         final WeakReference<Lane>[] lanes = new WeakReference[4];
         private int victim;
@@ -1806,9 +1802,18 @@ public final class Tempo {
             aggs = kept;
         }
 
-        /** Start of a row, or the first start of an aggregate node. */
+        /** Start of a row (of an inline handoff, its task's), or the first start of an aggregate node. */
         long startOf(int x) {
-            return x < rows ? start[x] : aggCell[(x - rows - 1) * Aggs.CELLS + Aggs.FIRST];
+            return x < rows ? start[inline(x) ? x + 1 : x] : aggCell[(x - rows - 1) * Aggs.CELLS + Aggs.FIRST];
+        }
+
+        /**
+         * Whether handoff row {@code r} ran inline (caller-runs): its task began on the submitting thread
+         * under the handoff's parent as the lane's next row. A task cancelled before it began never did.
+         */
+        boolean inline(int r) {
+            return begun(r) && bodyLane[r] == lane && bodyRow[r] == r + 1 && parent[r + 1] == parent[r]
+                    && (flags[r + 1] & UNRUN) == 0;
         }
 
         void hide(int r) {
@@ -2041,6 +2046,7 @@ public final class Tempo {
             v.shape = v.subShape = s;
             v.live = s.live;
             v.inline = false;
+            v.row = r > s.rows ? -1 : r;
             if (r > s.rows) {
                 int k = (r - s.rows - 1) * Aggs.KEY, b = (r - s.rows - 1) * Aggs.CELLS;
                 long[] c = s.aggCell;
@@ -2075,7 +2081,7 @@ public final class Tempo {
             v.flags = begun ? flags | b.flags[br] : flags;
             v.handoff = handoff;
             v.begun = begun;
-            v.inline = begun && b == s && b.parent[br] >= 0;
+            v.inline = begun && s.inline(r);
             v.wait = begun ? (b.wait == null ? 0 : b.wait[br]) : handoff ? Math.max(0, now - v.start) : 0;
             v.cpu = b.cpu == null || handoff && !begun ? -1 : b.cpu[br];
             v.label = b.label == null ? null : b.label[br];
@@ -2188,7 +2194,7 @@ public final class Tempo {
             return dropped;
         }
 
-        /** Detail spans folded into aggregates for want of budget: the wire's {@code x=} folded count. */
+        /** Detail spans folded into aggregates for want of budget, open ones included. */
         int folded() {
             return folded;
         }
@@ -2315,11 +2321,12 @@ public final class Tempo {
      * Two walks over the stitched tree: the first numbers the threads and names the records use, the
      * second writes the records into the one builder. Records deeper than {@link #maxDepth}, and the
      * aggregates of aggregate-only spans nested in others (the wire has no children under an aggregate),
-     * are left out with their subtrees and counted as dropped (an aggregate's folded spans then no longer
-     * as folded), like a non-finite attribute value.
+     * are left out with their subtrees and counted as dropped, like a non-finite attribute value. Every
+     * occurrence in an aggregate on the wire counts as folded (FORMAT.md §4), as do folded spans still open.
      */
     static final class Header implements SpanVisitor {
         static final int MAX_DEPTH = 35, MIN_BYTES = 256;
+        static final int KEEP = 8192; // a thread keeps its builder up to this capacity (one output String per render)
         private static final char[] DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz".toCharArray(),
                 HEX = "0123456789ABCDEF".toCharArray();
         private static final int SHOWN = FAILED | CANCELLED | WAIT | HEALED | MISUSE;
@@ -2337,13 +2344,13 @@ public final class Tempo {
         private StringBuilder out; // null during the first walk
         private int limit, records, skip;
         private long rootStart, rootDur, left, written, nonFinite; // left, written: spans, aggregates by count
-        private long leftFolded, foldedSeen; // folded occurrences of the aggregates left out, of all aggregates
+        private long aggregated, foldedSeen; // occurrences in the aggregates written; folded ones in all aggregates
 
-        private Header(Snapshot snap, int maxDepth, boolean attributes) {
+        private Header(Snapshot snap, int maxDepth, boolean attributes, int nameBound) {
             this.snap = snap;
             this.maxDepth = maxDepth;
             this.attributes = attributes;
-            nameIndex = new int[Name.capacity()];
+            nameIndex = new int[nameBound];
             laneIndex = new int[snap.shapes.length];
         }
 
@@ -2353,16 +2360,38 @@ public final class Tempo {
          * §7.1); below 256 bytes, or if that does not fit either, it is the fallback. Empty without a root.
          */
         static String of(Snapshot s, int maxBytes) {
-            StringBuilder b = new StringBuilder(Math.max(64, Math.min(maxBytes, 4096)));
-            Header full = new Header(s, MAX_DEPTH, true);
+            ThreadSlot slot = SLOT.get();
+            StringBuilder b = slot.text;
+            slot.text = null;
+            if (b == null) b = new StringBuilder(Math.max(64, Math.min(maxBytes, KEEP / 2)));
+            String value = of(s, maxBytes, b);
+            if (b.capacity() <= KEEP) slot.text = b;
+            return value;
+        }
+
+        private static String of(Snapshot s, int maxBytes, StringBuilder b) {
+            int names = nameBound(s);
+            Header full = new Header(s, MAX_DEPTH, true, names);
             if (full.write(b, maxBytes)) return b.toString();
             if (full.records == 0) return "";
-            if (maxBytes >= MIN_BYTES && new Header(s, 1, false).write(b, maxBytes)) return b.toString();
+            if (maxBytes >= MIN_BYTES && new Header(s, 1, false, names).write(b, maxBytes)) return b.toString();
             b.setLength(0);
             b36(b.append("v1;x=0."), s.dropped() + full.left + full.written
                     + Math.max(0, s.folded() - full.foldedSeen)); // folded spans still open are in no aggregate
             b36(b.append(";T=%3F;N=%3F;S=00.0."), us(full.rootDur));
             return b.append(";e=1").toString();
+        }
+
+        /** More than the largest name id the snapshot uses: span names, attribute keys, aggregates. */
+        private static int nameBound(Snapshot s) {
+            int max = -1;
+            for (Shape p : s.shapes) {
+                if (p == null) continue;
+                for (int r = 0; r < p.rows; r++) max = Math.max(max, p.name[r]);
+                for (int k : p.attrKey) max = Math.max(max, k >>> KIND_BITS);
+                for (int e = 0; e < p.aggs; e++) max = Math.max(max, p.aggKey[e * Aggs.KEY + Aggs.NAME]);
+            }
+            return max + 1;
         }
 
         /** Writes the value into {@code b}, giving up once it is longer than {@code max}; whether it fits. */
@@ -2375,9 +2404,9 @@ public final class Tempo {
             b.setLength(0);
             b.append("v1");
             if (snap.wall > 0) b36(b.append(";w="), snap.wall);
-            // aggregates left out count as dropped, so their folded occurrences no longer count as folded;
-            // folded spans still open are in no aggregate yet and stay folded
-            long dropped = snap.dropped() + left + nonFinite, folded = snap.folded() - leftFolded;
+            // aggregates left out count as dropped only; spans folded for want of budget that are still
+            // open are in no aggregate yet and count as folded
+            long dropped = snap.dropped() + left + nonFinite, folded = aggregated + Math.max(0, snap.folded() - foldedSeen);
             if (folded > 0 || dropped > 0) b36(b36(b.append(";x="), folded).append('.'), dropped);
             boolean live = false;
             for (int l = 0; l < laneIndex.length; l++) {
@@ -2408,7 +2437,6 @@ public final class Tempo {
                 if (skip < 0 || d <= skip) skip = d; // left out with its subtree
                 if (out == null) {
                     left += v.count;
-                    leftFolded += v.folded;
                     foldedSeen += v.folded;
                 }
                 return;
@@ -2417,6 +2445,7 @@ public final class Tempo {
             aggregateAt[d] = v.aggregate;
             if (out == null) {
                 foldedSeen += v.folded;
+                if (v.aggregate) aggregated += v.count;
                 count(v);
             } else if (out.length() <= limit) record(out, v);
             records++;
@@ -2455,13 +2484,14 @@ public final class Tempo {
         private void record(StringBuilder b, SpanView v) {
             int d = v.depth;
             if (records > 0) b.append('/');
-            long start = us(v.start - rootStart), delta = Math.max(0, start - cur[d]);
+            // an inline handoff is a plain child from when it began (FORMAT.md §6.5)
+            long start = us(v.start + (v.inline ? v.wait : 0) - rootStart), delta = Math.max(0, start - cur[d]);
             cur[d] = cur[d + 1] = cur[d] + delta;
             b36(b36(b36(b.append(DIGITS[d]), nameIndex[v.name.id] - 1).append('.'), delta).append('.'), us(v.duration));
             int thread = d == 0 ? 0 : unrun(v) ? threadAt[d - 1] : laneIndex[v.shape.lane] - 1;
             threadAt[d] = thread;
             if (d > 0 && thread != threadAt[d - 1]) b36(b.append('@'), thread);
-            if (v.handoff && !v.aggregate && !(v.inline && v.wait < 1000)) b36(b.append('~'), us(v.wait));
+            if (v.handoff && !v.aggregate && !v.inline) b36(b.append('~'), us(v.wait));
             if (v.cpu >= 0) b36(b.append('*'), us(v.cpu));
             if (v.aggregate) {
                 b36(b36(b36(b.append('+'), v.count).append('.'), us(v.min)).append('.'), us(v.max));
@@ -2837,7 +2867,7 @@ public final class Tempo {
             return ctx.dropped();
         }
 
-        /** Detail spans folded into aggregates for want of budget so far: the wire's {@code x=} folded count. */
+        /** Detail spans folded into aggregates for want of budget so far, open ones included. */
         int folded() {
             return ctx.folded();
         }
@@ -3148,13 +3178,16 @@ public final class Tempo {
     /** Read-only view of one recorded span, reused across {@link SpanVisitor#visit} calls. */
     public static final class SpanView {
         Shape shape, subShape; // the span's lane; for a begun handoff the submitter's, whose attributes come first
+        int row; // its row in subShape (for a handoff, the handoff row); -1 for an aggregate
         int id, parent, depth, flags, attrFrom, attrTo, subFrom, subTo;
         Name name;
         String label;
         long start, duration, wait, cpu, count, min, max, extent, maxAt;
-        long folded; // of count, the occurrences folded for want of budget (x=folded)
+        long folded; // of count, the occurrences folded for want of budget
         boolean open, live, handoff, begun, aggregate;
-        boolean inline; // a handoff begun on the submitting thread inside the submitter's lane
+        // A handoff run inline (caller-runs): begun on the submitting thread under the handoff's parent before
+        // that thread recorded anything else; never a task cancelled or rejected before it began.
+        boolean inline;
 
         SpanView() {}
 

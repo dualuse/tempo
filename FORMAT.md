@@ -264,7 +264,9 @@ A plain record ends at `start + dur`. Handoffs that did not run normally:
 | Cancelled while running (`^c`) | Normal handoff record with the worker thread. |
 | Open at render (`^o`) | `dur` = render time − (start + wait). |
 
-A handoff executed inline on the submitting thread is an ordinary child without `~`.
+A handoff executed inline on the submitting thread (caller-runs: it began there, under
+the same parent, before that thread recorded anything else) is an ordinary child without
+`~` that starts when it began. A task cancelled or rejected before start is never inline.
 A handoff may land on the parent's own thread (a pool thread submitting to its own
 pool); then `~` is present and `@` is omitted.
 

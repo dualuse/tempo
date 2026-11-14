@@ -14,9 +14,11 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.SplittableRandom;
 import java.util.TreeMap;
 
@@ -140,9 +142,13 @@ class HeaderTest {
                 + "S=00.0.5:1=3:2=2.5;e=1", t.toHeader());
     }
 
-    /** Caller-runs: a handoff begun at once in the submitter's own lane is a plain child; later, it keeps its wait. */
+    /**
+     * Caller-runs: a handoff begun on the submitting thread under its parent before that thread recorded
+     * anything else is a plain child from when it began, however long the submit took. Begun after a
+     * sibling was recorded, it keeps its wait on the same thread.
+     */
     @Test
-    void inlineHandoffWithoutWaitIsAPlainChild() {
+    void inlineHandoffIsAPlainChildWhateverItsWait() {
         Trace t = Tempo.start(SEARCH, opts());
         Span root = t.root();
         clock.add(1000);
@@ -151,13 +157,34 @@ class HeaderTest {
         Span a = now.begin();
         clock.add(2000);
         a.close();
-        Handoff later = root.handoff(MATCH);
+        Handoff slow = root.handoff(MATCH);
         clock.add(3000);
-        Span b = later.begin();
+        Span b = slow.begin();
         clock.add(1000);
         b.close();
+        Handoff later = root.handoff(DECODE);
+        clock.add(1000);
+        root.span(SCORE).close();
+        clock.add(1000);
+        Span c = later.begin();
+        clock.add(1000);
+        c.close();
         t.close();
-        assertTrue(t.toHeader().endsWith(";S=00.0.7/11.1.2/12.2.1~3;e=3"), t.toHeader());
+        assertTrue(t.toHeader().endsWith(";S=00.0.a/11.1.2/12.5.1/13.1.1~2/14.1.0;e=5"), t.toHeader());
+    }
+
+    /** Rejected or cancelled on the submitting thread before it began, a task keeps its wait, even of 0 ns. */
+    @Test
+    void taskRejectedOnTheSubmittingThreadKeepsItsWait() {
+        Trace t = Tempo.start(SEARCH, opts());
+        clock.add(1000);
+        t.root().handoff(LOAD).reject();
+        Handoff h = t.root().handoff(MATCH);
+        clock.add(500);
+        h.cancel();
+        clock.add(1000);
+        t.close();
+        assertTrue(t.toHeader().endsWith(";S=00.0.2/11.1.0~0^c/12.0.0~0^c;e=3"), t.toHeader());
     }
 
     /** A task cancelled before it began nominally sits on its parent's thread, whichever thread cancelled it. */
@@ -277,6 +304,24 @@ class HeaderTest {
         assertEquals(51L, fallback.get("dropped"));
     }
 
+    /** Every occurrence in an aggregate on the wire counts as folded, also of an always-on name below the level. */
+    @Test
+    void aggregatesOfAlwaysOnSpansCountAsFolded() {
+        Name always = Tempo.name("always-on").aggregate();
+        Trace t = Tempo.start(SEARCH, opts().level(Tempo.COARSE));
+        for (int i = 0; i < 10; i++) {
+            clock.add(1000);
+            t.root().detail(always).close();
+        }
+        clock.add(1000);
+        t.close();
+        assertEquals(0, t.snapshot().folded());
+        String h = t.toHeader();
+        assertTrue(h.contains(";x=a.0;"), h);
+        assertEquals(List.of(10), aggregates(h));
+        assertEquals(10L, WireDecoder.decode(h).get("folded"));
+    }
+
     /** Counts of the aggregate records of a value, in order. */
     private static List<Integer> aggregates(String header) {
         List<Integer> counts = new ArrayList<>();
@@ -321,7 +366,7 @@ class HeaderTest {
         SplittableRandom rnd = new SplittableRandom(20261113);
         Map<String, Integer> seen = new TreeMap<>();
         for (int round = 0; round < 300; round++) roundTrip(rnd, round, seen);
-        for (String what : new String[] {"records", "agg", "wait", "@", "cpu", "attrs", "f", "c", "o", "n", "w", "m", "live", "dropped"}) {
+        for (String what : new String[] {"records", "agg", "wait", "inline", "@", "cpu", "attrs", "f", "c", "o", "n", "w", "m", "live", "dropped"}) {
             assertTrue(seen.getOrDefault(what, 0) > 10, () -> "too few " + seen);
         }
     }
@@ -334,6 +379,7 @@ class HeaderTest {
             for (int i = 0; i < 4; i++) stacks.add(new ArrayList<>());
             stacks.get(0).add(t.root());
             List<Handoff> pending = new ArrayList<>();
+            Set<Long> inline = new HashSet<>(); // handoff rows begun as caller-runs, judged when they began
             long[] cpu = {0};
             for (int step = 0, steps = rnd.nextInt(10, 400); step < steps; step++) {
                 s.clock.add(rnd.nextInt(4) == 0 ? 0 : rnd.nextInt(1, 5000));
@@ -350,7 +396,12 @@ class HeaderTest {
                             return null;
                         });
                     } else {
-                        Span b = s.at(k, h::begin);
+                        Span b = s.at(k, () -> {
+                            boolean caller = callerRuns(h);
+                            Span x = h.begin();
+                            if (caller && x != NOOP) inline.add((long) h.lane.id << 32 | h.row);
+                            return x;
+                        });
                         if (b != NOOP) stack.add(b);
                     }
                     continue;
@@ -402,7 +453,7 @@ class HeaderTest {
             if (!open) close(s, stacks, t);
             Snapshot snap = s.at(0, t::snapshot);
             String header = snap.toHeader();
-            Map<String, Object> want = expected(snap), got = WireDecoder.decode(header);
+            Map<String, Object> want = expected(snap, inline), got = WireDecoder.decode(header);
             assertTrue(Json.same(want, got), () -> "round " + round + ": " + header + "\ngot:  " + Json.show(got)
                     + "\nwant: " + Json.show(want));
 
@@ -419,7 +470,18 @@ class HeaderTest {
                 return null;
             });
             count(got, seen);
+            seen.merge("inline", inline.size(), Integer::sum);
         }
+    }
+
+    /**
+     * Whether {@code h}, begun now, runs inline: on its submitter's thread, which has recorded no row
+     * since the handoff's and whose innermost open span is still the handoff's parent.
+     */
+    private static boolean callerRuns(Handoff h) {
+        Tempo.Lane l = h.lane;
+        if (l == null || Thread.currentThread() != l.owner || l.depth == 0 || l.rowCount != h.row + 1) return false;
+        return l.rowAt[l.depth - 1] == l.rows[h.row >>> Tempo.Lane.CHUNK_BITS].parent[h.row & Tempo.Lane.MASK];
     }
 
     private static void count(Map<String, Object> doc, Map<String, Integer> seen) {
@@ -492,32 +554,38 @@ class HeaderTest {
         int nonFinite;
     }
 
-    /** The JSON form the value of {@code snap} should decode to, built from {@link Snapshot#forEachSpan}. */
-    static Map<String, Object> expected(Snapshot snap) {
+    /**
+     * The JSON form the value of {@code snap} should decode to, built from {@link Snapshot#forEachSpan};
+     * {@code inline} holds the handoffs ({@code lane << 32 | row}) run inline, which are plain children.
+     */
+    static Map<String, Object> expected(Snapshot snap, Set<Long> inline) {
         List<Seen> seen = new ArrayList<>();
         int[] skip = {-1};
-        long[] left = {0, 0}; // spans left out; folded occurrences of the aggregates among them
+        long[] left = {0}, occurrences = {0, 0}; // spans left out; in the aggregates written, folded in all
         boolean[] aggregate = new boolean[MAX_DEPTH + 1];
         snap.forEachSpan(v -> {
             int d = v.depth();
             if (skip[0] >= 0 && d > skip[0] || d > MAX_DEPTH || d == 0 && !seen.isEmpty() || d > 0 && aggregate[d - 1]) {
                 if (skip[0] < 0 || d <= skip[0]) skip[0] = d;
                 left[0] += v.count();
-                left[1] += v.folded;
+                occurrences[1] += v.folded;
                 return;
             }
             skip[0] = -1;
             aggregate[d] = v.aggregate();
+            occurrences[0] += v.aggregate() ? v.count() : 0;
+            occurrences[1] += v.folded;
+            boolean caller = v.handoff() && inline.contains((long) v.subShape.lane << 32 | v.row);
             Seen x = new Seen();
             x.depth = d;
             x.name = v.name().toString();
             x.lane = v.shape.lane;
             x.flags = v.flags;
             x.unrun = (v.flags & Tempo.UNRUN) != 0;
-            x.start = v.startNanos();
+            x.start = v.startNanos() + (caller ? v.waitNanos() : 0);
             x.dur = v.durationNanos();
             x.aggregate = v.aggregate();
-            x.waits = v.handoff() && !v.aggregate() && !(v.inline && v.waitNanos() < 1000);
+            x.waits = v.handoff() && !v.aggregate() && !caller;
             x.wait = v.waitNanos();
             x.cpu = v.cpuNanos();
             x.open = v.open();
@@ -551,7 +619,8 @@ class HeaderTest {
         if (snap.wall > 0) doc.put("wall", snap.wall);
         long nonFinite = 0;
         for (Seen x : seen) nonFinite += x.nonFinite;
-        doc.put("folded", snap.folded() - left[1]); // a left-out aggregate counts as dropped only
+        // a left-out aggregate counts as dropped only; folded spans still open are in no aggregate yet
+        doc.put("folded", occurrences[0] + Math.max(0, snap.folded() - occurrences[1]));
         doc.put("dropped", snap.dropped() + left[0] + nonFinite);
         TreeMap<Integer, Integer> lanes = new TreeMap<>();
         for (Seen x : seen) if (!x.unrun) lanes.put(x.lane, 0);

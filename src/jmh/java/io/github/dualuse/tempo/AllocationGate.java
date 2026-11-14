@@ -21,14 +21,21 @@ import java.util.TreeMap;
  * {@code perOp + setup / cycle}. The gate applies to {@code perOp}, solved from the two cycle lengths;
  * the setup is reported, and {@code traceLifecycle} is held to a ceiling of its own. A handoff allocates
  * exactly one small object, so the handoff benchmarks are gated at its size instead of zero.
+ *
+ * <p>Rendering the 300-span trace of {@code Rendered} is held to ceilings: the encoder alone
+ * ({@code snapshotToHeader}) to its one output String (3,440 characters, 3.5 KB) plus about 2 KB of
+ * per-render tables and walk state, measured 5.2 KB; {@code toHeader} adds the copy of the trace that
+ * {@code snapshot()} takes, measured 22.6 KB.
  */
 public final class AllocationGate {
 
     static final double PER_OP = 0.01;   // B/op
     static final double SETUP = 1024;    // B per trace start + close + release
     static final double HANDOFF = 32;    // B per handoff: exactly one small object
+    static final double ENCODE = 6 * 1024, RENDER = 24 * 1024; // B per render of the 300-span trace
     static final String GATED = "span|spanNotInlined|phase|done|setLong|detailDisabled|traceLifecycle"
-            + "|handoff|handoffInline|currentDetailNoTrace|currentDetailCoarse|waited|alwaysOn|folded";
+            + "|handoff|handoffInline|currentDetailNoTrace|currentDetailCoarse|waited|alwaysOn|folded"
+            + "|snapshotToHeader|toHeader";
 
     public static void main(String[] args) throws RunnerException {
         Iterable<RunResult> results = new Runner(new OptionsBuilder()
@@ -59,6 +66,9 @@ public final class AllocationGate {
                 ok &= check(e.getKey(), perOp, gate, String.format(" B/op net of %.0f B per trace", setup));
             } else if (e.getKey().equals("traceLifecycle")) {
                 ok &= check(e.getKey(), byCycle.get(0), SETUP, " B/trace");
+            } else if (e.getKey().endsWith("oHeader")) {
+                double gate = e.getKey().equals("toHeader") ? RENDER : ENCODE;
+                ok &= check(e.getKey(), byCycle.get(0), gate, " B/render");
             } else {
                 ok &= check(e.getKey(), byCycle.get(0), PER_OP, " B/op");
             }
