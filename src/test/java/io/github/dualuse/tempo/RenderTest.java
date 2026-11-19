@@ -16,7 +16,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.SplittableRandom;
 
-import static io.github.dualuse.tempo.Tempo.DETAIL;
+import static io.github.dualuse.tempo.Tempo.STEP;
 import static io.github.dualuse.tempo.Tempo.NOOP;
 import static io.github.dualuse.tempo.TempoTest.onOtherThread;
 import static org.junit.jupiter.api.Assertions.*;
@@ -36,12 +36,12 @@ class RenderTest {
 
     @AfterEach
     void noTraceLeftOnThread() {
-        assertSame(NOOP, Tempo.current(), "a test left a span open on the test thread");
+        TempoTest.assertNothingLeftOpen();
     }
 
     /** Three legacy phases: two labelled laps and an unlabelled label-first phase; 1,751,234,572 ns in all. */
     private Trace threePhases(Trace t) {
-        Span s = t.root();
+        Span s = t;
         clock.add(1_234_567);
         s.done(DECODE, "Decode Input #3");
         clock.add(250_000_000);
@@ -56,7 +56,7 @@ class RenderTest {
 
     @Test
     void runtimeIsByteExact() {
-        Trace t = threePhases(Tempo.start(SEARCH, opts()));
+        Trace t = threePhases(Tempo.trace(SEARCH, opts()));
         assertEquals("1.751s = 0.001s (Decode Input #3) + 0.250s (Rerank & Filter = v2(a:b)) + 1.500s (match)", t.toRuntime(3));
         assertEquals("1.751234572s = 0.001234567s (Decode Input #3) + 0.25s (Rerank & Filter = v2(a:b)) + 1.5s (match)",
                 t.toRuntime(-1));
@@ -72,13 +72,13 @@ class RenderTest {
 
     @Test
     void serverTimingIsByteExact() {
-        Trace t = threePhases(Tempo.start(SEARCH, opts()));
+        Trace t = threePhases(Tempo.trace(SEARCH, opts()));
         assertEquals("decode-input;dur=1.235, rerank-filter-top-10-;dur=250.000, match;dur=1500.000, total;dur=1751.235",
                 t.toServerTiming());
 
-        Trace u = Tempo.start(SEARCH, opts());
+        Trace u = Tempo.trace(SEARCH, opts());
         clock.add(7);
-        u.root().done(SCORE).legacy();
+        u.done(SCORE).legacy();
         clock.add(493);
         u.close();
         assertEquals("-score-v2;dur=0.000, total;dur=0.001", u.toServerTiming());
@@ -86,7 +86,7 @@ class RenderTest {
 
     @Test
     void forEachTopVisitsTheLegacyPhasesInStartOrder() {
-        Trace t = threePhases(Tempo.start(SEARCH, opts()));
+        Trace t = threePhases(Tempo.trace(SEARCH, opts()));
         List<String> got = new ArrayList<>();
         t.forEachTop((name, label, start, dur) -> got.add(name + "|" + label + "|" + start + "+" + dur));
         assertEquals(List.of("Decode Input|Decode Input #3|0+1234567",
@@ -96,8 +96,8 @@ class RenderTest {
 
     @Test
     void aTraceWithoutLegacyPhasesPrintsTheTotalOnly() {
-        Trace t = Tempo.start(SEARCH, opts());
-        t.root().done(LOAD); // a lap, not legacy
+        Trace t = Tempo.trace(SEARCH, opts());
+        t.done(LOAD); // a lap, not legacy
         clock.add(250_000_000);
         t.close();
         assertEquals("0.250s", t.toRuntime(3));
@@ -108,10 +108,10 @@ class RenderTest {
 
     @Test
     void nonLegacyPhasesDoNotChangeTheRuntimeText() throws Exception {
-        Trace plain = threePhases(Tempo.start(SEARCH, opts()));
+        Trace plain = threePhases(Tempo.trace(SEARCH, opts()));
 
-        Trace t = Tempo.start(SEARCH, opts().level(DETAIL));
-        Span s = t.root();
+        Trace t = Tempo.trace(SEARCH, opts()).records(STEP);
+        Span s = t;
         s.phase(ROUTING);                                   // a top-level phase, not legacy
         clock.add(3_000);
         s.done(ROUTING);
@@ -120,7 +120,7 @@ class RenderTest {
             x.done(SCORE, "Nested lap");                    // legacy, but not a child of the root
         }
         s.done(DECODE, "Decode Input #3");
-        try (Span d = s.detail(SCORE)) {
+        try (Span d = s.step(SCORE)) {
             clock.add(100);
         }
         s.handoff(LOAD).begin().close();                    // inline task
@@ -149,8 +149,8 @@ class RenderTest {
 
     @Test
     void anOpenTraceRendersUpToNow() throws Exception {
-        Trace t = Tempo.start(SEARCH, opts());
-        Span s = t.root();
+        Trace t = Tempo.trace(SEARCH, opts());
+        Span s = t;
         clock.add(100_000_000);
         s.done(DECODE, "Decode");
         s.phase(RERANK).legacy();                           // open and legacy
@@ -171,11 +171,11 @@ class RenderTest {
 
     @Test
     void labelsPastTheFirstLabelTableAreRead() {
-        Trace t = Tempo.start(SEARCH, opts());
+        Trace t = Tempo.trace(SEARCH, opts());
         StringBuilder expected = new StringBuilder("0.020s");
         for (int i = 0; i < 20; i++) {
             clock.add(1_000_000);
-            t.root().done(LOAD, "Load #" + i);
+            t.done(LOAD, "Load #" + i);
             expected.append(i == 0 ? " = " : " + ").append("0.001s (Load #").append(i).append(')');
         }
         t.close();
@@ -185,7 +185,7 @@ class RenderTest {
 
     @Test
     void snapshotRendersAfterRelease() {
-        Trace t = threePhases(Tempo.start(SEARCH, opts()));
+        Trace t = threePhases(Tempo.trace(SEARCH, opts()));
         Snapshot before = t.snapshot();
         t.release();
         assertEquals("0.000s", t.toRuntime(3));
@@ -204,30 +204,30 @@ class RenderTest {
     @Test
     void printOnCloseWritesOneLine() {
         List<String> out = new ArrayList<>();
-        Trace t = Tempo.start(SEARCH, opts()).printOnClose(out::add, "Batch #1: x=(a&b)");
+        Trace t = Tempo.trace(SEARCH, opts()).printOnClose(out::add, "Batch #1: x=(a&b)");
         clock.add(500_000_000);
-        t.root().done(DECODE, "Decode");
-        t.root().phase(RERANK).legacy();
+        t.done(DECODE, "Decode");
+        t.phase(RERANK).legacy();
         clock.add(1_000_000_000);
         assertEquals(List.of(), out);
-        t.root().close();                                   // the root's close prints, not just Trace.close
+        t.close();                                   // the root's close prints, not just Trace.close
         t.close();
         assertEquals(List.of("Batch #1: x=(a&b): 1.5s = 0.5s (Decode) + 1.0s (Rerank & Filter=Top(10))"), out);
 
         out.clear();
-        try (Trace u = Tempo.start(SEARCH, opts()).printOnClose(out::add, "Job")) {
+        try (Trace u = Tempo.trace(SEARCH, opts()).printOnClose(out::add, "Job")) {
             clock.add(250_000_000);
         }
         assertEquals(List.of("Job: 0.25s"), out);
 
         out.clear();
-        try (Trace u = Tempo.start(SEARCH, opts()).printOnClose(out::add, null)) {
+        try (Trace u = Tempo.trace(SEARCH, opts()).printOnClose(out::add, null)) {
             clock.add(1);
         }
         assertEquals(List.of("1.0E-9s"), out);
 
         out.clear();
-        Trace closed = Tempo.start(SEARCH, opts());
+        Trace closed = Tempo.trace(SEARCH, opts());
         clock.add(2_000_000_000);
         closed.close();
         closed.printOnClose(out::add, "Late");              // already closed: printed at once
@@ -237,14 +237,14 @@ class RenderTest {
 
     @Test
     void printOnCloseMisuse() throws Exception {
-        Trace t = Tempo.start(SEARCH, opts());
+        Trace t = Tempo.trace(SEARCH, opts());
         t.printOnClose(null, "x");
         assertNull(onOtherThread(() -> t.printOnClose(line -> fail("foreign"), "x")));
         t.printOnClose(line -> { throw new IllegalStateException("printer"); }, "x");
         t.close();                                          // the printer's throw is counted, not thrown
         assertEquals(3, t.misuses());
 
-        Trace s = Tempo.start(SEARCH, opts().strict(true));
+        Trace s = Tempo.trace(SEARCH, opts().strict(true));
         s.printOnClose(line -> { throw new IllegalStateException("printer"); }, "x");
         AssertionError e = assertThrows(AssertionError.class, s::close);
         assertEquals("printer", e.getCause().getMessage());
@@ -254,8 +254,8 @@ class RenderTest {
 
     @Test
     void runtimeReadsTheRootLaneInPlace() {
-        Trace t = Tempo.start(SEARCH, opts());
-        Span s = t.root();
+        Trace t = Tempo.trace(SEARCH, opts());
+        Span s = t;
         for (int i = 0; i < 5_000; i++) s.span(LOAD).set(SCORE, i).close();
         s.done(DECODE, "Decode Input #3");
         s.phase(MATCH).legacy();
@@ -290,14 +290,14 @@ class RenderTest {
 
     @Test
     void runtimeWithoutDigitsIsDoubleToString() {
-        Trace t = Tempo.start(SEARCH, opts());
+        Trace t = Tempo.trace(SEARCH, opts());
         t.close();
         for (long nanos : samples(200_000)) assertEquals(Double.toString(nanos / 1e9) + "s", t.toRuntime(-1, nanos));
     }
 
     @Test
     void runtimeWithDigitsRoundsTheExactValueHalfUp() {
-        Trace t = Tempo.start(SEARCH, opts());
+        Trace t = Tempo.trace(SEARCH, opts());
         t.close();
         boolean formatter = Runtime.version().feature() >= 21; // since then %f rounds the shortest repr, as Double.toString
         SplittableRandom r = new SplittableRandom(7);

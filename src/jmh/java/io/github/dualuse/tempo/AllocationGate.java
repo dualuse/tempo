@@ -37,8 +37,8 @@ public final class AllocationGate {
     static final double SETUP = 1024;    // B per trace start + close + release
     static final double HANDOFF = 32;    // B per handoff: exactly one small object
     static final double ENCODE = 6 * 1024, RENDER = 24 * 1024, JSON = 2560; // B per render of the 300-span trace
-    static final String GATED = "span|spanNotInlined|phase|done|setLong|detailDisabled|traceLifecycle"
-            + "|handoff|handoffInline|handoffFolded|currentDetailNoTrace|currentDetailCoarse|waited|alwaysOn|folded"
+    static final String GATED = "span|spanStatic|spanNotInlined|phase|done|setLong|tickDisabled|traceLifecycle"
+            + "|handoff|handoffInline|handoffFolded|tickNoTrace|tickStatic|stepUndrawn|folded"
             + "|snapshotToHeader|toHeader|snapshotWriteJson";
 
     public static void main(String[] args) throws RunnerException {

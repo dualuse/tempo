@@ -109,14 +109,14 @@ public final class ResponseHeaders {
 
     static Response search(ThreadPoolExecutor cpu) throws Exception {
         // linkBase: every Tempo-Link of this trace opens our own viewer instead of the public one.
-        Tempo.Trace t = Tempo.start(SEARCH, new Tempo.Options().level(Tempo.DETAIL).linkBase(VIEWER).strict(true));
+        Tempo.Trace t = Tempo.trace(SEARCH, new Tempo.Options().linkBase(VIEWER).strict(true)).records(Tempo.STEP);
         List<String> hits = new ArrayList<>();
         try (t) {
-            Tempo.Span s = t.root();
+            Tempo.Span s = t;
             Demo.cpu(2_000); // parse the query
             s.done(DECODE, "Decode Query");
             s.phase(RERANK).legacy();
-            try (Tempo.Span load = s.detail(LOAD)) {
+            try (Tempo.Span load = s.step(LOAD)) {
                 Demo.io(3); // read the candidates
                 load.set(BYTES, 48_213);
             }
@@ -215,16 +215,16 @@ public final class ResponseHeaders {
     static void ladder(ThreadPoolExecutor index) throws Exception {
         // A large budget records all 2,000 spans as rows, so that rendering, not recording, decides what
         // to fold: the same trace can then go out whole as JSON and trimmed in a header.
-        Tempo.Trace t = Tempo.start(UPDATE, new Tempo.Options().level(Tempo.DETAIL).budget(4_096).strict(true));
+        Tempo.Trace t = Tempo.trace(UPDATE, new Tempo.Options().budget(4_096).strict(true)).records(Tempo.STEP);
         try (t) {
-            Tempo.Span s = t.root();
+            Tempo.Span s = t;
             List<Future<?>> shards = new ArrayList<>();
             for (int i = 0; i < SHARDS; i++) {
                 Tempo.Handoff h = s.handoff(SHARD).set(DOCS, DOCS_PER_SHARD);
                 shards.add(index.submit(() -> {
                     try (Tempo.Span shard = h.begin()) {
                         for (int d = 0; d < DOCS_PER_SHARD; d++) {
-                            try (Tempo.Span tokenize = shard.detail(TOKENIZE)) {
+                            try (Tempo.Span tokenize = shard.step(TOKENIZE)) {
                                 Demo.cpu(5);
                                 tokenize.set(TERMS, 40 + d);
                             }
@@ -288,7 +288,7 @@ public final class ResponseHeaders {
         return nanos / 1e6;
     }
 
-    /** Aggregate records of a value: those with {@code +count.min.max.extent.maxAt}. */
+    /** Total records of a value: those with {@code +count.min.max.extent.maxAt}. */
     static int aggregates(String value) {
         int n = 0;
         for (String record : Demo.field(value, "S").split("/")) if (record.indexOf('+') >= 0) n++;

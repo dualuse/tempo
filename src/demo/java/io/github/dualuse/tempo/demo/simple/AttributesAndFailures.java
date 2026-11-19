@@ -59,9 +59,9 @@ public final class AttributesAndFailures {
         // detects it, instead of being healed and counted. set, fail and cancel after close are allowed
         // until the next span opens at the same depth (see thumbnails below), and are not misuse. In
         // production leave it off.
-        Tempo.Trace t = Tempo.start(UPLOAD, new Tempo.Options().strict(true));
+        Tempo.Trace t = Tempo.trace(UPLOAD, new Tempo.Options().strict(true));
         try (t) {
-            upload(t.root());
+            upload(t);
         }
 
         Demo.check(Tempo.current() == Tempo.NOOP, "once the trace closed, Tempo.current() is NOOP again");
@@ -185,9 +185,9 @@ public final class AttributesAndFailures {
     static void strictAndHealed() {
         // Without strict, as in production: the request is unharmed. The open span is ended at its
         // parent's close, flagged healed and counted as misuse: flag m in Tempo-Timing.
-        Tempo.Trace t = Tempo.start(STATUS);
+        Tempo.Trace t = Tempo.trace(STATUS);
         try (t) {
-            t.root().run(RENDER, () -> {
+            t.run(RENDER, () -> {
                 leakyLookup("logo");
                 Demo.cpu(200);
             });
@@ -200,8 +200,8 @@ public final class AttributesAndFailures {
 
         // With strict, as in a test: the same close throws, naming the mistake.
         String error = null;
-        try (Tempo.Trace s = Tempo.start(STATUS, new Tempo.Options().strict(true))) {
-            s.root().run(RENDER, () -> leakyLookup("logo"));
+        try (Tempo.Trace s = Tempo.trace(STATUS, new Tempo.Options().strict(true))) {
+            s.run(RENDER, () -> leakyLookup("logo"));
         } catch (AssertionError e) {
             error = e.getMessage();
         }

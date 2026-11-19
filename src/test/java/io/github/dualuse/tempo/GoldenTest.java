@@ -5,6 +5,7 @@ import io.github.dualuse.tempo.Tempo.Name;
 import io.github.dualuse.tempo.Tempo.Options;
 import io.github.dualuse.tempo.Tempo.Span;
 import io.github.dualuse.tempo.Tempo.Trace;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestFactory;
@@ -27,7 +28,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import static io.github.dualuse.tempo.Tempo.DETAIL;
+import static io.github.dualuse.tempo.Tempo.STEP;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
@@ -45,6 +46,11 @@ import static org.junit.jupiter.api.Assertions.*;
  * spans only; and an aggregate is one per parent, lap and name, without attributes.
  */
 class GoldenTest {
+
+    @AfterEach
+    void noTraceLeftOnThread() {
+        TempoTest.assertNothingLeftOpen();
+    }
 
     static final Path DATA = Paths.get(System.getProperty("tempo.testdata", "testdata"));
 
@@ -204,7 +210,7 @@ class GoldenTest {
     @Test
     void singleRoot() {
         try (Script s = new Script("single-root")) {
-            Trace t = s.on(0, 0, () -> Tempo.start(SEARCH, s.options()));
+            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options()));
             s.run(0, 1500, t::close);
             assertHeader("single-root", golden("single-root"), s.render(1500, t));
         }
@@ -216,8 +222,8 @@ class GoldenTest {
                 ratio = Tempo.name("ratio"), delta = Tempo.name("delta"), threshold = Tempo.name("threshold"),
                 mean = Tempo.name("mean"), skew = Tempo.name("skew");
         try (Script s = new Script("attributes")) {
-            Trace t = s.on(0, 0, () -> Tempo.start(SEARCH, s.options()));
-            Span root = t.root();
+            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options()));
+            Span root = t;
             s.run(0, 0, () -> root.set(K, 10).set(offset, -42).set(zero, 0));
             Span index = s.on(0, 100, () -> root.span(INDEX).set(hits, 9007199254740991L).set(ratio, 0.5).set(delta, -0.25));
             s.run(0, 4100, index::close);
@@ -232,8 +238,8 @@ class GoldenTest {
     @Test
     void handoff() {
         try (Script s = new Script("handoff")) {
-            Trace t = s.cpu(-1).on(0, 0, () -> Tempo.start(SEARCH, s.options().cpu(true)));
-            Span root = t.root();
+            Trace t = s.cpu(-1).on(0, 0, () -> Tempo.trace(SEARCH, s.options().cpu(true)));
+            Span root = t;
             Span describe = s.cpu(0).on(0, 50, () -> root.span(DESCRIBE).cpu());
             Handoff infer1 = s.on(0, 100, () -> describe.handoff(INFER)), infer2 = s.on(0, 140, () -> describe.handoff(INFER));
 
@@ -269,8 +275,8 @@ class GoldenTest {
     @Test
     void handoffNotRun() {
         try (Script s = new Script("handoff-not-run")) {
-            Trace t = s.on(0, 0, () -> Tempo.start(SEARCH, s.options().cpu(true)));
-            Span rerank = s.on(0, 1000, () -> t.root().span(RERANK));
+            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options().cpu(true)));
+            Span rerank = s.on(0, 1000, () -> t.span(RERANK));
             Handoff a = s.on(0, 1010, () -> rerank.handoff(LOAD)), b = s.on(0, 1020, () -> rerank.handoff(LOAD)),
                     c = s.on(0, 1030, () -> rerank.handoff(LOAD)), d = s.on(0, 1040, () -> rerank.handoff(LOAD));
             Span la = s.cpu(0).on(1, 1025, a::begin);
@@ -285,7 +291,7 @@ class GoldenTest {
             s.on(0, 8100, () -> rerank.handoff(MATCH)); // never started
             s.cpu(-1).run(0, 9030, c::cancel);           // cancelled before it started
             s.run(0, 28000, rerank::close);
-            Span encode = s.on(0, 28100, () -> t.root().span(ENCODE));
+            Span encode = s.on(0, 28100, () -> t.span(ENCODE));
             s.run(0, 29600, encode::close);
             s.run(0, 30000, t::close);
             assertHeader("handoff-not-run", golden("handoff-not-run"), s.render(30000, t));
@@ -300,8 +306,8 @@ class GoldenTest {
                 + "S=00.0.6y0:9=512:8=1/11.a.rs/12.ua.rs@1~0/13.uk.rs@2~0/14.uk.2s/15.2s.2s/16.2s.2s/17.2s.2s/18.2s.2s;e=9";
         Name snake = Tempo.name("snake_case");
         try (Script s = new Script("names")) {
-            Trace t = s.on(0, 0, () -> Tempo.start(GET_SEARCH, s.options()));
-            Span root = t.root();
+            Trace t = s.on(0, 0, () -> Tempo.trace(GET_SEARCH, s.options()));
+            Span root = t;
             s.run(0, 0, () -> root.set(Tempo.name("bytes read"), 512).set(snake, 1));
             Span grosse = s.on(0, 10, () -> root.span(Tempo.name("Größe")));
             s.run(0, 1010, grosse::close);
@@ -333,8 +339,8 @@ class GoldenTest {
                 + "S=00.0.12kw/11.a.334/12.35m.ffk@1~0/23.1e.ccg@2~2s/34.6y.p0@3~0/23.1e.bko/35.2s.1jk@0~0/16.fic.jag"
                 + "/24.2s.7ps@3~0/27.7sk.asw;e=a";
         try (Script s = new Script("threads")) {
-            Trace t = s.on(0, 0, () -> Tempo.start(SEARCH, s.options()));
-            Span root = t.root();
+            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options()));
+            Span root = t;
             Span decode = s.on(0, 10, () -> root.span(DECODE));
             s.run(0, 4010, decode::close);
             Handoff hd = s.on(0, 4100, () -> root.handoff(DESCRIBE));
@@ -379,9 +385,9 @@ class GoldenTest {
                 + "/pp.7.1og4/qq.7.1ofk/rr.7.1of0/ss.7.1oeg/tt.7.1odw/uu.7.1odc/vv.7.1ocs/ww.7.1oc8/xx.7.1obo/yy.7.1ob4"
                 + "/zz.0.1oak/310.1osw.1e/411.5.k/411.p.a/112.1tic.2bc/213.a.28k;e=15";
         try (Script s = new Script("deep-nesting")) {
-            Trace t = s.on(0, 0, () -> Tempo.start(SEARCH, s.options()));
+            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options()));
             Span[] level = new Span[35];
-            level[0] = t.root();
+            level[0] = t;
             level[1] = s.on(0, 100, () -> level[0].span(DESCRIBE));
             for (int k = 2; k <= 34; k++) {
                 int at = k;
@@ -418,8 +424,8 @@ class GoldenTest {
                 + "S=00.0.1b2g^o/11.u.1jk^f/12.1li.99c/23.1e.93s^w/14.99c.0^m/11.2s.0^fm/15.0.1040^o/26.2s.zzk@1~1o^o"
                 + "/27.2s.zyg^ow;e=9";
         try (Script s = new Script("failed-open")) {
-            Trace t = s.on(0, 0, () -> Tempo.start(SEARCH, s.options()));
-            Span root = t.root();
+            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options()));
+            Span root = t;
             Span decode = s.on(0, 30, () -> root.span(DECODE).fail());
             s.run(0, 2030, decode::close);
             s.run(0, 2100, () -> root.phase(INDEX));
@@ -448,20 +454,20 @@ class GoldenTest {
         String closest = "v1;w=mwevdy39;x=1c.3;l=1.2.3;T=http-4:cpu-1:cpu-2:io-1;N=search:rerank:match:load;"
                 + "S=00.0.1lvc/11.2s.1l3k/22.2s.1lps@1~1e^o/22.2s.1i1u@2~3mk^o/23.2s.2bc@3~5/23.2e4.1j7i@3~0^o;e=6";
         try (Script s = new Script("live-and-folded")) {
-            Trace t = s.on(0, 0, () -> Tempo.start(SEARCH, s.options().level(DETAIL).budget(4))); // the four handoffs
-            Span rerank = s.on(0, 100, () -> t.root().span(RERANK));
+            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options().budget(4)).records(STEP)); // the four handoffs
+            Span rerank = s.on(0, 100, () -> t.span(RERANK));
             Handoff m1 = s.on(0, 200, () -> rerank.handoff(MATCH)), m2 = s.on(0, 300, () -> rerank.handoff(MATCH)),
                     l1 = s.on(0, 400, () -> rerank.handoff(LOAD)), l2 = s.on(0, 3500, () -> rerank.handoff(LOAD));
             Span w1 = s.on(1, 250, m1::begin);
             s.run(1, 300, () -> {
                 Span x = w1;
-                for (int i = 0; i < 34; i++) x = x.detail(SCORE);    // folded, all still open
-                for (int i = 0; i < 3; i++) assertSame(Tempo.NOOP, x.detail(SCORE)); // dropped at depth 35
+                for (int i = 0; i < 34; i++) x = x.step(SCORE);    // folded, all still open
+                for (int i = 0; i < 3; i++) assertSame(Tempo.NOOP, x.step(SCORE)); // dropped at depth 35
             });
             Span w2 = s.on(2, 5000, m2::begin);
             s.run(2, 5100, () -> {
                 Span x = w2;
-                for (int i = 0; i < 14; i++) x = x.detail(SCORE);
+                for (int i = 0; i < 14; i++) x = x.step(SCORE);
             });
             Span w3 = s.on(3, 405, l1::begin);
             s.run(3, 3405, w3::close);
@@ -488,8 +494,8 @@ class GoldenTest {
                 + "/22.2s.1jk@1~a/22.1e.2bc@1~1ig/22.3cu.1i0g@1~6y0.jg*334+14.p0.3h0.1xg0.vmw"
                 + "/23.2s.37qo@_~n5c.1xg*3674+14.1jk.6y0.2klc.5eg^f/24.2s.m8+b4.1.9.3uw0.3u48/15.42zo.668;e=8";
         try (Script s = new Script("aggregates")) {
-            Trace t = s.on(0, 0, () -> Tempo.start(SEARCH, s.options().level(DETAIL).budget(2).cpu(true)));
-            Span rerank = s.on(0, 500, () -> t.root().span(RERANK));
+            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options().budget(2).cpu(true)).records(STEP));
+            Span rerank = s.on(0, 500, () -> t.span(RERANK));
             Handoff a = s.on(0, 600, () -> rerank.handoff(LOAD)), b = s.on(0, 650, () -> rerank.handoff(LOAD));
             Span la = s.on(3, 610, a::begin);
             s.run(3, 2610, la::close);
@@ -524,11 +530,11 @@ class GoldenTest {
             score.add(new long[] {185198, 2});
             s.cpu(-1);
             for (long[] o : score) {
-                Span x = s.on(0, o[0], () -> rerank.detail(SCORE));
+                Span x = s.on(0, o[0], () -> rerank.step(SCORE));
                 s.run(0, o[0] + o[1], x::close);
             }
             s.run(0, 190500, rerank::close);
-            Span encode = s.on(0, 191000, () -> t.root().span(ENCODE));
+            Span encode = s.on(0, 191000, () -> t.span(ENCODE));
             s.run(0, 199000, encode::close);
             s.run(0, 200000, t::close);
             assertHeader("aggregates", closest, s.render(200000, t));
@@ -545,8 +551,8 @@ class GoldenTest {
     @Test
     void searchExample() {
         try (Script s = new Script("search-example")) {
-            Trace t = s.cpu(-1).on(0, 0, () -> Tempo.start(GET_SEARCH, s.options().cpu(true).budget(5)));
-            Span root = t.root();
+            Trace t = s.cpu(-1).on(0, 0, () -> Tempo.trace(GET_SEARCH, s.options().cpu(true).budget(5)));
+            Span root = t;
             Span decode = s.on(0, 120, () -> root.span(DECODE));
             s.run(0, 8420, decode::close);
             Span describe = s.cpu(0).on(0, 8450, () -> root.span(DESCRIBE).cpu());
@@ -604,9 +610,9 @@ class GoldenTest {
     @Test
     void fallback() {
         try (Script s = new Script("fallback")) {
-            Trace t = s.on(0, 0, () -> Tempo.start(SEARCH, s.options().headerBytes(255)));
+            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options().headerBytes(255)));
             for (int i = 0; i < 100; i++) {
-                Span x = s.on(0, 100 + 1000 * i, () -> t.root().span(LOAD));
+                Span x = s.on(0, 100 + 1000 * i, () -> t.span(LOAD));
                 s.run(0, 600 + 1000 * i, x::close);
             }
             s.run(0, 207126, t::close);

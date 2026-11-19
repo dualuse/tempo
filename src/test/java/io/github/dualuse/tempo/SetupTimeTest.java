@@ -14,8 +14,8 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 
-import static io.github.dualuse.tempo.Tempo.COARSE;
-import static io.github.dualuse.tempo.Tempo.DETAIL;
+import static io.github.dualuse.tempo.Tempo.SPAN;
+import static io.github.dualuse.tempo.Tempo.STEP;
 import static io.github.dualuse.tempo.Tempo.NOOP;
 import static io.github.dualuse.tempo.TempoTest.lines;
 import static io.github.dualuse.tempo.TempoTest.onThread;
@@ -33,7 +33,7 @@ class SetupTimeTest {
 
     @AfterEach
     void noTraceLeftOnThread() {
-        assertSame(NOOP, Tempo.current(), "a test left a span open on the test thread");
+        TempoTest.assertNothingLeftOpen();
     }
 
     /** A clock that advances by {@code step} on every read, and by whatever {@link #add} says. */
@@ -70,10 +70,10 @@ class SetupTimeTest {
 
     @Test
     void theRootStartsAtZeroAndTheLegacyStepsCountFromIt() {
-        for (int level : new int[] {COARSE, DETAIL}) {
+        for (int level : new int[] {SPAN, STEP}) {
             Stepping clock = new Stepping(10);
-            Trace t = Tempo.start(SEARCH, new Options().clock(clock).level(level).cpu(false));
-            Span s = t.root();
+            Trace t = Tempo.trace(SEARCH, new Options().clock(clock).cpu(false)).records(level);
+            Span s = t;
             s.span(LOAD).close();          // the zero point is the first read; this one runs from 10 to 20
             s.done(DECODE, "Decode");      // a lap from the root's start, 0, to 30
             clock.add(100);
@@ -107,18 +107,18 @@ class SetupTimeTest {
             }
             return steps.getAsLong();
         };
-        Trace t = Tempo.start(SEARCH, new Options().clock(clock).cpu(false));
+        Trace t = Tempo.trace(SEARCH, new Options().clock(clock).cpu(false));
         t.close();
-        assertEquals(List.of(Tempo.class.getName() + ".start"), firstRead.subList(0, 1), String.valueOf(firstRead));
+        assertEquals(List.of(Tempo.class.getName() + ".trace"), firstRead.subList(0, 1), String.valueOf(firstRead));
         assertFalse(firstRead.stream().anyMatch(f -> f.endsWith(".<init>")), String.valueOf(firstRead));
         assertEquals(lines("search 0+10"), starts(t)); // the zero point, then the close
     }
 
     @Test
     void theRootStartsAtZeroWithTheSystemClock() {
-        for (int level : new int[] {COARSE, DETAIL}) {
-            Trace t = Tempo.start(SEARCH, new Options().level(level));
-            t.root().done(DECODE, "Decode");
+        for (int level : new int[] {SPAN, STEP}) {
+            Trace t = Tempo.trace(SEARCH, new Options()).records(level);
+            t.done(DECODE, "Decode");
             t.close();
             List<Long> starts = new ArrayList<>();
             t.forEachSpan(v -> starts.add(v.startNanos()));
@@ -140,8 +140,8 @@ class SetupTimeTest {
             cold[0] = false;
             return 0;
         };
-        Trace t = Tempo.start(SEARCH, new Options().clock(clock).cpuClock(cpu).level(DETAIL));
-        t.root().span(LOAD).close();
+        Trace t = Tempo.trace(SEARCH, new Options().clock(clock).cpuClock(cpu)).records(STEP);
+        t.span(LOAD).close();
         t.close();
         assertEquals(lines(
                 "search 0+1000030",
@@ -153,7 +153,7 @@ class SetupTimeTest {
     @Test
     void theRootsCpuTimeStartsRightAfterTheZeroPoint() {
         TempoTest.Clock clock = new TempoTest.Clock(), cpu = new TempoTest.Clock();
-        Trace t = Tempo.start(SEARCH, new Options().clock(clock).cpuClock(cpu).level(DETAIL));
+        Trace t = Tempo.trace(SEARCH, new Options().clock(clock).cpuClock(cpu)).records(STEP);
         cpu.add(40);
         clock.add(50);
         t.close();
@@ -177,37 +177,38 @@ class SetupTimeTest {
     void theFirstCpuReadIsOnTheThreadThatStartsOrRaisesTheTrace() throws Exception {
         String me = Thread.currentThread().getName();
 
-        Recording started = new Recording(); // DETAIL from the start: the start reads it
-        Trace a = Tempo.start(SEARCH, new Options().cpuClock(started).level(DETAIL));
+        Recording started = new Recording(); // STEP from the start: the start reads it
+        Trace a = Tempo.trace(SEARCH, new Options().cpuClock(started)).records(STEP);
         assertEquals(List.of(me), started.threads);
-        Handoff h = a.root().handoff(MATCH);
+        Handoff h = a.handoff(MATCH);
         assertNull(onThread("worker", () -> h.begin().close()));
         a.close();
         assertEquals(List.of(me, "worker", "worker", me), started.threads);
 
-        Recording raised = new Recording(); // COARSE, then raised by the handler: the raise reads it
-        Trace b = Tempo.start(SEARCH, new Options().cpuClock(raised));
-        Handoff early = b.root().handoff(MATCH); // submitted before the raise, begun after it
+        Recording raised = new Recording(); // SPAN, then raised by the handler: the raise reads it
+        Trace b = Tempo.trace(SEARCH, new Options().cpuClock(raised));
+        Handoff early = b.handoff(MATCH); // submitted before the raise, begun after it
         assertEquals(List.of(), raised.threads);
-        assertTrue(b.raise(DETAIL));
+        b.records(STEP);
+        assertEquals(STEP, b.records());
         assertEquals(List.of(me), raised.threads);
         assertNull(onThread("worker", () -> early.begin().close()));
         b.close();
         assertEquals(me, raised.threads.get(0));
-        assertEquals(List.of(me, "worker", "worker"), raised.threads); // the root was not measured: COARSE at its open
+        assertEquals(List.of(me, "worker", "worker", me), raised.threads); // the root's own from the widening on
 
         Recording off = new Recording(); // CPU off, or already measured: a raise reads nothing
-        Trace c = Tempo.start(SEARCH, new Options().cpuClock(off).cpu(false));
-        assertTrue(c.raise(DETAIL));
+        Trace c = Tempo.trace(SEARCH, new Options().cpuClock(off).cpu(false));
+        c.records(STEP);
         c.close();
-        Trace d = Tempo.start(SEARCH, new Options().cpuClock(off).cpu(true));
-        assertTrue(d.raise(DETAIL));
+        Trace d = Tempo.trace(SEARCH, new Options().cpuClock(off).cpu(true));
+        d.records(STEP);
         d.close();
         assertEquals(List.of(me, me), off.threads); // d's root: at the start and at the close
 
-        Recording coarse = new Recording(); // COARSE throughout: never
-        Trace e = Tempo.start(SEARCH, new Options().cpuClock(coarse));
-        Handoff g = e.root().handoff(MATCH);
+        Recording coarse = new Recording(); // SPAN throughout: never
+        Trace e = Tempo.trace(SEARCH, new Options().cpuClock(coarse));
+        Handoff g = e.handoff(MATCH);
         assertNull(onThread("worker", () -> g.begin().close()));
         e.close();
         assertEquals(List.of(), coarse.threads);
@@ -222,9 +223,9 @@ class SetupTimeTest {
                 clock.add(7);
                 return cpu[0];
             };
-            Trace t = Tempo.start(SEARCH, new Options().clock(clock).cpuClock(costly).level(DETAIL).budget(budget));
+            Trace t = Tempo.trace(SEARCH, new Options().clock(clock).cpuClock(costly).budget(budget)).records(STEP);
             clock.add(10);
-            Handoff h = t.root().handoff(MATCH); // submitted at 17: the root's CPU read came first
+            Handoff h = t.handoff(MATCH); // submitted at 17: the root's CPU read came first
             clock.add(30);
             assertNull(onThread("worker", () -> {
                 Span m = h.begin();              // begins at 47, then reads CPU: 54
@@ -233,9 +234,9 @@ class SetupTimeTest {
                 m.close();                       // ends at 59, then reads CPU: 66
             }));
             t.close();                           // 66
-            Tempo.Aggregate a = t.aggregate(MATCH);
-            assertEquals(30, a.waitSumNanos(), "budget " + budget + ": the wait is the time in the queue, no read in it");
-            assertEquals(12, a.sumNanos(), "budget " + budget + ": the start's CPU read is the task's run time");
+            Tempo.Total a = t.total(MATCH);
+            assertEquals(30, a.waitSum(), "budget " + budget + ": the wait is the time in the queue, no read in it");
+            assertEquals(12, a.sum(), "budget " + budget + ": the start's CPU read is the task's run time");
             if (budget > 0) {
                 assertEquals(lines(
                         "search 0+66",
@@ -263,9 +264,9 @@ class SetupTimeTest {
                 Trace t = trace[0];
                 return base.get() + (t == null ? 0 : 1000L * (t.ctx.lanesById().length - 1));
             };
-            Trace t = trace[0] = Tempo.start(SEARCH, new Options().clock(clock).cpu(false).level(DETAIL).budget(budget));
+            Trace t = trace[0] = Tempo.trace(SEARCH, new Options().clock(clock).cpu(false).budget(budget)).records(STEP);
             base.addAndGet(10);
-            Handoff h = t.root().handoff(MATCH); // submitted at 10
+            Handoff h = t.handoff(MATCH); // submitted at 10
             base.addAndGet(30);
             assertNull(onThread("worker", () -> {
                 Span m = h.begin();              // wins the handoff at 40, then sets the worker's lane up: 1040
@@ -273,9 +274,9 @@ class SetupTimeTest {
                 m.close();                       // 1045
             }));
             t.close();
-            Tempo.Aggregate a = t.aggregate(MATCH);
-            assertEquals(30, a.waitSumNanos(), "budget " + budget + ": the wait is the time in the queue, no lane setup in it");
-            assertEquals(1005, a.sumNanos(), "budget " + budget + ": the lane setup is the task's run time");
+            Tempo.Total a = t.total(MATCH);
+            assertEquals(30, a.waitSum(), "budget " + budget + ": the wait is the time in the queue, no lane setup in it");
+            assertEquals(1005, a.sum(), "budget " + budget + ": the lane setup is the task's run time");
             if (budget > 0) {
                 assertEquals(lines(
                         "search 0+1045",

@@ -73,10 +73,10 @@ public final class BatchUpload {
         io.prestartAllCoreThreads(); // a service's pools are warm when a request arrives
         cpu.prestartAllCoreThreads();
 
-        Tempo.Trace t = Tempo.start(UPLOAD, new Tempo.Options().strict(true).cpu(true));
+        Tempo.Trace t = Tempo.trace(UPLOAD, new Tempo.Options().strict(true).cpu(true));
         List<Item> items = new ArrayList<>();
         try (t) {
-            Tempo.Span root = t.root();
+            Tempo.Span root = t;
             long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(DEADLINE_MS); // from the request's start
             for (int i = 0; i < ITEMS; i++) {
                 final int index = i;

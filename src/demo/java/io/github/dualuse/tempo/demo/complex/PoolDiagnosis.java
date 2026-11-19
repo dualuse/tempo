@@ -19,7 +19,7 @@ import java.util.concurrent.ThreadPoolExecutor;
  * One pool or two? A search service loads candidates (blocking I/O) and matches each one (CPU), and
  * the team argues whether both kinds of task should share one pool sized to the cores. Instead of
  * arguing, the demo serves the same six concurrent requests under both layouts, traces every request
- * at {@code DETAIL}, and answers the question by reading the traces in code.
+ * at {@code STEP}, and answers the question by reading the traces in code.
  *
  * <ul>
  *   <li>Layout A: one pool {@code shared} of 2 threads (the cores) runs loads and matches. A blocking
@@ -134,10 +134,10 @@ public final class PoolDiagnosis {
 
     /** One request, on a request thread: the traced code is the same under both layouts. */
     private static Tempo.Trace search(ThreadPoolExecutor loads, ThreadPoolExecutor matches, int pools) throws Exception {
-        // DETAIL measures the CPU time of every task, which the diagnosis needs.
-        Tempo.Trace t = Tempo.start(SEARCH, new Tempo.Options().level(Tempo.DETAIL).strict(true));
+        // STEP measures the CPU time of every task, which the diagnosis needs.
+        Tempo.Trace t = Tempo.trace(SEARCH, new Tempo.Options().strict(true)).records(Tempo.STEP);
         try (t) {
-            Tempo.Span s = t.root().set(POOLS, pools);     // tells the layouts apart in a viewer
+            Tempo.Span s = t.set(POOLS, pools);     // tells the layouts apart in a viewer
             List<Future<Future<?>>> pending = new ArrayList<>();
             for (int c = 0; c < CANDIDATES; c++) {
                 // The pool's busy threads and queue depth at submit: tools/tempo --pools draws them as

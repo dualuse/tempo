@@ -24,7 +24,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 
-import static io.github.dualuse.tempo.Tempo.DETAIL;
+import static io.github.dualuse.tempo.Tempo.STEP;
 import static io.github.dualuse.tempo.Tempo.NOOP;
 import static io.github.dualuse.tempo.TempoTest.lines;
 import static io.github.dualuse.tempo.TempoTest.onThread;
@@ -40,23 +40,23 @@ class LifetimeTest {
     final TempoTest.Clock clock = new TempoTest.Clock();
 
     Options opts() {
-        return new Options().clock(clock).level(DETAIL);
+        return new Options().clock(clock);
     }
 
     @AfterEach
     void noTraceLeftOnThread() {
-        assertSame(NOOP, Tempo.current(), "a test left a span open on the test thread");
+        TempoTest.assertNothingLeftOpen();
     }
 
     // ---- release and snapshots ---------------------------------------------------------------------
 
     @Test
     void aSnapshotStaysCompleteAfterReleaseAndTheReuseOfItsChunks() throws Exception {
-        Trace t = Tempo.start(SEARCH, opts().budget(1));
-        Span s = t.root().set(BYTES, 7);
-        s.detail(LOAD).close();
+        Trace t = Tempo.trace(SEARCH, opts().budget(1)).records(STEP);
+        Span s = t.set(BYTES, 7);
+        s.step(LOAD).close();
         clock.add(2);
-        s.detail(LOAD).close(); // folds
+        s.step(LOAD).close(); // folds
         s.done(DECODE, "Decode #1");
         Handoff h = s.handoff(MATCH).set(SCORE, 3);
         clock.add(1);
@@ -75,7 +75,7 @@ class LifetimeTest {
         String expected = lines(
                 "search 0+12 bytes=7",
                 "  decode 0+2 lap legacy 'Decode #1'",
-                "    load 0+0 detail",
+                "    load 0+0 step",
                 "    load 2+0 agg*1 min=0 max=0 maxAt=0 extent=0",
                 "  match 2+4 agg*1 min=4 max=4 maxAt=0 extent=5 handoff~1/1 @worker-1", // folded: past the budget too
                 "  load 7+5");
@@ -83,7 +83,7 @@ class LifetimeTest {
         assertEquals(lines(
                 "search 0+7 open bytes=7",
                 "  decode 0+2 lap legacy 'Decode #1'",
-                "    load 0+0 detail",
+                "    load 0+0 step",
                 "    load 2+0 agg*1 min=0 max=0 maxAt=0 extent=0",
                 "  match 2+4 agg*1 min=4 max=4 maxAt=0 extent=5 handoff~1/1 @worker-1",
                 "  load 7+0 open"), tree(early));
@@ -91,24 +91,24 @@ class LifetimeTest {
         t.release();
         assertEquals("", tree(t));
         assertEquals("", tree(t.snapshot()));
-        assertEquals(0, t.aggregate(LOAD).count());
+        assertEquals(0, t.total(LOAD).count());
         assertEquals(0, t.elapsedNanos());
 
-        Trace other = Tempo.start(MATCH, opts()); // takes the released chunks and overwrites them
-        for (int i = 0; i < 3_000; i++) other.root().span(DECODE).set(SCORE, -1).close();
+        Trace other = Tempo.trace(MATCH, opts()).records(STEP); // takes the released chunks and overwrites them
+        for (int i = 0; i < 3_000; i++) other.span(DECODE).set(SCORE, -1).close();
         other.close();
         assertEquals(expected, tree(snap));
         assertEquals(12, snap.elapsedNanos());
-        assertEquals("count=3 sum=5 min=0 max=5 waits=0 waitSum=0 waitMax=0", snap.aggregate(LOAD).toString());
+        assertEquals("count=3 sum=5 mean=1 min=0 max=5 waitSum=0 waitMax=0", snap.total(LOAD).toString());
         assertEquals(2, snap.folded());
         other.release();
     }
 
     @Test
     void releaseReturnsEveryChunkAndKeepsOnlyLaneShells() throws Exception {
-        Trace t = Tempo.start(SEARCH, opts().budget(Integer.MAX_VALUE));
-        for (int i = 0; i < 2_000; i++) t.root().detail(LOAD).set(BYTES, i).close();
-        Handoff h = t.root().handoff(MATCH);
+        Trace t = Tempo.trace(SEARCH, opts().budget(Integer.MAX_VALUE)).records(STEP);
+        for (int i = 0; i < 2_000; i++) t.step(LOAD).set(BYTES, i).close();
+        Handoff h = t.handoff(MATCH);
         assertNull(onThread("worker-1", () -> {
             try (Span w = h.begin()) {
                 for (int i = 0; i < 1_000; i++) w.span(LOAD).set(BYTES, i).close();
@@ -136,11 +136,11 @@ class LifetimeTest {
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         try {
             for (int k = 0; k < 1_000; k++) {
-                Trace t = Tempo.start(SEARCH, new Options().level(DETAIL));
+                Trace t = Tempo.trace(SEARCH, new Options()).records(STEP);
                 List<Future<?>> fs = new ArrayList<>();
                 for (int i = 0; i < 8; i++) {
-                    fs.add(pool.submit(t.root().handoff(MATCH).runnable(() -> {
-                        for (int j = 0; j < 4; j++) Tempo.current().detail(LOAD).set(BYTES, j).close();
+                    fs.add(pool.submit(t.handoff(MATCH).runnable(() -> {
+                        for (int j = 0; j < 4; j++) Tempo.current().step(LOAD).set(BYTES, j).close();
                     })));
                 }
                 for (Future<?> f : fs) f.get();
@@ -236,7 +236,7 @@ class LifetimeTest {
                         Trace t = recent.get(i);
                         if (t == null) continue;
                         oneStamp(t.snapshot());
-                        t.aggregate(LOAD);
+                        t.total(LOAD);
                         t.elapsedNanos();
                     }
                 }
@@ -252,21 +252,21 @@ class LifetimeTest {
         try {
             for (int k = 0; k < traces && failed.get() == null; k++) {
                 long stamp = k;
-                Trace t = Tempo.start(SEARCH, new Options().level(DETAIL).budget(64));
-                t.root().set(STAMP, stamp);
+                Trace t = Tempo.trace(SEARCH, new Options().budget(64)).records(STEP);
+                t.set(STAMP, stamp);
                 recent.set(k % recent.length(), t);
                 List<Future<?>> fs = new ArrayList<>();
                 for (int i = 0; i < tasks; i++) {
-                    Handoff h = t.root().handoff(MATCH).set(STAMP, stamp);
+                    Handoff h = t.handoff(MATCH).set(STAMP, stamp);
                     fs.add(pool.submit(() -> {
                         Span w = h.begin();
                         w.set(STAMP, stamp);
-                        for (int j = 0; j < spans; j++) w.detail(LOAD).set(STAMP, stamp).close();
+                        for (int j = 0; j < spans; j++) w.step(LOAD).set(STAMP, stamp).close();
                         w.close();
                         w.set(STAMP, stamp); // a late annotation of a task that may be released by now
                     }));
                 }
-                Handoff late = t.root().handoff(MATCH);
+                Handoff late = t.handoff(MATCH);
                 fs.get(0).get(); // the rest straggle past the release
                 t.close();
                 Snapshot snap = t.snapshot();
@@ -327,11 +327,11 @@ class LifetimeTest {
     @Test
     void aLaneFoundIdleWasCopiedComplete() throws Exception {
         for (int round = 0; round < 4; round++) {
-            Trace t = Tempo.start(SEARCH);
+            Trace t = Tempo.trace(SEARCH);
             int n = 3_000;
             Handoff[] hs = new Handoff[n];
-            for (int i = 0; i < n; i++) hs[i] = t.root().handoff(MATCH);
-            Handoff first = t.root().handoff(DECODE);
+            for (int i = 0; i < n; i++) hs[i] = t.handoff(MATCH);
+            Handoff first = t.handoff(DECODE);
             AtomicReference<Tempo.Lane> lane = new AtomicReference<>();
             AtomicBoolean done = new AtomicBoolean();
             AtomicReference<Throwable> failed = new AtomicReference<>();
@@ -389,8 +389,8 @@ class LifetimeTest {
     void aCopyWithAWriteBetweenItsStateReadsIsLive() throws Exception {
         ExecutorService pool = TempoTest.worker("worker-1");
         try {
-            Trace t = Tempo.start(SEARCH, opts());
-            Handoff a = t.root().handoff(MATCH), b = t.root().handoff(MATCH), c = t.root().handoff(MATCH);
+            Trace t = Tempo.trace(SEARCH, opts()).records(STEP);
+            Handoff a = t.handoff(MATCH), b = t.handoff(MATCH), c = t.handoff(MATCH);
             pool.submit(() -> a.begin().close()).get();
             Tempo.Lane l = t.ctx.lanesById()[1];
 
@@ -425,8 +425,8 @@ class LifetimeTest {
         int begun = 0, refused = 0;
         try {
             for (int i = 0; i < 5_000; i++) {
-                Trace t = Tempo.start(SEARCH);
-                Handoff h = t.root().handoff(MATCH);
+                Trace t = Tempo.trace(SEARCH);
+                Handoff h = t.handoff(MATCH);
                 t.close();
                 AtomicBoolean go = new AtomicBoolean();
                 Future<Boolean> task = pool.submit(() -> {

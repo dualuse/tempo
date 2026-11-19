@@ -5,6 +5,7 @@ import io.github.dualuse.tempo.Tempo.Name;
 import io.github.dualuse.tempo.Tempo.Snapshot;
 import io.github.dualuse.tempo.Tempo.Span;
 import io.github.dualuse.tempo.Tempo.Trace;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 
@@ -24,6 +25,11 @@ import static org.junit.jupiter.api.Assertions.*;
 /** The byte-budget ladder of FORMAT.md §7.1. */
 class LadderTest {
 
+    @AfterEach
+    void noTraceLeftOnThread() {
+        TempoTest.assertNothingLeftOpen();
+    }
+
     static final Name RENDER = Tempo.name("GET /render"), PARSE = Tempo.name("parse"), LAYOUT = Tempo.name("layout"),
             MEASURE = Tempo.name("measure"), FLOW = Tempo.name("flow"), LINE = Tempo.name("line"),
             GLYPH = Tempo.name("glyph"), TILE = Tempo.name("tile"), RASTER = Tempo.name("raster"),
@@ -37,8 +43,8 @@ class LadderTest {
      */
     static Snapshot ladderTrace() {
         try (GoldenTest.Script s = new GoldenTest.Script("ladder")) {
-            Trace t = s.on(0, 0, () -> Tempo.start(RENDER, s.options().cpu(true)));
-            Span root = t.root();
+            Trace t = s.on(0, 0, () -> Tempo.trace(RENDER, s.options().cpu(true)));
+            Span root = t;
             Span parse = s.on(0, 100, () -> root.span(PARSE).set(BYTES, 5120));
             s.run(0, 2100, parse::close);
             Span layout = s.on(0, 2200, () -> root.span(LAYOUT));

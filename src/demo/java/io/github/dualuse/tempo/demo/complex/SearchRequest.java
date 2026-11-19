@@ -26,9 +26,9 @@ import java.util.function.Predicate;
  * good hits and takes back the work that has not started; one load, from cold storage, is still
  * running when the response goes out.
  *
- * <p>It shows the whole lifecycle in a service: a filter that starts every trace {@code COARSE} and
+ * <p>It shows the whole lifecycle in a service: a filter that starts every trace {@code SPAN} and
  * times the routing before the handler, an opt-in ({@code tempo=1}) that raises the trace to
- * {@code DETAIL} once, handoffs from the request thread and from a pool thread (the chain
+ * {@code STEP} once, handoffs from the request thread and from a pool thread (the chain
  * request → {@code io-N} → {@code cpu-N}, with a queue wait on each hop), blocking waits, a hot loop
  * that spends the detail budget and folds, an early exit that takes back every task that has not begun
  * (each cancel either wins, and the task never runs, or loses to a task already running), a straggler,
@@ -107,12 +107,12 @@ public final class SearchRequest {
 
     /** In front of every handler: starts the trace, times the routing, renders the headers at the end. */
     Response filter(String query) throws Exception {
-        // COARSE, before anyone has read the request: cheap enough for every request in production.
-        Tempo.Trace t = Tempo.start(SEARCH, new Tempo.Options().strict(true).headerBytes(TEMPO_BYTES));
+        // SPAN, before anyone has read the request: cheap enough for every request in production.
+        Tempo.Trace t = Tempo.trace(SEARCH, new Tempo.Options().strict(true).headerBytes(TEMPO_BYTES));
         Response r;
         try (t) {
             Demo.cpu(1_000); // authenticate, match the route
-            t.root().done(ROUTING, "Routing"); // a lap from the trace start: the time before the handler
+            t.done(ROUTING, "Routing"); // a lap from the trace start: the time before the handler
             r = handle(t, query);
         }
         // One snapshot for all four headers, so they agree. The tasks still running go on recording into
@@ -137,13 +137,13 @@ public final class SearchRequest {
 
     /** The handler. Each step is a lap of the root, labelled for the legacy {@code Runtime} header. */
     Response handle(Tempo.Trace t, String query) throws Exception {
-        Tempo.Span root = t.root();
+        Tempo.Span root = t;
 
         // The opt-in gate: once, and before the first detail span, or raise refuses (strict: throws). At
-        // DETAIL every task measures its CPU time; the first CPU read in a JVM sets that clock up (it takes
+        // STEP every task measures its CPU time; the first CPU read in a JVM sets that clock up (it takes
         // milliseconds), and raise() does it here, on the request thread: in the first such request of a
         // JVM it shows in this lap, never as a task's queue wait.
-        if (query.contains("tempo=1")) t.raise(Tempo.DETAIL);
+        if (query.contains("tempo=1")) t.records(Tempo.STEP);
 
         Demo.cpu(1_000);
         root.done(DECODE, "Decode");
@@ -218,7 +218,7 @@ public final class SearchRequest {
         if (m == null) return; // taken back by the early exit before it began
         try (m) {
             for (int f = 0; f < FEATURES; f++) {
-                try (Tempo.Span s = m.detail(SCORE)) {
+                try (Tempo.Span s = m.step(SCORE)) {
                     Demo.cpu(SCORE_MICROS);
                 }
             }
@@ -338,7 +338,7 @@ public final class SearchRequest {
 
     static void check(Response r, String requestThread) {
         List<Row> rows = Row.all(r.snapshot);
-        Demo.check(r.trace.level() == Tempo.DETAIL, "the opt-in raised the trace to DETAIL");
+        Demo.check(r.trace.records() == Tempo.STEP, "the opt-in raised the trace to STEP");
         Demo.check(r.hits.size() == WANTED, "the request found " + WANTED + " good hits and stopped");
 
         Demo.check(count(rows, v -> v.depth == 0 && requestThread.equals(v.thread)) == 1, "the root runs on " + requestThread);
@@ -403,7 +403,7 @@ public final class SearchRequest {
         Demo.check(inOrder(r.serverTiming, "routing;", "decode;", "describe;", "lookup;", "rerank;", "total;"),
                 "Server-Timing lists the steps in order, then the total");
 
-        // CPU time is measured for each lane root at DETAIL, so each task shows what kind of work it is.
+        // CPU time is measured for each lane root at STEP, so each task shows what kind of work it is.
         long[] load = cpuAndWall(rows, LOAD), match = cpuAndWall(rows, MATCH);
         Demo.check(load[0] >= 0 && load[0] * 2 < load[1], "loads are mostly off CPU: they wait for I/O");
         Demo.check(match[0] > 0, "matches have their CPU time measured");

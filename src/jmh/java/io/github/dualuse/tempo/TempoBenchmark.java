@@ -35,7 +35,7 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
 public class TempoBenchmark {
 
     static final Tempo.Name ROOT = Tempo.name("bench"), CHILD = Tempo.name("child"), KEY = Tempo.name("key"),
-            ALWAYS = Tempo.name("always").aggregate();
+            RATIO = Tempo.name("ratio");
     /** Handoffs count against the budget; the cycling benchmarks record every one of theirs. */
     static final Tempo.Options UNBUDGETED = new Tempo.Options().budget(Integer.MAX_VALUE);
 
@@ -49,8 +49,8 @@ public class TempoBenchmark {
 
         @Setup(Level.Trial)
         public void setUp() {
-            trace = Tempo.start(ROOT, UNBUDGETED);
-            root = trace.root();
+            trace = Tempo.trace(ROOT, UNBUDGETED);
+            root = trace;
         }
 
         @TearDown(Level.Trial)
@@ -63,8 +63,8 @@ public class TempoBenchmark {
             if (++used == cycle) {
                 trace.close();
                 trace.release();
-                trace = Tempo.start(ROOT, UNBUDGETED);
-                root = trace.root();
+                trace = Tempo.trace(ROOT, UNBUDGETED);
+                root = trace;
                 used = 0;
             }
             return root;
@@ -82,8 +82,8 @@ public class TempoBenchmark {
 
         @Setup(Level.Trial)
         public void setUp() {
-            trace = Tempo.start(ROOT, UNBUDGETED);
-            root = trace.root();
+            trace = Tempo.trace(ROOT, UNBUDGETED);
+            root = trace;
         }
 
         @TearDown(Level.Trial)
@@ -96,8 +96,8 @@ public class TempoBenchmark {
             if (++used == cycle) {
                 trace.close();
                 trace.release();
-                trace = Tempo.start(ROOT, UNBUDGETED);
-                root = trace.root();
+                trace = Tempo.trace(ROOT, UNBUDGETED);
+                root = trace;
                 used = 0;
             }
             return root;
@@ -111,8 +111,8 @@ public class TempoBenchmark {
 
         @Setup(Level.Trial)
         public void setUp() {
-            trace = Tempo.start(ROOT, UNBUDGETED);
-            root = trace.root();
+            trace = Tempo.trace(ROOT, UNBUDGETED);
+            root = trace;
         }
 
         @TearDown(Level.Trial)
@@ -122,7 +122,7 @@ public class TempoBenchmark {
         }
     }
 
-    /** A DETAIL trace without budget: every detail span folds into the lane's aggregate. */
+    /** A trace that records steps, without budget: every step folds into the lane's aggregate. */
     @State(Scope.Thread)
     public static class Folding {
         Tempo.Trace trace;
@@ -130,8 +130,8 @@ public class TempoBenchmark {
 
         @Setup(Level.Trial)
         public void setUp() {
-            trace = Tempo.start(ROOT, new Tempo.Options().level(Tempo.DETAIL).budget(0));
-            root = trace.root();
+            trace = Tempo.trace(ROOT, new Tempo.Options().budget(0)).records(Tempo.STEP);
+            root = trace;
         }
 
         @TearDown(Level.Trial)
@@ -149,6 +149,13 @@ public class TempoBenchmark {
     @Benchmark
     public void span(Cycling s) {
         s.root().span(CHILD).close();
+    }
+
+    /** Cost promise 4: a span through the static API, which finds its parent through the ThreadLocal. */
+    @Benchmark
+    public void spanStatic(Cycling s) {
+        s.root(); // cycles the trace like the others
+        Tempo.span(CHILD).close();
     }
 
     @Benchmark
@@ -178,10 +185,10 @@ public class TempoBenchmark {
         s.root().set(KEY, 42L);
     }
 
-    /** Explicit handle, unmarked name, COARSE trace: the true no-op path. */
+    /** Explicit handle, a trace of spans only: an unrecorded tick, the true no-op path. */
     @Benchmark
-    public Tempo.Span detailDisabled(Coarse s) {
-        Tempo.Span d = s.root.detail(CHILD);
+    public Tempo.Span tickDisabled(Coarse s) {
+        Tempo.Span d = s.root.tick(CHILD);
         d.close();
         return d;
     }
@@ -207,18 +214,18 @@ public class TempoBenchmark {
         s.root.handoff(CHILD).begin().close();
     }
 
-    /** Explicit handle, always-on name, COARSE trace: an aggregate-only span (two clock reads, no row). */
+    /** Explicit handle, a trace of spans only: an undrawn step (two clock reads, no row, its total). */
     @Benchmark
-    public Tempo.Span alwaysOn(Coarse s) {
-        Tempo.Span d = s.root.detail(ALWAYS);
+    public Tempo.Span stepUndrawn(Coarse s) {
+        Tempo.Span d = s.root.step(CHILD);
         d.close();
         return d;
     }
 
-    /** Explicit handle, DETAIL trace over its budget: a folded span (two clock reads, an aggregate update). */
+    /** Explicit handle, a trace of steps over its budget: a folded step (two clock reads, an aggregate update). */
     @Benchmark
     public Tempo.Span folded(Folding s) {
-        Tempo.Span d = s.root.detail(CHILD);
+        Tempo.Span d = s.root.step(CHILD);
         d.close();
         return d;
     }
@@ -229,20 +236,16 @@ public class TempoBenchmark {
         return Tempo.Cpu.now();
     }
 
+    /** A static tick without a trace: the ThreadLocal read and a branch. */
     @Benchmark
-    public Tempo.Span currentDetailNoTrace() {
-        return Tempo.current().detail(CHILD);
+    public Tempo.Span tickNoTrace() {
+        return Tempo.tick(CHILD);
     }
 
+    /** A static tick in a trace of spans only: the ThreadLocal read and the level check. */
     @Benchmark
-    public Tempo.Span currentDetailCoarse(Coarse s) {
-        return Tempo.current().detail(CHILD);
-    }
-
-    /** Always-on queue wait without a lane: one clock read at submit, one at start, a lane-less aggregate. */
-    @Benchmark
-    public long waited(Coarse s) {
-        return s.trace.waited(CHILD, s.trace.submitted());
+    public Tempo.Span tickStatic(Coarse s) {
+        return Tempo.tick(CHILD);
     }
 
     /**
@@ -272,10 +275,10 @@ public class TempoBenchmark {
                 p.trace.close();
                 p.trace.release();
             }
-            p.trace = Tempo.start(ROOT, UNBUDGETED);
+            p.trace = Tempo.trace(ROOT, UNBUDGETED);
             p.used = 0;
         }
-        Tempo.Handoff h = p.trace.root().handoff(CHILD);
+        Tempo.Handoff h = p.trace.handoff(CHILD);
         int i = (int) (p.put & (Pipe.SIZE - 1));
         while (p.ring.get(i) != null) if (c.stopMeasurement) return;
         p.ring.lazySet(i, h);
@@ -305,14 +308,14 @@ public class TempoBenchmark {
 
         @Setup(Level.Trial)
         public void setUp() {
-            trace = Tempo.start(ROOT, new Tempo.Options().headerBytes(1 << 16));
-            Tempo.Span root = trace.root();
+            trace = Tempo.trace(ROOT, new Tempo.Options().headerBytes(1 << 16));
+            Tempo.Span root = trace;
             for (int i = 0; i < 30; i++) {
                 try (Tempo.Span parent = root.span(CHILD)) {
                     for (int j = 0; j < 9; j++) {
                         Tempo.Span c = parent.span(j % 2 == 0 ? CHILD : KEY);
                         if (j % 3 == 0) c.set(KEY, 1000L * i + j);
-                        if (j % 5 == 0) c.set(ALWAYS, i / 7.0);
+                        if (j % 5 == 0) c.set(RATIO, i / 7.0);
                         c.close();
                     }
                 }
@@ -364,7 +367,7 @@ public class TempoBenchmark {
 
     @Benchmark
     public void traceLifecycle() {
-        Tempo.Trace t = Tempo.start(ROOT, UNBUDGETED);
+        Tempo.Trace t = Tempo.trace(ROOT, UNBUDGETED);
         t.close();
         t.release();
     }

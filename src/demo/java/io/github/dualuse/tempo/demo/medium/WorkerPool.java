@@ -20,7 +20,7 @@ import java.util.function.ToLongFunction;
  * notifies three subscribers through a pool that refuses work when it is full.
  *
  * <p>It shows a {@code Handoff} captured at submit and its queue wait, a blocking join marked
- * {@code waiting()}, CPU time per pool task at {@code DETAIL}, and the three ways a handoff ends other
+ * {@code waiting()}, CPU time per pool task at {@code STEP}, and the three ways a handoff ends other
  * than running on a pool thread: inline (caller-runs), rejected ({@code reject()}) and skipped by an
  * early exit ({@code cancel()}, which says whether it won the race with the worker).
  *
@@ -53,12 +53,12 @@ public final class WorkerPool {
         ThreadPoolExecutor store = Demo.pool("store", 1, 1, new ThreadPoolExecutor.CallerRunsPolicy());
         ThreadPoolExecutor notify = Demo.pool("notify", 1, 1, new ThreadPoolExecutor.AbortPolicy());
         try {
-            // DETAIL (see LevelsAndOptIn): the load spans are recorded, and every task begun on a pool
+            // STEP (see LevelsAndOptIn): the load spans are recorded, and every task begun on a pool
             // thread (a lane root) samples its thread's CPU time, so the response shows CPU next to wall
             // time per task.
-            Tempo.Trace t = Tempo.start(REQUEST, new Tempo.Options().level(Tempo.DETAIL).strict(true));
+            Tempo.Trace t = Tempo.trace(REQUEST, new Tempo.Options().strict(true)).records(Tempo.STEP);
             try (t) {
-                match(t.root(), work, store, notify);
+                match(t, work, store, notify);
             }
             check(t, Thread.currentThread().getName());
             Demo.respond(t);
@@ -150,7 +150,7 @@ public final class WorkerPool {
         if (shard % 2 == 0) {
             Demo.cpu(TimeUnit.MILLISECONDS.toMicros(TASK_MS));          // in memory: compute only
         } else {
-            Tempo.Span load = Tempo.current().detail(LOAD);
+            Tempo.Span load = Tempo.current().step(LOAD);
             try (load) {
                 Demo.io(LOAD_MS);                                       // cold: blocks, off CPU
             }

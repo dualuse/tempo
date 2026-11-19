@@ -31,9 +31,9 @@ public final class FirstTrace {
 
     public static void main(String[] args) throws Exception {
         // The root span opens here, on this thread; strict turns any misuse into an AssertionError.
-        Tempo.Trace t = Tempo.start(HELLO, new Tempo.Options().strict(true));
+        Tempo.Trace t = Tempo.trace(HELLO, new Tempo.Options().strict(true));
         try (t) {
-            handle(t.root(), "name=Ada");
+            handle(t, "name=Ada");
         }
         // Closed, but still readable: everything below reads the finished trace.
 

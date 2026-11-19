@@ -30,20 +30,27 @@ import java.util.zip.Deflater;
 /**
  * Phase profiling for request-shaped work.
  *
- * <p>A {@link Trace} records a tree of {@link Span}s into per-thread primitive buffers. Recording
- * never throws into the caller (unless {@link Options#strict(boolean)} asks for it), allocates
- * nothing per span once warm, and below the trace's level {@link Span#detail(Name)} and
- * {@link Span#deep(Name)} cost a branch or two, unless the name is always-on ({@link Name#aggregate()}).
+ * <p>A {@link Trace} records a tree of {@link Span}s into per-thread primitive buffers. Code opens spans
+ * with static calls, and they assemble themselves under the thread's innermost open span. Recording never
+ * throws into the caller (unless {@link Options#strict(boolean)} asks for it) and allocates nothing per
+ * span once warm.
  *
  * <pre>{@code
- * static final Tempo.Name SEARCH = Tempo.name("search"), DECODE = Tempo.name("decode");
+ * static final Tempo.Name DECODE = Tempo.name("decode");
  *
- * try (Tempo.Trace t = Tempo.start(SEARCH)) {
- *     try (Tempo.Span s = t.root().span(DECODE)) {
- *         s.set(BYTES, image.length);
+ * try (Tempo.Trace t = Tempo.trace("GET /search")) {
+ *     try (Tempo.Span s = Tempo.span(DECODE)) {
+ *         s.set("bytes", image.length);
  *     }
+ *     response.header("Tempo-Timing", t.toHeader());
  * }
  * }</pre>
+ *
+ * <p>Three words open a span, and the word says what is measured: a {@link #span} is always timed and
+ * drawn; a {@link #step} is always timed (its totals and listeners), and drawn when the trace records
+ * steps ({@link Trace#records(int)}); a {@link #tick} is timed and drawn only when the trace records
+ * ticks, and costs about a branch otherwise. Outside a trace a span or step is timed only when its name
+ * has a global listener ({@link #on}); otherwise it is a no-op.
  *
  * <p>A {@link Span} is a handle that only its lane's owner thread may use. The handle object is reused
  * for the next span opened at the same depth on that thread, so a handle is its span only until then:
@@ -51,15 +58,20 @@ import java.util.zip.Deflater;
  * block right after, are fine).
  * Work for another thread goes through a {@link Handoff}: {@code s.handoff(n)} where the task is
  * submitted, {@code h.begin()} (or {@code h.runnable(r)}) where it runs, which records its queue wait.
+ * Build with {@code -Xlint} and a span opened by try-with-resources but not used in its block warns;
+ * {@code @SuppressWarnings("try")} silences it, or {@link #run} and {@link #call} are the compact form.
  */
 public final class Tempo {
 
-    /** Recording levels: coarse spans are always recorded, detail and deep spans only on opt-in. */
-    public static final int COARSE = 0, DETAIL = 1, DEEP = 2;
+    /**
+     * What a trace records ({@link Trace#records(int)}): spans always; steps and ticks drawn on request.
+     * Levels are a recorder concept and do not appear on the wire.
+     */
+    public static final int SPAN = 0, STEP = 1, TICK = 2;
 
     // Row flag bits (16-bit column).
     static final int PHASE = 1, RETRO = 1 << 1, HANDOFF = 1 << 2, WAIT = 1 << 3, FAILED = 1 << 4,
-            CANCELLED = 1 << 5, HEALED = 1 << 6, MISUSE = 1 << 7, DETAIL_ROW = 1 << 8, DEEP_ROW = 1 << 9,
+            CANCELLED = 1 << 5, HEALED = 1 << 6, MISUSE = 1 << 7, STEP_ROW = 1 << 8, TICK_ROW = 1 << 9,
             LEGACY = 1 << 10, TASK = 1 << 11, UNRUN = 1 << 12; // UNRUN: a task cancelled before it began
     static final int NEVER = 1 << 13; // in an aggregate's flags only: no handoff of it started
 
@@ -78,104 +90,194 @@ public final class Tempo {
 
     private Tempo() {}
 
-    /** Interns a name. Keep the result in a {@code static final}; {@code null} and {@code ""} map to {@code ?}. */
+    /**
+     * Interns a name. Keep the result in a {@code static final}: it is the fast path, with no lookup per
+     * span. {@code ""} is the name of an unnamed span, {@code null} maps to {@code ?}. Every method that
+     * takes a {@code Name} also takes a {@code String}, which it looks up in the same global table.
+     */
     public static Name name(String literal) {
         return Name.intern(literal, false);
     }
 
-    /** Starts a {@link #COARSE} trace whose root span is opened on the calling thread. */
-    public static Trace start(Name root) {
-        return start(root, null);
+    /** Starts a trace whose root span is opened on the calling thread; see {@link #trace(Name, Options)}. */
+    public static Trace trace(Name name) {
+        return trace(name, null);
+    }
+
+    /** Like {@link #trace(Name)}, the name looked up as for {@link #span(String)}. */
+    public static Trace trace(String name) {
+        return trace(name, null);
     }
 
     /**
-     * Starts a trace whose root span is opened on the calling thread. The clock is read first, before
-     * anything else (not even a class Tempo loads on first use): that reading is the trace's zero point and
-     * the root's start, so all of Tempo's setup is counted in the root's time.
+     * Starts a trace whose root span is opened on the calling thread; the {@code Trace} is that span. The
+     * clock is read first, before anything else (not even a class Tempo loads on first use): that reading
+     * is the trace's zero point and the root's start, so all of Tempo's setup is counted in the root's time.
+     *
+     * <p>Started on a thread that is inside a trace already (one not released), it joins that trace
+     * instead: it opens a span under the innermost one, and the returned {@code Trace} renders the subtree
+     * of that span. {@code options} are then ignored, and {@link Trace#total}, {@link Trace#on} and {@link
+     * Trace#records(int)} act on the whole trace; {@link Trace#release()} leaves the buffers to the outer
+     * trace. So a trace left open on a pool thread takes in every later trace there: close each one.
      */
-    public static Trace start(Name root, Options options) {
+    public static Trace trace(Name name, Options options) {
         long zero = options == null ? SYSTEM_CLOCK.getAsLong() : options.clock.getAsLong(); // DEFAULTS.clock is SYSTEM_CLOCK
-        return new Trace(root, options == null ? Options.DEFAULTS : options, zero);
+        return Trace.open(name, null, options, zero);
+    }
+
+    /** Like {@link #trace(Name, Options)}, the name looked up as for {@link #span(String)}. */
+    public static Trace trace(String name, Options options) {
+        long zero = options == null ? SYSTEM_CLOCK.getAsLong() : options.clock.getAsLong();
+        return Trace.open(null, name, options, zero);
     }
 
     /**
-     * The innermost open span of the calling thread, or {@link #NOOP}. An open phase is not a span of
-     * its own here: inside {@code s.phase(n)} this returns {@code s}, whose new children still nest
-     * under the phase. Costs one {@code ThreadLocal} lookup, so {@code Tempo.current().detail(n)} is
-     * not free even when detail is off.
+     * Opens a span under the calling thread's innermost open span; always timed and drawn. Outside a trace
+     * it is timed only for the name's global listeners ({@link #on}), else it is {@link #NOOP}. Costs one
+     * {@code ThreadLocal} read more than {@link Span#span(Name)}.
+     */
+    public static Span span(Name name) {
+        ThreadSlot slot = SLOT.get();
+        Lane l = slot.current;
+        return l != null ? l.openSpan(name, 0) : slot.free(name);
+    }
+
+    /**
+     * Like {@link #span(Name)}, the name looked up in a global table. A name new to the table is added; past
+     * 4,096 such names it maps to {@code <other>}, counted as misuse. Outside a trace it is only looked up.
+     */
+    public static Span span(String name) {
+        ThreadSlot slot = SLOT.get();
+        Lane l = slot.current;
+        return l != null ? l.openSpan(name) : slot.free(Name.find(name));
+    }
+
+    /** An unnamed span, labelled only by its phases: {@link #span(Name)} with the name {@code ""}. */
+    public static Span span() {
+        return span(Name.EMPTY);
+    }
+
+    /**
+     * Opens a step under the calling thread's innermost open span: always timed into the trace's totals
+     * and listeners, drawn when the trace records steps ({@link Trace#records(int)}), against its budget
+     * ({@link Options#budget}). Outside a trace like {@link #span(Name)}.
+     */
+    public static Span step(Name name) {
+        ThreadSlot slot = SLOT.get();
+        Lane l = slot.current;
+        return l != null ? l.openStep(name, 0) : slot.free(name);
+    }
+
+    /** Like {@link #step(Name)}, the name looked up as for {@link #span(String)}. */
+    public static Span step(String name) {
+        ThreadSlot slot = SLOT.get();
+        Lane l = slot.current;
+        return l != null ? l.openStep(name) : slot.free(Name.find(name));
+    }
+
+    /**
+     * Opens a tick under the calling thread's innermost open span: timed and drawn only when the trace
+     * records ticks, against its budget; otherwise {@link #NOOP}, which costs the {@code ThreadLocal} read
+     * and a branch. Never timed outside a trace.
+     */
+    public static Span tick(Name name) {
+        Lane l = SLOT.get().current;
+        return l != null ? l.openTick(name, 0) : NOOP;
+    }
+
+    /** Like {@link #tick(Name)}, the name looked up as for {@link #span(String)}. */
+    public static Span tick(String name) {
+        Lane l = SLOT.get().current;
+        return l != null ? l.openTick(name) : NOOP;
+    }
+
+    /**
+     * Runs {@code body} inside a {@link #span(Name)}; a throwable flags the span failed and is rethrown
+     * unwrapped. Outside a trace, with a global listener on the name, this times the body for it.
+     */
+    public static <E extends Exception> void run(Name name, ThrowingRunnable<E> body) throws E {
+        Span s = span(name);
+        try {
+            body.run();
+        } catch (Throwable t) {
+            s.fail();
+            throw t;
+        } finally {
+            s.close();
+        }
+    }
+
+    /** Like {@link #run(Name, ThrowingRunnable)}, the name looked up as for {@link #span(String)}. */
+    public static <E extends Exception> void run(String name, ThrowingRunnable<E> body) throws E {
+        Span s = span(name);
+        try {
+            body.run();
+        } catch (Throwable t) {
+            s.fail();
+            throw t;
+        } finally {
+            s.close();
+        }
+    }
+
+    /** Like {@link #run(Name, ThrowingRunnable)} for a body with a result. */
+    public static <T, E extends Exception> T call(Name name, ThrowingSupplier<T, E> body) throws E {
+        Span s = span(name);
+        try {
+            return body.get();
+        } catch (Throwable t) {
+            s.fail();
+            throw t;
+        } finally {
+            s.close();
+        }
+    }
+
+    /** Like {@link #call(Name, ThrowingSupplier)}, the name looked up as for {@link #span(String)}. */
+    public static <T, E extends Exception> T call(String name, ThrowingSupplier<T, E> body) throws E {
+        Span s = span(name);
+        try {
+            return body.get();
+        } catch (Throwable t) {
+            s.fail();
+            throw t;
+        } finally {
+            s.close();
+        }
+    }
+
+    /**
+     * The innermost open span of the calling thread, or {@link #NOOP}: the explicit way to annotate it,
+     * as in {@code Tempo.current().set("hits", n)}. An open phase is not a span of its own here: inside
+     * {@code s.phase(n)} this returns {@code s}. Costs one {@code ThreadLocal} read.
      */
     public static Span current() {
-        Lane l = SLOT.get().current;
-        if (l == null) return NOOP;
+        ThreadSlot slot = SLOT.get();
+        Lane l = slot.current;
+        if (l == null && ((l = slot.free) == null || l.depth == 0)) return NOOP;
         int d = l.depth - 1;
         while (d > 0 && l.isPhase(d)) d--;
         return d < 0 ? NOOP : l.handles[d];
     }
 
-    /** A listener that passes nanoseconds on to {@code sink} as seconds. */
-    public static LongConsumer seconds(DoubleConsumer sink) {
-        Objects.requireNonNull(sink, "sink");
-        return nanos -> sink.accept(nanos / 1e9);
-    }
-
     /**
-     * Wraps a listener that is not thread-safe: calls to the returned one are serialized by a lock of
-     * its own. Listeners run on the threads that end spans, concurrently, and are not locked otherwise.
+     * Adds a global listener, called with the duration in nanoseconds of every timed occurrence of
+     * {@code name}: spans, steps, recorded ticks, phases and {@link Span#add}, in every trace started from
+     * now on, and outside traces for spans and steps. Set listeners once at start-up. A listener runs on
+     * the thread that ends the occurrence, without a lock, so it must be thread-safe; a throwable it
+     * raises is counted as misuse in that trace.
      */
-    public static LongConsumer serialized(LongConsumer sink) {
-        Objects.requireNonNull(sink, "sink");
-        Object lock = new Object();
-        return nanos -> {
-            synchronized (lock) {
-                sink.accept(nanos);
-            }
-        };
+    public static void on(Name name, LongConsumer nanos) {
+        if (name != null) name.listen(nanos);
     }
 
-    /**
-     * Runs {@code body} and passes its wall time in nanoseconds to {@code sink}, also when it throws; the
-     * body's throwable is rethrown unwrapped. Needs no trace: two clock reads, nothing recorded. A
-     * throwing sink never reaches the caller: its throwable is added as suppressed to the body's, or
-     * dropped when the body completed.
-     */
-    public static <T, E extends Exception> T time(LongConsumer sink, ThrowingSupplier<T, E> body) throws E {
-        long start = SYSTEM_CLOCK.getAsLong();
-        Throwable failed = null;
-        try {
-            return body.get();
-        } catch (Throwable t) {
-            failed = t;
-            throw t;
-        } finally {
-            report(sink, start, failed);
-        }
-    }
-
-    /** Like {@link #time(LongConsumer, ThrowingSupplier)} for a body without a result. */
-    public static <E extends Exception> void time(LongConsumer sink, ThrowingRunnable<E> body) throws E {
-        long start = SYSTEM_CLOCK.getAsLong();
-        Throwable failed = null;
-        try {
-            body.run();
-        } catch (Throwable t) {
-            failed = t;
-            throw t;
-        } finally {
-            report(sink, start, failed);
-        }
-    }
-
-    private static void report(LongConsumer sink, long start, Throwable failed) {
-        if (sink == null) return;
-        try {
-            sink.accept(SYSTEM_CLOCK.getAsLong() - start);
-        } catch (Throwable t) {
-            if (failed != null && failed != t) failed.addSuppressed(t);
-        }
+    /** Like {@link #on(Name, LongConsumer)}; the name is added to the global table if new. */
+    public static void on(String name, LongConsumer nanos) {
+        if (name != null) Name.intern(name, false).listen(nanos);
     }
 
     static int clampLevel(int level) {
-        return Math.max(COARSE, Math.min(DEEP, level));
+        return Math.max(SPAN, Math.min(TICK, level));
     }
 
     /**
@@ -203,19 +305,22 @@ public final class Tempo {
 
     // ---------------------------------------------------------------------------------------------
 
-    /** An interned span or attribute name. Names are constants; dynamic data belongs in attributes. */
+    /**
+     * An interned span or attribute name. Names are constants; dynamic data belongs in attributes. A name
+     * carries no settings; its global listeners are added with {@link Tempo#on}.
+     */
     public static final class Name {
         static final int DYNAMIC_CAP = 4096;
+        static int dynamicCap = DYNAMIC_CAP; // guarded by TABLE; lowered by tests only
         private static final ConcurrentHashMap<String, Name> TABLE = new ConcurrentHashMap<>();
         private static volatile Name[] byId = new Name[256];
         private static int size, dynamicSize; // guarded by TABLE
-        static volatile boolean anySink;    // some name has a sink; read once per trace
+        static volatile boolean anySink;    // some name has a listener; read once per trace
         private static final LongConsumer[] NO_SINKS = {};
-        static final Name UNKNOWN = intern("?", false), OTHER = intern("<other>", false);
+        static final Name UNKNOWN = intern("?", false), OTHER = intern("<other>", false), EMPTY = create("");
 
         public final int id;
         final String text;
-        boolean marked; // always-on; set at class init in practice, so a plain read on the detail path
         volatile LongConsumer[] sinks = NO_SINKS; // replaced whole on add, so a racy read sees it whole
 
         private Name(int id, String text) {
@@ -223,53 +328,73 @@ public final class Tempo {
             this.text = text;
         }
 
-        /**
-         * Adds a global listener, called with the duration in nanoseconds each time a span of this name
-         * ends, in every trace started from now on, and for {@link Trace#add}. It runs on the thread that
-         * ends the span, without a lock, so it must be thread-safe (see {@link Tempo#serialized}); a
-         * throwable it raises is counted as misuse. Marks the name always-on like {@link #aggregate()}.
-         */
-        public Name sink(LongConsumer nanos) {
-            if (nanos == null) return this;
+        void listen(LongConsumer nanos) {
+            if (nanos == null) return;
             synchronized (this) {
                 LongConsumer[] s = Arrays.copyOf(sinks, sinks.length + 1);
                 s[s.length - 1] = nanos;
                 sinks = s;
             }
-            marked = true;
             anySink = true;
-            return this;
+        }
+
+        /** Whether the name has a global listener. */
+        boolean listened() {
+            return sinks.length != 0;
         }
 
         /**
-         * Marks the name always-on: below the trace's level {@link Span#detail} and {@link Span#deep}
-         * return an aggregate-only span instead of {@link Tempo#NOOP}. It writes no row, costs two clock
-         * reads, adds its duration to its lane's aggregate and so to {@link Trace#aggregate(Name)}, and
-         * calls the listeners.
+         * Dynamic names (the {@code String} overloads) stop growing the table at the cap and map to {@code
+         * <other>}. {@code null} maps to {@code ?}, {@code ""} to the name of unnamed spans.
          */
-        public Name aggregate() {
-            marked = true;
-            return this;
-        }
-
-        /** Dynamic names (the {@code String} overloads) stop growing the table at the cap and map to {@code <other>}. */
         static Name intern(String text, boolean dynamic) {
-            if (text == null || text.isEmpty()) return UNKNOWN;
+            if (text == null) return UNKNOWN;
             Name n = TABLE.get(text);
             if (n != null) return n;
             synchronized (TABLE) {
                 n = TABLE.get(text);
                 if (n != null) return n;
-                if (dynamic && dynamicSize == DYNAMIC_CAP) return OTHER;
+                if (dynamic && dynamicSize >= dynamicCap) return OTHER;
                 if (dynamic) dynamicSize++;
+                return create(text);
+            }
+        }
+
+        private static Name create(String text) {
+            synchronized (TABLE) {
                 Name[] t = byId;
                 if (size == t.length) t = Arrays.copyOf(t, size * 2);
-                t[size] = n = new Name(size, text);
+                Name n = t[size] = new Name(size, text);
                 size++;
                 byId = t;
                 TABLE.put(text, n);
                 return n;
             }
+        }
+
+        /** The name if it is in the table, without adding it; null otherwise and for {@code null}. */
+        static Name find(String text) {
+            return text == null ? null : TABLE.get(text);
+        }
+
+        /** Lets {@code more} new dynamic names in from now on; returns the cap to restore. Tests only. */
+        static int capDynamic(int more) {
+            synchronized (TABLE) {
+                int old = dynamicCap;
+                dynamicCap = Math.min(old, dynamicSize + more);
+                return old;
+            }
+        }
+
+        static void restoreCap(int cap) {
+            synchronized (TABLE) {
+                dynamicCap = cap;
+            }
+        }
+
+        /** Whether {@code n}, interned from {@code text} by a {@code String} overload, stands for another name. */
+        static boolean overflowed(Name n, String text) {
+            return n == OTHER && !OTHER.text.equals(text);
         }
 
         static Name byId(int id) {
@@ -282,41 +407,36 @@ public final class Tempo {
         }
     }
 
-    /** Settings for one trace; read once at {@link Tempo#start(Name, Options)}. */
+    /** Settings for one trace; read once at {@link Tempo#trace(Name, Options)}. */
     public static final class Options {
         static final Options DEFAULTS = new Options(); // never handed out, so never mutated
 
-        int level = COARSE, budget = 512, headerBytes = 3000, lanes = 256, cpu = CPU_AUTO;
+        int budget = 512, headerBytes = 3000, lanes = 256, cpu = CPU_AUTO;
         boolean strict;
         LongSupplier clock = SYSTEM_CLOCK, cpuClock; // cpuClock: tests only; null reads the thread's CPU time
         LongSupplier wallClock = System::currentTimeMillis; // tests only
         String linkBase; // null: Link.base()
 
-        /** {@link #COARSE} (default), {@link #DETAIL} or {@link #DEEP}; out-of-range values are clamped. */
-        public Options level(int level) {
-            this.level = clampLevel(level);
-            return this;
-        }
-
         /**
-         * {@link #DETAIL} and {@link #DEEP} spans and handoffs recorded individually per trace, default 512;
+         * Steps and ticks drawn and handoffs recorded individually per trace, default 512;
          * past it they fold into aggregates ({@link SpanView#aggregate()}), handoffs with their queue waits.
          * Lanes take the budget in blocks of {@code max(1, budget / 64)} and give back what they did not use
          * when their task ends.
          */
-        public Options budget(int detailSpans) {
-            this.budget = Math.max(0, detailSpans);
+        public Options budget(int spans) {
+            this.budget = Math.max(0, spans);
             return this;
         }
 
         /**
          * Thread CPU time of each lane root (the trace's root and every task begun on another thread) and
          * of the spans that ask with {@link Span#cpu()}; see {@link SpanView#cpuNanos()}. By default it
-         * is measured whenever the level is {@link #DETAIL} or above when the span opens, never at
-         * {@link #COARSE}. {@code true} measures at every level, {@code false} never. The first read in a
-         * JVM sets the clock up (it loads the management bean: milliseconds); a trace that measures CPU pays
-         * it on the thread that starts it, or raises it to measuring ({@link Trace#raise}), in the root's
-         * time, so no task's queue wait or run time ever includes it. A task reads the clock as soon as it
+         * is measured whenever the trace records steps ({@link Trace#records(int)}) when the span opens, never
+         * while it records spans only; the root's then only with {@code true}. {@code true} measures at every
+         * level, {@code false} never. The first read in a JVM sets the clock up (it loads the management bean:
+         * milliseconds); a trace that measures CPU pays it on the thread that starts it, or widens it to
+         * measuring ({@link Trace#records(int)}), in the root's time, so no task's queue wait or run time ever
+         * includes it. A task reads the clock as soon as it
          * wins its handoff, before it sets up its thread's lane or reads its CPU time: both are run time,
          * not queue wait.
          */
@@ -374,7 +494,7 @@ public final class Tempo {
          * only for a task that begins while that lane is open under another trace's task. A pool
          * of platform threads stays far below the cap; with a thread per task (virtual threads) the tasks
          * begun past it are not recorded. Such a task's handoff is left out of the tree, its queue wait
-         * is added to {@link Trace#aggregate(Name)} of the handoff's name, and it counts as dropped.
+         * is added to {@link Trace#total(Name)} of the handoff's name, and it counts as dropped.
          */
         public Options lanes(int max) {
             this.lanes = Math.max(1, max);
@@ -408,7 +528,9 @@ public final class Tempo {
             }
         }
 
-        static final Context NONE = new Context();
+        static final Context NONE = new Context(-1, false); // below SPAN, so NOOP.tick() returns at the level check
+        /** Of the spans timed outside a trace for global listeners: records nothing, never released. */
+        static final Context FREE = new Context(SPAN, true);
 
         final long id, epoch, wall; // wall: epoch milliseconds at the start
         final LongSupplier clock, cpuClock;
@@ -417,21 +539,21 @@ public final class Tempo {
         final String linkBase; // null: Link.base()
         final AtomicInteger misuses = new AtomicInteger();
         volatile int level;
-        volatile boolean detailSeen, released;
-        boolean raised; // guarded by this
-        // Written by the starting thread before the first child span; other threads read them after a
-        // handoff, which orders the reads. Listeners is immutable, so even a racy read sees it whole.
-        boolean listening; // a global sink existed at start, or a per-trace listener was added
+        volatile boolean seen, released; // seen: a step or tick was opened, so records(level) is too late
+        boolean widened; // guarded by this
+        // Written under this lock; a thread sees a listener added elsewhere once it synchronizes with that
+        // thread, e.g. through a handoff submitted after it. Listeners is immutable, so even a racy read
+        // sees it whole.
+        boolean listening; // a global listener existed at start, or a per-trace listener was added
         Listeners on;
-        Consumer<String> printer; // printOnClose; written and read by the starting thread
         private volatile Lane lanes;    // CAS-linked registry, newest first
         private volatile Totals totals; // created with the first lane-less record
         private volatile int dropped;   // tasks left unrecorded at the lane cap
-        private volatile int credits;   // detail budget not handed out to a lane
+        private volatile int credits;   // step and tick budget not handed out to a lane
         private long[] lost;            // guarded by this: (laneId << 32 | row, submit) of handoffs whose task has no record
         private int lostCount;
 
-        private Context() {
+        private Context(int level, boolean listening) {
             id = -1;
             epoch = wall = 0;
             clock = SYSTEM_CLOCK;
@@ -440,11 +562,12 @@ public final class Tempo {
             budget = block = headerBytes = maxLanes = 0;
             linkBase = null;
             cpu = CPU_OFF;
-            level = -1; // below COARSE, so NOOP.detail() returns at the level check
+            this.level = level;
+            this.listening = listening;
         }
 
         /**
-         * {@code zero}: the clock read as {@link Tempo#start} was entered, the trace's zero point and the
+         * {@code zero}: the clock read as {@link Tempo#trace} was entered, the trace's zero point and the
          * root's start, so the setup that follows (the classes Tempo loads on first use, the lane, the first
          * CPU read of a JVM) is counted in the root's time, not hidden.
          */
@@ -465,7 +588,7 @@ public final class Tempo {
             headerBytes = o.headerBytes;
             linkBase = o.linkBase;
             maxLanes = o.lanes;
-            level = o.level;
+            level = SPAN;
             listening = Name.anySink;
         }
 
@@ -475,7 +598,7 @@ public final class Tempo {
 
         /** Whether a span opening now has its CPU time measured. */
         boolean cpu() {
-            return cpu == CPU_ON || cpu == CPU_AUTO && level >= DETAIL;
+            return cpu == CPU_ON || cpu == CPU_AUTO && level >= STEP;
         }
 
         long cpuNow() {
@@ -487,14 +610,24 @@ public final class Tempo {
             if (strict) throw new AssertionError("Tempo misuse: " + what);
         }
 
-        boolean listens(int nameId) {
-            Listeners l = on;
-            if (l != null) for (int id : l.ids) if (id == nameId) return true;
-            return false;
+        /** Marks that a step or tick was opened: from now on the trace's level is fixed. */
+        void sawStep() {
+            if (!seen) seen = true;
         }
 
         /**
-         * Calls the global sinks and this trace's listeners of {@code n}, each on its own: a throwable is
+         * The name of a {@code String} parameter: interned in the global table; past its cap {@code <other>},
+         * counted as misuse. {@code null} stays null, for the caller to count.
+         */
+        Name name(String text) {
+            if (text == null) return null;
+            Name n = Name.intern(text, true);
+            if (Name.overflowed(n, text)) misuse("name table full: " + Name.DYNAMIC_CAP + " names from strings");
+            return n;
+        }
+
+        /**
+         * Calls the global listeners and this trace's listeners of {@code n}, each on its own: a throwable is
          * caught and counted as misuse, so the others still run and the recording stays consistent; the
          * first one is returned for strict mode.
          */
@@ -588,12 +721,12 @@ public final class Tempo {
         }
 
         /**
-         * {@link Snapshot#aggregate} read in place: the same rows, task waits and lane aggregates, summed
+         * {@link Snapshot#total} read in place: the same rows, task waits and lane aggregates, summed
          * without a copy. A read racing {@link #release()} may see recycled chunks; like a Snapshot's, it
          * is thrown away, also when what it read made it fail.
          */
-        Aggregate aggregate(int id) {
-            if (released) return Aggregate.EMPTY;
+        Total total(int id) {
+            if (released) return Total.EMPTY;
             long count = 0, sum = 0, min = Long.MAX_VALUE, max = 0, waits = 0, waitSum = 0, waitMax = 0;
             try {
                 for (Lane l = lanes; l != null; l = l.next) {
@@ -627,13 +760,13 @@ public final class Tempo {
                         // as in Shape: not ended yet, or moved under a lap row past the rows read
                         if (a.keys[k + Aggs.NAME] != id || a.cells[b + Aggs.COUNT] == 0 || kind == Aggs.TASKS
                                 || kind == Aggs.SPANS && a.keys[k] >= rows) continue;
-                        if (kind != Aggs.UNRUN) { // a folded task that ran, or a span
+                        if (kind != Aggs.UNRUN) { // a folded task that ran, a folded or undrawn span
                             count += a.cells[b + Aggs.COUNT];
                             sum += a.cells[b + Aggs.SUM];
                             min = Math.min(min, a.cells[b + Aggs.MIN]);
                             max = Math.max(max, a.cells[b + Aggs.MAX_DUR]);
                         }
-                        if (kind != Aggs.SPANS) { // folded tasks, run or cancelled, waited
+                        if (kind == Aggs.RAN || kind == Aggs.UNRUN) { // folded tasks, run or cancelled, waited
                             waits += a.cells[b + Aggs.COUNT];
                             waitSum += a.cells[b + Aggs.WAIT_SUM];
                             waitMax = Math.max(waitMax, a.cells[b + Aggs.WAIT_MAX]);
@@ -642,14 +775,14 @@ public final class Tempo {
                 }
             } catch (RuntimeException e) {
                 VarHandle.acquireFence();
-                if (released) return Aggregate.EMPTY;
+                if (released) return Total.EMPTY;
                 throw e;
             }
             VarHandle.acquireFence();
-            return released ? Aggregate.EMPTY : Totals.merge(totals, id, count, sum, min, max, waits, waitSum, waitMax);
+            return released ? Total.EMPTY : Totals.merge(totals, id, count, sum, min, max, waits, waitSum, waitMax);
         }
 
-        /** Hands a lane up to one block of the detail budget; 0 when it is spent. */
+        /** Hands a lane up to one block of the step and tick budget; 0 when it is spent. */
         int credits() {
             int c, n;
             do {
@@ -682,7 +815,7 @@ public final class Tempo {
         /**
          * A handoff whose task gets no record: at the lane cap ({@code count}), or at a lane's row, depth,
          * event or aggregate cap (counted there). Its row is left out of the tree, a folded one out of its
-         * aggregate, and its queue wait goes to the trace's aggregate of its name.
+         * aggregate, and its queue wait goes to the trace's total of its name.
          */
         void lost(Handoff h, boolean count) {
             if (count) DROPPED.getAndAdd(this, 1);
@@ -718,7 +851,7 @@ public final class Tempo {
     }
 
     /**
-     * Lane-less aggregates of one trace, keyed by name: thread-safe, lock-free, allocation-free once a
+     * Lane-less totals of one trace, keyed by name: thread-safe, lock-free, allocation-free once a
      * name has a slot. Open addressing whose slots are claimed once and never move; a full table chains
      * a larger one, so a name lives in exactly one table of the chain.
      */
@@ -784,7 +917,7 @@ public final class Tempo {
          * The lane sums of {@code id} (min {@link Long#MAX_VALUE} when count is 0) plus its lane-less
          * entry in {@code totals}, which may be null; one allocation.
          */
-        static Aggregate merge(Totals totals, int id, long count, long sum, long min, long max,
+        static Total merge(Totals totals, int id, long count, long sum, long min, long max,
                 long waits, long waitSum, long waitMax) {
             for (Totals t = totals; t != null; t = t.next) {
                 int s = t.slot(id, false);
@@ -801,7 +934,7 @@ public final class Tempo {
                 waitMax = Math.max(waitMax, cell(c, b + WAIT_MAX));
                 break;
             }
-            return new Aggregate(count, sum, count == 0 ? 0 : min, max, waits, waitSum, waitMax);
+            return new Total(count, sum, count == 0 ? 0 : min, max, waitSum, waitMax);
         }
 
         /** The slot of {@code id}, claiming a free one if {@code claim}; -1 if absent (and, claiming, the table is full). */
@@ -837,10 +970,22 @@ public final class Tempo {
      */
     static final class ThreadSlot {
         Lane current;
+        Lane free; // the spans timed outside a trace for global listeners; created on first use
         StringBuilder text; // the header encoder's, reused while it stays small (Header.KEEP)
         @SuppressWarnings("unchecked")
         final WeakReference<Lane>[] lanes = new WeakReference[4];
         private int victim;
+
+        /**
+         * A span or step of {@code n} opened outside a trace: timed for the name's global listeners if it has
+         * any, on this thread's free lane, which records nothing; else {@link #NOOP}.
+         */
+        Span free(Name n) {
+            if (n == null || !n.listened()) return NOOP;
+            Lane l = free;
+            if (l == null) free = l = new Lane(Context.FREE, this);
+            return l.freeFrame(n);
+        }
 
         /** An idle lane of this thread for the trace: cached, found in the registry, or new; null at the lane cap. */
         Lane lane(Context ctx) {
@@ -987,6 +1132,7 @@ public final class Tempo {
         final Context ctx;
         final Thread owner;
         final ThreadSlot slot;
+        final boolean free; // a thread's free lane: frames for global listeners only, never registered
         int id;
         Lane next; // trace registry link, set before the lane is published
 
@@ -995,16 +1141,16 @@ public final class Tempo {
         final Rows[] rows = new Rows[CHUNKS];
         Events[] events;
 
-        // Open stack: rowAt[d] is the open row at depth d < depth; handles[d] is the reusable handle for depth d.
-        // An aggregate-only span is a frame without a row: its handle's row is FRAME and rowAt holds the
+        // Open stack: rowAt[d] is the open row at depth d < depth; handles[d] is the reusable handle for depth d,
+        // or while a nested trace is open there (and until the next span opens there) that Trace.
+        // A folded or undrawn span is a frame without a row: its handle's row is FRAME and rowAt holds the
         // row of the nearest recorded span below it, which is the parent of anything opened above it.
         final int[] rowAt = new int[MAX_DEPTH];
         final Span[] handles = new Span[MAX_DEPTH];
         int depth, rowCount, eventCount, dropped;
-        boolean framed; // a frame was ever opened: the trace's listeners are frozen
-        int credit, folded; // detail budget held by this lane; detail spans folded for want of it
+        int credit, folded; // step and tick budget held by this lane; those folded for want of it
 
-        // Folded and aggregate-only spans; replaced by a grown copy via AGGS.setRelease, like labels.
+        // Folded and undrawn spans; replaced by a grown copy via AGGS.setRelease, like labels.
         private Aggs aggs;
 
         // The folded handoffs submitted here whose task may not have begun, newest first and linked by
@@ -1044,6 +1190,8 @@ public final class Tempo {
             this.ctx = ctx;
             this.owner = Thread.currentThread();
             this.slot = slot;
+            free = ctx == Context.FREE;
+            if (free) id = -1;
         }
 
         boolean retired() {
@@ -1196,7 +1344,7 @@ public final class Tempo {
                 if (root) idle();
                 return NOOP;
             }
-            Span s = openFrame(Name.byId(id), e, wait, now);
+            Span s = openFrame(Name.byId(id), e, wait, now, null);
             s.folded = true;
             if (root) {
                 saved = slot.current;
@@ -1217,8 +1365,13 @@ public final class Tempo {
          * lane's included, is the root's own time.
          */
         Span openRoot(Name n, int flags, long cpu) {
+            return openRoot(null, n, flags, cpu);
+        }
+
+        /** {@link #openRoot(Name, int, long)} with {@code t} as the root's handle; null for a plain one. */
+        Span openRoot(Trace t, Name n, int flags, long cpu) {
             if (!activate()) return NOOP;
-            Span h = stack(n, flags);
+            Span h = stack(n, flags, t);
             if (h == NOOP) {
                 idle();
                 return NOOP;
@@ -1231,7 +1384,119 @@ public final class Tempo {
             return h;
         }
 
-        /** A child span; inside a folded task, which has no row to hang it from, aggregate-only. */
+        // ---- opening at the top of the stack (owner thread; the free lane times for listeners only) ----
+
+        /** A span; {@code null} is misuse, recorded as {@code ?}. */
+        Span openSpan(Name n, int flags) {
+            if (free) return n != null && n.listened() ? freeFrame(n) : NOOP;
+            if (n == null) {
+                ctx.misuse("null name");
+                return push(Name.UNKNOWN, flags | MISUSE);
+            }
+            return push(n, flags);
+        }
+
+        Span openSpan(String text) {
+            if (free) return openSpan(Name.find(text), 0);
+            Name n = ctx.name(text);
+            return openSpan(n, Name.overflowed(n, text) ? MISUSE : 0);
+        }
+
+        /** A step: drawn when the trace records steps, against the budget; else an undrawn frame. */
+        Span openStep(Name n, int flags) {
+            if (free) return n != null && n.listened() ? freeFrame(n) : NOOP;
+            ctx.sawStep();
+            if (n == null) {
+                ctx.misuse("null name");
+                n = Name.UNKNOWN;
+                flags |= MISUSE;
+            }
+            return ctx.level < STEP ? undrawn(n) : budgeted(n, flags | STEP_ROW);
+        }
+
+        Span openStep(String text) {
+            if (free) return openStep(Name.find(text), 0);
+            Name n = ctx.name(text);
+            return openStep(n, Name.overflowed(n, text) ? MISUSE : 0);
+        }
+
+        /** A tick: drawn when the trace records ticks, against the budget; else {@link #NOOP}. */
+        Span openTick(Name n, int flags) {
+            if (ctx.level < TICK) {
+                if (!free) ctx.sawStep();
+                return NOOP;
+            }
+            ctx.sawStep();
+            if (n == null) {
+                ctx.misuse("null name");
+                n = Name.UNKNOWN;
+                flags |= MISUSE;
+            }
+            return budgeted(n, flags | TICK_ROW);
+        }
+
+        Span openTick(String text) {
+            if (ctx.level < TICK) return openTick((Name) null, 0);
+            Name n = ctx.name(text);
+            return openTick(n, Name.overflowed(n, text) ? MISUSE : 0);
+        }
+
+        /**
+         * A nested trace: a span at the top of this lane, with {@code t} as its handle, which renders its
+         * subtree; in a folded task, which has no row to hang it from, a frame. Null at a cap.
+         */
+        Span nest(Trace t, Name n, int flags) {
+            if (rowAt[depth - 1] < 0) {
+                if (depth == MAX_DEPTH) {
+                    dropped++;
+                    return null;
+                }
+                Span h = openFrame(n, entry(n, Aggs.SPANS), 0, 0, t);
+                h.time = ctx.now();
+                return h;
+            }
+            Span h = stack(n, flags, t);
+            if (h == NOOP) return null;
+            start(h);
+            return h;
+        }
+
+        /** Closes everything above depth {@code d}, healed, so a span can open on top of {@code d}: misuse. */
+        void healAbove(int d) {
+            long now = ctx.now();
+            int top = depth;
+            boolean healed = unwind(d, now);
+            publish();
+            if (ctx.listening) fire(d + 1, top);
+            if (thrown != null) rethrow();
+            if (healed) ctx.misuse("span opened under a span that is not the innermost");
+        }
+
+        /** A frame of the free lane: no row and no aggregate, timed for its name's global listeners. */
+        Span freeFrame(Name n) {
+            if (depth == MAX_DEPTH) return NOOP;
+            Span h = openFrame(n, -1, 0, 0, null);
+            h.time = ctx.now(); // read last: the bookkeeping is not timed
+            return h;
+        }
+
+        /**
+         * A step the trace does not draw: a frame timed into the lane's undrawn entry of its name, which
+         * {@link Trace#total} reads and no render shows. Spans opened inside it are recorded under its
+         * nearest recorded ancestor.
+         */
+        private Span undrawn(Name n) {
+            if (depth == MAX_DEPTH) {
+                dropped++;
+                return NOOP;
+            }
+            Span h = openFrame(n, aggregate(-1, 0, -1, n.id, Aggs.HIDDEN), 0, 0, null);
+            h.hidden = true;
+            h.time = ctx.now(); // read last: the bookkeeping is not timed
+            return h;
+        }
+
+        /** A child span; inside a folded task, which has no row to hang it from, folded. */
         Span push(Name n, int flags) {
             if (rowAt[depth - 1] < 0) return frame(n);
             Span h = stack(n, flags);
@@ -1240,8 +1505,8 @@ public final class Tempo {
         }
 
         /**
-         * A {@link #DETAIL} or {@link #DEEP} span: a row while the lane holds budget, refilled a block at
-         * a time from the trace; once the trace's budget is spent, folded into the lane's aggregates.
+         * A drawn step or tick: a row while the lane holds budget, refilled a block at a time from the
+         * trace; once the trace's budget is spent, folded into the lane's aggregates.
          */
         Span budgeted(Name n, int flags) {
             if (rowAt[depth - 1] < 0) return frame(n);
@@ -1264,32 +1529,33 @@ public final class Tempo {
         }
 
         /**
-         * Opens an aggregate-only span above the open one: no row, its start kept in the handle; it ends
+         * Opens a folded span above the open one: no row, its start kept in the handle; it ends
          * into the aggregate keyed by its anchor (the nearest recorded span), the anchor's lap, its parent
-         * (-1 when that is the anchor, else the name of the enclosing aggregate-only span) and its name.
+         * (-1 when that is the anchor, else the name of the enclosing folded span) and its name.
          */
         Span frame(Name n) {
             if (depth == MAX_DEPTH) {
                 dropped++;
                 return NOOP;
             }
-            Span h = openFrame(n, entry(n, Aggs.SPANS), 0, 0);
+            Span h = openFrame(n, entry(n, Aggs.SPANS), 0, 0, null);
             h.time = ctx.now(); // read last: the bookkeeping is not timed
             return h;
         }
 
-        /** Pushes frame {@code n} into aggregate {@code agg}; it started at {@code now}, after a queue wait of {@code wait}. */
-        private Span openFrame(Name n, int agg, long wait, long now) {
+        /**
+         * Pushes frame {@code n} into aggregate {@code agg} (-1: none) with handle {@code t}, or the depth's
+         * own if null; it started at {@code now}, after a queue wait of {@code wait}.
+         */
+        private Span openFrame(Name n, int agg, long wait, long now, Trace t) {
             int d = depth;
             rowAt[d] = d == 0 ? -1 : rowAt[d - 1]; // -1: a folded task's root, no row below
             depth = d + 1;
-            framed = true;
-            Span h = handles[d];
-            if (h == null) handles[d] = h = new Span(this, ctx, d);
+            Span h = handle(d, t);
             h.row = FRAME;
             h.frame = n;
             h.agg = agg;
-            h.folded = false;
+            h.folded = h.hidden = false;
             h.flags = 0;
             h.wait = wait;
             h.time = now;
@@ -1298,12 +1564,15 @@ public final class Tempo {
 
         /**
          * The aggregate entry for {@code n} folded on top of the stack: anchored at the nearest recorded span
-         * (-1 in a folded task without one) and its lap, parented by the enclosing aggregate-only span, if any.
+         * (-1 in a folded task without one) and its lap, parented by the enclosing folded span, if any (an
+         * undrawn step is passed over, as it is not drawn).
          */
         private int entry(Name n, int kind) {
             int d = depth, a = d - 1;
             while (a >= 0 && handles[a].row == FRAME) a--;
-            return aggregate(rowAt[d - 1], a < 0 ? 0 : lapOrdinal(a), a == d - 1 ? -1 : handles[d - 1].frame.id, n.id, kind);
+            int p = d - 1;
+            while (p > a && handles[p].hidden) p--;
+            return aggregate(rowAt[d - 1], a < 0 ? 0 : lapOrdinal(a), p == a ? -1 : handles[p].frame.id, n.id, kind);
         }
 
         /** The entry of an aggregate key, created if new; -1 past {@link Aggs#MAX} entries (counted as a drop). */
@@ -1351,7 +1620,7 @@ public final class Tempo {
         }
 
         /** Measures the CPU time of the span at depth {@code d} from {@code t}, a reading of it; -1 is none. */
-        private void startCpu(int d, long t) {
+        void startCpu(int d, long t) {
             if (t < 0) return;
             if (cpuAt == null) cpuAt = new long[MAX_DEPTH];
             cpuAt[d] = t;
@@ -1360,6 +1629,11 @@ public final class Tempo {
 
         /** Opens a row on top of the stack and hands out the depth's handle; the caller sets the start and publishes. */
         private Span stack(Name n, int flags) {
+            return stack(n, flags, null);
+        }
+
+        /** {@link #stack(Name, int)} with {@code t} as the handle; null for the depth's own. */
+        private Span stack(Name n, int flags, Trace t) {
             int d = depth;
             if (d == MAX_DEPTH) {
                 dropped++;
@@ -1375,9 +1649,24 @@ public final class Tempo {
                 lapOrdinal[d] = 0;
                 lapFrom[d] = aggregates();
             }
-            Span h = handles[d];
-            if (h == null) handles[d] = h = new Span(this, ctx, d);
+            Span h = handle(d, t);
             h.row = r;
+            return h;
+        }
+
+        /**
+         * The handle for a span opening at depth {@code d}: {@code t}, a nested trace, which takes the depth's
+         * place until the next span opens there; else the depth's own, given back by a nested trace.
+         */
+        private Span handle(int d, Trace t) {
+            Span h = handles[d];
+            if (t != null) {
+                t.displaced = h instanceof Trace ? ((Trace) h).displaced : h;
+                handles[d] = t;
+                return t;
+            }
+            if (h instanceof Trace) h = handles[d] = ((Trace) h).displaced;
+            if (h == null) handles[d] = h = new Span(this, ctx, d);
             return h;
         }
 
@@ -1414,11 +1703,12 @@ public final class Tempo {
             depth = d;
             publish();
             if (ctx.listening) fire(d, top); // before exitRoot, which may return the rows to the pool
-            if (d == 0 && id == 0 && ctx.printer != null) {
-                Throwable t = print(ctx.printer);
+            Span h = handles[d];
+            if (h instanceof Trace && ((Trace) h).printer != null && h.row != FRAME) {
+                Throwable t = print(((Trace) h).printer, h.row);
                 if (t != null && ctx.strict && thrown == null) thrown = t;
             }
-            if (d == 0) exitRoot();
+            if (d == 0 && !free) exitRoot();
             if (thrown != null) rethrow();
             if (healed) ctx.misuse("span closed while a child span was open");
         }
@@ -1473,10 +1763,10 @@ public final class Tempo {
             if (t != null && ctx.strict && thrown == null) thrown = t;
         }
 
-        /** Passes the {@code Runtime} text of this, the root lane, to {@code out}; returns what it threw, counted as misuse. */
-        Throwable print(Consumer<String> out) {
+        /** Passes the {@code Runtime} text of the trace at {@code row} to {@code out}; returns what it threw, counted as misuse. */
+        Throwable print(Consumer<String> out, int row) {
             try {
-                out.accept(tops(handles[0].row).runtime(-1));
+                out.accept(tops(row).runtime(-1));
                 return null;
             } catch (Throwable t) {
                 ctx.misuses.incrementAndGet();
@@ -1739,7 +2029,7 @@ public final class Tempo {
 
         /**
          * The legacy phases under row {@code root} and its wall time, read in place with one {@code now}
-         * for whatever is open; empty once released. Safe from any thread. Legacy rows are phases, which
+         * for whatever is open, their starts from the root's; empty once released. Safe from any thread. Legacy rows are phases, which
          * a RETRO lap never adopts, so row order is their order in the stitched tree.
          */
         Tops tops(int root) {
@@ -1747,7 +2037,7 @@ public final class Tempo {
             try {
                 long c = committed();
                 int n = (int) (c >>> 32), nEvents = (int) c;
-                long now = ctx.now();
+                long now = ctx.now(), base = 0; // the root's start: 0 for a trace's, a nested trace's own
                 Tops t = new Tops();
                 for (int r = root; r < n; r++) {
                     Rows k = rows[r >>> CHUNK_BITS];
@@ -1755,8 +2045,12 @@ public final class Tempo {
                     if (r != root && (k.parent[i] != root || (k.flags[i] & LEGACY) == 0)) continue;
                     long d = (long) DUR.getOpaque(k.dur, i), s = k.start[i];
                     d = d != OPEN ? d : Math.max(0, now - s);
-                    if (r == root) t.total = d;
-                    else t.add(r, k.name[i], null, s, d);
+                    if (r == root) {
+                        t.total = d;
+                        base = s;
+                    } else {
+                        t.add(r, k.name[i], null, s - base, d);
+                    }
                 }
                 String[] text = t.n == 0 ? null : (String[]) LABELS.getAcquire(this);
                 for (int e = 0; text != null && e < nEvents; e++) {
@@ -1776,8 +2070,9 @@ public final class Tempo {
 
     /**
      * The aggregates of one lane, keyed by (anchor row, lap ordinal, parent, name, kind) where the parent is
-     * -1 for the anchor itself or the name of an enclosing aggregate-only span. {@code SPANS} hold folded
-     * and aggregate-only spans. A handoff past the budget is a {@code TASKS} entry where it was submitted,
+     * -1 for the anchor itself or the name of an enclosing folded span. {@code SPANS} hold folded spans,
+     * {@code HIDDEN} the undrawn steps of a name, which only the totals read (anchor -1, lap 0, parent -1).
+     * A handoff past the budget is a {@code TASKS} entry where it was submitted,
      * which counts the submits; its tasks are occurrences in the lane that runs ({@code RAN}) or cancels
      * ({@code UNRUN}) them, in an entry keyed by the {@code TASKS} entry instead: ANCHOR is its index, LAP
      * its lane. So every entry has one writer, the owner, and a render merges the occurrences into their
@@ -1786,10 +2081,10 @@ public final class Tempo {
      */
     static final class Aggs {
         static final int MAX = 4096, KEY = 5, ANCHOR = 0, LAP = 1, PARENT = 2, NAME = 3, KIND = 4;
-        static final int SPANS = 0, TASKS = 1, RAN = 2, UNRUN = 3;
+        static final int SPANS = 0, TASKS = 1, RAN = 2, UNRUN = 3, HIDDEN = 4;
         // Over the ended occurrences; a handoff's starts at its submit and ends at submit + wait + duration.
         static final int CELLS = 15, COUNT = 0, SUM = 1, MIN = 2, MAX_DUR = 3, FIRST = 4, LAST = 5, MAX_AT = 6, CPU = 7,
-                FOLDED = 8,     // occurrences folded for want of budget; the rest were aggregate-only
+                FOLDED = 8,     // occurrences folded for want of budget; the rest were in a folded task
                 WAIT_SUM = 9, WAIT_MAX = 10,
                 FLAGS = 11,     // the flags every occurrence has
                 SUBMITS = 12, SUBMIT_SUM = 13, SUBMIT_FIRST = 14; // handoffs submitted (TASKS), begun (RAN) or cancelled (UNRUN)
@@ -2181,7 +2476,7 @@ public final class Tempo {
         }
 
         /**
-         * The anchor row, or for an aggregate nested in another aggregate-only span the earlier aggregate
+         * The anchor row, or for an aggregate nested in another folded span the earlier aggregate
          * of that name under the same anchor and lap (created when that span opened, so before this one).
          * Without an anchor (folded in a folded task) it is a top-level node of the lane.
          */
@@ -2215,7 +2510,8 @@ public final class Tempo {
 
     /**
      * An immutable copy of a trace stitched into one tree: its lanes, their aggregates and the lane-less
-     * aggregates as they were when {@link Trace#snapshot()} took it. It references no lane, so it stays
+     * totals as they were when {@link Trace#snapshot()} took it; of a nested trace, the copy renders
+     * its subtree, with times from its start. It references no lane, so it stays
      * complete after {@link Trace#release()}, and any thread may read it. Taken after release it is empty.
      *
      * <p>A handoff row is drawn as one record with the task linked to it (submit time, queue wait, the
@@ -2236,13 +2532,19 @@ public final class Tempo {
         final int headerBytes;
         private final String linkBase;
         private final int misuses, dropped, folded;
+        // The record rendered as the root: lane 0, row 0 for a trace; a nested trace's row, whose subtree
+        // alone is rendered, its start (base) the zero point of every time and its thread the first.
+        final int rootLane, rootRow;
+        final long base;
+        final boolean subtree;
 
         private Snapshot() {
             shapes = new Shape[0];
             totals = null;
-            now = wall = 0;
-            misuses = dropped = folded = headerBytes = 0;
+            now = wall = base = 0;
+            misuses = dropped = folded = headerBytes = rootLane = rootRow = 0;
             linkBase = null;
+            subtree = false;
         }
 
         /**
@@ -2250,11 +2552,16 @@ public final class Tempo {
          * read chunks that went back to the pool; it is thrown away, also when what it read made it fail.
          */
         static Snapshot of(Context ctx) {
-            if (ctx.released) return EMPTY;
+            return of(ctx, 0, 0, false);
+        }
+
+        /** The subtree of {@code row} in lane {@code lane}, or with {@code subtree} false the whole trace. */
+        static Snapshot of(Context ctx, int lane, int row, boolean subtree) {
+            if (ctx.released || ctx.id < 0) return EMPTY;
             try {
-                Snapshot s = new Snapshot(ctx);
+                Snapshot s = new Snapshot(ctx, lane, row, subtree);
                 VarHandle.acquireFence();
-                return ctx.released ? EMPTY : s;
+                return ctx.released || subtree && s.shapes[lane] == null ? EMPTY : s;
             } catch (RuntimeException e) {
                 VarHandle.acquireFence();
                 if (ctx.released) return EMPTY;
@@ -2262,17 +2569,22 @@ public final class Tempo {
             }
         }
 
-        private Snapshot(Context ctx) {
+        private Snapshot(Context ctx, int lane, int row, boolean subtree) {
             now = ctx.now();
-            wall = ctx.wall;
             headerBytes = ctx.headerBytes;
             linkBase = ctx.linkBase;
             Lane[] lanes = ctx.lanesById();
             shapes = new Shape[lanes.length];
             for (int i = 0; i < lanes.length; i++) if (lanes[i] != null) shapes[i] = Shape.of(lanes[i]);
+            this.subtree = subtree;
+            rootLane = lane;
+            rootRow = row;
+            Shape top = lane < shapes.length ? shapes[lane] : null;
+            base = subtree && top != null && row < top.rows ? top.start[row] : 0;
+            wall = ctx.wall > 0 ? ctx.wall + base / 1_000_000 : ctx.wall;
             totals = ctx.frozenTotals();
             misuses = ctx.misuses.get();
-            dropped = ctx.dropped();
+            dropped = subtree ? 0 : ctx.dropped(); // what a lane drops is not known by subtree
             int lostFolded = 0;
             long[] lost = ctx.lost();
             for (int i = 0; i < lost.length; i += 2) {
@@ -2283,7 +2595,7 @@ public final class Tempo {
                 if (r >= 0 && r < s.rows) s.hide(r);
                 else if (r < 0 && ~r < s.aggs) s.unsubmit(~r, lost[i + 1]);
             }
-            folded = ctx.folded() - lostFolded;
+            folded = subtree ? 0 : ctx.folded() - lostFolded; // a subtree counts the folded it shows
             // A task whose handoff row is not visible (a live render racing the submit) is left out.
             for (Shape s : shapes) {
                 if (s == null || s.link == null) continue;
@@ -2300,7 +2612,8 @@ public final class Tempo {
             for (Shape s : shapes) {
                 for (int e = 0; s != null && e < s.aggs; e++) {
                     int k = e * Aggs.KEY, target = s.aggKey[k];
-                    if (s.aggKey[k + Aggs.KIND] < Aggs.RAN) continue;
+                    int kind = s.aggKey[k + Aggs.KIND];
+                    if (kind != Aggs.RAN && kind != Aggs.UNRUN) continue;
                     Shape t = shape((long) s.aggKey[k + Aggs.LAP] << 32);
                     if (t != null && target < t.aggs && t.aggKey[target * Aggs.KEY + Aggs.KIND] == Aggs.TASKS) t.merge(target, s, e);
                 }
@@ -2335,8 +2648,8 @@ public final class Tempo {
             int[] lane = new int[16], row = new int[16], id = new int[16]; // the path to the current record
             int n = 0;
             for (Shape top : shapes) {
-                if (top == null) continue;
-                for (int r = top.first[top.rows]; r >= 0 && n < limit; r = top.next[r]) {
+                if (top == null || subtree && top.lane != rootLane) continue;
+                for (int r = subtree ? rootRow : top.first[top.rows]; r >= 0 && n < limit; r = subtree ? -1 : top.next[r]) {
                     int d = 0;
                     lane[0] = top.lane;
                     row[0] = r;
@@ -2406,6 +2719,7 @@ public final class Tempo {
                 v.max = c[b + Aggs.MAX_DUR];
                 v.extent = c[b + Aggs.LAST] - v.start;
                 v.maxAt = c[b + Aggs.MAX_AT] - v.start;
+                v.start -= base;
                 visitor.visit(v);
                 return;
             }
@@ -2436,17 +2750,15 @@ public final class Tempo {
             v.folded = 0;
             v.min = v.max = v.extent = v.duration;
             v.maxAt = 0;
+            v.start -= base;
             visitor.visit(v);
         }
 
         /**
-         * Count, sum and extremes of the spans of {@code name} that ended, recorded or folded into
-         * aggregates in any lane, plus those added without a lane ({@link Trace#add}); and the queue waits
-         * of its tasks, begun or cancelled, plus those added without a lane. Handoff entries and cancelled
-         * tasks add no occurrence.
+         * Like {@link Trace#total(Name)}, as the snapshot was taken: of the whole trace, also for a nested one.
          */
-        public Aggregate aggregate(Name name) {
-            if (name == null) return Aggregate.EMPTY;
+        public Total total(Name name) {
+            if (name == null) return Total.EMPTY;
             int id = name.id;
             long count = 0, sum = 0, min = Long.MAX_VALUE, max = 0, waits = 0, waitSum = 0, waitMax = 0;
             for (Shape s : shapes) {
@@ -2468,7 +2780,7 @@ public final class Tempo {
                     min = Math.min(min, d);
                     max = Math.max(max, d);
                 }
-                for (int e = 0; e < s.aggs; e++) { // as Trace.aggregate: never-started tasks have no wait yet
+                for (int e = 0; e < s.aggs; e++) { // as Trace.total: never-started tasks have no wait yet
                     int k = e * Aggs.KEY, b = e * Aggs.CELLS, kind = s.aggKey[k + Aggs.KIND];
                     if (s.aggKey[k + Aggs.NAME] != id || s.aggCell[b + Aggs.COUNT] == 0 || kind == Aggs.TASKS
                             || kind == Aggs.SPANS && s.aggKey[k] >= s.rows) continue;
@@ -2478,7 +2790,7 @@ public final class Tempo {
                         min = Math.min(min, s.aggCell[b + Aggs.MIN]);
                         max = Math.max(max, s.aggCell[b + Aggs.MAX_DUR]);
                     }
-                    if (kind != Aggs.SPANS) {
+                    if (kind == Aggs.RAN || kind == Aggs.UNRUN) {
                         waits += s.aggCell[b + Aggs.COUNT];
                         waitSum += s.aggCell[b + Aggs.WAIT_SUM];
                         waitMax = Math.max(waitMax, s.aggCell[b + Aggs.WAIT_MAX]);
@@ -2488,11 +2800,23 @@ public final class Tempo {
             return Totals.merge(totals, id, count, sum, min, max, waits, waitSum, waitMax);
         }
 
+        /** {@link #total(Name)} of the name {@code name}; empty for a name never interned. */
+        public Total total(String name) {
+            return total(Name.find(name));
+        }
+
+        /** The shape of the root's lane, or null if it has no root. */
+        private Shape top() {
+            Shape s = rootLane < shapes.length ? shapes[rootLane] : null;
+            return s == null || rootRow >= s.rows ? null : s;
+        }
+
         /** Wall time of the root span: its duration, or while it was open its age when the snapshot was taken. */
         public long elapsedNanos() {
-            Shape s = shapes.length == 0 ? null : shapes[0];
-            if (s == null || s.rows == 0) return 0;
-            return s.dur[0] != Lane.OPEN ? s.dur[0] : Math.max(0, now - s.start[0]);
+            Shape s = top();
+            if (s == null) return 0;
+            int r = rootRow;
+            return s.dur[r] != Lane.OPEN ? s.dur[r] : Math.max(0, now - s.start[r]);
         }
 
         /**
@@ -2560,14 +2884,14 @@ public final class Tempo {
         }
 
         private Tops tops() {
-            Shape s = shapes.length == 0 ? null : shapes[0];
-            if (s == null || s.rows == 0) return Tops.EMPTY;
+            Shape s = top();
+            if (s == null) return Tops.EMPTY;
             Tops t = new Tops();
             t.total = elapsedNanos();
-            for (int r = 1; r < s.rows; r++) { // row order is tree order for phases, see Lane.tops
-                if (s.parent[r] != 0 || (s.flags[r] & LEGACY) == 0) continue;
+            for (int r = rootRow + 1; r < s.rows; r++) { // row order is tree order for phases, see Lane.tops
+                if (s.parent[r] != rootRow || (s.flags[r] & LEGACY) == 0) continue;
                 long d = s.dur[r];
-                t.add(r, s.name[r], s.label == null ? null : s.label[r], s.start[r], d != Lane.OPEN ? d : Math.max(0, now - s.start[r]));
+                t.add(r, s.name[r], s.label == null ? null : s.label[r], s.start[r] - base, d != Lane.OPEN ? d : Math.max(0, now - s.start[r]));
             }
             return t;
         }
@@ -2580,7 +2904,7 @@ public final class Tempo {
             return dropped;
         }
 
-        /** Detail spans folded into aggregates for want of budget, open ones included. */
+        /** Steps and ticks folded into aggregates for want of budget, open ones included. */
         int folded() {
             return folded;
         }
@@ -2706,7 +3030,7 @@ public final class Tempo {
      * Writes a {@link Snapshot} as a {@code Tempo-Timing} v1 value in the canonical form of FORMAT.md §7.
      * Two walks over the stitched tree: the first numbers the threads and names the records use, the
      * second writes the records into the one builder. Records deeper than {@link #MAX_DEPTH} (wire depth
-     * adds up along handoff chains), the aggregates of aggregate-only spans nested in others (the wire has
+     * adds up along handoff chains), the aggregates of folded spans nested in others (the wire has
      * no children under an aggregate) and the lane-level nodes besides the root (aggregates of a folded
      * task that had no recorded span to hang them from) are left out with their subtrees and counted as
      * dropped, like a non-finite attribute value: a record at depth 35 stands for its whole subtree. Every
@@ -2729,6 +3053,7 @@ public final class Tempo {
         private final Snapshot snap;
         private final int[] nameIndex; // by name id: wire index + 1; -1 for an attribute key not numbered yet
         private final int[] laneIndex; // by lane id: wire thread index + 1, 0 for a lane no record uses
+        private int[] laneOrder;       // lane ids by wire thread index
         private int[] order = new int[16], keys = new int[16]; // name ids by wire index; keys by first use
         private int names, nKeys;
         private final long[] cur = new long[MAX_DEPTH + 2];
@@ -2828,7 +3153,12 @@ public final class Tempo {
             snap.forEachSpan(this);
             if (records == 0) return false;
             for (int i = 0; i < nKeys; i++) if (nameIndex[keys[i]] < 0) number(keys[i]);
-            for (int l = 0, n = 0; l < laneIndex.length; l++) if (laneIndex[l] != 0) laneIndex[l] = ++n;
+            // the root's thread is thread 0; the others follow by lane id
+            int n = 0, root = snap.rootLane;
+            laneOrder = new int[laneIndex.length];
+            if (laneIndex[root] != 0) laneIndex[laneOrder[n] = root] = ++n;
+            for (int l = 0; l < laneIndex.length; l++) if (l != root && laneIndex[l] != 0) laneIndex[laneOrder[n] = l] = ++n;
+            laneOrder = Arrays.copyOf(laneOrder, n);
             // aggregates left out count as dropped only; spans folded for want of budget that are still
             // open are in no aggregate yet and count as folded
             dropped = snap.dropped() + left + nonFinite;
@@ -2848,15 +3178,13 @@ public final class Tempo {
             if (snap.wall > 0) b36(b.append(";w="), snap.wall);
             if (folded > 0 || dropped > 0) b36(b36(b.append(";x="), folded).append('.'), dropped);
             boolean live = false;
-            for (int l = 0; l < laneIndex.length; l++) {
-                if (laneIndex[l] == 0 || !snap.shapes[l].live) continue;
-                b36(b.append(live ? "." : ";l="), laneIndex[l] - 1);
+            for (int i = 0; i < laneOrder.length; i++) {
+                if (!snap.shapes[laneOrder[i]].live) continue;
+                b36(b.append(live ? "." : ";l="), i);
                 live = true;
             }
             b.append(";T=");
-            for (int l = 0, n = 0; l < laneIndex.length; l++) {
-                if (laneIndex[l] != 0) name(n++ == 0 ? b : b.append(':'), snap.shapes[l].thread);
-            }
+            for (int i = 0; i < laneOrder.length; i++) name(i == 0 ? b : b.append(':'), snap.shapes[laneOrder[i]].thread);
             b.append(";N=");
             for (int i = 0; i < names; i++) name(i == 0 ? b : b.append(':'), Name.byId(order[i]).text);
             b.append(";S=");
@@ -2888,11 +3216,11 @@ public final class Tempo {
             j.number(h.dropped);
             j.key("threads");
             j.begin('[');
-            for (int l = 0; l < h.laneIndex.length; l++) if (h.laneIndex[l] != 0) j.string(text(s.shapes[l].thread));
+            for (int i = 0; any && i < h.laneOrder.length; i++) j.string(text(s.shapes[h.laneOrder[i]].thread));
             j.end(']');
             j.key("live");
             j.begin('[');
-            for (int l = 0; l < h.laneIndex.length; l++) if (h.laneIndex[l] != 0 && s.shapes[l].live) j.number(h.laneIndex[l] - 1);
+            for (int i = 0; any && i < h.laneOrder.length; i++) if (s.shapes[h.laneOrder[i]].live) j.number(i);
             j.end(']');
             j.key("truncated");
             j.bool(false);
@@ -3729,158 +4057,158 @@ public final class Tempo {
 
     // ---------------------------------------------------------------------------------------------
 
-    /** One request's recording. Not pooled. Reads stay valid after {@link #close()} until {@link #release()}. */
-    public static final class Trace implements AutoCloseable {
-        final Context ctx;
-        private final Lane rootLane;
-        private final Span root;
+    /**
+     * One request's recording, and its outermost span: {@code t.span(n)} opens a child as {@code
+     * Tempo.span(n)} does. Not pooled. Reads stay valid after {@link #close()} until {@link #release()}.
+     * A trace started inside another one ({@link Tempo#trace(Name, Options)}) joins it as a subtree.
+     */
+    public static final class Trace extends Span {
+        /** The trace that records nothing: what a nested trace is when its span has no room. */
+        static final Trace NOOP_TRACE = new Trace(null, Context.NONE, 0, false);
 
-        Trace(Name name, Options options, long zero) {
-            ctx = new Context(options, zero); // zero: the clock read as start was entered, the root's start
+        private final boolean nested; // joined an outer trace: renders its subtree, releases nothing
+        Span displaced;               // nested: the handle of its depth, given back to the next span there
+        Consumer<String> printer;     // printOnClose; written and read by the owner thread
+
+        Trace(Lane lane, Context ctx, int depth, boolean nested) {
+            super(lane, ctx, depth);
+            this.nested = nested;
+        }
+
+        /** {@link Tempo#trace}: {@code zero} is the clock read first, {@code text} the name when given as a String. */
+        static Trace open(Name name, String text, Options options, long zero) {
+            ThreadSlot slot = SLOT.get();
+            Lane cur = slot.current;
+            if (cur != null && !cur.ctx.released) return nest(cur, name, text);
+            Context ctx = new Context(options == null ? Options.DEFAULTS : options, zero); // zero: the root's start
             // Right after: CPU covers the root like its wall time, and the first CPU read of a JVM (it loads
             // the management bean, milliseconds) happens here, counted in the root's own time.
             long cpu = ctx.cpu() ? ctx.cpuNow() : -1;
             int flags = 0;
+            if (text != null) {
+                name = ctx.name(text);
+                if (Name.overflowed(name, text)) flags = MISUSE;
+            }
             if (name == null) {
                 ctx.misuse("null name");
                 name = Name.UNKNOWN;
                 flags = MISUSE;
             }
-            rootLane = ctx.register(new Lane(ctx, SLOT.get()));
-            root = rootLane.openRoot(name, flags, cpu);
+            Lane lane = ctx.register(new Lane(ctx, slot));
+            Trace t = new Trace(lane, ctx, 0, false);
+            lane.openRoot(t, name, flags, cpu);
+            return t;
         }
 
-        /**
-         * The root span, opened at {@link Tempo#start}. It starts at 0, the moment {@code start} was entered,
-         * so Tempo's own setup (and in the first trace of a JVM that measures CPU, the CPU clock's one-time
-         * initialization) is part of its time, never hidden.
-         */
-        public Span root() {
-            return root;
+        /** A trace started inside the trace of {@code cur}, the thread's current lane: a span of it on top. */
+        private static Trace nest(Lane cur, Name name, String text) {
+            Context ctx = cur.ctx;
+            int flags = 0;
+            if (text != null) {
+                name = ctx.name(text);
+                if (Name.overflowed(name, text)) flags = MISUSE;
+            }
+            if (name == null) {
+                ctx.misuse("null name");
+                name = Name.UNKNOWN;
+                flags = MISUSE;
+            }
+            Trace t = new Trace(cur, ctx, cur.depth, true);
+            return cur.nest(t, name, flags) == null ? NOOP_TRACE : t;
         }
 
-        public int level() {
+        /** What the trace records: {@link #SPAN} (from the start), {@link #STEP} or {@link #TICK}. */
+        public int records() {
             return ctx.level;
         }
 
         /**
-         * Raises the level, once, before any detail span exists. Asking for the current level or a lower
-         * one changes nothing. Returns whether the trace now records at {@code level} or above. A raise that
-         * turns on CPU time ({@link Options#cpu}) reads the CPU clock once on the calling thread, so the
-         * JVM's one-time setup of that clock (milliseconds) is paid here, never inside a pool task.
+         * Widens what the trace records to {@code level} ({@link #STEP} or {@link #TICK}), once, before the
+         * first step or tick opens, so it chains as {@code Tempo.trace(name).records(Tempo.STEP)}; afterwards
+         * it is misuse and changes nothing (strict mode throws), which {@link #records()} shows. Asking for
+         * the current level or a lower one changes nothing. A widening that turns on CPU time ({@link
+         * Options#cpu}) reads the CPU clock once on the calling thread, so the JVM's one-time setup of that
+         * clock (milliseconds) is paid here, in the trace's wall time, never inside a pool task; called on the
+         * owner thread while the trace is open, the trace's own CPU time is measured from that read on. On a
+         * nested trace it widens the whole trace.
          */
-        public boolean raise(int level) {
+        public Trace records(int level) {
+            if (lane == null) return this;
             int to = clampLevel(level);
             String refused = null;
             boolean cpuOn = false;
             synchronized (ctx) {
-                if (to <= ctx.level) return true;
-                if (ctx.raised || ctx.detailSeen) {
-                    refused = ctx.raised ? "level raised twice" : "level raised after a detail span was recorded";
+                if (to <= ctx.level) return this;
+                if (ctx.widened || ctx.seen) {
+                    refused = ctx.widened ? "records widened twice" : "records widened after a step or tick opened";
                 } else {
                     boolean before = ctx.cpu();
-                    ctx.raised = true;
+                    ctx.widened = true;
                     ctx.level = to;
                     cpuOn = !before && ctx.cpu();
                 }
             }
             if (refused != null) {
                 ctx.misuse(refused);
-                return false;
+            } else if (cpuOn) {
+                long cpu = ctx.cpuNow(); // the first read of a JVM sets the clock up, on this thread
+                Lane l = lane;
+                if (Thread.currentThread() == owner && depth < l.depth && l.handles[depth] == this && row != Lane.FRAME
+                        && (l.cpuMask >>> depth & 1) == 0) l.startCpu(depth, cpu);
             }
-            if (cpuOn) ctx.cpuNow(); // the result is not needed: the read sets the clock up on this thread
-            return true;
-        }
-
-        /** Wall time of the root span: running time while open, its duration once closed, 0 after release. */
-        public long elapsedNanos() {
-            return rootLane.elapsed(root.row);
-        }
-
-        /** Ends the root span, healing any span still open. Idempotent on the owner thread. */
-        @Override
-        public void close() {
-            if (Thread.currentThread() == rootLane.owner && rootLane.depth == 0) return;
-            root.close();
+            return this;
         }
 
         /**
          * Returns the trace's buffers to the pool. Optional and idempotent; afterwards every read is empty
          * and never throws, so take a {@link #snapshot()} first to render later. A thread still inside a
          * task of this trace keeps its lane until the task ends; handoffs begun after release record nothing.
+         * On a nested trace it does nothing: the buffers are the outer trace's.
          */
         public void release() {
-            ctx.release();
+            if (lane != null && !nested) ctx.release();
         }
 
         /**
-         * Adds a listener for this trace, called with the duration in nanoseconds each time a span of
-         * {@code name} ends, and for {@link #add}. Like {@link Name#sink} it runs on the ending thread
-         * without a lock, and it makes the name always-on in this trace. Only on the starting thread and
-         * before the root's first child span; later calls are misuse and ignored.
+         * Adds a listener for this trace, called with the duration in nanoseconds of every timed occurrence
+         * of {@code name} that ends from now on: spans, steps, recorded ticks, phases and {@link Span#add}.
+         * Like {@link Tempo#on} it runs on the ending thread without a lock, so it must be thread-safe. Any
+         * thread may add one; another thread hears it once it synchronizes with the adding one, e.g. through
+         * a handoff submitted after it. On a nested trace it listens to the whole trace.
          */
         public Trace on(Name name, LongConsumer nanos) {
+            if (lane == null) return this;
             if (name == null || nanos == null) {
                 ctx.misuse("null listener");
-            } else if (Thread.currentThread() != rootLane.owner) {
-                ctx.misuse("listener added on a foreign thread");
-            } else if (rootLane.depth != 1 || rootLane.rowCount != 1 || rootLane.framed) {
-                ctx.misuse("listener added after the first child span");
-            } else {
+                return this;
+            }
+            synchronized (ctx) {
                 ctx.on = new Listeners(ctx.on, name.id, nanos);
                 ctx.listening = true;
             }
             return this;
         }
 
-        /**
-         * Adds one occurrence of {@code name} lasting {@code nanos} to {@link #aggregate(Name)}, without a
-         * span or a lane, and calls its listeners on the calling thread. Thread-safe, at every level, also
-         * after close; allocation-free once the trace has seen the name. Ignored after release.
-         */
-        public void add(Name name, long nanos) {
-            if (ctx.released) return;
-            long v = Math.max(0, nanos);
-            ctx.totals().add(ctx.key(name), false, v);
-            Throwable t = name != null && ctx.listening ? ctx.notify(name, v) : null;
-            if (t != null && ctx.strict) throw Context.listenerThrew(t);
-        }
-
-        /** Adds a queue wait of {@code nanos} to {@link #aggregate(Name)}, like {@link #add}. */
-        public void addWait(Name name, long nanos) {
-            total(name, true, nanos);
+        /** Like {@link #on(Name, LongConsumer)}, the name looked up as for {@link Tempo#span(String)}. */
+        public Trace on(String name, LongConsumer nanos) {
+            return lane == null ? this : on(ctx.name(name), nanos);
         }
 
         /**
-         * The trace clock now, as a token for {@link #waited}. Take it where a task is submitted and pass
-         * it to the task; one clock read and nothing else.
+         * Count, sum, mean and extremes of every timed occurrence of {@code name} that ended: spans, steps
+         * (drawn, folded over the budget or undrawn), recorded ticks, phases and {@link Span#add}; and the
+         * queue waits of its tasks, of tasks left unrecorded at a cap, begun or cancelled. The numbers are
+         * the same whatever the trace drew. Exact once the contributing threads are done, best effort while
+         * they run; empty after release. On a nested trace, those of the whole trace. Reads the lanes in
+         * place: no copy, one allocation, time linear in the trace's rows, events and aggregates.
          */
-        public long submitted() {
-            return ctx.now();
+        public Total total(Name name) {
+            return name == null || lane == null ? Total.EMPTY : ctx.total(name.id);
         }
 
-        /** Adds the queue wait from {@code submitted}, a token of {@link #submitted()}, to now; returns it. */
-        public long waited(Name name, long submitted) {
-            long wait = Math.max(0, ctx.now() - submitted);
-            total(name, true, wait);
-            return wait;
-        }
-
-        private void total(Name name, boolean wait, long nanos) {
-            if (ctx.released) return;
-            ctx.totals().add(ctx.key(name), wait, Math.max(0, nanos));
-        }
-
-        /**
-         * Count, sum and extremes of every span of {@code name} that ended: recorded, folded over the
-         * budget, aggregate-only (an always-on name below the level, see {@link Name#aggregate()}) and
-         * added through {@link #add}; and the queue waits of its tasks, of tasks left unrecorded at a cap,
-         * and those added through {@link #addWait} and {@link #waited}. Exact once the contributing threads
-         * are done, best effort while they run; empty after release. Reads the lanes in place: no copy,
-         * one allocation, time linear in the trace's rows, events and aggregates.
-         */
-        public Aggregate aggregate(Name name) {
-            return name == null ? Aggregate.EMPTY : ctx.aggregate(name.id);
+        /** Like {@link #total(Name)}; empty for a name never interned. */
+        public Total total(String name) {
+            return total(Name.find(name));
         }
 
         /**
@@ -3964,35 +4292,37 @@ public final class Tempo {
 
         /**
          * An immutable copy of the trace as it is now, which stays readable after {@link #release()}: take
-         * it before releasing when the trace is rendered later. Empty after release.
+         * it before releasing when the trace is rendered later. Of a nested trace, its subtree, with times
+         * from its start. Empty after release.
          */
         public Snapshot snapshot() {
-            return Snapshot.of(ctx);
+            if (lane == null || row == Lane.FRAME) return Snapshot.EMPTY;
+            return Snapshot.of(ctx, lane.id, row, nested);
         }
 
         /**
-         * Visits the legacy phases in start order: the root's children marked by {@link Span#done(Name,
-         * String)} or {@link Span#legacy()}, with their label ({@code null} if none), start from the trace
-         * start and duration; an open phase lasts until now. Reads the root's lane in place.
+         * Visits the legacy phases in start order: the trace's children marked by {@link Span#done(Name,
+         * String)} or {@link Span#legacy()}, with their label ({@code null} if none), start from the trace's
+         * start and duration; an open phase lasts until now. Reads the trace's lane in place.
          */
         public void forEachTop(TopVisitor visitor) {
-            rootLane.tops(root.row).forEach(visitor);
+            tops().forEach(visitor);
         }
 
         /**
          * The legacy {@code Runtime} text {@code <total>s = <d1>s (<label1>) + ... + <dn>s (<labeln>)}, or
-         * {@code <total>s} without legacy phases (see {@link #forEachTop}). The total is the root's wall time,
+         * {@code <total>s} without legacy phases (see {@link #forEachTop}). The total is the trace's wall time,
          * up to now while it is open. Each phase prints its label, or its name without one. Durations are
          * seconds with {@code digits} fixed decimals, rounded half up, or with {@code digits = -1} as
          * {@code Double.toString(nanos / 1e9)} prints them. After release: just the total, {@code 0}.
          */
         public String toRuntime(int digits) {
-            return rootLane.tops(root.row).runtime(digits);
+            return tops().runtime(digits);
         }
 
         /** {@link #toRuntime(int)} with the total given, so it can match a total read once for several headers. */
         public String toRuntime(int digits, long totalNanos) {
-            return rootLane.tops(root.row).runtime(digits, totalNanos);
+            return tops().runtime(digits, totalNanos);
         }
 
         /**
@@ -4002,25 +4332,30 @@ public final class Tempo {
          * {@code -}; durations are milliseconds with three decimals, rounded half up.
          */
         public String toServerTiming() {
-            return rootLane.tops(root.row).serverTiming();
+            return tops().serverTiming();
+        }
+
+        private Tops tops() {
+            return lane == null || row == Lane.FRAME ? Tops.EMPTY : lane.tops(row);
         }
 
         /**
          * Passes {@code <label>: } and the {@link #toRuntime(int) toRuntime(-1)} text to {@code out} as one
-         * line when the root closes, or at once if it has closed; no prefix for a {@code null} label. Only
-         * on the starting thread; a throw from {@code out} is handled like a listener's ({@link #on}).
+         * line when the trace closes, or at once if it has closed; no prefix for a {@code null} label. Only
+         * on the owner thread; a throw from {@code out} is handled like a listener's ({@link #on}).
          */
         public Trace printOnClose(Consumer<String> out, String label) {
+            if (lane == null) return this;
             if (out == null) {
                 ctx.misuse("null printer");
-            } else if (Thread.currentThread() != rootLane.owner) {
+            } else if (Thread.currentThread() != owner) {
                 ctx.misuse("printer added on a foreign thread");
             } else {
                 Consumer<String> p = label == null ? out : line -> out.accept(label + ": " + line);
-                if (rootLane.depth > 0) {
-                    ctx.printer = p;
-                } else {
-                    Throwable t = rootLane.print(p);
+                if (depth < lane.depth && lane.handles[depth] == this) {
+                    printer = p;
+                } else if (row != Lane.FRAME) {
+                    Throwable t = lane.print(p, row);
                     if (t != null && ctx.strict) throw Context.listenerThrew(t);
                 }
             }
@@ -4035,7 +4370,7 @@ public final class Tempo {
             return ctx.dropped();
         }
 
-        /** Detail spans folded into aggregates for want of budget so far, open ones included. */
+        /** Steps and ticks folded into aggregates for want of budget so far, open ones included. */
         int folded() {
             return ctx.folded();
         }
@@ -4049,19 +4384,24 @@ public final class Tempo {
      * every call through it acts on the new one, undetected, even under {@link Options#strict}. Keep a
      * handle inside the block that opened it. Until the next span opens there, {@link #set}, {@link #fail},
      * {@link #cancel} and {@link #waiting} work after close too, as in the catch block right after, on a
-     * span with a row: a folded or aggregate-only one ({@link #detail}) keeps no attributes, and flags only
-     * while it is open. The other calls after close, and every call on a foreign thread, are ignored and
-     * counted as misuse, and methods that open spans then return {@link #NOOP}.
+     * span with a row: a folded or undrawn one ({@link #step}) keeps no attributes, and flags only while it
+     * is open. The other calls after close, and every call on a foreign thread, are ignored and counted as
+     * misuse, and methods that open spans then return {@link #NOOP}.
+     *
+     * <p>A span opens children only as the innermost open span of its thread (an open phase of it aside):
+     * opening one under a span with others open above it closes those first, flagged healed, and counts
+     * as misuse (strict mode throws).
      */
-    public static final class Span implements AutoCloseable {
+    public static class Span implements AutoCloseable {
         final Lane lane;
         final Context ctx;
         final Thread owner;
         final int depth;
-        int row;    // Lane.FRAME for an aggregate-only span, which has the next six
+        int row;    // Lane.FRAME for a span without a row (folded, undrawn, or outside a trace), which has the next seven
         Name frame;
         int agg;    // its entry in the lane's aggregates, or -1
-        boolean folded; // folded for want of budget, not aggregate-only
+        boolean folded; // folded for want of budget
+        boolean hidden; // an undrawn step: only the totals read its entry
         int flags;  // flags set while open, kept where every occurrence of the aggregate has them
         long wait;  // the queue wait of a folded task
         long time;  // start while open, then duration
@@ -4074,64 +4414,74 @@ public final class Tempo {
         }
 
         /**
-         * Opens a child span; always recorded, but in a folded task begun outside the trace, which has no
-         * row to hang it from, aggregate-only. Its parent is the innermost open span of this lane.
+         * Opens a child span, always timed and drawn; in a folded task begun outside the trace, which has
+         * no row to hang it from, folded. Outside a trace it is timed only for the name's global listeners.
          */
         public Span span(Name name) {
-            return open(name, 0);
+            Lane l = top();
+            return l == null ? NOOP : l.openSpan(name, 0);
         }
 
-        /** Looks the name up in a global table capped at 4096 dynamic names; overflow maps to {@code <other>}. */
+        /** Like {@link #span(Name)}, the name looked up as for {@link Tempo#span(String)}. */
         public Span span(String name) {
-            if (!live()) return NOOP;
-            Name n = Name.intern(name, true);
-            if (n.text.equals(name)) return lane.push(n, 0);
-            ctx.misuse(n == Name.OTHER ? "dynamic name table full" : "empty name");
-            return lane.push(n, MISUSE);
+            Lane l = top();
+            return l == null ? NOOP : l.openSpan(name);
+        }
+
+        /** An unnamed child span, labelled only by its phases. */
+        public Span span() {
+            return span(Name.EMPTY);
         }
 
         /**
-         * A child span recorded at {@link #DETAIL} and above while the trace's budget lasts
-         * ({@link Options#budget}); past it, folded. Below the level, {@link #NOOP}, unless the name is
-         * always-on ({@link Name#aggregate()}, {@link Name#sink}, {@link Trace#on}): then aggregate-only.
-         * A folded or aggregate-only span writes no row: it times itself into an aggregate of its lane
-         * (see {@link SpanView#aggregate()}), {@link Trace#aggregate(Name)} and the listeners. Spans opened
-         * inside it are recorded under its nearest recorded ancestor; attributes and phases on it are
-         * ignored, flags set while it is open show on the aggregate if every occurrence has them, and
+         * A child step: always timed into the trace's totals and listeners; drawn when the trace records
+         * steps ({@link Trace#records(int)}) while its budget lasts ({@link Options#budget}), past it folded.
+         * A folded or undrawn step writes no row: it costs two clock reads and an aggregate update. Spans
+         * opened inside it are recorded under its nearest recorded ancestor; attributes and phases on it are
+         * ignored, flags set while it is open show on a folded aggregate if every occurrence has them, and
          * {@link #cpu()} adds to the aggregate's CPU time.
          */
-        public Span detail(Name name) {
-            if (ctx.level < DETAIL) return name != null && (name.marked || ctx.on != null) ? below(name) : NOOP;
-            if (!ctx.detailSeen) ctx.detailSeen = true;
-            return budgeted(name, DETAIL_ROW);
+        public Span step(Name name) {
+            Lane l = top();
+            return l == null ? NOOP : l.openStep(name, 0);
         }
 
-        /** A child span recorded at {@link #DEEP}; below, like {@link #detail} below {@link #DETAIL}. */
-        public Span deep(Name name) {
-            if (ctx.level < DEEP) return name != null && (name.marked || ctx.on != null) ? below(name) : NOOP;
-            if (!ctx.detailSeen) ctx.detailSeen = true;
-            return budgeted(name, DEEP_ROW);
+        /** Like {@link #step(Name)}, the name looked up as for {@link Tempo#span(String)}. */
+        public Span step(String name) {
+            Lane l = top();
+            return l == null ? NOOP : l.openStep(name);
         }
 
-        private Span below(Name name) {
-            return (name.marked || ctx.listens(name.id)) && live() ? lane.frame(name) : NOOP;
-        }
-
-        private Span open(Name name, int flags) {
-            if (!live()) return NOOP;
-            if (name == null) {
-                ctx.misuse("null name");
-                return lane.push(Name.UNKNOWN, flags | MISUSE);
+        /**
+         * A child tick: timed and drawn only when the trace records ticks, then like a drawn {@link #step};
+         * otherwise {@link #NOOP} at the cost of a branch.
+         */
+        public Span tick(Name name) {
+            if (ctx.level < TICK) {
+                if (lane != null && !lane.free) ctx.sawStep();
+                return NOOP;
             }
-            return lane.push(name, flags);
+            Lane l = top();
+            return l == null ? NOOP : l.openTick(name, 0);
         }
 
-        /** Counts against the trace's budget; over it the span folds into an aggregate. */
-        private Span budgeted(Name name, int flags) {
-            if (!live()) return NOOP;
-            if (name != null) return lane.budgeted(name, flags);
-            ctx.misuse("null name");
-            return lane.budgeted(Name.UNKNOWN, flags | MISUSE);
+        /** Like {@link #tick(Name)}, the name looked up as for {@link Tempo#span(String)}. */
+        public Span tick(String name) {
+            if (ctx.level < TICK) return tick((Name) null);
+            Lane l = top();
+            return l == null ? NOOP : l.openTick(name);
+        }
+
+        /**
+         * The lane, for a child to open on top: null unless {@link #live()}; with spans open above this one,
+         * those are closed first, healed (misuse). An open phase of this span stays: children nest under it.
+         */
+        private Lane top() {
+            if (!live()) return null;
+            Lane l = lane;
+            int top = l.depth - 1;
+            if (top != depth && !(top == depth + 1 && l.isPhase(top))) l.healAbove(depth);
+            return l;
         }
 
         /** Runs {@code body} inside a child span; a throwable flags the span failed and is rethrown unwrapped. */
@@ -4147,8 +4497,34 @@ public final class Tempo {
             }
         }
 
-        /** Like {@link #run} for a body with a result. */
+        /** Like {@link #run(Name, ThrowingRunnable)}, the name looked up as for {@link Tempo#span(String)}. */
+        public <E extends Exception> void run(String name, ThrowingRunnable<E> body) throws E {
+            Span s = span(name);
+            try {
+                body.run();
+            } catch (Throwable t) {
+                s.fail();
+                throw t;
+            } finally {
+                s.close();
+            }
+        }
+
+        /** Like {@link #run(Name, ThrowingRunnable)} for a body with a result. */
         public <T, E extends Exception> T call(Name name, ThrowingSupplier<T, E> body) throws E {
+            Span s = span(name);
+            try {
+                return body.get();
+            } catch (Throwable t) {
+                s.fail();
+                throw t;
+            } finally {
+                s.close();
+            }
+        }
+
+        /** Like {@link #call(Name, ThrowingSupplier)}, the name looked up as for {@link Tempo#span(String)}. */
+        public <T, E extends Exception> T call(String name, ThrowingSupplier<T, E> body) throws E {
             Span s = span(name);
             try {
                 return body.get();
@@ -4173,6 +4549,11 @@ public final class Tempo {
             return this;
         }
 
+        /** Like {@link #phase(Name)}, the name looked up as for {@link Tempo#span(String)}. */
+        public Span phase(String name) {
+            return lane == null ? this : phase(ctx.name(name));
+        }
+
         /**
          * Ends a lap of this span, label after. If a {@link #phase} is open, ends that phase under its own
          * name (a different {@code name} is kept as a zero-length misuse entry). Otherwise records a lap
@@ -4183,12 +4564,22 @@ public final class Tempo {
             return done(name, 0, null);
         }
 
+        /** Like {@link #done(Name)}, the name looked up as for {@link Tempo#span(String)}. */
+        public Span done(String name) {
+            return lane == null ? this : done(ctx.name(name), 0, null);
+        }
+
         /**
          * Like {@link #done(Name)}, and selects the lap for the legacy headers, shown there as
          * {@code legacyLabel} or, if that is {@code null}, as the name.
          */
         public Span done(Name name, String legacyLabel) {
             return done(name, LEGACY, legacyLabel);
+        }
+
+        /** Like {@link #done(Name, String)}, the name looked up as for {@link Tempo#span(String)}. */
+        public Span done(String name, String legacyLabel) {
+            return lane == null ? this : done(ctx.name(name), LEGACY, legacyLabel);
         }
 
         private Span done(Name name, int flags, String label) {
@@ -4211,10 +4602,15 @@ public final class Tempo {
             return this;
         }
 
+        /** Like {@link #phaseSet(Name, long)}, the key looked up as for {@link Tempo#span(String)}. */
+        public Span phaseSet(String key, long value) {
+            return lane == null ? this : phaseSet(ctx.name(key), value);
+        }
+
         /**
          * Measures the thread's CPU time from now until the span closes, when the trace measures CPU
          * ({@link Options#cpu}); see {@link SpanView#cpuNanos()}. A read costs a system call. On a folded
-         * or aggregate-only span it adds to the aggregate's CPU time.
+         * or undrawn span it adds to the aggregate's CPU time.
          */
         public Span cpu() {
             if (live() && ctx.cpu()) lane.sampleCpu(depth);
@@ -4241,6 +4637,11 @@ public final class Tempo {
             return result;
         }
 
+        /** Like {@link #lap(Name, ThrowingSupplier)}, the name looked up as for {@link Tempo#span(String)}. */
+        public <T, E extends Exception> T lap(String name, ThrowingSupplier<T, E> body) throws E {
+            return lap(lane == null ? null : ctx.name(name), body);
+        }
+
         /** Phase boundaries of this span so far; separates the laps for aggregation. */
         int lapOrdinal() {
             return lane == null ? 0 : lane.lapOrdinal(depth);
@@ -4254,11 +4655,16 @@ public final class Tempo {
         /**
          * Attaches a number to this span. Also after it closed (e.g. in the catch block right after), until
          * the next span opens at the same depth on this thread: from then on the handle is that span.
-         * Ignored on a folded or aggregate-only span, which has no row to keep it ({@link #detail}).
+         * Ignored on a folded or undrawn span, which has no row to keep it ({@link #step}).
          */
         public Span set(Name key, long value) {
             if (owned() && row != Lane.FRAME) lane.event(row, key(key) << KIND_BITS | ATTR_LONG, value);
             return this;
+        }
+
+        /** Like {@link #set(Name, long)}, the key looked up as for {@link Tempo#span(String)}. */
+        public Span set(String key, long value) {
+            return lane == null || lane.free ? this : set(ctx.name(key), value);
         }
 
         public Span set(Name key, double value) {
@@ -4266,26 +4672,57 @@ public final class Tempo {
             return this;
         }
 
+        /** Like {@link #set(Name, double)}, the key looked up as for {@link Tempo#span(String)}. */
+        public Span set(String key, double value) {
+            return lane == null || lane.free ? this : set(ctx.name(key), value);
+        }
+
         private int key(Name key) {
             return ctx.key(key);
         }
 
         /**
+         * Adds one occurrence of {@code name} lasting {@code nanos}, measured elsewhere, to the trace's
+         * totals ({@link Trace#total}) and calls the name's listeners on the calling thread. No span is
+         * drawn. Any thread, also after close; allocation-free once the trace has seen the name. Outside a
+         * trace it only calls the global listeners. Ignored after release.
+         */
+        public Span add(Name name, long nanos) {
+            if (lane == null || ctx.released) return this;
+            long v = Math.max(0, nanos);
+            if (!lane.free) ctx.totals().add(ctx.key(name), false, v);
+            Throwable t = name != null && ctx.listening ? ctx.notify(name, v) : null;
+            if (t != null && ctx.strict) throw Context.listenerThrew(t);
+            return this;
+        }
+
+        /** Like {@link #add(Name, long)}, the name looked up as for {@link Tempo#span(String)}. */
+        public Span add(String name, long nanos) {
+            if (lane == null) return this;
+            return add(lane.free ? Name.find(name) : ctx.name(name), nanos);
+        }
+
+        /**
          * Records the submit of a task to another thread: a handoff entry under the innermost open span,
          * and the handle the task {@link Handoff#begin() begins} with. Allocates that one small object.
-         * Recorded whatever the level (guard with {@link #detailed()} where handoffs are detail), but against
-         * the budget ({@link Options#budget}): past it the handoff writes no entry and its task, wherever it
-         * runs, folds into an aggregate under this span that keeps the queue waits, the thread or that there
-         * were several, and the flags all its tasks share. Attributes on a folded handoff are ignored.
+         * Recorded whatever the trace records, but against the budget ({@link Options#budget}): past it the
+         * handoff writes no entry and its task, wherever it runs, folds into an aggregate under this span
+         * that keeps the queue waits, the thread or that there were several, and the flags all its tasks
+         * share. Attributes on a folded handoff are ignored. Outside a trace, {@link Handoff#NOOP}.
          */
         public Handoff handoff(Name name) {
-            if (!live()) return Handoff.NOOP;
+            if (!live() || lane.free) return Handoff.NOOP;
             return name != null ? lane.handoff(name, 0) : lane.handoff(nullName(), MISUSE);
+        }
+
+        /** Like {@link #handoff(Name)}, the name looked up as for {@link Tempo#span(String)}. */
+        public Handoff handoff(String name) {
+            return lane == null || lane.free ? Handoff.NOOP : handoff(ctx.name(name));
         }
 
         /**
          * Marks the span failed. Also after close, until the next span opens at this depth, like {@link
-         * #set(Name, long)}; on a folded or aggregate-only span ({@link #detail}) only while it is open.
+         * #set(Name, long)}; on a folded or undrawn span ({@link #step}) only while it is open.
          */
         public Span fail() {
             return flag(FAILED);
@@ -4318,37 +4755,39 @@ public final class Tempo {
             return lane == null ? 0 : row == Lane.FRAME ? lane.frameElapsed(this) : lane.elapsed(row);
         }
 
+        /** Whether this span records into a trace: not {@link #NOOP}, and not a span timed outside a trace. */
         public boolean recording() {
-            return this != NOOP;
+            return lane != null && !lane.free;
         }
 
-        /** Whether the trace records {@link #DETAIL} spans; guards work done only for detail. */
-        public boolean detailed() {
-            return ctx.level >= DETAIL;
-        }
-
-        /** Ends the span and any span still open above it (flagged healed, counted as misuse). */
+        /**
+         * Ends the span and any span still open above it (flagged healed, counted as misuse). Closing a
+         * {@link Trace} again does nothing.
+         */
         @Override
         public void close() {
-            if (live()) lane.close(depth);
+            Lane l = lane;
+            if (l != null && Thread.currentThread() == owner && depth < l.depth && l.handles[depth] == this) l.close(depth);
+            else if (!(this instanceof Trace) || Thread.currentThread() != owner) live(); // counts the misuse
         }
 
-        /** {@link #live()} and has a row: phases, laps and CPU time do nothing on an aggregate-only span. */
+        /** {@link #live()} and has a row: phases, laps and CPU time do nothing on a folded or undrawn span. */
         private boolean recorded() {
             return live() && row != Lane.FRAME;
         }
 
         /** Owner thread and still open. */
         private boolean live() {
-            if (Thread.currentThread() == owner && depth < lane.depth) return true;
-            if (this != NOOP) ctx.misuse(Thread.currentThread() == owner ? "span used after close" : "span used on a foreign thread");
+            Lane l = lane;
+            if (Thread.currentThread() == owner && depth < l.depth && l.handles[depth] == this) return true;
+            if (l != null) ctx.misuse(Thread.currentThread() == owner ? "span used after close" : "span used on a foreign thread");
             return false;
         }
 
         /** Owner thread; the span may be closed. */
         private boolean owned() {
             if (Thread.currentThread() == owner) return true;
-            if (this != NOOP) ctx.misuse("span used on a foreign thread");
+            if (lane != null) ctx.misuse("span used on a foreign thread");
             return false;
         }
     }
@@ -4402,8 +4841,8 @@ public final class Tempo {
         public long durationNanos() { return duration; }
 
         /**
-         * Spans of one name folded into one entry, per parent and lap: aggregate-only spans and detail spans
-         * past the budget, per lane; or the tasks of handoffs past the budget, from whichever threads ran
+         * Spans of one name folded into one entry, per parent and lap: steps and ticks past the budget, and
+         * spans in a folded task, per lane; or the tasks of handoffs past the budget, from whichever threads ran
          * them, which make it a {@link #handoff()} with queue waits. Its start is the first occurrence's (a
          * handoff's submit), its flags those every occurrence has; it has no attributes.
          */
@@ -4478,9 +4917,9 @@ public final class Tempo {
         /** The legacy label given to {@link Span#done(Name, String)}, or {@code null}. */
         public String label() { return label; }
 
-        /** {@link #COARSE}, {@link #DETAIL} or {@link #DEEP}. */
+        /** {@link #SPAN}, {@link #STEP} or {@link #TICK}: the word that opened it. */
         public int level() {
-            return (flags & DEEP_ROW) != 0 ? DEEP : (flags & DETAIL_ROW) != 0 ? DETAIL : COARSE;
+            return (flags & TICK_ROW) != 0 ? TICK : (flags & STEP_ROW) != 0 ? STEP : SPAN;
         }
 
         /**
@@ -4599,8 +5038,8 @@ public final class Tempo {
          * wait since the submit is recorded with it. On a thread already inside the trace (the task runs
          * inline) the span is a child of that thread's innermost open span, otherwise the root of the
          * thread's lane, and {@link Tempo#current()} returns it until it closes. For a handoff past the budget
-         * it is aggregate-only (see {@link Span#detail}): its duration and wait go to the handoff's aggregate,
-         * and spans opened in it, with no row to hang from on a thread outside the trace, are aggregate-only
+         * it is folded (see {@link Span#step}): its duration and wait go to the handoff's aggregate,
+         * and spans opened in it, with no row to hang from on a thread outside the trace, are folded
          * too. {@link Tempo#NOOP} after release, past the lane cap, when the handoff was cancelled or
          * rejected first (a race {@link #cancel()} won, not misuse), and on a second begin (misuse). A task
          * that can be cancelled should start with {@link #tryBegin()} instead, which tells a won cancel apart
@@ -4896,41 +5335,44 @@ public final class Tempo {
         }
     }
 
-    /** Count, sum and extremes of a name's occurrences, and of their queue waits. Zero when there were none. */
-    public static final class Aggregate {
-        static final Aggregate EMPTY = new Aggregate(0, 0, 0, 0, 0, 0, 0);
+    /**
+     * A trace's totals of one name ({@link Trace#total}): count, sum, mean and extremes of its timed
+     * occurrences in nanoseconds, and the sum and maximum of its tasks' queue waits. Zero when there were none.
+     */
+    public static final class Total {
+        static final Total EMPTY = new Total(0, 0, 0, 0, 0, 0);
 
-        private final long count, sum, min, max, waits, waitSum, waitMax;
+        private final long count, sum, min, max, waitSum, waitMax;
 
-        Aggregate(long count, long sum, long min, long max, long waits, long waitSum, long waitMax) {
+        Total(long count, long sum, long min, long max, long waitSum, long waitMax) {
             this.count = count;
             this.sum = sum;
             this.min = min;
             this.max = max;
-            this.waits = waits;
             this.waitSum = waitSum;
             this.waitMax = waitMax;
         }
 
         public long count() { return count; }
 
-        public long sumNanos() { return sum; }
+        public long sum() { return sum; }
 
-        public long minNanos() { return min; }
+        /** {@link #sum()} / {@link #count()}, 0 when nothing was counted. */
+        public long mean() { return count == 0 ? 0 : sum / count; }
 
-        public long maxNanos() { return max; }
+        public long min() { return min; }
 
-        /** Queue waits recorded for the name; independent of {@link #count()}. */
-        public long waitCount() { return waits; }
+        public long max() { return max; }
 
-        public long waitSumNanos() { return waitSum; }
+        /** Queue waits of the name's tasks, begun or cancelled; independent of {@link #count()}. */
+        public long waitSum() { return waitSum; }
 
-        public long waitMaxNanos() { return waitMax; }
+        public long waitMax() { return waitMax; }
 
         @Override
         public String toString() {
-            return "count=" + count + " sum=" + sum + " min=" + min + " max=" + max
-                    + " waits=" + waits + " waitSum=" + waitSum + " waitMax=" + waitMax;
+            return "count=" + count + " sum=" + sum + " mean=" + mean() + " min=" + min + " max=" + max
+                    + " waitSum=" + waitSum + " waitMax=" + waitMax;
         }
     }
 

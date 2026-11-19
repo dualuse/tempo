@@ -40,7 +40,7 @@ public final class StopwatchSteps {
 
     public static void main(String[] args) throws Exception {
         List<String> log = new ArrayList<>(); // stands in for the job's logger
-        Tempo.Trace t = Tempo.start(IMPORT, new Tempo.Options().strict(true));
+        Tempo.Trace t = Tempo.trace(IMPORT, new Tempo.Options().strict(true));
         // The old stopwatch logged one line at the end of the job; this does the same when the trace closes.
         t.printOnClose(line -> {
             log.add(line);
@@ -48,7 +48,7 @@ public final class StopwatchSteps {
         }, "import");
 
         try (t) {
-            Tempo.Span job = t.root();
+            Tempo.Span job = t;
 
             // Label first: fetch runs from here to done(FETCH), and legacy() picks it for the headers now.
             job.phase(FETCH).legacy();

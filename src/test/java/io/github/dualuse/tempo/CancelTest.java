@@ -43,7 +43,7 @@ class CancelTest {
 
     @AfterEach
     void noTraceLeftOnThread() {
-        assertSame(NOOP, Tempo.current(), "a test left a span open on the test thread");
+        TempoTest.assertNothingLeftOpen();
     }
 
     /**
@@ -64,8 +64,8 @@ class CancelTest {
 
     @Test
     void cancelReturnsWhetherItWon() throws Exception {
-        Trace t = Tempo.start(SEARCH, strict());
-        Handoff a = t.root().handoff(MATCH), b = t.root().handoff(LOAD), c = t.root().handoff(DECODE);
+        Trace t = Tempo.trace(SEARCH, strict());
+        Handoff a = t.handoff(MATCH), b = t.handoff(LOAD), c = t.handoff(DECODE);
         clock.add(3);
         assertTrue(a.cancel());               // won: recorded as cancelled before it began
         assertFalse(a.cancel());              // ended already
@@ -76,7 +76,7 @@ class CancelTest {
         s.close();
         assertFalse(c.cancel());
         assertFalse(Handoff.NOOP.cancel());
-        Handoff late = t.root().handoff(MATCH);
+        Handoff late = t.handoff(MATCH);
         t.close();
         assertEquals(0, t.misuses());
         assertEquals(lines(
@@ -92,14 +92,14 @@ class CancelTest {
 
     @Test
     void beginAfterCancelIsTheCancelsWinNotMisuseAndBeginTwiceIsMisuse() {
-        Trace t = Tempo.start(SEARCH, strict());
-        Handoff h = t.root().handoff(MATCH);
+        Trace t = Tempo.trace(SEARCH, strict());
+        Handoff h = t.handoff(MATCH);
         assertTrue(h.cancel());
         assertNull(h.tryBegin());              // the hand-written early return
         assertSame(NOOP, h.begin());           // no AssertionError under strict
         assertNull(h.tryBegin());
 
-        Handoff g = t.root().handoff(LOAD);
+        Handoff g = t.handoff(LOAD);
         Span s = g.tryBegin();
         assertTrue(s.recording());
         s.close();
@@ -115,9 +115,9 @@ class CancelTest {
 
     @Test
     void wrappersSkipTheBodyOfATaskCancelledBeforeItBegan() throws Exception {
-        Trace t = Tempo.start(SEARCH, strict());
+        Trace t = Tempo.trace(SEARCH, strict());
         AtomicInteger ran = new AtomicInteger();
-        Handoff r = t.root().handoff(MATCH), c = t.root().handoff(LOAD), s = t.root().handoff(DECODE);
+        Handoff r = t.handoff(MATCH), c = t.handoff(LOAD), s = t.handoff(DECODE);
         Runnable runnable = r.runnable(ran::incrementAndGet);
         Callable<Integer> callable = c.callable(ran::incrementAndGet);
         Supplier<Integer> supplier = s.supplier(ran::incrementAndGet);
@@ -141,8 +141,8 @@ class CancelTest {
                 "  decode 0+0 cancelled handoff~4"), tree(t));
 
         // A won cancel holds after release too: the body still does not run.
-        Trace u = Tempo.start(SEARCH, strict());
-        Handoff h = u.root().handoff(MATCH), k = u.root().handoff(LOAD);
+        Trace u = Tempo.trace(SEARCH, strict());
+        Handoff h = u.handoff(MATCH), k = u.handoff(LOAD);
         Runnable skipped = h.runnable(ran::incrementAndGet), run = k.runnable(ran::incrementAndGet);
         assertTrue(h.cancel());
         u.close();
@@ -158,14 +158,14 @@ class CancelTest {
     void theEarlyExitPatternCancelsQueuedTasksAndLeavesRunningOnesAlone() throws Exception {
         ThreadPoolExecutor pool = pool(1);
         try {
-            Trace t = Tempo.start(SEARCH, strict());
+            Trace t = Tempo.trace(SEARCH, strict());
             CountDownLatch running = new CountDownLatch(1), finish = new CountDownLatch(1);
             AtomicInteger ran = new AtomicInteger();
             List<Handoff> handoffs = new ArrayList<>();
             List<FutureTask<Integer>> futures = new ArrayList<>();
             for (int i = 0; i < 4; i++) {
                 int n = i;
-                Handoff h = t.root().handoff(MATCH).set(INDEX, n);
+                Handoff h = t.handoff(MATCH).set(INDEX, n);
                 FutureTask<Integer> f = new FutureTask<>(h.callable(() -> {
                     if (n == 0) {
                         running.countDown();
@@ -211,12 +211,12 @@ class CancelTest {
      */
     @Test
     void theEarlyExitPatternStopsTheWorkWithoutATraceToo() throws Exception {
-        Trace closed = Tempo.start(SEARCH, new Options().clock(clock)); // not strict: the use after close below is misuse
+        Trace closed = Tempo.trace(SEARCH, new Options().clock(clock)); // not strict: the use after close below is misuse
         closed.close();
         List<Handoff> noops = List.of(
                 Tempo.current().handoff(MATCH),                     // no trace on this thread
                 NOOP.handoff(MATCH),
-                closed.root().handoff(MATCH));                      // not live
+                closed.handoff(MATCH));                      // not live
         for (Handoff h : noops) assertSame(Handoff.NOOP, h);
         closed.release();
 
@@ -253,8 +253,8 @@ class CancelTest {
      */
     @Test
     void theWrappersAreNotLambdas() {
-        Trace t = Tempo.start(SEARCH, strict());
-        Handoff h = t.root().handoff(MATCH);
+        Trace t = Tempo.trace(SEARCH, strict());
+        Handoff h = t.handoff(MATCH);
         Runnable r = h.runnable(() -> { });
         Callable<Integer> c = h.callable(() -> 1);
         Supplier<Integer> s = h.supplier(() -> 1);
@@ -279,8 +279,8 @@ class CancelTest {
         try {
             for (int round = 0; round < rounds; round++) {
                 boolean traced = round % 4 != 3;
-                Trace t = traced ? Tempo.start(SEARCH, strict().clock(Tempo.SYSTEM_CLOCK).budget(2 * tasks)) : null;
-                Span root = traced ? t.root() : Tempo.current();
+                Trace t = traced ? Tempo.trace(SEARCH, strict().clock(Tempo.SYSTEM_CLOCK).budget(2 * tasks)) : null;
+                Span root = traced ? t : Tempo.current();
                 AtomicIntegerArray ran = new AtomicIntegerArray(tasks), cancelled = new AtomicIntegerArray(tasks);
                 AtomicInteger started = new AtomicInteger();
                 List<Handoff> handoffs = new ArrayList<>();

@@ -23,11 +23,9 @@ import java.util.regex.Pattern;
  * <p>It shows long-running stage workers joining the request's trace (one handoff per worker, begun on
  * the worker, so each worker records one lane), per-frame detail spans that run past the trace's budget
  * and fold into one aggregate per stage lane, end of stream with poison pills, a summary for the response
- * body built from {@code t.aggregate(name)}, a size-limited header next to the full trace as JSON in the
+ * body built from {@code t.total(name)}, a size-limited header next to the full trace as JSON in the
  * body, and backpressure as {@code waiting()} spans that show where the pipeline is throttled. The header's
- * aggregates carry count, sum, min and max; the per-stage queue wait ({@code t.waited}) is in the body's
- * summary only, because the wire carries waits only for handoffs. It builds on {@code WorkerPool} and
- * {@code MetricsAndListeners}.
+ * aggregates carry count, sum, min and max. It builds on {@code WorkerPool} and {@code MetricsAndListeners}.
  *
  * <pre>
  * ./gradlew -q demo -Pdemo=IngestPipeline                      the story, the response and its body
@@ -53,11 +51,11 @@ public final class IngestPipeline {
             DECODER = Tempo.name("decoder"), DESCRIBER = Tempo.name("describer"), WRITER = Tempo.name("writer"),
             FRAMES = Tempo.name("frames"), BYTES = Tempo.name("bytes");
 
-    // Per-frame work and the blocked puts. Always-on: t.aggregate(name) counts them at every level, so the
-    // summary in the body stays complete when a request is traced COARSE and these spans write no rows.
-    static final Tempo.Name DECODE = Tempo.name("decode").aggregate(), DESCRIBE = Tempo.name("describe").aggregate(),
-            STORE = Tempo.name("store").aggregate(), FLUSH = Tempo.name("flush").aggregate(),
-            BACKPRESSURE = Tempo.name("backpressure").aggregate();
+    // Per-frame work and the blocked puts, as steps: t.total(name) counts them whatever the trace draws, so
+    // the summary in the body stays complete when a request records spans only and these write no rows.
+    static final Tempo.Name DECODE = Tempo.name("decode"), DESCRIBE = Tempo.name("describe"),
+            STORE = Tempo.name("store"), FLUSH = Tempo.name("flush"),
+            BACKPRESSURE = Tempo.name("backpressure");
 
     static final int FRAME_COUNT = 120, QUEUE = 8, DECODERS = 2, BATCH = 16;
     // describe is the slowest stage by far (4 ms a frame against 1 ms a chunk read), so queues fill up.
@@ -73,7 +71,6 @@ public final class IngestPipeline {
     /** One frame on its way through the pipeline. */
     static final class Frame {
         final int bytes;
-        long ready; // t.submitted() when a stage was done with it: its wait for the next, a blocked put included
 
         Frame(int bytes) {
             this.bytes = bytes;
@@ -101,10 +98,10 @@ public final class IngestPipeline {
     }
 
     static void upload(ExecutorService decoders, ExecutorService describers, ExecutorService writers) throws Exception {
-        Tempo.Trace t = Tempo.start(UPLOAD, new Tempo.Options().level(Tempo.DETAIL).budget(BUDGET)
-                .headerBytes(HEADER_BYTES).strict(true));
+        Tempo.Trace t = Tempo.trace(UPLOAD, new Tempo.Options().budget(BUDGET)
+                .headerBytes(HEADER_BYTES).strict(true)).records(Tempo.STEP);
         try (t) {
-            Tempo.Span root = t.root().set(FRAMES, FRAME_COUNT);
+            Tempo.Span root = t.set(FRAMES, FRAME_COUNT);
             BlockingQueue<Frame> toDecode = new ArrayBlockingQueue<>(QUEUE), toDescribe = new ArrayBlockingQueue<>(QUEUE),
                     toStore = new ArrayBlockingQueue<>(QUEUE);
 
@@ -119,7 +116,7 @@ public final class IngestPipeline {
                 long bytes = 0;
                 for (int i = 0; i < FRAME_COUNT; i++) {
                     Frame f = new Frame(40_000 + i % 7 * 1_000);
-                    try (Tempo.Span c = r.detail(READ)) {
+                    try (Tempo.Span c = r.step(READ)) {
                         Demo.io(READ_MS); // the next chunk of the request body
                         c.set(BYTES, f.bytes);
                     }
@@ -139,16 +136,15 @@ public final class IngestPipeline {
         // The numbers a client logs, from the aggregates: every frame counts, recorded as a row or folded.
         StringBuilder body = new StringBuilder("{\"frames\":").append(FRAME_COUNT).append(",\"summary\":{");
         for (Tempo.Name n : new Tempo.Name[] {DECODE, DESCRIBE, STORE}) {
-            Tempo.Aggregate a = t.aggregate(n);
+            Tempo.Total a = t.total(n);
             body.append('"').append(n).append("\":").append(stats(a)).append(',');
-            Demo.say(String.format(Locale.ROOT, "%-9s %d frames, %s ms in all, slowest %s ms; waits for the stage: %s ms in all"
-                            + " (overlapping), longest %s ms", n, a.count(), ms(a.sumNanos()), ms(a.maxNanos()),
-                    ms(a.waitSumNanos()), ms(a.waitMaxNanos())));
+            Demo.say(String.format(Locale.ROOT, "%-9s %d frames, %s ms in all, slowest %s ms", n, a.count(), ms(a.sum()),
+                    ms(a.max())));
         }
-        Tempo.Aggregate flushes = t.aggregate(FLUSH), pressure = t.aggregate(BACKPRESSURE);
+        Tempo.Total flushes = t.total(FLUSH), pressure = t.total(BACKPRESSURE);
         body.append("\"flush\":").append(stats(flushes)).append(",\"backpressure\":").append(stats(pressure)).append("},");
         Demo.say(String.format(Locale.ROOT, "flush     %d batches, %s ms; backpressure: %d blocked puts, %s ms",
-                flushes.count(), ms(flushes.sumNanos()), pressure.count(), ms(pressure.sumNanos())));
+                flushes.count(), ms(flushes.sum()), pressure.count(), ms(pressure.sum())));
 
         // A response holds a snapshot, never the trace. The header keeps to its byte limit; the body has none.
         Tempo.Snapshot snap = t.snapshot();
@@ -185,9 +181,8 @@ public final class IngestPipeline {
 
     /** Hands a frame to the next stage; a put that has to wait for room is backpressure. */
     static void put(Tempo.Trace t, Tempo.Span s, BlockingQueue<Frame> next, Frame f) throws InterruptedException {
-        if (f != END) f.ready = t.submitted();
         if (next.offer(f)) return;
-        try (Tempo.Span b = s.detail(BACKPRESSURE).waiting()) {
+        try (Tempo.Span b = s.step(BACKPRESSURE).waiting()) {
             next.put(f);
         }
     }
@@ -196,8 +191,7 @@ public final class IngestPipeline {
             throws InterruptedException {
         int n = 0;
         for (Frame f; (f = in.take()) != END; n++) {
-            t.waited(DECODE, f.ready); // how long the frame waited for this stage, into aggregate(DECODE)
-            try (Tempo.Span d = stage.detail(DECODE)) {
+            try (Tempo.Span d = stage.step(DECODE)) {
                 Demo.cpu(DECODE_US);
             }
             put(t, stage, out, f);
@@ -215,8 +209,7 @@ public final class IngestPipeline {
                 ends++;
                 continue;
             }
-            t.waited(DESCRIBE, f.ready);
-            try (Tempo.Span d = stage.detail(DESCRIBE)) {
+            try (Tempo.Span d = stage.step(DESCRIBE)) {
                 Demo.cpu(DESCRIBE_US);
             }
             put(t, stage, out, f);
@@ -230,8 +223,7 @@ public final class IngestPipeline {
         List<Frame> batch = new ArrayList<>(BATCH);
         int n = 0;
         for (Frame f; (f = in.take()) != END; n++) {
-            t.waited(STORE, f.ready);
-            try (Tempo.Span s = stage.detail(STORE)) {
+            try (Tempo.Span s = stage.step(STORE)) {
                 Demo.cpu(STORE_US); // serialize the frame into the batch
             }
             batch.add(f);
@@ -242,7 +234,7 @@ public final class IngestPipeline {
     }
 
     static void flush(Tempo.Span stage, List<Frame> batch) {
-        try (Tempo.Span w = stage.detail(FLUSH)) {
+        try (Tempo.Span w = stage.step(FLUSH)) {
             Demo.io(FLUSH_MS); // one write for the whole batch
             w.set(FRAMES, batch.size());
         }
@@ -253,13 +245,12 @@ public final class IngestPipeline {
 
     static void check(Tempo.Trace t, String body, String header, int headerBytes, int headerSpans, int jsonSpans) {
         for (Tempo.Name n : new Tempo.Name[] {DECODE, DESCRIBE, STORE}) {
-            Tempo.Aggregate a = t.aggregate(n);
-            Demo.check(a.count() == FRAME_COUNT && a.waitCount() == FRAME_COUNT,
-                    n + ": aggregate(" + n + ") counts every frame, and its wait for the stage");
+            Tempo.Total a = t.total(n);
+            Demo.check(a.count() == FRAME_COUNT, n + ": total(" + n + ") counts every frame");
             Demo.check(Demo.occurrences(t, v -> v.name() == n) == FRAME_COUNT, n + ": rows plus folded counts are all frames");
             Demo.check(Demo.count(t, v -> v.name() == n && v.aggregate()) >= 1, n + ": past the budget, frames fold into an aggregate");
         }
-        Demo.check(t.aggregate(FLUSH).count() == (FRAME_COUNT + BATCH - 1) / BATCH,
+        Demo.check(t.total(FLUSH).count() == (FRAME_COUNT + BATCH - 1) / BATCH,
                 "the store writes in batches of " + BATCH + ", the last one at end of stream");
 
         Demo.check(Demo.count(t, v -> v.name() == DECODER && v.handoff() && v.thread().startsWith("decode-")) == DECODERS
@@ -292,9 +283,8 @@ public final class IngestPipeline {
 
     // ------------------------------------------------------------------ small helpers
 
-    static String stats(Tempo.Aggregate a) {
-        return String.format(Locale.ROOT, "{\"count\":%d,\"ms\":%s,\"maxMs\":%s,\"waitMs\":%s,\"waitMaxMs\":%s}",
-                a.count(), ms(a.sumNanos()), ms(a.maxNanos()), ms(a.waitSumNanos()), ms(a.waitMaxNanos()));
+    static String stats(Tempo.Total a) {
+        return String.format(Locale.ROOT, "{\"count\":%d,\"ms\":%s,\"maxMs\":%s}", a.count(), ms(a.sum()), ms(a.max()));
     }
 
     static String ms(long nanos) {

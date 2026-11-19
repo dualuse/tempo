@@ -3,6 +3,7 @@ package io.github.dualuse.tempo;
 import io.github.dualuse.tempo.Tempo.Options;
 import io.github.dualuse.tempo.Tempo.Span;
 import io.github.dualuse.tempo.Tempo.Trace;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
@@ -22,6 +23,11 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /** {@code Tempo-Link}: the base baked in at build time, its overrides, and the packing of FORMAT.md section 9. */
 class LinkTest {
+
+    @AfterEach
+    void noTraceLeftOnThread() {
+        TempoTest.assertNothingLeftOpen();
+    }
 
     final TempoTest.Clock clock = new TempoTest.Clock();
 
@@ -44,7 +50,7 @@ class LinkTest {
         }
         assertEquals(expected, Tempo.Link.Built.BASE, property + " " + repository + " " + remote);
         if (System.getProperty("tempo.linkBase") == null) {
-            Trace t = Tempo.start(TempoTest.SEARCH, new Options().clock(clock));
+            Trace t = Tempo.trace(TempoTest.SEARCH, new Options().clock(clock));
             t.close();
             assertTrue(t.toLink().startsWith(expected + "#t=z."), t.toLink());
         }
@@ -75,8 +81,10 @@ class LinkTest {
 
     @Test
     void optionsWinOverTheSystemPropertyWhichWinsOverTheBakedBase() {
-        Trace t = Tempo.start(TempoTest.SEARCH, new Options().clock(clock));
-        Trace u = Tempo.start(TempoTest.SEARCH, new Options().clock(clock).linkBase("file:///opt/viewer/index.html"));
+        Trace t = Tempo.trace(TempoTest.SEARCH, new Options().clock(clock));
+        t.close(); // one at a time: a trace started inside another joins it
+        Trace u = Tempo.trace(TempoTest.SEARCH, new Options().clock(clock).linkBase("file:///opt/viewer/index.html"));
+        u.close();
         String saved = System.getProperty("tempo.linkBase");
         try {
             System.setProperty("tempo.linkBase", "https://viewer.example/tempo/");
@@ -88,8 +96,6 @@ class LinkTest {
             if (saved == null) System.clearProperty("tempo.linkBase");
             else System.setProperty("tempo.linkBase", saved);
         }
-        u.close();
-        t.close();
     }
 
     @Test
@@ -107,9 +113,9 @@ class LinkTest {
     /** The fragment inflates to the header value; after release both are empty. */
     @Test
     void theLinkCarriesTheHeaderValue() throws Exception {
-        Trace t = Tempo.start(TempoTest.SEARCH, new Options().clock(clock).wallClock(() -> 1794567890123L)
+        Trace t = Tempo.trace(TempoTest.SEARCH, new Options().clock(clock).wallClock(() -> 1794567890123L)
                 .linkBase("https://viewer.example/tempo/"));
-        Span s = t.root().span(TempoTest.DECODE);
+        Span s = t.span(TempoTest.DECODE);
         clock.add(3_000_000);
         s.close();
         clock.add(1_000_000);
@@ -163,7 +169,7 @@ class LinkTest {
     /** An explicit base wins over the options, which win over the default; a bad one is refused. */
     @Test
     void anExplicitBaseWins() throws Exception {
-        Trace t = Tempo.start(TempoTest.SEARCH, new Options().clock(clock).linkBase("https://viewer.example/tempo/"));
+        Trace t = Tempo.trace(TempoTest.SEARCH, new Options().clock(clock).linkBase("https://viewer.example/tempo/"));
         clock.add(1_000_000);
         t.close();
         assertTrue(t.toLink().startsWith("https://viewer.example/tempo/#t=z."), t.toLink());

@@ -44,7 +44,7 @@ class HeaderTest {
 
     @AfterEach
     void noTraceLeftOnThread() {
-        assertSame(NOOP, Tempo.current(), "a test left a span open on the test thread");
+        TempoTest.assertNothingLeftOpen();
     }
 
     // ---- names and numbers ------------------------------------------------------------------------
@@ -134,8 +134,8 @@ class HeaderTest {
 
     @Test
     void attributesKeepTheFirstPositionAndTheLastValueAndDropNonFiniteOnes() {
-        Trace t = Tempo.start(SEARCH, opts());
-        t.root().set(BYTES, 1).set(RATIO, 2.5).set(BYTES, 3).set(NAN, Double.NaN).set(SCORE, 1.0).set(SCORE, Double.POSITIVE_INFINITY);
+        Trace t = Tempo.trace(SEARCH, opts());
+        t.set(BYTES, 1).set(RATIO, 2.5).set(BYTES, 3).set(NAN, Double.NaN).set(SCORE, 1.0).set(SCORE, Double.POSITIVE_INFINITY);
         clock.add(5000);
         t.close();
         assertEquals("v1;w=mwevdy2z;x=0.2;T=" + name(Thread.currentThread().getName()) + ";N=search:bytes:ratio;"
@@ -149,8 +149,8 @@ class HeaderTest {
      */
     @Test
     void inlineHandoffIsAPlainChildWhateverItsWait() {
-        Trace t = Tempo.start(SEARCH, opts());
-        Span root = t.root();
+        Trace t = Tempo.trace(SEARCH, opts());
+        Span root = t;
         clock.add(1000);
         Handoff now = root.handoff(LOAD);
         clock.add(999);
@@ -176,10 +176,10 @@ class HeaderTest {
     /** Rejected or cancelled on the submitting thread before it began, a task keeps its wait, even of 0 ns. */
     @Test
     void taskRejectedOnTheSubmittingThreadKeepsItsWait() {
-        Trace t = Tempo.start(SEARCH, opts());
+        Trace t = Tempo.trace(SEARCH, opts());
         clock.add(1000);
-        t.root().handoff(LOAD).reject();
-        Handoff h = t.root().handoff(MATCH);
+        t.handoff(LOAD).reject();
+        Handoff h = t.handoff(MATCH);
         clock.add(500);
         h.cancel();
         clock.add(1000);
@@ -190,9 +190,9 @@ class HeaderTest {
     /** A task cancelled before it began nominally sits on its parent's thread, whichever thread cancelled it. */
     @Test
     void taskCancelledBeforeItBeganSitsOnItsParentsThread() throws InterruptedException {
-        Trace t = Tempo.start(SEARCH, opts());
+        Trace t = Tempo.trace(SEARCH, opts());
         clock.add(1000);
-        Handoff h = t.root().handoff(LOAD);
+        Handoff h = t.handoff(LOAD);
         clock.add(4000);
         assertNull(TempoTest.onThread("canceller", h::cancel));
         clock.add(1000);
@@ -208,8 +208,8 @@ class HeaderTest {
      */
     @Test
     void recordsDeeperThan35FoldIntoTheirDepth35Ancestor() throws InterruptedException {
-        Trace t = Tempo.start(SEARCH, opts());
-        Span s = t.root();
+        Trace t = Tempo.trace(SEARCH, opts());
+        Span s = t;
         for (int d = 1; d < 34; d++) s = s.span(LOAD);
         Handoff h = s.handoff(MATCH); // depth 34
         Handoff[] next = new Handoff[1];
@@ -238,8 +238,8 @@ class HeaderTest {
     @Test
     void overTheLimitTheLadderFoldsFirst() {
         try (GoldenTest.Script s = new GoldenTest.Script(1794567890123L, "http-1", "worker")) {
-            Trace t = s.on(0, 0, () -> Tempo.start(SEARCH, s.options()));
-            Span root = s.on(0, 0, () -> t.root().set(BYTES, 7));
+            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options()));
+            Span root = s.on(0, 0, () -> t.set(BYTES, 7));
             Span d = s.on(0, 1000, () -> root.span(DECODE).set(SCORE, 0.5));
             for (int i = 0; i < 40; i++) {
                 Span l = s.on(0, 1100 + 100 * i, () -> d.span(LOAD));
@@ -267,32 +267,31 @@ class HeaderTest {
     /** An aggregate nested in another one is left out: its spans count as dropped and no longer as folded. */
     @Test
     void aggregateNestedInAnAggregateCountsAsDroppedOnly() {
-        Name marked = Tempo.name("marked-only").aggregate();
-        Trace t = Tempo.start(SEARCH, opts().level(Tempo.DETAIL).budget(0));
-        Span root = t.root();
+        Trace t = Tempo.trace(SEARCH, opts().budget(0)).records(Tempo.STEP);
+        Span root = t;
         for (int i = 0; i < 3; i++) {
             clock.add(1000);
-            try (Span b = root.detail(LOAD)) {
+            try (Span b = root.step(LOAD)) {
                 for (int j = 0; j < 2; j++) {
                     clock.add(1000);
-                    b.detail(MATCH).close();
+                    b.step(MATCH).close();
                 }
-                b.deep(marked).close(); // aggregate-only (below DEEP), not folded: left out, never counted as folded
+                b.tick(MATCH).close(); // not recorded below TICK: neither folded nor dropped
             }
         }
         clock.add(1000);
         t.close();
         assertEquals(9, t.snapshot().folded());
         String h = t.toHeader();
-        assertTrue(h.contains(";x=3.9;"), h); // 3 load on the wire; 6 match and 3 marked-only left out
+        assertTrue(h.contains(";x=3.6;"), h); // 3 load on the wire; 6 match left out
         assertEquals(List.of(3), aggregates(h));
     }
 
     /** At ladder step 4 an aggregate at depth 2 is left out with the spans: folded drops to 0. */
     @Test
     void aggregateLeftOutAtTheLastLadderStepCountsAsDroppedOnly() {
-        Trace t = Tempo.start(SEARCH, opts().level(Tempo.DETAIL).budget(0).cpu(false).headerBytes(256));
-        Span root = t.root();
+        Trace t = Tempo.trace(SEARCH, opts().budget(0).cpu(false).headerBytes(256)).records(Tempo.STEP);
+        Span root = t;
         clock.add(1000);
         try (Span d = root.span(DECODE)) {
             for (int i = 0; i < 40; i++) { // names of their own, so that nothing folds
@@ -301,7 +300,7 @@ class HeaderTest {
             }
             for (int i = 0; i < 10; i++) {
                 clock.add(1000);
-                d.detail(SCORE).close();
+                d.step(SCORE).close();
             }
         }
         clock.add(1000);
@@ -314,29 +313,29 @@ class HeaderTest {
         assertEquals(51L, fallback.get("dropped"));
     }
 
-    /** Every occurrence in an aggregate on the wire counts as folded, also of an always-on name below the level. */
+    /** Steps a trace does not draw are no aggregate on the wire: neither folded nor dropped. */
     @Test
-    void aggregatesOfAlwaysOnSpansCountAsFolded() {
-        Name always = Tempo.name("always-on").aggregate();
-        Trace t = Tempo.start(SEARCH, opts().level(Tempo.COARSE));
+    void undrawnStepsCountAsNeitherFoldedNorDropped() {
+        Name undrawn = Tempo.name("undrawn-on-the-wire");
+        Trace t = Tempo.trace(SEARCH, opts());
         for (int i = 0; i < 10; i++) {
             clock.add(1000);
-            t.root().detail(always).close();
+            t.step(undrawn).close();
         }
         clock.add(1000);
         t.close();
         assertEquals(0, t.snapshot().folded());
         String h = t.toHeader();
-        assertTrue(h.contains(";x=a.0;"), h);
-        assertEquals(List.of(10), aggregates(h));
-        assertEquals(10L, WireDecoder.decode(h).get("folded"));
+        assertFalse(h.contains(";x="), h);
+        assertTrue(h.endsWith(";N=search;S=00.0.b;e=1"), h);
+        assertEquals(10, t.total(undrawn).count());
     }
 
     /** A folded task still open at the render is in no aggregate yet, but folded all the same. */
     @Test
     void anOpenFoldedTaskCountsAsFolded() {
-        Trace t = Tempo.start(SEARCH, opts().budget(0));
-        Handoff h = t.root().handoff(LOAD);
+        Trace t = Tempo.trace(SEARCH, opts().budget(0));
+        Handoff h = t.handoff(LOAD);
         clock.add(1000);
         Span x = h.begin(); // caller-runs, past the budget
         clock.add(1000);
@@ -354,7 +353,7 @@ class HeaderTest {
      */
     @Test
     void aValueThatFitsIsKeptAlsoBelow256Bytes() {
-        Trace t = Tempo.start(SEARCH, opts().headerBytes(100));
+        Trace t = Tempo.trace(SEARCH, opts().headerBytes(100));
         clock.add(1500);
         t.close();
         String v = t.toHeader();
@@ -377,7 +376,7 @@ class HeaderTest {
 
     @Test
     void releasedTraceRendersEmptyAndAnEarlierSnapshotStillRenders() {
-        Trace t = Tempo.start(SEARCH, opts());
+        Trace t = Tempo.trace(SEARCH, opts());
         clock.add(1500);
         t.close();
         Snapshot before = t.snapshot();
@@ -442,11 +441,12 @@ class HeaderTest {
      */
     static Snapshot randomSnapshot(SplittableRandom rnd, int round, Set<Long> inline) {
         try (GoldenTest.Script s = new GoldenTest.Script(1794567890123L + round, "http-1", "cpu 1", "cpu-2", "io_1")) {
-            Options o = s.options().level(rnd.nextInt(3)).budget(rnd.nextInt(10)).cpu(rnd.nextBoolean());
-            Trace t = s.at(0, () -> Tempo.start(SEARCH, o));
+            int records = rnd.nextInt(3);
+            Options o = s.options().budget(rnd.nextInt(10)).cpu(rnd.nextBoolean());
+            Trace t = s.at(0, () -> Tempo.trace(SEARCH, o).records(records));
             List<List<Span>> stacks = new ArrayList<>();
             for (int i = 0; i < 4; i++) stacks.add(new ArrayList<>());
-            stacks.get(0).add(t.root());
+            stacks.get(0).add(t);
             List<Handoff> pending = new ArrayList<>();
             long[] cpu = {0};
             for (int step = 0, steps = rnd.nextInt(10, 400); step < steps; step++) {
@@ -483,8 +483,8 @@ class HeaderTest {
                 Span opened = s.at(k, () -> {
                     switch (op) {
                         case 0: return h.span(n);
-                        case 1: return h.detail(n).cpu();
-                        case 2: return h.deep(n);
+                        case 1: return h.step(n).cpu();
+                        case 2: return h.tick(n);
                         case 3:
                             if (k == 0 && i == 0) return null;
                             h.close();

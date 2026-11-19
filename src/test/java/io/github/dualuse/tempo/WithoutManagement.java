@@ -14,8 +14,8 @@ public final class WithoutManagement {
         } catch (ClassNotFoundException e) {
             management = false;
         }
-        Tempo.Trace t = Tempo.start(Tempo.name("search"), new Tempo.Options().level(Tempo.DETAIL).cpu(true));
-        t.root().span(Tempo.name("decode")).cpu().close();
+        Tempo.Trace t = Tempo.trace(Tempo.name("search"), new Tempo.Options().cpu(true)).records(Tempo.STEP);
+        t.span(Tempo.name("decode")).cpu().close();
         t.close();
         StringBuilder b = new StringBuilder("management=" + management);
         t.forEachSpan(s -> b.append(' ').append(s.name()).append(" cpu=").append(s.cpuNanos()));

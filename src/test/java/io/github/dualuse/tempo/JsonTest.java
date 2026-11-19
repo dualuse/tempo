@@ -11,6 +11,7 @@ import io.github.dualuse.tempo.Tempo.Options;
 import io.github.dualuse.tempo.Tempo.Snapshot;
 import io.github.dualuse.tempo.Tempo.Span;
 import io.github.dualuse.tempo.Tempo.Trace;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.msgpack.jackson.dataformat.MessagePackFactory;
 
@@ -31,6 +32,11 @@ import static org.junit.jupiter.api.Assertions.*;
  * the same tree. The golden vectors get these checks where {@link GoldenTest} records them.
  */
 class JsonTest {
+
+    @AfterEach
+    void noTraceLeftOnThread() {
+        TempoTest.assertNothingLeftOpen();
+    }
 
     static final ObjectMapper JSON = new ObjectMapper().registerModule(TempoJackson.module());
     static final ObjectMapper[] BINARY = {
@@ -95,8 +101,8 @@ class JsonTest {
     @Test
     void exactText() throws IOException {
         try (GoldenTest.Script s = new GoldenTest.Script(1794567890123L, "http \"1\"", "cpu\t2")) {
-            Trace t = s.on(0, 0, () -> Tempo.start(TempoTest.SEARCH, s.options()));
-            Span root = t.root();
+            Trace t = s.on(0, 0, () -> Tempo.trace(TempoTest.SEARCH, s.options()));
+            Span root = t;
             Span q = s.on(0, 10, () -> root.span(QUOTED).set(RATIO, 0.000001).set(K, 2.0).set(BIG, 1e20)
                     .set(NEG, -0.0).set(NAN, Double.NaN).set(K, 7.25));
             s.run(0, 1010, q::close);
@@ -128,12 +134,12 @@ class JsonTest {
     @Test
     void aggregatesLiveAndOpen() throws IOException {
         try (GoldenTest.Script s = new GoldenTest.Script(0, "main", "pool")) {
-            Trace t = s.on(0, 0, () -> Tempo.start(TempoTest.SEARCH, s.options().level(Tempo.DETAIL).budget(2)));
-            Span root = t.root();
+            Trace t = s.on(0, 0, () -> Tempo.trace(TempoTest.SEARCH, s.options().budget(2)).records(Tempo.STEP));
+            Span root = t;
             Handoff h = s.on(0, 50, () -> root.handoff(TempoTest.MATCH));
             for (int i = 0; i < 3; i++) {
                 long at = 100 + 100 * i;
-                Span d = s.on(0, at, () -> root.detail(TempoTest.DECODE));
+                Span d = s.on(0, at, () -> root.step(TempoTest.DECODE));
                 s.run(0, at + 10 + i, d::close);
             }
             s.on(1, 700, h::begin);
@@ -151,7 +157,7 @@ class JsonTest {
     @Test
     void emptyAfterRelease() throws IOException {
         String empty = "{\"v\":1,\"unit\":\"us\",\"folded\":0,\"dropped\":0,\"threads\":[],\"live\":[],\"truncated\":false,\"spans\":[]}";
-        Trace t = Tempo.start(TempoTest.SEARCH, new Options().clock(new TempoTest.Clock()));
+        Trace t = Tempo.trace(TempoTest.SEARCH, new Options().clock(new TempoTest.Clock()));
         t.close();
         t.release();
         StringBuilder b = new StringBuilder();
@@ -164,11 +170,11 @@ class JsonTest {
     @Test
     void noSizeLimit() throws IOException {
         TempoTest.Clock clock = new TempoTest.Clock();
-        Trace t = Tempo.start(TempoTest.SEARCH, new Options().clock(clock).headerBytes(300));
+        Trace t = Tempo.trace(TempoTest.SEARCH, new Options().clock(clock).headerBytes(300));
         try {
             for (int i = 0; i < 2000; i++) {
                 clock.add(1000);
-                try (Span s = t.root().span(i % 2 == 0 ? TempoTest.LOAD : TempoTest.MATCH)) {
+                try (Span s = t.span(i % 2 == 0 ? TempoTest.LOAD : TempoTest.MATCH)) {
                     s.set(K, i);
                     clock.add(500);
                 }
@@ -189,8 +195,8 @@ class JsonTest {
     @Test
     void writeErrorsReachTheCaller() throws IOException {
         TempoTest.Clock clock = new TempoTest.Clock();
-        Trace t = Tempo.start(TempoTest.SEARCH, new Options().clock(clock));
-        for (int i = 0; i < 400; i++) t.root().span(TempoTest.LOAD).close();
+        Trace t = Tempo.trace(TempoTest.SEARCH, new Options().clock(clock));
+        for (int i = 0; i < 400; i++) t.span(TempoTest.LOAD).close();
         t.close();
         Snapshot snap = t.snapshot();
         t.release();
@@ -223,8 +229,8 @@ class JsonTest {
 
     @Test
     void serializerOnAFieldWithoutTheModule() throws IOException {
-        Trace t = Tempo.start(TempoTest.SEARCH, new Options().clock(new TempoTest.Clock()));
-        t.root().span(TempoTest.LOAD).close();
+        Trace t = Tempo.trace(TempoTest.SEARCH, new Options().clock(new TempoTest.Clock()));
+        t.span(TempoTest.LOAD).close();
         t.close();
         Response r = new Response();
         r.tempo = t.snapshot();
