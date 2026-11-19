@@ -27,7 +27,7 @@ public final class TaskStress {
 
     /** The submitter's root lane of {@code ctx}, open, drawing tasks. */
     static Tempo.Lane root(Tempo.Context ctx) {
-        ctx.level = Tempo.STEP;
+        ctx.level(Tempo.STEP);
         Tempo.Lane root = ctx.register(new Tempo.Lane(ctx, new Tempo.ThreadSlot()));
         root.openRoot(N, 0, -1); // stays open
         return root;

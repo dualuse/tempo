@@ -179,26 +179,24 @@ class LadderTest {
      */
     @Test
     void theReferenceAndTheViewersAgree() throws Exception {
-        Path file = Files.createTempFile("tempo-java-outputs", ".tsv"), plain = Files.createTempFile("tempo-java-outputs", ".tsv");
+        Path file = Files.createTempFile("tempo-java-outputs", ".tsv");
         try {
-            Files.write(file, corpus(true).getBytes(StandardCharsets.UTF_8));
-            Files.write(plain, corpus(false).getBytes(StandardCharsets.UTF_8));
+            Files.write(file, corpus().getBytes(StandardCharsets.UTF_8));
             run("python3", "tests/check_java_outputs.py", file.toString());
-            run("node", "tests/check_java_outputs.mjs", plain.toString());
+            run("node", "tests/check_java_outputs.mjs", file.toString());
         } finally {
             Files.delete(file);
-            Files.delete(plain);
         }
     }
 
-    /** The values and links of {@link #theReferenceAndTheViewersAgree}, with or without phases and unnamed spans. */
-    private static String corpus(boolean phases) {
+    /** The values and links of {@link #theReferenceAndTheViewersAgree}, phases and unnamed spans included. */
+    private static String corpus() {
         SplittableRandom rnd = new SplittableRandom(20261116);
         StringBuilder corpus = new StringBuilder();
         Snapshot ladder = ladderTrace();
         for (int limit : new int[] {100, 256, 300, 400, 500}) line(corpus, "header", limit, ladder, ladder.toHeader(limit));
         for (int round = 0; round < 80; round++) {
-            Snapshot snap = HeaderTest.randomSnapshot(rnd, round, new HashSet<>(), phases);
+            Snapshot snap = HeaderTest.randomSnapshot(rnd, round, new HashSet<>());
             int length = snap.toHeader(Integer.MAX_VALUE).length();
             for (int i = 0; i < 3; i++) {
                 int limit = 256 + rnd.nextInt(Math.max(1, length - 255));

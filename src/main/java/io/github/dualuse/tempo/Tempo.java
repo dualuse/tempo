@@ -46,12 +46,14 @@ import java.util.zip.Deflater;
  * <pre>{@code
  * static final Tempo.Name DECODE = Tempo.name("decode");
  *
- * try (Tempo.Trace t = Tempo.trace("GET /search")) {
+ * Tempo.Trace t = Tempo.trace("GET /search");
+ * try (t) {
  *     try (Tempo.Span s = Tempo.span(DECODE)) {
  *         s.set("bytes", image.length);
  *     }
- *     response.header("Tempo-Timing", t.toHeader());
  * }
+ * response.header("Tempo-Timing", t.toHeader()); // after the block: the root has closed
+ * t.release();
  * }</pre>
  *
  * <p>Three words open a span, and the word says what is measured: a {@link #span} is always timed and
@@ -258,9 +260,11 @@ public final class Tempo {
     }
 
     /**
-     * The innermost open span of the calling thread, or {@link #NOOP}: the explicit way to annotate it,
-     * as in {@code Tempo.current().set("hits", n)}. A phase is a section of its span, never a span of its
-     * own: inside {@code s.phase(n)} this returns {@code s}. Costs one {@code ThreadLocal} read.
+     * The innermost open span of the calling thread: the explicit way to annotate it, as in {@code
+     * Tempo.current().set("hits", n)}. Outside a trace it is {@link #NOOP}, or, while a span or step timed
+     * only for a global listener ({@link #on}) is open, that span, which keeps no attributes. A phase is a
+     * section of its span, never a span of its own: inside {@code s.phase(n)} this returns {@code s}.
+     * Costs one {@code ThreadLocal} read.
      */
     public static Span current() {
         ThreadSlot slot = SLOT.get();
@@ -288,9 +292,8 @@ public final class Tempo {
      * A task that runs {@code body}, and the {@link java.util.concurrent.Future} of it: hand it to an
      * executor ({@code execute}, or {@code submit}, which wraps it) where it runs. Its parent is the
      * calling thread's innermost open span, and its queue wait starts now; see {@link Task}. Allocates the
-     * one task object, also outside a trace, where it still cancels.
-     *
-     * @throws NullPointerException if {@code body} is null
+     * one task object, also outside a trace, where it still cancels. A null body is misuse (strict mode
+     * throws) and does nothing.
      */
     public static RunnableTask runnable(Name name, Runnable body) {
         return new RunnableTask(name, null, body, 0);
@@ -303,12 +306,12 @@ public final class Tempo {
 
     /** Like {@link #runnable(Name, Runnable)} for a body with a result. */
     public static <V> CallableTask<V> callable(Name name, Callable<V> body) {
-        return new CallableTask<>(name, null, body, 0);
+        return new CallTask<>(name, null, body, 0);
     }
 
     /** Like {@link #callable(Name, Callable)}, the name looked up as for {@link #span(String)}. */
     public static <V> CallableTask<V> callable(String name, Callable<V> body) {
-        return new CallableTask<>(null, name, body, 0);
+        return new CallTask<>(null, name, body, 0);
     }
 
     /**
@@ -328,10 +331,13 @@ public final class Tempo {
      * An executor over {@code pool} whose every submit is a task of {@code name} ({@link #runnable},
      * {@link #callable}) with its queue wait, under the submitting thread's innermost open span. The task
      * is handed to {@code pool.execute} and is itself the {@link java.util.concurrent.Future} that {@code
-     * submit} returns, so a submit allocates one object. {@code Future.cancel} cancels the task first: the
-     * body of a task that has not begun never runs. A submit that {@code pool} refuses is recorded as
-     * rejected, and the {@link RejectedExecutionException} is thrown on. A task made by {@link #runnable}
-     * or {@link #callable} goes in as it is, under its own name. Shutting down shuts {@code pool} down.
+     * submit} returns, so a submit allocates one object; so do {@code invokeAll} and {@code invokeAny}, one
+     * task per element. {@code Future.cancel} cancels the task first: the body of a task that has not begun
+     * never runs. A submit that {@code pool} refuses is recorded as rejected, and the {@link
+     * RejectedExecutionException} is thrown on. A task made by {@link #runnable} or {@link #callable} goes
+     * in as it is, under its own name, and is the future. Shutting down shuts {@code pool} down. A null
+     * {@code pool} is misuse (strict mode throws): the executor then runs every task on the submitting
+     * thread.
      *
      * <pre>{@code
      * ExecutorService match = Tempo.executor(pool, "match");
@@ -339,12 +345,20 @@ public final class Tempo {
      * }</pre>
      */
     public static ExecutorService executor(ExecutorService pool, Name name) {
-        return new TaskExecutor(pool, name);
+        return new TaskExecutor(pool(pool), name);
     }
 
     /** Like {@link #executor(ExecutorService, Name)}; the name is added to the global table if new. */
     public static ExecutorService executor(ExecutorService pool, String name) {
-        return new TaskExecutor(pool, name == null ? null : Name.intern(name, false));
+        return new TaskExecutor(pool(pool), name == null ? null : Name.intern(name, false));
+    }
+
+    /** {@code pool}, or for null (misuse in the calling thread's trace) one that runs every task at once. */
+    private static ExecutorService pool(ExecutorService pool) {
+        if (pool != null) return pool;
+        Lane l = SLOT.get().current;
+        if (l != null) l.ctx.misuse("null pool");
+        return new TaskExecutor.Inline();
     }
 
     /**
@@ -601,7 +615,7 @@ public final class Tempo {
      */
     static final class Context {
         private static final AtomicLong IDS = new AtomicLong();
-        private static final VarHandle LANES, TOTALS, DROPPED, CREDITS;
+        private static final VarHandle LANES, TOTALS, DROPPED, CREDITS, MODE;
 
         static {
             try {
@@ -610,6 +624,7 @@ public final class Tempo {
                 TOTALS = l.findVarHandle(Context.class, "totals", Totals.class);
                 DROPPED = l.findVarHandle(Context.class, "dropped", int.class);
                 CREDITS = l.findVarHandle(Context.class, "credits", int.class);
+                MODE = l.findVarHandle(Context.class, "mode", int.class);
             } catch (ReflectiveOperationException e) {
                 throw new ExceptionInInitializerError(e);
             }
@@ -625,8 +640,12 @@ public final class Tempo {
         final int budget, block, headerBytes, maxLanes, cpu;
         final String linkBase; // null: Link.base()
         final AtomicInteger misuses = new AtomicInteger();
-        volatile int level;
-        volatile boolean seen, released; // seen: a step or tick was opened, so records(level) is too late
+        // The level and whether a step, tick or task was seen, in one word, so a step reads the level it is
+        // opened at in the same atomic step that fixes it, and records(level) cannot widen in between:
+        // (level + 1) << 1 | SEEN, which keeps the levels in order (below SPAN is Context.NONE's).
+        static final int SEEN = 1, STEP_MODE = (STEP + 1) << 1, TICK_MODE = (TICK + 1) << 1;
+        volatile int mode;
+        volatile boolean released;
         boolean widened; // guarded by this
         // Written under this lock; a thread sees a listener added elsewhere once it synchronizes with that
         // thread, e.g. through a task submitted after it. Listeners is immutable, so even a racy read
@@ -651,7 +670,7 @@ public final class Tempo {
             budget = block = headerBytes = maxLanes = 0;
             linkBase = null;
             cpu = CPU_OFF;
-            this.level = level;
+            this.mode = (level + 1) << 1;
             this.listening = listening;
         }
 
@@ -677,7 +696,7 @@ public final class Tempo {
             headerBytes = o.headerBytes;
             linkBase = o.linkBase;
             maxLanes = o.lanes;
-            level = SPAN;
+            mode = (SPAN + 1) << 1;
             listening = Name.anySink;
         }
 
@@ -687,7 +706,17 @@ public final class Tempo {
 
         /** Whether a span opening now has its CPU time measured. */
         boolean cpu() {
-            return cpu == CPU_ON || cpu == CPU_AUTO && level >= STEP;
+            return cpu == CPU_ON || cpu == CPU_AUTO && mode >= STEP_MODE;
+        }
+
+        /** What the trace records: {@link #SPAN}, {@link #STEP} or {@link #TICK}. */
+        int level() {
+            return (mode >> 1) - 1;
+        }
+
+        /** Tests: sets the level as if widened, without the checks. */
+        void level(int level) {
+            mode = (level + 1) << 1 | mode & SEEN;
         }
 
         long cpuNow() {
@@ -699,9 +728,32 @@ public final class Tempo {
             if (strict) throw new AssertionError("Tempo misuse: " + what);
         }
 
-        /** Marks that a step or tick was opened: from now on the trace's level is fixed. */
-        void sawStep() {
-            if (!seen) seen = true;
+        /**
+         * Marks that a step, tick or task was opened: from now on the trace's level is fixed. Returns the
+         * mode it is fixed at, read in the same atomic step, so a widening either came before it or fails.
+         */
+        int sawStep() {
+            int m = mode;
+            return (m & SEEN) != 0 ? m : markSeen();
+        }
+
+        private int markSeen() {
+            int m;
+            while (((m = mode) & SEEN) == 0 && !MODE.compareAndSet(this, m, m | SEEN)) { }
+            return m | SEEN;
+        }
+
+        /**
+         * Widens the level to {@code level}, unless a step, tick or task was seen first. Called under the
+         * lock, which orders it against another widening; the seen mark is a CAS, which this one races.
+         */
+        boolean widen(int level) {
+            int m;
+            do {
+                m = mode;
+                if ((m & SEEN) != 0) return false;
+            } while (!MODE.compareAndSet(this, m, (level + 1) << 1));
+            return true;
         }
 
         /**
@@ -1063,13 +1115,14 @@ public final class Tempo {
      * no trace.
      */
     static final class ThreadSlot {
-        private static final VarHandle RETURNED, RETURNED_PHASES;
+        private static final VarHandle RETURNED, RETURNED_PHASES, RETURNED_KITS;
 
         static {
             try {
                 MethodHandles.Lookup l = MethodHandles.lookup();
                 RETURNED = l.findVarHandle(ThreadSlot.class, "returned", Span.class);
                 RETURNED_PHASES = l.findVarHandle(ThreadSlot.class, "returnedPhases", Phase.class);
+                RETURNED_KITS = l.findVarHandle(ThreadSlot.class, "returnedKits", Kit.class);
             } catch (ReflectiveOperationException e) {
                 throw new ExceptionInInitializerError(e);
             }
@@ -1085,9 +1138,11 @@ public final class Tempo {
         // retiring lane pushes its handles onto from any thread, and that the owner takes whole.
         private Span spare;
         @SuppressWarnings("unused") private volatile Span returned;
-        // The same for the phase handles, linked by Phase.link.
+        // The same for the phase handles, linked by Phase.link, and for the lanes' arrays, linked by Kit.link.
         private Phase sparePhase;
         @SuppressWarnings("unused") private volatile Phase returnedPhases;
+        private Kit spareKit;
+        @SuppressWarnings("unused") private volatile Kit returnedKits;
 
         /** Owner only: a pooled handle, or null if there is none. */
         Span take() {
@@ -1129,6 +1184,35 @@ public final class Tempo {
             } while (!RETURNED_PHASES.compareAndSet(this, top, head));
         }
 
+        /** Owner only: the arrays of a lane this thread had before, or null if there are none. */
+        Kit takeKit() {
+            Kit k = spareKit;
+            if (k == null) {
+                if (RETURNED_KITS.getAcquire(this) == null) return null;
+                k = (Kit) RETURNED_KITS.getAndSet(this, null);
+            }
+            spareKit = k.link;
+            k.link = null;
+            return k;
+        }
+
+        /** Any thread: pools the arrays of a retired lane of this thread. */
+        void giveKit(Kit k) {
+            Kit top;
+            do {
+                top = (Kit) RETURNED_KITS.getVolatile(this);
+                k.link = top;
+            } while (!RETURNED_KITS.compareAndSet(this, top, k));
+        }
+
+        /** Kits pooled; for tests, while no thread uses the slot. */
+        int kits() {
+            int n = 0;
+            for (Kit k = spareKit; k != null; k = k.link) n++;
+            for (Kit k = returnedKits; k != null; k = k.link) n++;
+            return n;
+        }
+
         /** Handles pooled, span and phase handles; for tests, while no thread uses the slot. */
         int pooled() {
             int n = 0;
@@ -1164,13 +1248,38 @@ public final class Tempo {
                 }
             }
             Lane l = ctx.idleLane(Thread.currentThread());
-            if (l == null && !ctx.full()) l = ctx.register(new Lane(ctx, this));
-            if (l != null) lanes[free >= 0 ? free : victim++ & 3] = new WeakReference<>(l);
+            if (l == null && !ctx.full()) {
+                Lane fresh = new Lane(ctx, this);
+                if ((l = ctx.register(fresh)) == null) fresh.giveBack(); // the cap was reached in between
+            }
+            if (l != null) lanes[free >= 0 ? free : victim++ & 3] = l.ref();
             return l;
         }
     }
 
     // ---------------------------------------------------------------------------------------------
+
+    /**
+     * The arrays of a lane: its chunk tables, open stack, frame and phase state and aggregates. A thread's
+     * slot pools them from one of its lanes to the next, so a thread's lane in its next trace allocates only
+     * itself (see {@link Lane#retire}). A lane retired races readers on other threads as its chunks do: a
+     * reader of a released trace may see the arrays in use by a later lane, and discards what it read.
+     */
+    static final class Kit {
+        /** Aggregates up to this many entries are pooled with the kit; a larger table goes to the GC. */
+        static final int KEEP_AGGS = 64;
+
+        final Rows[] rows = new Rows[Lane.CHUNKS];
+        final int[] rowAt = new int[Lane.MAX_DEPTH];
+        final Span[] handles = new Span[Lane.MAX_DEPTH];
+        Events[] events;
+        Span[] frames;
+        Aggs aggs;
+        long[] times, cpuAt;
+        int[] phaseAt;
+        Phase[] rowless;
+        Kit link; // the next kit in its slot's pool
+    }
 
     /** Row columns for {@link Lane#CHUNK} rows; pooled globally, never referenced by callers. */
     static final class Rows {
@@ -1311,7 +1420,10 @@ public final class Tempo {
 
         // Chunk tables never reallocate; a chunk is stored before the commit that exposes its first element.
         // The event table is created with the first event, so a lane without attributes never pays for it.
-        final Rows[] rows = new Rows[CHUNKS];
+        // The tables and the arrays below come from the kit, the owner thread's arrays of an earlier lane.
+        private final Kit kit;
+        private WeakReference<Lane> ref; // this lane in its owner's slot, made once
+        final Rows[] rows;
         Events[] events;
 
         // Open stack: rowAt[d] is the open row at depth d < depth (or NO_ROW, CROSS), handles[d] its handle. A recorded span has
@@ -1319,8 +1431,8 @@ public final class Tempo {
         // the lane retires); a trace's root and a nested trace have their Trace. A folded or undrawn span is
         // a frame without a row: its handle is the one of its depth in frames, its row is FRAME, and rowAt
         // holds the row of the nearest recorded span below it, which is the parent of anything opened above.
-        final int[] rowAt = new int[MAX_DEPTH];
-        final Span[] handles = new Span[MAX_DEPTH];
+        final int[] rowAt;
+        final Span[] handles;
         private Span[] frames; // created with the first frame
         private Span issued, issuedTail;
         int depth, rowCount, eventCount, dropped;
@@ -1379,6 +1491,28 @@ public final class Tempo {
             this.slot = slot;
             free = ctx == Context.FREE;
             if (free) id = -1;
+            Kit k = slot == null || free ? null : slot.takeKit();
+            kit = k = k == null ? new Kit() : k;
+            rows = k.rows;
+            rowAt = k.rowAt;
+            handles = k.handles;
+            events = k.events;
+            frames = k.frames;
+            times = k.times;
+            cpuAt = k.cpuAt;
+            phaseAt = k.phaseAt;
+            rowless = k.rowless;
+        }
+
+        /** This lane, weakly, for its owner's slot; made once, so a lane found again costs nothing. Owner only. */
+        WeakReference<Lane> ref() {
+            WeakReference<Lane> r = ref;
+            return r != null ? r : (ref = new WeakReference<>(this));
+        }
+
+        /** A lane that was never registered (at the lane cap): its kit goes back to the slot. */
+        void giveBack() {
+            if (slot != null && !free) slot.giveKit(kit);
         }
 
         boolean retired() {
@@ -1413,10 +1547,10 @@ public final class Tempo {
                 n = Name.UNKNOWN;
                 flags = MISUSE;
             }
-            ctx.sawStep();
+            int mode = ctx.sawStep();
             t.name = n;
             int p = rowAt[depth - 1];
-            if (ctx.level >= STEP) {
+            if (mode >= Context.STEP_MODE) {
                 if (p >= 0 && (credit != 0 || (credit = ctx.credits()) != 0)) {
                     int r = row(n, flags | HANDOFF, p);
                     if (r >= 0) {
@@ -1494,7 +1628,7 @@ public final class Tempo {
             if (hr < 0) return foldedTask(h, run, now);
             boolean root = depth == 0;
             if (root && !activate()) return NOOP;
-            if (h.lane.nameAt(hr) < 0) { // the submitter's lane is retired: the trace was released
+            if (h.lane.retired() || h.lane.nameAt(hr) < 0) { // the submitter's lane is retired: the trace was released
                 if (root) idle();
                 return NOOP;
             }
@@ -1644,6 +1778,7 @@ public final class Tempo {
         /** A span; {@code null} is misuse, recorded as {@code ?}. */
         Span openSpan(Name n, int flags) {
             if (free) return n != null && n.listened() ? freeFrame(n) : NOOP;
+            if (timed != 0 && underStop()) flags |= afterStop();
             if (n == null) {
                 ctx.misuse("null name");
                 return push(Name.UNKNOWN, flags | MISUSE);
@@ -1660,13 +1795,14 @@ public final class Tempo {
         /** A step: drawn when the trace records steps, against the budget; else an undrawn frame. */
         Span openStep(Name n, int flags) {
             if (free) return n != null && n.listened() ? freeFrame(n) : NOOP;
-            ctx.sawStep();
+            int mode = ctx.sawStep();
+            if (timed != 0 && underStop()) flags |= afterStop();
             if (n == null) {
                 ctx.misuse("null name");
                 n = Name.UNKNOWN;
                 flags |= MISUSE;
             }
-            return ctx.level < STEP ? undrawn(n) : budgeted(n, flags | STEP_ROW);
+            return mode < Context.STEP_MODE ? undrawn(n) : budgeted(n, flags | STEP_ROW);
         }
 
         Span openStep(String text) {
@@ -1677,11 +1813,8 @@ public final class Tempo {
 
         /** A tick: drawn when the trace records ticks, against the budget; else {@link #NOOP}. */
         Span openTick(Name n, int flags) {
-            if (ctx.level < TICK) {
-                if (!free) ctx.sawStep();
-                return NOOP;
-            }
-            ctx.sawStep();
+            if (ctx.mode < Context.TICK_MODE && (free || ctx.sawStep() < Context.TICK_MODE)) return NOOP;
+            if (timed != 0 && underStop()) flags |= afterStop();
             if (n == null) {
                 ctx.misuse("null name");
                 n = Name.UNKNOWN;
@@ -1691,7 +1824,7 @@ public final class Tempo {
         }
 
         Span openTick(String text) {
-            if (ctx.level < TICK) return openTick((Name) null, 0);
+            if (ctx.mode < Context.TICK_MODE && (free || ctx.sawStep() < Context.TICK_MODE)) return NOOP;
             Name n = ctx.name(text);
             return openTick(n, Name.overflowed(n, text) ? MISUSE : 0);
         }
@@ -1835,7 +1968,13 @@ public final class Tempo {
         /** The entry of an aggregate key, created if new; -1 past {@link Aggs#MAX} entries (counted as a drop). */
         private int aggregate(int anchor, int lane, int parent, int name, int kind) {
             Aggs a = aggs;
-            if (a == null) AGGS.setRelease(this, a = new Aggs(8));
+            if (a == null) {
+                a = kit.aggs;
+                if (a == null) a = new Aggs(8);
+                else a.reset();
+                kit.aggs = null;
+                AGGS.setRelease(this, a);
+            }
             int e = a.find(anchor, lane, parent, name, kind);
             if (e >= 0) return e;
             if (a.size() == Aggs.MAX) {
@@ -1851,10 +1990,24 @@ public final class Tempo {
             return a == null ? 0 : a.size();
         }
 
-        /** Elapsed time of frame handle {@code h}, which holds its start while open, then its duration; best effort off the owner. */
+        /**
+         * Elapsed time of frame handle {@code h}, which holds its start in {@code time} and, once it ended,
+         * its duration in {@code wait}; best effort off the owner.
+         */
         long frameElapsed(Span h) {
             if (ctx.released || retired()) return 0;
-            return h.depth < depth ? Math.max(0, ctx.now() - h.time) : h.time;
+            return open(h) ? Math.max(0, ctx.now() - h.time) : h.wait;
+        }
+
+        /** Start of frame handle {@code h} while it is open; 0 once it ended. Best effort off the owner. */
+        long frameStart(Span h) {
+            if (ctx.released || retired()) return 0;
+            return open(h) ? h.time : 0;
+        }
+
+        private boolean open(Span h) {
+            int d = h.depth;
+            return d < depth && handles[d] == h;
         }
 
         /** CPU time since {@link #sampleCpu} of depth {@code k}, read after the end so the read is not timed; -1 if not measured. */
@@ -1919,8 +2072,12 @@ public final class Tempo {
             return h;
         }
 
-        /** The handle the folded and undrawn spans at depth {@code d} share; the free lane's are its own. */
+        /**
+         * The handle the folded and undrawn spans at depth {@code d} share; the free lane's are its own.
+         * Strict mode gives each frame a handle of its own, so a use after close is always caught.
+         */
         private Span frameHandle(int d) {
+            if (ctx.strict) return new Span(this, ctx, d);
             Span[] f = frames;
             if (f == null) frames = f = new Span[MAX_DEPTH];
             Span h = f[d];
@@ -1986,13 +2143,21 @@ public final class Tempo {
         private boolean end(int k, long now, boolean heal) {
             Span h = handles[k];
             if ((timed >>> k & 1) != 0) {
-                if ((phaseAt[k << 2 | MODE] & STOPPED) != 0) now = times[k << 2 | STOP];
+                if ((phaseAt[k << 2 | MODE] & STOPPED) != 0) {
+                    now = times[k << 2 | STOP];
+                    // a child open at the stop or opened after it (misuse, counted then) ends inside the span
+                    long last = h.row == FRAME ? Long.MIN_VALUE : lastChild(h.row);
+                    if (last > now) {
+                        now = last;
+                        flagRow(k);
+                    }
+                }
                 if (phaseAt[k << 2 | ROW] != NO_PHASE) endPhase(k, now, 0);
             }
             if (h.row == FRAME) {
                 long start = h.time, dur = Math.max(0, now - start), cpu = cpuSince(k);
-                h.time = dur;
                 if (h.agg >= 0) aggs.add(h.agg, start - h.wait, dur, h.wait, cpu, h.flags, h.folded);
+                h.wait = dur; // the queue wait is spent: from now on the duration
                 return heal;
             }
             int r = h.row;
@@ -2013,7 +2178,7 @@ public final class Tempo {
         private void fire(int d, int top) {
             for (int k = top - 1; k >= d; k--) {
                 Span h = handles[k];
-                if (h.row == FRAME) notify(h.frame, h.time);
+                if (h.row == FRAME) notify(h.frame, h.wait);
                 else notify(Name.byId(nameOf(h.row)), rows[h.row >>> CHUNK_BITS].dur[h.row & MASK]);
             }
         }
@@ -2223,13 +2388,18 @@ public final class Tempo {
 
         /**
          * Ends the span at depth {@code d} at clock reading {@code t}, its open phase with it; it stays on the
-         * stack until it closes. Within its last boundary and now.
+         * stack until it closes. Within its last boundary, the end of its last child, and now. A child still
+         * open ends no earlier than now: the stop is now, and misuse.
          */
         void stop(int d, long t) {
             timing(d);
             if (stoppedAlready(d, "stop(nanos)")) return;
-            long now = ctx.now(), want = relative(t), at = clamp(want, times[d << 2 | MARK], now);
-            boolean clamped = at != want;
+            int r = handles[d].row;
+            boolean open = depth - 1 > d;
+            long now = ctx.now(), want = relative(t), lo = open ? now : times[d << 2 | MARK];
+            if (r != FRAME && !open) lo = Math.max(lo, lastChild(r));
+            long at = clamp(want, lo, now);
+            boolean clamped = open || at != want;
             if (phaseAt[d << 2 | ROW] != NO_PHASE) endPhase(d, at, clamped ? MISUSE : 0);
             else boundary(d, at);
             times[d << 2 | STOP] = at;
@@ -2238,7 +2408,43 @@ public final class Tempo {
             if (clamped) flagRow(d);
             publish();
             if (thrown != null) rethrow();
-            if (clamped) ctx.misuse("stop(nanos) before the last boundary or after now");
+            if (open) ctx.misuse("stop(nanos) while a child span is open");
+            else if (clamped) ctx.misuse("stop(nanos) before the last boundary or a child's end, or after now");
+        }
+
+        /**
+         * The latest end of what ended under row {@code r}: its child rows (not its phases, nor the records
+         * of tasks submitted from it, which run elsewhere) and the folded spans anchored at it. {@link
+         * Long#MIN_VALUE} for none.
+         */
+        private long lastChild(int r) {
+            long max = Long.MIN_VALUE;
+            for (int x = r + 1; x < rowCount; x++) {
+                Rows c = rows[x >>> CHUNK_BITS];
+                int i = x & MASK;
+                long dur = c.dur[i];
+                if (c.parent[i] == r && (c.flags[i] & (PHASE | HANDOFF)) == 0 && dur != OPEN) max = Math.max(max, c.start[i] + dur);
+            }
+            Aggs a = aggs;
+            for (int e = 0, n = a == null ? 0 : a.size(); e < n; e++) {
+                int k = e * Aggs.KEY, b = e * Aggs.CELLS;
+                if (a.keys[k] == r && a.keys[k + Aggs.KIND] == Aggs.SPANS && a.cells[b + Aggs.COUNT] > 0) {
+                    max = Math.max(max, a.cells[b + Aggs.LAST]);
+                }
+            }
+            return max;
+        }
+
+        /** Whether the innermost open span was stopped by hand ({@link #stop}): a child opened now is misuse. */
+        private boolean underStop() {
+            int d = depth - 1;
+            return (timed >>> d & 1) != 0 && (phaseAt[d << 2 | MODE] & STOPPED) != 0;
+        }
+
+        /** Counts a child opened under a stopped span (strict mode throws first); its row is flagged. */
+        private int afterStop() {
+            ctx.misuse("span opened under a span stopped by hand");
+            return MISUSE;
         }
 
         /**
@@ -2292,15 +2498,23 @@ public final class Tempo {
             return p;
         }
 
-        /** The handle the rowless phases at depth {@code d} share, bound to the span open there. */
+        /**
+         * The handle the rowless phases at depth {@code d} share, bound to the span open there; in strict
+         * mode one of its own.
+         */
         private Phase rowless(int d) {
+            if (ctx.strict) {
+                Phase p = new Phase();
+                p.bind(this, handles[d], d, FRAME);
+                return p;
+            }
             Phase[] f = rowless;
             if (f == null) rowless = f = new Phase[MAX_DEPTH];
             Phase p = f[d];
             if (p == null) {
-                if (free || ctx.strict) p = new Phase();
+                if (free) p = new Phase();
                 else if ((p = slot.takePhase()) == null) p = new Phase();
-                if (!free && !ctx.strict) {
+                if (!free) {
                     if (issuedPhases == null) issuedPhasesTail = p;
                     p.link = issuedPhases;
                     issuedPhases = p;
@@ -2426,14 +2640,16 @@ public final class Tempo {
          * to the pool. A table entry is cleared before its chunk is given away, and a reader that still
          * picked one up discards what it read, because it finds the trace released (see Snapshot). The
          * span and phase handles go back to the owner's slot, each detached first (see Span#detach), so a
-         * use of one is stale from now until the owner issues it again.
+         * use of one is stale from now until the owner issues it again. Last the lane's arrays go back to
+         * the slot as its kit, for the owner's next lane; a reader of this lane may then see them in use
+         * there, which it discards in the same way.
          */
         private void retire() {
             int s = state;
             if ((s & KIND) != IDLE || !STATE.compareAndSet(this, s, s | RETIRED)) return;
             Arrays.fill(handles, null);
-            frames = null;
-            rowless = null;
+            if (frames != null) Arrays.fill(frames, null);
+            if (rowless != null) Arrays.fill(rowless, null);
             Span h = issued;
             if (h != null) {
                 for (Span x = h; x != null; x = x.link) x.detach();
@@ -2457,10 +2673,21 @@ public final class Tempo {
                 t[i] = null;
                 EVENT_POOL.give(c);
             }
+            Aggs a = aggs;
             aggs = null;
             waiting = null;
             across = null;
             labels = null;
+            if (slot == null || free) return;
+            Kit k = kit;
+            k.events = events;
+            k.frames = frames;
+            k.rowless = rowless;
+            k.times = times;
+            k.cpuAt = cpuAt;
+            k.phaseAt = phaseAt;
+            if (a != null && a.keys.length <= Kit.KEEP_AGGS * Aggs.KEY) k.aggs = a;
+            slot.giveKit(k);
         }
 
         private void publish() {
@@ -2483,6 +2710,30 @@ public final class Tempo {
             VarHandle.acquireFence();
             if (ctx.released) return 0; // the chunk may have been recycled while it was read
             return dur != OPEN ? dur : Math.max(0, ctx.now() - start);
+        }
+
+        /** Name id of row {@code r}, or -1 once released or past the commit. Safe from any thread. */
+        int nameIn(int r) {
+            if (ctx.released || retired()) return -1;
+            long c = committed();
+            if (r < 0 || r >= (int) (c >>> 32)) return -1;
+            Rows k = rows[r >>> CHUNK_BITS];
+            if (k == null) return -1;
+            int id = k.name[r & MASK];
+            VarHandle.acquireFence();
+            return ctx.released ? -1 : id;
+        }
+
+        /** Start of row {@code r} from the trace's start, or 0 once released or past the commit. Safe from any thread. */
+        long startIn(int r) {
+            if (ctx.released || retired()) return 0;
+            long c = committed();
+            if (r < 0 || r >= (int) (c >>> 32)) return 0;
+            Rows k = rows[r >>> CHUNK_BITS];
+            if (k == null) return 0;
+            long start = k.start[r & MASK];
+            VarHandle.acquireFence();
+            return ctx.released ? 0 : start;
         }
 
         /**
@@ -2571,6 +2822,12 @@ public final class Tempo {
         /** Entries published so far; any thread. */
         int size() {
             return (int) SIZE.getAcquire(this);
+        }
+
+        /** Owner of a new lane: empties a pooled table for reuse. */
+        void reset() {
+            SIZE.setRelease(this, 0);
+            Arrays.fill(index, 0);
         }
 
         boolean full() {
@@ -4632,7 +4889,7 @@ public final class Tempo {
 
         /** What the trace records: {@link #SPAN} (from the start), {@link #STEP} or {@link #TICK}. */
         public int records() {
-            return ctx.level;
+            return ctx.level();
         }
 
         /**
@@ -4651,13 +4908,14 @@ public final class Tempo {
             String refused = null;
             boolean cpuOn = false;
             synchronized (ctx) {
-                if (to <= ctx.level) return this;
-                if (ctx.widened || ctx.seen) {
-                    refused = ctx.widened ? "records widened twice" : "records widened after a step or tick opened";
+                if (to <= ctx.level()) return this;
+                boolean before = ctx.cpu();
+                if (ctx.widened) {
+                    refused = "records widened twice";
+                } else if (!ctx.widen(to)) {
+                    refused = "records widened after a step or tick opened";
                 } else {
-                    boolean before = ctx.cpu();
                     ctx.widened = true;
-                    ctx.level = to;
                     cpuOn = !before && ctx.cpu();
                 }
             }
@@ -4894,11 +5152,21 @@ public final class Tempo {
     // ---------------------------------------------------------------------------------------------
 
     /**
-     * Anything timed: a {@link Span} or a {@link Phase}. Numbers and the failed flag attach to it; its
-     * duration is {@link #elapsedNanos()}.
+     * Anything timed: a {@link Span}, a {@link Phase} or a {@link Task}. It has a name and a start, and its
+     * duration is {@link #elapsedNanos()}; numbers and the failed flag attach to it. A task's own time is
+     * its queue wait; its run is timed by its span.
      */
     public abstract static class Timing {
         Timing() {}
+
+        /** The name; null on {@link Tempo#NOOP} and when nothing is kept (see each type). Any thread. */
+        public abstract Name name();
+
+        /**
+         * The start, in nanoseconds from the trace's start; 0 outside a trace, after release, and when
+         * nothing is kept (see each type). Any thread, best effort off the owner.
+         */
+        public abstract long startNanos();
 
         /** Attaches a number. */
         public abstract Timing set(Name key, long value);
@@ -4918,7 +5186,7 @@ public final class Tempo {
         /** Marks it failed; only the flag is recorded, not the throwable. */
         public abstract Timing fail(Throwable cause);
 
-        /** Running time while open, the duration once ended. */
+        /** Running time while open, the duration once ended; of a task, its queue wait. */
         public abstract long elapsedNanos();
     }
 
@@ -4971,8 +5239,8 @@ public final class Tempo {
         boolean folded; // folded for want of budget
         boolean hidden; // an undrawn step: only the totals read its entry
         int flags;  // flags set while open, kept where every occurrence of the aggregate has them
-        long wait;  // the queue wait of a folded task
-        long time;  // start while open, then duration
+        long wait;  // the queue wait of a folded task while open; the duration once ended
+        long time;  // the start
 
         Span(Lane lane, Context ctx, int depth) {
             this.lane = lane;
@@ -5066,12 +5334,10 @@ public final class Tempo {
          * otherwise {@link #NOOP} at the cost of a branch.
          */
         public Span tick(Name name) {
-            if (ctx.level < TICK) {
-                if (lane != null && !lane.free) {
-                    ctx.sawStep();
-                    if (ctx.strict && stale()) misuse(STALE);
-                }
-                return NOOP;
+            if (ctx.mode < Context.TICK_MODE) {
+                if (lane == null || lane.free) return NOOP;
+                if (ctx.strict && stale()) misuse(STALE);
+                if (ctx.sawStep() < Context.TICK_MODE) return NOOP;
             }
             Lane l = top();
             return l == null ? NOOP : l.openTick(name, 0);
@@ -5079,7 +5345,8 @@ public final class Tempo {
 
         /** Like {@link #tick(Name)}, the name looked up as for {@link Tempo#span(String)}. */
         public Span tick(String name) {
-            if (ctx.level < TICK) return tick((Name) null);
+            if (ctx.mode < Context.TICK_MODE && (lane == null || lane.free || ctx.sawStep() < Context.TICK_MODE))
+                return tick((Name) null);
             Lane l = top();
             return l == null ? NOOP : l.openTick(name);
         }
@@ -5376,6 +5643,37 @@ public final class Tempo {
             return r == Lane.FRAME ? l.frameElapsed(this) : l.elapsed(r);
         }
 
+        /**
+         * The span's name; null on {@link Tempo#NOOP} and once the trace is released. A span folded past
+         * the budget or an undrawn step shares its handle with the others at its depth, so after it closed
+         * this is the name of the latest of them. Any thread, best effort off the owner.
+         */
+        @Override
+        public Name name() {
+            long s = (long) STAMP.getAcquire(this);
+            Lane l = lane;
+            int r = row;
+            Name f = frame;
+            if (l == null || s != l.ctx.id) return null;
+            if (r == Lane.FRAME) return l.ctx.released ? null : f;
+            int id = l.nameIn(r);
+            return id < 0 ? null : Name.byId(id);
+        }
+
+        /**
+         * The span's start, in nanoseconds from the trace's start: where it opened, or {@link #start(long)}
+         * put it. 0 on {@link Tempo#NOOP}, outside a trace, once released, and on a folded or undrawn span
+         * once it closed. Any thread, best effort off the owner.
+         */
+        @Override
+        public long startNanos() {
+            long s = (long) STAMP.getAcquire(this);
+            Lane l = lane;
+            int r = row;
+            if (l == null || l.free || s != l.ctx.id) return 0;
+            return r == Lane.FRAME ? l.frameStart(this) : l.startIn(r);
+        }
+
         /** Whether this span records into a trace: not {@link #NOOP}, not a span timed outside a trace, not pooled. */
         public boolean recording() {
             Lane l = lane;
@@ -5622,6 +5920,27 @@ public final class Tempo {
             int r = row;
             if (l == null || r == Lane.FRAME || s != l.ctx.id) return 0;
             return l.elapsed(r);
+        }
+
+        /** The phase's name; null for a phase without a row, on {@link #NOOP} and after release. Any thread. */
+        @Override
+        public Name name() {
+            long s = (long) STAMP.getAcquire(this);
+            Lane l = lane;
+            int r = row;
+            if (l == null || r == Lane.FRAME || s != l.ctx.id) return null;
+            int id = l.nameIn(r);
+            return id < 0 ? null : Name.byId(id);
+        }
+
+        /** The phase's start, in nanoseconds from the trace's start; 0 for a phase without a row and after release. Any thread. */
+        @Override
+        public long startNanos() {
+            long s = (long) STAMP.getAcquire(this);
+            Lane l = lane;
+            int r = row;
+            if (l == null || r == Lane.FRAME || s != l.ctx.id) return 0;
+            return l.startIn(r);
         }
     }
 
@@ -6036,14 +6355,41 @@ public final class Tempo {
             return fail();
         }
 
+        /** The task's name; any thread. */
+        @Override
+        public Name name() {
+            return name;
+        }
+
+        /** The submit, in nanoseconds from the trace's start; 0 outside a trace and after release. Any thread. */
+        @Override
+        public long startNanos() {
+            Lane l = lane;
+            return l == null || l.ctx.released ? 0 : submit;
+        }
+
+        /**
+         * The time the task object measures: its queue wait, {@link #waitNanos()}. Its run is timed by its
+         * span, which {@link Tempo#current()} returns inside the body.
+         */
+        @Override
+        public long elapsedNanos() {
+            return waitNanos();
+        }
+
         /**
          * The queue wait: up to now while the task waits, from its submit until it began or was cancelled
-         * once it did. Its run time is its span's. 0 outside a trace and after release. Any thread.
+         * once it did. 0 outside a trace and after release. Any thread.
          */
-        public long elapsedNanos() {
+        public long waitNanos() {
             Lane l = lane;
             if (l == null || l.ctx.released) return 0;
             return waiting() ? Math.max(0, l.ctx.now() - submit) : wait;
+        }
+
+        /** Whether a {@link #begin()} that returned null lost to an earlier begin (misuse), not to a cancel. */
+        final boolean begunBefore() {
+            return (state & STATES) == BEGUN;
         }
 
         static CancellationException cancelled() {
@@ -6055,9 +6401,9 @@ public final class Tempo {
             throw (T) t;
         }
 
-        static int body(Object body, int bits) {
-            Objects.requireNonNull(body, "body");
-            return bits;
+        /** After the constructor has recorded the submit: a null body is misuse there (strict mode throws). */
+        final void checkBody(Object body) {
+            if (body == null) misuse("null task body");
         }
     }
 
@@ -6088,6 +6434,14 @@ public final class Tempo {
 
         abstract V body() throws Exception;
 
+        /**
+         * The result of a body without one, from an executor's {@code submit(task, result)}: kept in the
+         * outcome until the body ends. Before the task has begun only.
+         */
+        final void preset(Object result) {
+            if (waiting() && future() == PENDING) outcome = result;
+        }
+
         @Override
         final boolean hasBody() {
             return true;
@@ -6102,6 +6456,7 @@ public final class Tempo {
             int f = NORMAL;
             try {
                 if (future() == PENDING) o = body(); // a cancel of the future may have come since the begin
+                if (o == null) o = outcome;          // a result preset by submit(task, result), or null
             } catch (Throwable t) {
                 s.fail();
                 o = t;
@@ -6252,23 +6607,28 @@ public final class Tempo {
         private final Runnable body;
 
         RunnableTask(Name name, String text, Runnable body, int bits) {
-            super(name, text, body(body, bits));
+            super(name, text, bits);
             this.body = body;
+            checkBody(body);
         }
 
         /** Tests: a task submitted in lane {@code l} (null: outside a trace), as if it were the thread's current lane. */
         RunnableTask(Lane l, Name name, Runnable body) {
-            super(l, name, body(body, 0));
+            super(l, name, 0);
             this.body = body;
+            checkBody(body);
         }
 
         @Override
         Void body() {
-            body.run();
+            if (body != null) body.run();
             return null;
         }
 
-        /** Begins the task and runs the body, unless it was cancelled or rejected first, or began before. */
+        /**
+         * Begins the task and runs the body, unless it was cancelled or rejected first, or began before
+         * (misuse): as a {@code FutureTask}'s, the body runs at most once.
+         */
         @Override
         public void run() {
             exec();
@@ -6278,35 +6638,41 @@ public final class Tempo {
     /**
      * A {@link Callable} task from {@link Tempo#callable}, and its {@link Future} (see {@link Task}): hand it
      * to an executor's {@code submit}, which calls {@link #call()}, or to a {@link Tempo#executor}, which
-     * returns it from {@code submit}. The future completes with the body's result or throwable. It is not
-     * a {@link Runnable}, so {@code submit} takes it as a {@code Callable}.
+     * runs it as it is and returns it from {@code submit}, {@code invokeAll} and {@code invokeAny}. The
+     * future completes with the body's result or throwable. Its type is not a {@link Runnable}, so {@code
+     * submit} takes it as a {@code Callable}.
      */
-    public static class CallableTask<V> extends TaskFuture<V> implements Callable<V> {
+    public abstract static class CallableTask<V> extends TaskFuture<V> implements Callable<V> {
         private final Callable<V> body;
 
         CallableTask(Name name, String text, Callable<V> body, int bits) {
-            super(name, text, body(body, bits));
+            super(name, text, bits);
             this.body = body;
+            checkBody(body);
         }
 
         @Override
         V body() throws Exception {
-            return body.call();
+            return body == null ? null : body.call();
         }
 
         /**
          * Begins the task and calls the body; a throwable marks the span failed and is rethrown. Throws
-         * {@link CancellationException} without calling it if the task was cancelled or rejected first, or
-         * began before.
+         * {@link CancellationException} without calling the body if the task was cancelled or rejected
+         * first. A second call is misuse (strict mode throws); it calls the body again, unrecorded, and
+         * leaves the future as the first call completed it.
          */
         @Override
         public V call() throws Exception {
             Span s = begin();
-            if (s == null) throw cancelled();
+            if (s == null) {
+                if (!begunBefore()) throw cancelled();
+                return body();
+            }
             runner = Thread.currentThread();
             V v;
             try {
-                v = body.call();
+                v = body();
             } catch (Throwable t) {
                 s.fail();
                 finish(s, EXCEPTIONAL, t);
@@ -6326,8 +6692,9 @@ public final class Tempo {
         private final Supplier<V> body;
 
         SupplierTask(Name name, String text, Supplier<V> body) {
-            super(name, text, body(body, 0));
+            super(name, text, 0);
             this.body = body;
+            checkBody(body);
         }
 
         @Override
@@ -6337,14 +6704,18 @@ public final class Tempo {
 
         /**
          * Begins the task and gets the body's value. Throws {@link CancellationException} without calling
-         * the body if the task was cancelled or rejected first, or began before.
+         * the body if the task was cancelled or rejected first. A second call is misuse (strict mode
+         * throws); it gets the body's value again, unrecorded.
          */
         @Override
         public V get() {
             Span s = begin();
-            if (s == null) throw cancelled();
+            if (s == null) {
+                if (!begunBefore()) throw cancelled();
+                return body == null ? null : body.get();
+            }
             try {
-                return body.get();
+                return body == null ? null : body.get();
             } catch (Throwable t) {
                 s.fail();
                 throw t;
@@ -6354,10 +6725,14 @@ public final class Tempo {
         }
     }
 
-    /** The task of a {@link Tempo#executor}'s {@code submit(Callable)}: a callable task the pool runs. */
+    /**
+     * The class of every {@link CallableTask}: also a {@link RunnableFuture}, so a {@link Tempo#executor}
+     * hands it to the pool's {@code execute} as it is. Its static type stays {@code CallableTask}, which is
+     * not a {@code Runnable}, so {@code pool.submit(task)} is not ambiguous.
+     */
     static final class CallTask<V> extends CallableTask<V> implements RunnableFuture<V> {
-        CallTask(Name name, Callable<V> body) {
-            super(name, null, body, QUIET);
+        CallTask(Name name, String text, Callable<V> body, int bits) {
+            super(name, text, body, bits);
         }
 
         @Override
@@ -6372,14 +6747,15 @@ public final class Tempo {
         private final V result;
 
         ResultTask(Name name, Runnable body, V result) {
-            super(name, null, body(body, QUIET));
+            super(name, null, QUIET);
             this.body = body;
             this.result = result;
+            checkBody(body);
         }
 
         @Override
         V body() {
-            body.run();
+            if (body != null) body.run();
             return result;
         }
 
@@ -6392,16 +6768,19 @@ public final class Tempo {
     /**
      * {@link Tempo#executor}: every task submitted to it is a task of its name, handed to the pool's
      * {@code execute} as its own {@link Future}, so a submit allocates that one object. A task made by
-     * {@link Tempo#runnable} goes in as it is, and one made by {@link Tempo#callable} through the pool's
-     * {@code submit}, under their own names. A submit the pool refuses is recorded as rejected before the
-     * {@link RejectedExecutionException} reaches the caller.
+     * {@link Tempo#runnable} or {@link Tempo#callable} goes in as it is, under its own name. A submit the
+     * pool refuses is recorded as rejected before the {@link RejectedExecutionException} reaches the
+     * caller. {@code invokeAll} goes through {@link #newTaskFor}; {@code invokeAny} through a view whose
+     * {@code execute} hands the JDK's completion wrapper of each task straight to the pool, so every
+     * element is recorded once, under its task's name.
      */
     static final class TaskExecutor extends AbstractExecutorService {
         private final ExecutorService pool;
         private final Name name;
+        private final Direct direct = new Direct();
 
         TaskExecutor(ExecutorService pool, Name name) {
-            this.pool = Objects.requireNonNull(pool, "pool");
+            this.pool = pool;
             this.name = name;
         }
 
@@ -6414,43 +6793,55 @@ public final class Tempo {
         /** Submits {@code r} as a task, which is the future returned; a throwable from it stays in the future. */
         @Override
         public Future<?> submit(Runnable r) {
-            if (!ours(r)) return start(new RunnableTask(name, null, r, Task.QUIET));
-            ((TaskFuture<?>) r).quiet();
-            return start((RunnableFuture<?>) r);
-        }
-
-        /** A task that is its own future and runnable: a {@link RunnableTask}, or one of this executor's. */
-        private static boolean ours(Runnable r) {
-            return r instanceof TaskFuture && r instanceof RunnableFuture;
+            return start(newTaskFor(r, null));
         }
 
         @Override
         public <T> Future<T> submit(Runnable r, T result) {
-            return start(new ResultTask<>(name, r, result));
+            return start(newTaskFor(r, result));
         }
 
         @Override
         public <T> Future<T> submit(Callable<T> c) {
-            if (!(c instanceof CallableTask) || c instanceof CallTask) return start(newTaskFor(c));
-            CallableTask<T> t = (CallableTask<T>) c; // the pool calls it from a future of its own
-            try {
-                pool.submit(t);
-            } catch (RejectedExecutionException e) {
-                t.reject();
-                throw e;
-            }
-            return t;
+            return start(newTaskFor(c));
         }
 
+        /** A task that is its own future and runnable: one made by {@link Tempo#runnable}, {@link Tempo#callable}, or this executor. */
+        private static boolean ours(Object r) {
+            return r instanceof TaskFuture && r instanceof RunnableFuture;
+        }
+
+        /** {@code r} itself if it is a task (its throwable kept in the future, {@code result} its result), else a new task. */
         @Override
+        @SuppressWarnings("unchecked")
         protected <T> RunnableFuture<T> newTaskFor(Runnable r, T result) {
-            return new ResultTask<>(name, r, result);
+            if (!ours(r)) return result == null ? (RunnableFuture<T>) new RunnableTask(name, null, r, Task.QUIET)
+                    : new ResultTask<>(name, r, result);
+            TaskFuture<?> t = (TaskFuture<?>) r;
+            t.quiet();
+            if (result != null) t.preset(result);
+            return (RunnableFuture<T>) r;
+        }
+
+        /** {@code c} itself if it is a task (its throwable kept in the future), else a new task. */
+        @Override
+        @SuppressWarnings("unchecked")
+        protected <T> RunnableFuture<T> newTaskFor(Callable<T> c) {
+            if (!ours(c)) return new CallTask<>(name, null, c, Task.QUIET);
+            ((TaskFuture<?>) c).quiet();
+            return (RunnableFuture<T>) c;
         }
 
         @Override
-        protected <T> RunnableFuture<T> newTaskFor(Callable<T> c) {
-            if (c instanceof CallTask) return (CallTask<T>) c;
-            return c instanceof CallableTask ? new java.util.concurrent.FutureTask<>(c) : new CallTask<>(name, c);
+        public <T> T invokeAny(java.util.Collection<? extends Callable<T>> tasks)
+                throws InterruptedException, ExecutionException {
+            return direct.invokeAny(tasks);
+        }
+
+        @Override
+        public <T> T invokeAny(java.util.Collection<? extends Callable<T>> tasks, long timeout, TimeUnit unit)
+                throws InterruptedException, ExecutionException, TimeoutException {
+            return direct.invokeAny(tasks, timeout, unit);
         }
 
         private <F extends Runnable> F start(F t) {
@@ -6491,6 +6882,91 @@ public final class Tempo {
         @Override
         public String toString() {
             return "Tempo.executor(" + pool + ", " + (name == null ? null : name.text) + ")";
+        }
+
+        /**
+         * The executor's view for {@code invokeAny}, whose {@code ExecutorCompletionService} wraps each task
+         * from {@link #newTaskFor} in a future of its own and passes that to {@code execute}: here it goes to
+         * the pool as it is, not into a second task. A wrapper the pool refuses leaves its task to {@code
+         * invokeAny}, which cancels it on the way out.
+         */
+        private final class Direct extends AbstractExecutorService {
+            @Override
+            public void execute(Runnable r) {
+                pool.execute(r);
+            }
+
+            @Override
+            protected <T> RunnableFuture<T> newTaskFor(Runnable r, T result) {
+                return TaskExecutor.this.newTaskFor(r, result);
+            }
+
+            @Override
+            protected <T> RunnableFuture<T> newTaskFor(Callable<T> c) {
+                return TaskExecutor.this.newTaskFor(c);
+            }
+
+            @Override
+            public void shutdown() {
+                pool.shutdown();
+            }
+
+            @Override
+            public List<Runnable> shutdownNow() {
+                return pool.shutdownNow();
+            }
+
+            @Override
+            public boolean isShutdown() {
+                return pool.isShutdown();
+            }
+
+            @Override
+            public boolean isTerminated() {
+                return pool.isTerminated();
+            }
+
+            @Override
+            public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
+                return pool.awaitTermination(timeout, unit);
+            }
+        }
+
+        /** The pool of an executor made over a null one: runs every task at once, on the submitting thread. */
+        static final class Inline extends AbstractExecutorService {
+            private volatile boolean shutdown;
+
+            @Override
+            public void execute(Runnable r) {
+                if (shutdown) throw new RejectedExecutionException("shut down");
+                r.run();
+            }
+
+            @Override
+            public void shutdown() {
+                shutdown = true;
+            }
+
+            @Override
+            public List<Runnable> shutdownNow() {
+                shutdown = true;
+                return new ArrayList<>();
+            }
+
+            @Override
+            public boolean isShutdown() {
+                return shutdown;
+            }
+
+            @Override
+            public boolean isTerminated() {
+                return shutdown;
+            }
+
+            @Override
+            public boolean awaitTermination(long timeout, TimeUnit unit) {
+                return shutdown;
+            }
         }
     }
 

@@ -651,6 +651,43 @@ class TempoTest {
         }
     }
 
+    /**
+     * Undrawn steps, folded spans and the phases of either share one handle per depth outside strict
+     * mode; strict mode gives each its own, so a use after close never reaches the next one there.
+     */
+    @Test
+    void strictGivesEveryUndrawnStepFoldedSpanAndRowlessPhaseAHandleOfItsOwn() {
+        try (Trace t = Tempo.trace(SEARCH, strict())) {
+            Span a = Tempo.step(LOAD);
+            a.close();
+            Span b = Tempo.step(DECODE);
+            assertNotSame(a, b);
+            AssertionError e = assertThrows(AssertionError.class, a::close);
+            assertEquals("Tempo misuse: span used after close", e.getMessage());
+            Tempo.Phase p = b.phase(JOIN);
+            Tempo.Phase q = b.phase(SCORE);
+            assertNotSame(p, q);
+            b.close();
+            assertThrows(AssertionError.class, () -> p.phase(LOAD));
+            assertEquals(2, t.misuses());
+        }
+        try (Trace t = Tempo.trace(SEARCH, strict().budget(0)).records(STEP)) {
+            Span a = Tempo.step(LOAD);
+            a.close();
+            Span b = Tempo.step(DECODE);
+            assertNotSame(a, b);
+            assertThrows(AssertionError.class, a::close);
+            b.close();
+        }
+        try (Trace t = Tempo.trace(SEARCH, opts())) { // outside strict: shared, as documented
+            Span a = Tempo.step(LOAD);
+            a.close();
+            Span b = Tempo.step(DECODE);
+            assertSame(a, b);
+            b.close();
+        }
+    }
+
     // ---- levels ---------------------------------------------------------------------------------------
 
     @Test
@@ -1572,6 +1609,75 @@ class TempoTest {
                 "    match 100+50 misuse",
                 "      decode 100+50 phase misuse"), tree(t));
         assertEquals(50, t.total(MATCH).sum());
+    }
+
+    @Test
+    void aStopByHandStaysAfterTheChildren() {
+        Trace t = Tempo.trace(SEARCH, opts());
+        long zero = clock.t;
+        Span p = t.span(LOAD);
+        clock.add(10);
+        Span x = p.span(MATCH);
+        x.run(DECODE, () -> clock.add(10));
+        x.close();                       // match 10+10
+        Span m = p.span(JOIN);
+        clock.add(10);
+        m.close();                       // join 20+10
+        clock.add(5);
+        p.stop(zero + 15);               // before join's end: at it
+        assertEquals(1, t.misuses());
+        p.close();
+        Span q = t.span(RERANK);
+        clock.add(5);
+        Span open = q.span(MATCH);
+        clock.add(5);
+        q.stop(zero + 38);               // a child is open: now, and misuse
+        assertEquals(2, t.misuses());
+        clock.add(5);
+        open.close();                    // ends after the stop: the span ends with it
+        q.close();
+        Span r = t.span(SCORE);
+        clock.add(5);
+        r.stop(zero + 50);
+        clock.add(5);
+        r.span(DECODE).close();          // opened after the stop: misuse, flagged, inside the span
+        assertEquals(3, t.misuses());
+        clock.add(5);
+        r.close();
+        t.close();
+        assertEquals(lines(
+                "search 0+65",
+                "  load 0+30 misuse",
+                "    match 10+10",
+                "      decode 10+10",
+                "    join 20+10",
+                "  rerank 35+15 misuse",
+                "    match 40+10",
+                "  score 50+10 misuse",
+                "    decode 60+0 misuse"), tree(t));
+    }
+
+    @Test
+    void strictThrowsOnAStopBeforeAChildEndsAndOnAChildAfterAStop() {
+        Trace t = Tempo.trace(SEARCH, strict());
+        long zero = clock.t;
+        Span p = t.span(LOAD);
+        clock.add(10);
+        p.span(MATCH).close();
+        clock.add(10);
+        Span j = p.span(JOIN);
+        AssertionError e = assertThrows(AssertionError.class, () -> p.stop(zero + 20));
+        assertEquals("Tempo misuse: stop(nanos) while a child span is open", e.getMessage());
+        j.close();
+        p.close();
+        Span q = t.span(RERANK);
+        q.stop(clock.t);
+        e = assertThrows(AssertionError.class, () -> Tempo.span(DECODE));
+        assertEquals("Tempo misuse: span opened under a span stopped by hand", e.getMessage());
+        assertSame(q, Tempo.current());  // nothing opened
+        q.close();
+        t.close();
+        assertEquals(2, t.misuses());
     }
 
     @Test
@@ -2535,6 +2641,74 @@ class TempoTest {
      * Cost promise 2 for tasks with a body: {@code Tempo.runnable} allocates the task, which is its own
      * future, and nothing else; so does a submit to {@code Tempo.executor}, whose future is the task.
      */
+    /**
+     * A thread that runs the tasks of other threads' traces: once it has a lane in each, running a task
+     * allocates nothing, also with more traces interleaving than its slot remembers lanes of (four). A
+     * lane of a later trace takes the arrays of a retired one, so it costs only itself.
+     */
+    @Test
+    void aPoolThreadRunsTasksOfInterleavedTracesWithoutAllocating() throws Exception {
+        int traces = 8, rounds = 40;
+        List<java.util.concurrent.ArrayBlockingQueue<RunnableTask>> queues = new ArrayList<>();
+        CountDownLatch done = new CountDownLatch(1);
+        List<Thread> submitters = new ArrayList<>();
+        AtomicReference<Throwable> failed = new AtomicReference<>();
+        for (int i = 0; i < traces; i++) {
+            java.util.concurrent.ArrayBlockingQueue<RunnableTask> q = new java.util.concurrent.ArrayBlockingQueue<>(rounds);
+            queues.add(q);
+            Thread th = new Thread(() -> {
+                try {
+                    Trace t = Tempo.trace(SEARCH, new Options());
+                    for (int r = 0; r < rounds; r++) q.put(Tempo.runnable(MATCH, NOTHING));
+                    done.await();
+                    t.close();
+                    t.release();
+                } catch (Throwable e) {
+                    failed.set(e);
+                }
+            });
+            th.start();
+            submitters.add(th);
+        }
+        long warm = 0;
+        for (int r = 0; r < rounds; r++) {
+            for (java.util.concurrent.ArrayBlockingQueue<RunnableTask> q : queues) {
+                RunnableTask task = q.take();
+                long b = allocatedBy(task::run);
+                if (r >= rounds / 2) warm += b;
+            }
+        }
+        done.countDown();
+        for (Thread th : submitters) th.join();
+        assertNull(failed.get());
+        assertEquals(0, warm, "bytes the worker allocated for " + traces * rounds / 2 + " tasks once it had its lanes");
+
+        // a lane in a later trace: the lane, its weak reference in the slot, and nothing more
+        long[] lane = new long[1];
+        for (int k = 0; k < 6; k++) {
+            java.util.concurrent.ArrayBlockingQueue<RunnableTask> q = new java.util.concurrent.ArrayBlockingQueue<>(1);
+            CountDownLatch ran = new CountDownLatch(1);
+            Thread th = new Thread(() -> {
+                try {
+                    Trace t = Tempo.trace(SEARCH, new Options());
+                    q.put(Tempo.runnable(MATCH, NOTHING));
+                    ran.await();
+                    t.close();
+                    t.release();
+                } catch (Throwable e) {
+                    failed.set(e);
+                }
+            });
+            th.start();
+            RunnableTask task = q.take();
+            lane[0] = allocatedBy(task::run);
+            ran.countDown();
+            th.join();
+        }
+        assertNull(failed.get());
+        assertTrue(lane[0] > 0 && lane[0] <= 512, "a pool thread's lane of a new trace: " + lane[0] + " B");
+    }
+
     @Test
     void aRunnableTaskAndAnExecutorSubmitAllocateOneObject() throws Exception {
         ExecutorService inline = new java.util.concurrent.AbstractExecutorService() { // runs every task at once

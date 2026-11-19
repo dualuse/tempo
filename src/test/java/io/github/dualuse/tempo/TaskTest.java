@@ -41,7 +41,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class TaskTest {
 
     static final Name SEARCH = TempoTest.SEARCH, RERANK = TempoTest.RERANK, MATCH = TempoTest.MATCH,
-            LOAD = TempoTest.LOAD, DECODE = TempoTest.DECODE, BYTES = TempoTest.BYTES;
+            LOAD = TempoTest.LOAD, DECODE = TempoTest.DECODE, BYTES = TempoTest.BYTES, JOIN = TempoTest.JOIN;
 
     final TempoTest.Clock clock = new TempoTest.Clock();
 
@@ -202,16 +202,26 @@ class TaskTest {
         CallableTask<Integer> c = Tempo.callable(LOAD, () -> 7);
         assertEquals(7, c.call());
         assertEquals(7, c.get());
-        assertThrows(CancellationException.class, c::call); // a second call does not run the body
+        assertEquals(7, c.call());       // a second call is misuse: the body runs again, unrecorded
         SupplierTask<String> s = Tempo.supplier(DECODE, () -> "x");
         assertEquals("x", CompletableFuture.supplyAsync(s, Runnable::run).get());
+        assertEquals("x", CompletableFuture.supplyAsync(s, Runnable::run).get()); // the same, healed
+        RunnableTask cancelled = Tempo.runnable(JOIN, () -> fail("cancelled"));
+        CallableTask<Integer> taken = Tempo.callable(JOIN, () -> 1);
+        assertTrue(cancelled.cancel() && taken.cancel());
+        cancelled.run();                 // a cancelled task is not run, and is not misuse
+        assertThrows(CancellationException.class, taken::call);
         t.close();
         assertEquals(lines(
                 "search 0+2",
                 "  match 0+2 failed handoff~0",
                 "  load 2+0 handoff~0",
-                "  decode 2+0 handoff~0"), tree(t));
-        assertEquals(2, t.misuses()); // begun twice: the second run and the second call
+                "  decode 2+0 handoff~0",
+                "  join 2+0 cancelled handoff~0",
+                "  join 2+0 cancelled handoff~0"), tree(t));
+        assertEquals(3, t.misuses()); // begun twice: the second run, call and get
+        assertEquals(1, t.total(LOAD).count());
+        assertEquals(1, t.total(DECODE).count());
     }
 
     @Test
@@ -319,6 +329,132 @@ class TaskTest {
         } finally {
             match.shutdownNow();
         }
+    }
+
+    @Test
+    void submitWithAResultKeepsTheTaskAndItsName() throws Exception {
+        ExecutorService pool = worker("worker-1");
+        ExecutorService match = Tempo.executor(pool, MATCH);
+        try {
+            Trace t = Tempo.trace(SEARCH, opts()).records(STEP);
+            RunnableTask load = Tempo.runnable(LOAD, () -> clock.add(1));
+            Future<String> f = match.submit(load, "done");
+            assertSame(load, f);
+            assertEquals("done", f.get());
+            t.close();
+            assertEquals(lines(
+                    "search 0+1",
+                    "  load 0+1 handoff~0 @worker-1"), tree(t));
+            assertEquals(0, t.total(MATCH).count());
+        } finally {
+            match.shutdownNow();
+        }
+    }
+
+    /**
+     * invokeAll and invokeAny make one task per element, under the executor's name or the task's own, and
+     * a cancel at their timeout or after the first result reaches the task.
+     */
+    @Test
+    void invokeAllAndInvokeAnyRecordEachElementOnce() throws Exception {
+        ExecutorService pool = worker("worker-1");
+        ExecutorService match = Tempo.executor(pool, MATCH);
+        try {
+            Trace t = Tempo.trace(SEARCH, opts().cpu(false)).records(STEP);
+            String first = match.invokeAny(List.of(() -> "a", () -> "b"));
+            assertTrue(first.equals("a") || first.equals("b"));
+            List<CallableTask<Integer>> own = List.of(Tempo.callable(LOAD, () -> 1), Tempo.callable(LOAD, () -> 2));
+            List<Future<Integer>> fs = match.invokeAll(own);
+            assertSame(own.get(0), fs.get(0));
+            assertSame(own.get(1), fs.get(1));
+            assertEquals(3, fs.get(0).get() + fs.get(1).get());
+            match.submit(() -> { }).get(); // the invokeAny loser, if it ran, has ended too
+            t.close();
+            String tree = tree(t);
+            assertEquals(3, tree.split("  match ", -1).length - 1, tree); // two of invokeAny, one submit
+            assertEquals(2, tree.split("  load ", -1).length - 1, tree);
+            assertEquals(2, t.total(LOAD).count());
+            long matches = t.total(MATCH).count(); // the loser may be cancelled before it began
+            assertTrue(matches == 2 || matches == 3, tree);
+            assertEquals(0, t.misuses());
+        } finally {
+            match.shutdownNow();
+        }
+    }
+
+    @Test
+    void aTimedInvokeAllCancelsTheTasksItGivesUpOn() throws Exception {
+        ExecutorService pool = worker("worker-1");
+        ExecutorService match = Tempo.executor(pool, MATCH);
+        CountDownLatch busy = new CountDownLatch(1), finish = new CountDownLatch(1);
+        try {
+            pool.execute(() -> {
+                busy.countDown();
+                try {
+                    finish.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            assertTrue(busy.await(10, TimeUnit.SECONDS));
+            Trace t = Tempo.trace(SEARCH, opts()).records(STEP);
+            AtomicInteger ran = new AtomicInteger();
+            CallableTask<Integer> late = Tempo.callable(LOAD, ran::incrementAndGet);
+            Callable<Integer> plain = ran::incrementAndGet;
+            List<Future<Integer>> fs = match.invokeAll(List.of(late, plain), 20, TimeUnit.MILLISECONDS);
+            for (Future<Integer> f : fs) assertTrue(f.isCancelled() && f instanceof Task);
+            assertFalse(late.cancel()); // cancelled already, by invokeAll
+            finish.countDown();
+            match.submit(() -> { }).get();
+            t.close();
+            assertEquals(0, ran.get());
+            assertEquals(lines(
+                    "search 0+0",
+                    "  load 0+0 cancelled handoff~0",
+                    "  match 0+0 cancelled handoff~0",
+                    "  match 0+0 handoff~0 @worker-1"), tree(t));
+        } finally {
+            finish.countDown();
+            match.shutdownNow();
+        }
+    }
+
+    @Test
+    void timingsHaveANameAndAStart() throws Exception {
+        Trace t = Tempo.trace(SEARCH, opts());
+        clock.add(5);
+        Span s = Tempo.span(LOAD);
+        clock.add(2);
+        Tempo.Phase p = s.phase(DECODE);
+        Task k = Tempo.task(MATCH);
+        clock.add(3);
+        assertEquals(LOAD, s.name());
+        assertEquals(5, s.startNanos());
+        assertEquals(DECODE, p.name());
+        assertEquals(7, p.startNanos());
+        assertEquals(MATCH, k.name());
+        assertEquals(7, k.startNanos());
+        assertEquals(3, k.waitNanos());
+        assertEquals(3, k.elapsedNanos()); // a task's own time is its queue wait
+        Span step = Tempo.step(DECODE);     // undrawn: kept while open
+        clock.add(1);
+        assertEquals(DECODE, step.name());
+        assertEquals(10, step.startNanos());
+        step.close();
+        assertEquals(1, step.elapsedNanos());
+        assertEquals(0, step.startNanos());
+        s.close();
+        assertEquals(SEARCH, t.name());
+        assertEquals(0, t.startNanos());
+        t.close();
+        assertNull(NOOP.name());
+        assertEquals(0, NOOP.startNanos());
+        t.release();
+        assertNull(s.name());
+        assertNull(p.name());
+        assertEquals(0, s.startNanos());
+        assertEquals(0, k.startNanos());
+        assertEquals(MATCH, k.name());
     }
 
     @Test
@@ -460,12 +596,29 @@ class TaskTest {
     }
 
     @Test
-    void anExecutorOverANullPoolIsRefused() {
-        assertThrows(NullPointerException.class, () -> Tempo.executor(null, MATCH));
-        assertThrows(NullPointerException.class, () -> Tempo.runnable(MATCH, null));
+    void aNullPoolOrBodyIsMisuseAndHealed() throws Exception {
         Trace t = Tempo.trace(SEARCH, opts()).records(STEP);
+        ExecutorService inline = Tempo.executor(null, MATCH); // runs every task on the submitting thread
+        assertEquals(1, t.misuses());
+        assertEquals(3, inline.submit(() -> 3).get());
+        RunnableTask r = Tempo.runnable(LOAD, null);
+        CallableTask<Integer> c = Tempo.callable(LOAD, null);
+        SupplierTask<Integer> s = Tempo.supplier(LOAD, null);
+        assertEquals(4, t.misuses());
+        r.run();
+        assertNull(c.call());
+        assertNull(s.get());
+        assertNull(r.get());
+        inline.shutdown();
+        assertThrows(RejectedExecutionException.class, () -> inline.execute(() -> { }));
         t.close();
-        assertEquals(lines("search 0+0"), tree(t)); // the refused task left nothing behind
+        assertEquals(1, t.total(MATCH).count());
+        assertEquals(3, t.total(LOAD).count());
+        Trace u = Tempo.trace(SEARCH, opts().strict(true));
+        assertThrows(AssertionError.class, () -> Tempo.executor(null, MATCH));
+        assertThrows(AssertionError.class, () -> Tempo.runnable(LOAD, null));
+        u.close();
+        Tempo.runnable(LOAD, null).run(); // outside a trace: nothing to count, nothing thrown
     }
 
     /** The old untraced early exit needed the executor: a task outside a trace now decides it alone. */
