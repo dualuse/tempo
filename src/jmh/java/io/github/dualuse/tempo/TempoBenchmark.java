@@ -321,6 +321,16 @@ public class TempoBenchmark {
         return EXECUTOR.submit(ANSWER);
     }
 
+    /**
+     * A {@code CallableTask} made by {@code Tempo.callable} and submitted to {@code Tempo.executor}: the
+     * executor hands the task itself to the pool, and returns it as the future, so one object (cost promise 2).
+     */
+    @Benchmark
+    public Future<Integer> executorCallableTask(Drawing s) {
+        s.cycle();
+        return EXECUTOR.submit(Tempo.callable(CHILD, ANSWER));
+    }
+
     /** A duration measured elsewhere, added to the totals of its name: {@code s.add(name, nanos)}. */
     @Benchmark
     public Tempo.Span add(SpansOnly s) {
@@ -352,30 +362,71 @@ public class TempoBenchmark {
         return Tempo.Cpu.now();
     }
 
-    /** A static tick without a trace: the ThreadLocal read and a branch. */
+    /** A static tick without a trace, opened and closed: the ThreadLocal read and a branch. */
     @Benchmark
     public Tempo.Span tickNoTrace() {
-        return Tempo.tick(CHILD);
-    }
-
-    /** Cost promise 3: a static tick in a trace of spans only, which may add the ThreadLocal read to the branch. */
-    @Benchmark
-    public Tempo.Span tickStatic(SpansOnly s) {
-        return Tempo.tick(CHILD);
+        Tempo.Span d = Tempo.tick(CHILD);
+        d.close();
+        return d;
     }
 
     /**
-     * Tasks across threads: {@code submit} creates a drawn task per op and passes it through a ring to
-     * {@code work}, which begins and closes it on its own thread. A group op is one of either side, so
-     * the group's B/op is half the bytes per task; the submit side cycles its trace every 1000.
+     * Cost promise 3: a static tick in a trace of spans only, opened and closed, which may add the
+     * ThreadLocal read to the branch. Closed, so a tick that opened a frame by mistake would show its
+     * clock reads here instead of filling the stack and taking its cheap early exit.
+     */
+    @Benchmark
+    public Tempo.Span tickStatic(SpansOnly s) {
+        Tempo.Span d = Tempo.tick(CHILD);
+        d.close();
+        return d;
+    }
+
+    /**
+     * Tasks across threads: {@code submit} creates a task per op and passes it through a ring to {@code
+     * work}, which runs it on its own thread, as a pool thread would. A group op is one of either side, so
+     * the group's B/op is half the bytes per task. The submit side starts a new trace every {@code cycle}
+     * tasks, so the worker sets up its lane of each trace once; the gate solves that per-trace setup out
+     * of the two cycle lengths, as for the cycling benchmarks, and holds it to a ceiling of its own.
      */
     @State(Scope.Group)
     public static class Pipe {
         static final int SIZE = 16;
+        @Param({"1000", "8000"})
+        int cycle;
         final AtomicReferenceArray<Tempo.Task> ring = new AtomicReferenceArray<>(SIZE);
         long put, take; // each used by one side only
         Tempo.Trace trace;
         int used;
+
+        /** The submit side: the trace of the next task, a new one every {@code cycle} tasks. */
+        Tempo.Trace cycled(boolean drawn) {
+            if (trace == null || ++used == cycle) {
+                if (trace != null) {
+                    trace.close();
+                    trace.release();
+                }
+                trace = drawn ? Tempo.trace(ROOT, DRAWN).records(Tempo.STEP) : Tempo.trace(ROOT, UNBUDGETED);
+                used = 0;
+            }
+            return trace;
+        }
+
+        void put(Tempo.Task h, Control c) {
+            int i = (int) (put & (SIZE - 1));
+            while (ring.get(i) != null) if (c.stopMeasurement) return;
+            ring.lazySet(i, h);
+            put++;
+        }
+
+        Tempo.Task take(Control c) {
+            int i = (int) (take & (SIZE - 1));
+            Tempo.Task h;
+            while ((h = ring.get(i)) == null) if (c.stopMeasurement) return null;
+            ring.lazySet(i, null);
+            take++;
+            return h;
+        }
 
         @TearDown(Level.Trial)
         public void tearDown() {
@@ -383,33 +434,37 @@ public class TempoBenchmark {
         }
     }
 
+    /** A drawn bare task, begun by hand on the worker: 48 B, the one {@code Task} (cost promise 2). */
     @Benchmark
     @Group("across")
     public void submit(Pipe p, Control c) {
-        if (p.trace == null || ++p.used == 1000) {
-            if (p.trace != null) {
-                p.trace.close();
-                p.trace.release();
-            }
-            p.trace = Tempo.trace(ROOT, DRAWN).records(Tempo.STEP);
-            p.used = 0;
-        }
-        Tempo.Task h = Tempo.task(CHILD);
-        int i = (int) (p.put & (Pipe.SIZE - 1));
-        while (p.ring.get(i) != null) if (c.stopMeasurement) return;
-        p.ring.lazySet(i, h);
-        p.put++;
+        p.cycled(true);
+        p.put(Tempo.task(CHILD), c);
     }
 
     @Benchmark
     @Group("across")
     public void work(Pipe p, Control c) {
-        int i = (int) (p.take & (Pipe.SIZE - 1));
-        Tempo.Task h;
-        while ((h = p.ring.get(i)) == null) if (c.stopMeasurement) return;
-        p.ring.lazySet(i, null);
-        p.take++;
-        h.tryBegin().close();
+        Tempo.Task h = p.take(c);
+        if (h != null) h.tryBegin().close();
+    }
+
+    /**
+     * An undrawn {@code RunnableTask}, as a trace of spans makes by default, run on the worker: 56 B, the
+     * one task, which is also its future (cost promise 2).
+     */
+    @Benchmark
+    @Group("acrossUndrawn")
+    public void submitUndrawn(Pipe p, Control c) {
+        p.cycled(false);
+        p.put(Tempo.runnable(CHILD, NOTHING), c);
+    }
+
+    @Benchmark
+    @Group("acrossUndrawn")
+    public void runUndrawn(Pipe p, Control c) {
+        Tempo.Task h = p.take(c);
+        if (h != null) ((Tempo.RunnableTask) h).run();
     }
 
     /**

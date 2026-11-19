@@ -39,7 +39,10 @@ import java.util.TreeMap;
  * <li>One object per task: the task is the one allocation of its submit, drawn, folded or undrawn,
  * and through {@code Tempo.executor}, where it is also the future. Gated at the size of that object
  * (64-bit JVM, compressed oops): a {@code Task} without a body or a {@code SupplierTask}, 48 B; a
- * {@code RunnableTask} or {@code CallableTask}, which is also its future, 56 B.
+ * {@code RunnableTask} or {@code CallableTask}, which is also its future, 56 B. Gated run on the
+ * submitting thread and, in the {@code across} groups, on a thread of its own, where a group op is half
+ * a task. There the worker sets up its lane of each trace once: that per-trace setup is solved out of the
+ * per-task figure and held to a ceiling of its own ({@code ACROSS_SETUP}, both threads together).
  * <li>An unrecorded tick costs about a branch through {@code s.tick(name)}: under half of one clock read,
  * so it reads no clock. The static {@code Tempo.tick(name)} may add the ThreadLocal read: under one
  * clock read. Both allocate nothing. An undrawn step is always timed: its time is reported, its
@@ -61,11 +64,12 @@ public final class CostGate {
     static final double NOTHING = 0.01;  // B/op: allocates nothing
     static final double TASK = 48, RUNNABLE_TASK = 56; // B per task: exactly one object
     static final double SETUP = 1024;    // B per trace start + close + release
+    static final double ACROSS_SETUP = 1024; // B per trace of the across groups: the submitter's trace and the worker's lane
     static final double ENCODE = 6 * 1024, RENDER = 24 * 1024, JSON = 2560; // B per render of the 300-span trace
     static final double TICK = 0.5, TICK_STATIC = 1.0, SPAN_STATIC = 6.4; // times one clock read
     static final String BASELINE = "baselineNanoTime";
 
-    enum Unit { PER_OP, PER_TRACE, PER_RENDER, TIMES_BASELINE }
+    enum Unit { PER_OP, SETUP_PER_TRACE, PER_TRACE, PER_RENDER, TIMES_BASELINE }
 
     /** One check: a benchmark, what is measured, and its limit; {@code limit < 0} only reports. */
     static final class Gate {
@@ -105,6 +109,11 @@ public final class CostGate {
             new Gate(P2, "taskUndrawn", Unit.PER_OP, RUNNABLE_TASK + NOTHING),
             new Gate(P2, "executorSubmit", Unit.PER_OP, RUNNABLE_TASK + NOTHING),
             new Gate(P2, "executorCall", Unit.PER_OP, RUNNABLE_TASK + NOTHING),
+            new Gate(P2, "executorCallableTask", Unit.PER_OP, RUNNABLE_TASK + NOTHING),
+            new Gate(P2, "across", Unit.PER_OP, TASK / 2 + NOTHING),
+            new Gate(P2, "across", Unit.SETUP_PER_TRACE, ACROSS_SETUP),
+            new Gate(P2, "acrossUndrawn", Unit.PER_OP, RUNNABLE_TASK / 2 + NOTHING),
+            new Gate(P2, "acrossUndrawn", Unit.SETUP_PER_TRACE, ACROSS_SETUP),
 
             new Gate(P3, "tickUnrecorded", Unit.PER_OP, NOTHING),
             new Gate(P3, "tickUnrecorded", Unit.TIMES_BASELINE, TICK),
@@ -167,6 +176,14 @@ public final class CostGate {
             }
             int longest = Collections.max(byCycle.keySet());
             switch (g.unit) {
+                case SETUP_PER_TRACE: {
+                    // a group op is half a task, so a trace of `cycle` tasks spans 2 * cycle group ops
+                    int c1 = Collections.min(byCycle.keySet());
+                    double b1 = byCycle.get(c1), b2 = byCycle.get(longest);
+                    double perOp = (b2 * longest - b1 * c1) / (longest - c1), setup = (b1 - perOp) * c1 * 2;
+                    ok &= check(g, setup, String.format("%.0f B per trace", setup));
+                    break;
+                }
                 case PER_OP:
                     if (byCycle.size() == 2) {
                         int c1 = Collections.min(byCycle.keySet());
