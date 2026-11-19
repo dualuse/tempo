@@ -9,7 +9,8 @@ Run what CI runs:
 
 ```
 ./gradlew check                    # unit tests, the golden vectors in Java, the link-base rule, the demos
-./gradlew jmhGate                  # allocation gate: recording must not allocate
+./gradlew jmhGate                  # cost gate: the four cost promises and the allocation ceilings
+./gradlew jcstress                 # concurrency tests of the lane state, handles and tasks
 python3 tests/run_golden.py        # vectors, ladder and samples against tools/tempo_ref.py
 python3 -m unittest tests.test_cli # the command-line viewer (Python 3.8+)
 python3 -m unittest tests.test_check_private  # tools/check-private.sh
@@ -19,17 +20,34 @@ node tests/check_site_headless.mjs   # Tempo Timeline in headless Chrome: sample
 
 - **One file.** The library is `Tempo.java`, plus the optional `TempoJackson.java`. It targets
   Java 11 and has no runtime dependencies.
-- **No allocation while recording.** Opening and closing spans, phases, attributes and flags
-  allocate nothing once warm; a handoff allocates its one 32-byte `Handoff`. `./gradlew jmhGate`
-  enforces this. Rendering may allocate its output.
+- **Four cost promises.** They are gates, not goals, and `./gradlew jmhGate` (`CostGate.java`)
+  checks each one; see [BENCHMARKS.md](BENCHMARKS.md).
+  1. A recorded span allocates 0 B once warm: its handle comes from the thread's pool. So do
+     phases, attributes, flags and steps.
+  2. A task allocates one object, itself: the `RunnableTask`, `CallableTask` or supplier task,
+     which through `Tempo.executor` is also the `Future`.
+  3. A tick the trace does not record costs about a branch through `s.tick(name)`; the static
+     `Tempo.tick(name)` may add the `ThreadLocal` read. A step the trace does not draw allocates
+     nothing.
+  4. A recorded span through the static API costs at most 6.4 times one `System.nanoTime()`,
+     measured in the same run.
+
+  A change that cannot keep a promise is discussed first; a gate is never loosened to let it
+  pass. Rendering may allocate its output, within the ceilings of the gate.
 - **Exact tests.** Tests use the fake clock (`Options.clock`) and assert exact numbers; no
   sleeps for timing.
+- **Misuse heals.** Outside strict mode the library never throws into the caller: misuse is
+  healed and counted. In strict mode (`Options.strict`) every misuse is an `AssertionError`.
 - **The format is a contract.** [FORMAT.md](FORMAT.md) is normative. A change to the wire or
   JSON form changes FORMAT.md, the vectors in `testdata/`, `tools/tempo_ref.py`, the Java
   encoder and both viewers in one pull request.
 - **Demos are checked.** Each demo in `src/demo` checks what it claims about its own trace, and
   `./gradlew demos` (part of `check`) runs them all. A change to the API or its behaviour updates
   the demos that show it; see [src/demo/README.md](src/demo/README.md).
+- **One style in examples.** The README, the demos and the Javadoc open spans with the static
+  calls (`Tempo.span`, `Tempo.step`, `Tempo.tick`), try-with-resources first and `Tempo.run` /
+  `Tempo.call` as the compact form. No example passes a trace or a span into a method; code
+  that needs the innermost span asks `Tempo.current()`.
 - **Invented names only.** Examples, tests, samples and commit messages use made-up span names,
   hosts and timings, never ones taken from a real service.
 

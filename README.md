@@ -1,30 +1,33 @@
 # Tempo
 
 Tempo is a small phase-profiling library for Java. It records where the time of one request
-or job goes (nested spans, phases and laps, work handed to thread pools with its queue wait)
-cheaply enough to stay switched on in production. It renders the result as response headers,
-as JSON, or as a link that opens the trace in a web viewer.
+or job goes (nested spans, the phases of a span, work handed to thread pools with its queue
+wait) cheaply enough to stay switched on in production. It renders the result as response
+headers, as JSON, or as a link that opens the trace in a web viewer.
 
 - **One source file**, `Tempo.java`, Java 11 or newer, no runtime dependencies. An optional
   second file, `TempoJackson.java`, serializes traces with Jackson.
-- **No allocation while recording.** Spans go into per-thread primitive buffers; a span costs
-  about 30 ns (two clock reads), a disabled detail span a branch. See [BENCHMARKS.md](BENCHMARKS.md).
+- **No allocation while recording.** Spans go into per-thread primitive buffers, and their
+  handles are pooled per thread. A span costs about 30 ns (two clock reads), a tick the trace
+  does not record about a branch, and a task allocates one object: itself. See
+  [BENCHMARKS.md](BENCHMARKS.md).
 - **A compact wire format**, `Tempo-Timing`, specified in [FORMAT.md](FORMAT.md): a whole
-  request tree with threads, queue waits, CPU time, attributes and flags in one header line,
-  kept to a byte limit by folding.
+  request tree with threads, queue waits, CPU time, phases, attributes and flags in one header
+  line, kept to a byte limit by folding.
 - **Two viewers**: `tools/tempo` in the terminal and **Tempo Timeline** in the browser at
   <https://dualuse.github.io/tempo/>. Neither sends a trace anywhere.
 
 ```
 $ curl -si https://api.example.org/search?q=lamp | tempo --tree
-search  ·  31.600 ms  ·  2026-11-14 05:56:18.513 UTC  ·  6 spans on 2 threads
+search  ·  31.600 ms  ·  2026-11-19 05:56:18.513 UTC  ·  5 spans and 2 phases on 3 threads
 span                   start   wait     dur    self    cpu  off-cpu  thread  flags  attributes
-search                 0.000         31.600   0.000  1.526   30.074  main
-├─ decode              0.000         20.000  20.000                  main
-└─ rerank             20.000         11.600   0.600                  main
-   ├─ load            20.000          3.000   3.000                  main           bytes=48213
-   ├─ match           23.000  0.500   8.000   8.000  0.010    7.990  cpu-1          queued=0
-   └─ join            23.500          8.000   8.000                  main    w
+search                 0.000         31.600  20.600  1.500   30.100  main
+├─ :decode             0.000         20.000                                  p
+├─ :rerank            20.000         11.600                                  p
+├─ load               20.000          3.000   3.000                  main           bytes=48213
+├─ match              23.000  0.400   7.600   7.600  7.500    0.100  cpu-1
+├─ match              23.000  0.900   5.300   5.300  5.200    0.100  cpu-2
+└─ join               23.100          8.000   8.000                  main    w
 ```
 
 ## Status
@@ -39,224 +42,356 @@ artifact yet: take the jar from a GitHub release, build it (`./gradlew jar`) or 
 ```java
 import io.github.dualuse.tempo.Tempo;
 
-static final Tempo.Name SEARCH = Tempo.name("search"), DECODE = Tempo.name("decode"),
-    RERANK = Tempo.name("rerank"), LOAD = Tempo.name("load"), MATCH = Tempo.name("match"),
-    JOIN = Tempo.name("join"), BYTES = Tempo.name("bytes"), QUEUED = Tempo.name("queued");
+static final ExecutorService MATCH = Tempo.executor(pool, "match");   // every submit is a "match" task
 
-Tempo.Trace t = Tempo.start(SEARCH, new Tempo.Options().level(Tempo.DETAIL));
+Tempo.Trace t = Tempo.trace("search").records(Tempo.STEP);   // draw steps and tasks, not only count them
 try (t) {
-  Tempo.Span s = t.root();
+  t.phase("decode").label("Decode Input");          // a phase: a section of the root's own timeline
   Query q = decode(body);
-  s.done(DECODE, "Decode Input");                    // a lap, named after it ran
-  s.phase(RERANK).legacy();                          // a phase, named before it runs
-  try (Tempo.Span l = s.detail(LOAD)) {              // recorded at DETAIL and above
-    l.set(BYTES, load(q));
+  t.phase("rerank").label("Rerank");                // ends decode and starts rerank at one clock read
+  try (Tempo.Span s = Tempo.span("load")) {         // a child of the thread's innermost open span
+    s.set("bytes", load(q));
   }
   List<Future<Score>> scores = new ArrayList<>();
-  for (Candidate c : candidates) {
-    Tempo.Handoff h = s.handoff(MATCH).set(QUEUED, queue.size());  // submitted here...
-    scores.add(pool.submit(h.callable(() -> match(q, c))));        // ...runs there, after its queue wait
-  }
-  try (Tempo.Span j = s.span(JOIN).waiting()) {      // a blocking wait
+  for (Candidate c : candidates) scores.add(MATCH.submit(() -> match(q, c)));   // queued here, run there
+  try (Tempo.Span join = Tempo.span("join").waiting()) {   // a blocking wait
     for (Future<Score> f : scores) f.get();
   }
-}
-response.setHeader("Runtime", t.toRuntime(3));       // 0.032s = 0.020s (Decode Input) + 0.012s (rerank)
+}                                                    // closing the trace ends rerank and the root
+response.setHeader("Runtime", t.toRuntime(3));       // 0.032s = 0.020s (Decode Input) + 0.012s (Rerank)
 response.setHeader("Server-Timing", t.toServerTiming());
 response.setHeader("Tempo-Timing", t.toHeader());   // the whole tree, see FORMAT.md
-t.release();                                         // optional: buffers go back to the pool
+t.release();                                         // optional: the buffers go back to the pool
 ```
 
-Names are interned once and kept in `static final` fields; dynamic data belongs in
-attributes, never in names. Recording never throws into the caller: misuse (a span used on
-the wrong thread, closed twice, left open) is healed and counted, and `Options.strict(true)`
-turns it into an `AssertionError` for tests.
+No method takes a trace or a span as a parameter. `Tempo.span(name)` opens a span under the
+innermost open span of the calling thread, so code deep in a call stack is instrumented the
+same way as the code that started the trace. Recording never throws into the caller: misuse
+(a span used on the wrong thread, closed twice, left open) is healed and counted, and
+`Options.strict(true)` turns it into an `AssertionError` for tests.
 
 ### Traces and spans
 
-`Tempo.start(name)` opens a trace and its root span on the calling thread;
-`Tempo.start(name, options)` takes `Options`. The root starts the moment `start` is entered,
-at 0 in every reading of the trace, so Tempo's own setup is part of the root's time (and of
-the totals of `Runtime` and `Server-Timing`) as time no child covers, never hidden. Closing
-the trace ends the root, and any span still open, at that instant. The trace stays readable
-until `release()`.
+`Tempo.trace(name)` starts a trace on the calling thread; `Tempo.trace(name, options)` takes
+`Options`. The `Trace` is the trace's root span. It starts the moment `trace` is entered, at 0
+in every reading of the trace, so Tempo's own setup is part of the root's time (and of the
+totals of `Runtime` and `Server-Timing`) as time no child covers, never hidden. Closing the
+trace ends the root, and any span still open, at that instant. The trace stays readable until
+`release()`.
+
+Try-with-resources is the usual form; `Tempo.run` and `Tempo.call` are the compact one:
 
 ```java
-try (Tempo.Span s = t.root().span(PARSE)) { parse(body); }   // always recorded
-t.root().run(VALIDATE, () -> validate(request));             // a child span around a body
-Plan p = t.root().call(PLAN, () -> plan(request));           // the same, with a result
+try (Tempo.Span s = Tempo.span("parse")) {          // closed on every path out of the block
+  s.set("bytes", body.length);
+  parse(body);
+}
+Tempo.run("validate", () -> validate(request));     // a span around a body
+Plan p = Tempo.call("plan", () -> plan(request));   // the same, with a result
 ```
 
-A span nests under the innermost open span of its thread. A `Span` handle belongs to its
-thread. Each recorded span has a handle of its own until its trace is released; then the thread
-pools the handle and issues it to a span of a later trace. A call through a pooled handle is
-ignored and counted as misuse; after the handle was issued again it reaches the new span,
-without any check. `strict` never pools a handle, so there every such call throws. Keep a
-handle inside the block that opened it.
-Deep in a call stack, `Tempo.current()` returns the innermost open span of the thread, or
-`Tempo.NOOP` (a handle that records nothing) outside a trace. `run`, `call` and `lap` flag
-the span failed when the body throws and rethrow the throwable unwrapped.
+`run` and `call` flag the span failed when the body throws, and rethrow the throwable
+unwrapped. Built with `-Xlint`, a try-with-resources whose span is not used inside the block
+warns (`try`); `@SuppressWarnings("try")` on the method silences it, or `run` and `call` avoid
+it.
 
-### Phases and laps
+To annotate the innermost open span from deep in a call stack, `Tempo.current()` returns it,
+as in `Tempo.current().set("hits", n)`; outside a trace it returns `Tempo.NOOP`, a handle that
+records nothing. That is the only static way to reach a span: there is no static `set`, `fail`
+or phase.
 
-Phases and laps split one span into consecutive steps.
+**Names.** `Tempo.name("parse")` interns a name. Kept in a `static final` field and passed
+instead of the string, it is the fast path, with no lookup per span. Every method that takes a
+`Name` also takes a `String`, looked up in the same global table. Names are constants; dynamic
+data belongs in attributes. Past 4,096 names made from strings, a new string maps to
+`<other>`, counted as misuse. `Tempo.span()` opens an unnamed span, labelled only by its
+phases.
+
+**Where a span opens.** `Tempo.span(name)` opens under the innermost open span of the thread;
+`s.span(name)` opens under `s`. If other spans are still open above `s`, they are closed first,
+flagged healed, and the misuse is counted. Outside a trace, `Tempo.span`, `step` and `tick` cost
+one `ThreadLocal` read and return `Tempo.NOOP`, unless the name of a span or step has a global
+listener (see [Totals and listeners](#totals-and-listeners)), which then hears its duration. A trace
+started inside another trace joins it: its root is a span under the innermost open one, and
+the inner `Trace` renders its own subtree. A trace left open on a pool thread therefore takes
+in the later traces of that thread, so close every trace.
+
+### Spans, steps and ticks
+
+Three words open a span, and the word says what is measured:
+
+| Word | Timed | Drawn |
+|---|---|---|
+| `span` | always | always |
+| `step` | always | when the trace records steps |
+| `tick` | only when the trace records ticks | when the trace records ticks |
+
+A span is always drawn, a step is always counted, a tick exists only on request. Work whose
+total is wanted in production, such as one item of a batch, is a `step`; inner-loop work is a
+`tick`. A trace records spans; `t.records(Tempo.STEP)` or `t.records(Tempo.TICK)` widens it,
+once, before the first step or tick opens and before the first task is submitted. Later it is
+misuse and changes nothing (strict mode throws); `t.records()` reads the level.
 
 ```java
-Tempo.Span s = t.root();
-s.phase(FETCH);                    // label first: FETCH runs from here to the next boundary
-fetch();                           //   spans opened now nest under FETCH
-s.done(FETCH);                     // ends the open phase
-transform();
-s.done(TRANSFORM, "Transform");    // label after: a lap from the last boundary to now
-Result r = s.lap(STORE, () -> store());   // runs the body, then done(STORE)
-s.phaseSet(ROWS, r.rows());        // an attribute on the last lap
-```
-
-The steps marked legacy (`done(name, label)` or `legacy()`) are the ones the `Runtime` and
-`Server-Timing` headers print, under their label.
-
-### Handoffs and queue wait
-
-A handoff carries a span to another thread and records how long the task waited in the
-queue. `handoff(name)` is called where the task is submitted, `begin()` where it runs:
-
-```java
-Tempo.Handoff h = s.handoff(MATCH).set(QUEUED, executor.getQueue().size());
-executor.execute(() -> {
-  try (Tempo.Span m = h.begin()) {   // queue wait = now - submit
-    match(c);
+Tempo.Trace t = Tempo.trace("import");
+if (verbose) t.records(Tempo.TICK);
+try (t) {
+  for (Row row : rows) {
+    try (Tempo.Span s = Tempo.step("row")) {         // always in t.total("row"); drawn only when verbose
+      s.set("cells", row.size());
+      for (Cell c : row) {
+        try (Tempo.Span k = Tempo.tick("cell")) {    // without TICK: Tempo.NOOP, about a branch
+          convert(c);
+        }
+      }
+    }
   }
-});
-```
-
-`runnable`, `callable` and `supplier` wrap a task in `begin()` and close. A task that runs
-inline on the submitting thread (caller-runs) becomes a plain child. One that never runs is
-marked with `h.cancel()` (an early exit) or `h.reject()` (the executor refused it), and shows
-as cancelled before it began (flag `c`, no run time); a handoff neither begun nor cancelled
-when the trace renders shows as never started (`n`). The `Handoff` is the one object Tempo
-allocates while recording, 32 bytes.
-
-Cancel and begin race for the handoff, and exactly one of them wins. `cancel()` and `reject()`
-return `true` if they won: the task is recorded as cancelled before it began, and a wrapped
-task skips its body when a worker takes it (`runnable` returns, `callable` and `supplier` throw
-`CancellationException`). They return `false` if the task has begun (it runs, and is recorded
-as it runs), was cancelled already, or Tempo takes no part: the handoff is `Handoff.NOOP` (no
-live trace, as in an untraced request, or past a cap) or the trace was released. Then nothing
-is recorded and the wrappers run the task as it is. So an early exit needs neither a lock nor
-the executor's help where Tempo takes part, and asks the executor where it does not:
-
-```java
-for (Pending p : pending) {
-  Tempo.Handoff h = p.handoff;
-  boolean won = h == Tempo.Handoff.NOOP ? pool.remove((Runnable) p.future) : h.cancel();
-  if (won) p.future.cancel(false);   // the body will not run
 }
 ```
 
-For `Handoff.NOOP`, `ThreadPoolExecutor.remove` decides the race: it takes the task out of the
-queue only if no worker took it (`submit` returns the very task it queues).
-`future.cancel(false)` alone cannot tell, since it also succeeds on a running task, whose body
-runs on and whose result is thrown away. Cancel pending work before releasing the trace.
+A step the trace does not draw costs its two clock reads and an update of its totals, and
+writes no row; a tick the trace does not record costs about a branch. `recording()` is false
+on `Tempo.NOOP`, so `if (k.recording())` guards work done only for a tick that records.
 
-On a recording handoff, `h.cancel()` alone on every pending handoff is enough for the trace and
-the work if the task is wrapped or starts with `tryBegin()`: such a task costs nothing when a
-worker takes it after a won cancel. `future.cancel(false)` completes the future for whoever
-waits on it (if a worker took the task a moment before, the future may complete through the
-wrapper instead, so go by what `cancel()` returned), and `ThreadPoolExecutor.remove` is only
-needed there to free the slots of a bounded queue at once. A hand-written task begins with
-`tryBegin()`, which returns `null` when the cancel won, and returns early; `begin()` returns
-`Tempo.NOOP` then, and the body runs unrecorded. Neither is misuse; beginning twice is.
+**Budget and folding.** A trace draws up to `Options.budget(n)` steps, ticks and tasks
+individually (512 by default). Past the budget they fold: occurrences of the same name under
+the same parent go into one aggregate with count, sum, min, max, extent, queue wait sum and
+max, CPU time, the thread (or that there were several) and the flags all of them share. A hot
+loop of thousands of iterations costs one aggregate, not thousands of rows, and the header says
+how many were folded. Folding changes what is drawn, never what `total` returns.
 
-On a thread without a trace, `t.submitted()` and `t.waited(name, token)` measure a queue
-wait into `t.aggregate(name)` with a single clock read each.
+**CPU time.** Thread CPU time is measured for each lane root (the trace's root and every task
+on a pool thread) when the trace records steps, or as `Options.cpu(true|false)` says;
+`span.cpu()` asks for it on one more span. The first CPU read in a JVM sets the clock up, which
+takes milliseconds: a trace pays it on the thread that starts it or widens it with `records`,
+in the root's time, never in a task's queue wait. A task reads its start as soon as it wins
+its begin, before it sets up its thread's lane or reads its CPU time, so its queue wait is time
+in the queue only.
+
+### Phases
+
+A phase is a labelled section of its span's own timeline. It is not the parent of anything:
+spans opened during a phase stay children of the span, and may cross phase boundaries.
+
+```java
+try (Tempo.Span s = Tempo.span("startup")) {
+  s.phase("init");                                   // starts now
+  init();
+  s.phase("loading");                                // ends init and starts loading at one clock read
+  try (Tempo.Span f = Tempo.span("fetch")) {         // a child of startup, not of loading
+    fetch();
+    s.phase("warm-up");                              // fetch runs on across the boundary
+    warmUp();
+  }
+}                                                    // closing the span ends warm-up
+```
+
+Run in a trace named `boot`, it is drawn like this (`tools/tempo --ascii`): the phases on their
+span's bar, with the span's name in front of it.
+
+```
+             ms 0                 10                 20
+                +-----------------+------------------+------------------
+main            |------------------------ boot ------------------------|
+                   startup |init-|-------- loading --------| warm-up |
+                                     |--------- fetch ----------|
+```
+
+- `s.phase(name)` starts a phase at its call; the time before the first phase, and after
+  `done()`, is unphased time of the span (dotted in the terminal, a lighter fill in Tempo
+  Timeline). A phase right after a phase shares one clock read.
+- `s.done()` (or its synonym `s.lap()`) ends the open phase; no phase opens in its place.
+- `s.done(name)` ends the open phase, which must be `name`. With another phase open, that one
+  ends anyway under its own name, flagged, and the misuse is counted (strict mode throws). With
+  no phase open, it names the stretch since the last boundary, as a stopwatch does:
+
+  ```java
+  Tempo.Span s = Tempo.current();
+  read();
+  s.done("read");                                    // the time since the span's start
+  transform();
+  s.done("transform");                               // the time since the last boundary
+  ```
+
+- `phase(name)` returns the `Phase`. `set`, `fail` and `label` apply to the phase; `phase`,
+  `lap` and `done` on it continue its span's sequence, and `done()` returns the span.
+- `label("Decode Input")` is the text the `Runtime` and `Server-Timing` headers print. They list
+  the labelled phases of the trace's root, as in the quick start.
+
+Phases count towards the totals and listeners of their name, also on a step the trace does not
+draw. The viewers report a phase's own start and duration only: no self time, no children.
+
+### Timing by hand
+
+Time measured elsewhere goes into a trace in two ways. `s.add(name, nanos)` adds one
+occurrence of `name` lasting `nanos` to the trace's totals and calls the name's listeners; no
+span is drawn. Any thread may call it, also after `s` closed.
+
+A span can also be timed from clock readings taken elsewhere (`System.nanoTime()`, or the
+clock of `Options.clock`), with `start(t)`, `lap(t)` and `stop(t)` on the span or its phase:
+
+```java
+Tempo.span("upload").phase("connect").start(t0).lap(t1).phase("send").stop(t2).close();
+```
+
+Each time must lie in its window: from the parent's start to now, laps in order, the stop not
+before the last boundary. A time outside is clamped into it, the span is flagged, and the
+misuse is counted (strict mode throws). A span timed by hand stays the thread's innermost open
+span until `close()`. The only lanes are threads: there are no named or pseudo-lanes.
+
+### Tasks and thread pools
+
+Work submitted on one thread to run on another is a task. It records its queue wait (from the
+submit to its begin) and its run, as a span on the thread that ran it. Like a step, a task is
+always counted: its run time and queue wait go to the totals and listeners of its name. It is
+drawn when the trace records steps, against the budget; otherwise spans opened inside it are
+drawn under the span it was submitted from, on the thread that ran it.
+
+The simplest way to make tasks is an executor:
+
+```java
+static final ExecutorService MATCH = Tempo.executor(pool, "match");
+
+Future<Score> f = MATCH.submit(() -> match(q, c));   // a "match" task under the innermost open span
+```
+
+Every submit becomes a task of the executor's name, handed to `pool.execute`. The task is
+itself the `Future` that `submit` returns, so a submit allocates one object. A submit the pool
+refuses is recorded as rejected, and the `RejectedExecutionException` is thrown on.
+
+Without such an executor, `Tempo.runnable`, `Tempo.callable` and `Tempo.supplier` make the
+task where the work is submitted. Each is the `Runnable`, `Callable` or `Supplier` itself, and
+a runnable or callable task is also its own `Future`:
+
+```java
+Tempo.RunnableTask index = Tempo.runnable("index", () -> index(doc));
+pool.execute(index);                                 // index is also the Future
+CompletableFuture<Page> page = CompletableFuture.supplyAsync(Tempo.supplier("render", () -> render(doc)), pool);
+```
+
+A task's parent is the innermost open span of the thread that made it. One that runs on the
+submitting thread (caller runs) becomes a plain child. `set` and `fail` on a task apply to its
+record at the submit; `elapsedNanos()` is its queue wait. A task submitted to `Tempo.executor`
+keeps its own name.
+
+**Cancelling and early exits.** Begin and cancel race for a task, and exactly one of them
+wins, inside a trace or not, with no lock and no help from the executor. `task.cancel()`
+returns `true` when the body will not run; the task is then recorded as cancelled before it
+began (flag `c`, no run time). `Future.cancel` on a task cancels the task first; once the body
+runs, it acts as `FutureTask.cancel` does, and the task's span is marked cancelled. So an early
+exit is:
+
+```java
+for (Future<Score> f : scores) f.cancel(false);     // the tasks not begun never run
+```
+
+A task neither begun nor cancelled when the trace renders shows as never started (`n`).
+Cancel pending work before releasing the trace.
+
+**Hand-written workers.** `Tempo.task(name)` is a task without a body, for a worker that takes
+work from a queue of its own. The worker begins it with `tryBegin()`, which returns `null` when
+the task was cancelled or rejected first:
+
+```java
+Tempo.Task task = Tempo.task("parse");               // where the work is queued
+queue.add(new Job(doc, task));
+
+Tempo.Span s = job.task.tryBegin();                  // on the worker
+if (s == null) return;                               // cancelled before it began: recorded so
+try (s) {
+  parse(job.doc);
+}
+```
+
+`task.reject()` records that a queue refused the task; it returns like `cancel()`.
 
 ### Attributes and flags
 
 ```java
-Tempo.Span q = s.detail(QUERY);
-try {
+Tempo.Span q = Tempo.span("query");
+try (q) {
   Rows rows = query();
-  q.set(ROWS, rows.size()).set(RATIO, rows.hitRatio());   // long and double attributes
+  q.set("rows", rows.size()).set("ratio", rows.hitRatio());   // long and double attributes
 } catch (TimeoutException e) {
-  q.fail(e);                               // only the flag is recorded, not the throwable
+  q.fail(e);                                         // after close: only the flag is recorded
   throw e;
-} finally {
-  q.close();
 }
 ```
 
-`set`, `fail()` and `cancel()` also work after the span closed, as in the catch block right
-after it, until the trace is released. (A span folded past the budget has no row and shares
-one handle per depth with the other folded spans: it keeps no attributes, and flags only while
-it is open.) `waiting()` marks a blocking wait (a join, a
-`take`, a `get`), which the viewers draw apart from run time and follow across threads on the
-critical path.
+`set`, `fail()` and `cancel()` also work after the span closed, as in the catch block above,
+until the trace is released. A step folded past the budget or not drawn has no row: it keeps no
+attributes, and flags only while it is open. `cancel()` on a span marks its work abandoned.
+`waiting()` marks a blocking wait (a join, a `take`, a `get`), which the viewers draw apart
+from run time and follow across threads on the critical path.
 
-### Levels
+### Totals and listeners
 
-Every trace records at one level, chosen when it starts: `Tempo.COARSE` (default),
-`Tempo.DETAIL` or `Tempo.DEEP`. `span` is always recorded; `detail` and `deep` only at their
-level and above. Below it they return `Tempo.NOOP` at the cost of a branch, so detail
-instrumentation can stay in hot code.
-
-```java
-Tempo.Trace t = Tempo.start(SEARCH, new Tempo.Options().level(debug ? Tempo.DETAIL : Tempo.COARSE));
-t.raise(Tempo.DEEP);                       // once, before the first detail span
-if (s.detailed()) s.set(KEYS, keys.size());   // guard work done only for detail
-```
-
-Thread CPU time is measured for each lane root (the trace's root and every task on a pool
-thread) from `DETAIL` up, or as `Options.cpu(true|false)` says; `span.cpu()` asks for it on
-one more span. The first CPU read in a JVM sets the clock up, which takes milliseconds: a
-trace pays it on the thread that starts it at such a level, or raises it there, so the first
-such trace of a JVM shows it in its root's time, never in a task's queue wait. A task reads
-its start as soon as it wins its handoff, before it sets up its thread's lane or reads its CPU
-time, so its queue wait is time in the queue only.
-
-### Budget and folding
-
-At `DETAIL` and `DEEP`, a trace records up to `Options.budget(n)` detail spans and
-handoffs individually (512 by default). Past the budget they fold: occurrences of the same
-name under the same parent go into one aggregate with count, sum, min, max, extent, queue
-wait sum and max, CPU time, the thread (or that there were several) and the flags all of them
-share. A hot loop of thousands of iterations costs one aggregate, not thousands of rows, and
-the header says how many spans were folded.
-
-### Listeners and aggregates
-
-A name can be measured at every level, without rows:
+A trace keeps, per name, the count, sum, minimum and maximum of everything timed under that
+name: spans, steps, recorded ticks, phases, tasks and `s.add`, and the queue waits of its
+tasks. The numbers are the same whether the trace drew the steps, folded them past the budget,
+or recorded spans only.
 
 ```java
-static final Tempo.Name LOAD = Tempo.name("load").aggregate();          // always-on
-static final Tempo.Name STORE = Tempo.name("store")
-    .sink(Tempo.seconds(storeHistogram::record));                       // global listener, seconds
-
-t.on(MATCH, Tempo.serialized(matchTimes::add));   // this trace only, before its first child span
-...
-Tempo.Aggregate a = t.aggregate(LOAD);    // count(), sumNanos(), minNanos(), maxNanos(), waitSumNanos() ...
+Tempo.Total m = t.total("match");    // count(), sum(), mean(), min(), max(), waitSum(), waitMax()
+log.info("match: {} tasks, {} ns mean, {} ns longest queue wait", m.count(), m.mean(), m.waitMax());
 ```
 
-Below the trace's level, `detail(LOAD)` on an always-on name times itself into the aggregate
-and calls the listeners, but writes no row. Listeners run on the thread that ends the span,
-without a lock; `Tempo.serialized` wraps one that is not thread-safe. `t.add(name, nanos)`
-adds a measurement taken elsewhere. Without any trace, `Tempo.time(sink, body)` times a body
-with two clock reads.
+A listener hears every timed occurrence of its name, in nanoseconds, on the thread that ends
+it, without a lock, so it must be thread-safe. `Tempo.on` adds a global one, set once at
+start-up; `t.on` adds one for a single trace:
+
+```java
+Tempo.on("store", nanos -> storeLatency.record(nanos));   // every trace, and outside traces
+t.on("match", nanos -> matchTimes.add(nanos));            // this trace only
+```
+
+Outside any trace, a span or step whose name has a global listener is still timed for it,
+with two clock reads and no allocation. So `Tempo.run("store", () -> store(x))` serves as a
+stopwatch for a metric, inside a trace or not.
 
 `t.printOnClose(log::info, "import")` passes `import: ` and the `Runtime` text to the logger
 when the trace closes, as a drop-in for a stopwatch log line.
 
+### Handles, misuse and strict mode
+
+A `Span` or `Phase` handle belongs to the thread that opened it. Each recorded span has a
+handle of its own for the whole trace, so `set`, `fail` and `cancel` after close reach that
+span. Once the trace is released, the thread pools the handle and later issues it to a span of
+another trace. A call through it while it sits in the pool is ignored and counted as misuse; a
+call after it was issued again reaches the new span, undetected. So keep a handle inside the
+block that opened it. Steps folded past the budget or not drawn share one handle per depth.
+
+Misuse, such as a span used on another thread, after close or after release, a span opened
+under one with others open above it, a `done(name)` that names another phase, a clamped time,
+or `records` called too late, is healed and counted, and the record is flagged `m` where there
+is one. Outside strict mode Tempo never throws. `Options.strict(true)` throws an
+`AssertionError` at the offending call instead, and never pools a handle, so every stale use
+throws: use it in tests.
+
+### Options
+
+| Option | Default | Sets |
+|---|---|---|
+| `budget(n)` | 512 | Steps, ticks and tasks drawn individually before they fold. |
+| `cpu(on)` | when the trace records steps | Whether lane roots measure thread CPU time. |
+| `headerBytes(n)` | 3,000 | Byte limit of `toHeader()` and of the value `toLink()` carries. |
+| `linkBase(url)` | the build's base | The viewer `toLink()` points at. |
+| `clock(supplier)` | `System::nanoTime` | The nanosecond clock of every timestamp; for tests. |
+| `lanes(n)` | 256 | Lanes (one per thread) of one trace. |
+| `strict(on)` | off | `AssertionError` on misuse, no pooled handles. |
+
 ### Reading a trace
 
-`forEachSpan(visitor)` walks the stitched tree with a reused read-only `SpanView`
-(start, duration, thread, queue wait, CPU, flags, attributes, aggregate statistics);
-`forEachTop(visitor)` visits the legacy steps. `snapshot()` takes an immutable copy that stays
-readable after `release()`, for rendering later or on another thread.
+`forEachSpan(visitor)` walks the stitched tree with a reused read-only `SpanView` (start,
+duration, thread, queue wait, CPU, flags, phase and label, attributes, aggregate statistics);
+`forEachTop(visitor)` visits the labelled phases of the root. `snapshot()` takes an immutable
+copy that stays readable after `release()`, for rendering later or on another thread.
 
 ## Demos
 
 `src/demo` holds eleven small programs that use Tempo the way an application does, graded
-simple, medium and complex: a first trace, phases and laps, failures, levels and opt-in,
-thread pools with queue wait and CPU time, metrics from spans, headers under a byte limit,
+simple, medium and complex: a first trace, phases, failures, steps and ticks on request,
+thread pools with queue wait and CPU time, totals and listeners, headers under a byte limit,
 and services with several pools, pipelines, fan-out, deadlines and early exits. They need
 nothing but the library and start no servers. Each one checks what it claims about its own
 trace. See [src/demo/README.md](src/demo/README.md) for the reading order.
@@ -271,20 +406,20 @@ trace. See [src/demo/README.md](src/demo/README.md) for the reading order.
 
 | Header | Method | Content |
 |---|---|---|
-| `Runtime` | `toRuntime(digits)` | `0.032s = 0.020s (Decode Input) + 0.012s (rerank)`: the legacy steps, in seconds |
-| `Server-Timing` | `toServerTiming()` | `decode;dur=20.000, rerank;dur=11.600, total;dur=31.600`: W3C, in milliseconds, shown by browser dev tools |
+| `Runtime` | `toRuntime(digits)` | `0.032s = 0.020s (Decode Input) + 0.012s (Rerank)`: the labelled phases of the root, in seconds |
+| `Server-Timing` | `toServerTiming()` | `decode;dur=20.000, rerank;dur=11.600, total;dur=31.600`: the same phases by name, W3C, in milliseconds, shown by browser dev tools |
 | `Tempo-Timing` | `toHeader()`, `toHeader(maxBytes)` | the whole tree, see below |
 | `Tempo-Link` | `toLink()`, `toLink(base, maxBytes)` | a URL that opens the trace in Tempo Timeline |
 
 The `Tempo-Timing` value of the quick-start request:
 
 ```
-v1;w=mwfzt13l;T=main:cpu-1;N=search:decode:rerank:load:match:join:bytes:queued;S=00.0.ods*16e/11.0.ffk/12.ffk.8y8/23.0.2bc:6=48213/24.2bc.668@1~dw*a:7=0/25.dw.668^w;e=6
+v1;w=mwn50afl;T=main:cpu-1:cpu-2;N=search:decode:rerank:load:match:join:bytes;S=00.0.ods*15o/11.0.ffk^p/12.ffk.8y8^p/13.0.2bc:6=48213/14.2bc.5v4@1~b4*5sc/14.0.438@2~p0*40g/15.2s.668^w;e=7
 ```
 
-One record per span, in pre-order: depth, name, start and duration (base 36, in
+One record per span or phase, in pre-order: depth, name, start and duration (base 36, in
 microseconds), then thread (`@`), queue wait (`~`), CPU time (`*`), attributes (`:`) and
-flags (`^`). The format, its error codes and its test vectors are
+flags (`^`; `p` marks a phase). The format, its error codes and its test vectors are
 specified in [FORMAT.md](FORMAT.md).
 
 **Size limits.** `toHeader()` keeps to `Options.headerBytes` (3,000 bytes by default),
@@ -389,32 +524,39 @@ are shell syntax.
 
 **Default view: lanes.** One row group per thread, grouped into pools by stripping a trailing
 `-<digits>` from the thread name (`cpu-1`, `cpu-2` form the pool `cpu`; `Thread-N` threads
-stay ungrouped). Nested spans stack into rows below their parent. A handoff that queued while
+stay ungrouped). Nested spans stack into rows below their parent. A span is a bar,
+`├── name ──┤`, its phases drawn inside it with the span's name in front; when a bar starts
+too near the left edge for its name, the chart gets a name column. A task that queued while
 its thread was still busy with earlier work of the request moves to a free row of that lane,
 so its queue wait stays visible.
 
 ```
-search  ·  31.600 ms  ·  2026-11-14 05:56:18.513 UTC  ·  6 spans on 2 threads
-            ms 0                   10                   20                  30
-               ┬───────────────────┬────────────────────┬───────────────────┬───
-main           search███████████████████████████████████████████████████████████
-               decode███████████████████████████████████rerank▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-                                                        load██ join─────────────
+search  ·  31.600 ms  ·  2026-11-19 05:56:18.513 UTC
+5 spans and 2 phases on 3 threads
+                   ms 0                   10                   20                   30
+                      ┬───────────────────┬────────────────────┬────────────────────┬───
+main           search ├──────────────── decode ─────────────────┼─────── rerank ───────┤
+                                                                ├load┤
+                                                                      ├╌╌╌╌ join ╌╌╌╌╌┤
 cpu
-  cpu-1                                                       ░match████████████
-  queued ≤1                                                   █▄
+  cpu-1                                                               ░├─── match ────┤
+  cpu-2                                                               ░░├─ match ─┤
+  queued ≤2                                                           █▅
 ```
 
 | Glyph | Meaning |
 |---|---|
-| `█` `▓` | Run time (the two shades separate neighbouring spans). |
-| `░` | Queue wait of a handoff, drawn dim in front of its run. |
-| `─` | Blocking wait (join, future get), flag `w`. |
+| `├─ name ─┤` | A span's run time, its name centred (`\|- name -\|` with `--ascii`). |
+| `┼` | A phase boundary inside a span's bar; each phase's name is centred in its section. |
+| `·` | Unphased time of a span that has phases. |
+| `*1` | A phase too narrow for its name, named in a footnote line under the lanes. |
+| `░` | Queue wait of a task, drawn dim in front of its run. |
+| `├╌╌┤` | Blocking wait (join, future get), flag `w`. |
 | `▚` with `×N` and `┃` | Aggregate of N folded spans over its extent; `┃` marks where the slowest one started. |
 | `✗` `⊘` `▶` `∅` `!` | Failed (also red), cancelled, still open at render, never started, misuse. |
 | `●` | Lane still live at render (`l=`); its records are best effort. |
-| `(mixed)`, `(queued)` | Aggregates on several threads of a pool, and handoffs that never ran. |
-| `queued ≤N` | Per pool: how many of this request's handoffs waited in the queue over time. |
+| `(mixed)`, `(queued)` | Aggregates on several threads of a pool, and tasks that never ran. |
+| `queued ≤N` | Per pool: how many of this request's tasks waited in the queue over time. |
 
 The time axis is in milliseconds. The legend follows the chart, then notices for folded or
 dropped spans (`x=`), live lanes (`l=`) and cut values.
@@ -423,20 +565,20 @@ dropped spans (`x=`), live lanes (`l=`) and cut values.
 
 | Option | Shows |
 |---|---|
-| `--tree` | Indented tree with start, queue wait, duration, self time, CPU, off-CPU and attributes. |
-| `--agg` | Per path: count, sum, self, min, max, wait sum, wait max, CPU. |
+| `--tree` | Indented tree with start, queue wait, duration, self time, CPU, off-CPU and attributes; a phase is listed as `:name` under its span. |
+| `--agg` | Per path: count, sum, self, min, max, wait sum, wait max, CPU; a phase is a row `span:name` with count and durations only. |
 | `--pools` | Per pool, over time: this request's running and queued tasks, and the `queued`/`active` gauges recorded at submit (the pool-wide signal). A table gives tasks, threads seen, run, wait, CPU, off-CPU and peaks. |
-| `--findings` | Stragglers (ending after their parent), never-started and open handoffs, failures, cancellations, the longest queue waits, and off-CPU time on compute pools. |
-| `--critical` | The chain that determined the end time. It walks back from the root's end, always into the child that finished last, and follows handoffs to other threads instead of the blocking wait on them. On an early exit, where the wait ends while the work still runs (an aggregate, or a straggler with nothing else ending within 1 ms of the wake-up), it follows the work running at the wake-up. Each hop shows its queue wait and run time; totals per pool follow. |
+| `--findings` | Stragglers (ending after their parent), never-started and open tasks, failures, cancellations, the longest queue waits, and off-CPU time on compute pools. |
+| `--critical` | The chain that determined the end time. It walks back from the root's end, always into the child that finished last, and follows tasks to other threads instead of the blocking wait on them. On an early exit, where the wait ends while the work still runs (an aggregate, or a straggler with nothing else ending within 1 ms of the wake-up), it follows the work running at the wake-up. Each hop shows its queue wait and run time; totals per pool follow. |
 | `--diff [OTHER]` | Per path, B (OTHER, a file or link) minus A (the input): Δcount, Δsum, Δself, Δwait, ΔCPU, sorted by the largest absolute change. Without OTHER, B is the `&c=` trace of the input link. |
 | `--stats FILES...` | Over many traces (also several per file, such as a log): per path, the number of traces containing it, the median count, and p50/p95/max of sum, self and wait (nearest rank). |
 | `--to json` | The JSON form of FORMAT.md. |
-| `--to chrome` | Chrome trace events for [Perfetto](https://ui.perfetto.dev) or `chrome://tracing`: one track per thread, queue waits as async slices, handoffs as flow arrows. |
+| `--to chrome` | Chrome trace events for [Perfetto](https://ui.perfetto.dev) or `chrome://tracing`: one track per thread, queue waits and phases as async slices, tasks as flow arrows. |
 | `--to folded` | Collapsed stacks (`a;b;c <µs>`) for flame-graph tools. Values are self times; queue waits are left out. |
 | `--to link` | The Tempo-Link URL of the trace (`z.` form; an input link's `&c=` is kept). JSON input is encoded into a header value first. |
 | `--check` | Validate only. Exit status 1 on a malformed or cut value, with the error code of FORMAT.md. |
 | `--threads REGEX` | Keep spans on threads whose name matches (`cpu-*` stands for a mixed aggregate). |
-| `--focus PATH` | Keep the subtree at a path such as `rerank` or `rerank/load`; the lanes zoom to it. |
+| `--focus PATH` | Keep the subtree at a path such as `load` or `startup/fetch`; the lanes zoom to it. |
 | `--depth N` | Keep at most N levels below the root or focus. |
 | `--min-ms X` | Keep spans of at least X ms, with their subtrees. |
 | `--open` | Write the trace's Tempo-Link to stdout and open it in the local browser. |
@@ -475,7 +617,8 @@ usage error.
 
 - **Paste** a `curl -i` response, a `Tempo-Timing` value, a Tempo-Link or a JSON body, or
   open a file. Add a second trace to compare.
-- **Tabs:** Lanes (zoom with the wheel, pan by dragging, click a span for its details), Tree,
+- **Tabs:** Lanes (zoom with the wheel, pan by dragging, click a span for its details; phases
+  are drawn on their span's bar, and a phase too narrow for its name shows it on hover), Tree,
   Aggregates, Pools, Findings, Critical path, Diff, and Stats over a batch.
 - **Share link:** the menu copies a link holding the whole trace (and the comparison trace)
   in its fragment. Links are made from the page's own address, so a self-hosted or forked
@@ -514,18 +657,21 @@ python3 tools/gen_traces.py --samples samples                                   
 
 ## Benchmarks
 
-JMH, 300-span traces where it matters; Apple M3 Max, JDK 24. Full table and method in
-[BENCHMARKS.md](BENCHMARKS.md).
+JMH, 300-span traces where it matters; Apple M3 Max, JDK 24, 2026-11-19. Full tables and method
+in [BENCHMARKS.md](BENCHMARKS.md).
 
 | Operation | Time | Allocation |
 |---|---|---|
-| span open + close | 33 ns | 0 B |
-| detail span past the budget (folded) | 29 ns | 0 B |
-| handoff submit | 19 ns | 32 B (the `Handoff`) |
+| one `System.nanoTime()`, for scale | 10 ns | 0 B |
+| `Tempo.span(name).close()`, recorded | 37 ns | 0 B |
+| a step the trace does not draw | 28 ns | 0 B |
+| a tick the trace does not record, `s.tick(name)` | 1.4 ns | 0 B |
+| a task submitted, begun and closed | 68 ns | 56 B: the task, which is also its `Future` |
 | `Tempo-Timing` value, 300 spans | 15 µs | 5.3 KB, mostly the output string |
 
-CI gates the allocation of every recording operation on JDK 11, 17 and 21
-(`./gradlew jmhGate`).
+CI holds every recording operation to its allocation, and the four cost promises to their
+gates, on JDK 11, 17 and 21 (`./gradlew jmhGate`): 0 B per recorded span, one object per task,
+an unrecorded tick under half a clock read, and a recorded static span at most 6.4 clock reads.
 
 ## Building and testing
 
@@ -534,7 +680,7 @@ CI gates the allocation of every recording operation on JDK 11, 17 and 21
 ./gradlew test -PtestJdk=11                      # the tests on another installed JDK
 ./gradlew check                                  # tests, the link-base rule and the demos
 ./gradlew demos                                  # every demo, with the checks of what each one shows
-./gradlew jmhGate                                # the allocation gate CI runs
+./gradlew jmhGate                                # the cost gate CI runs: the four cost promises
 ./gradlew jmh                                    # benchmarks, with -prof gc
 ./gradlew jcstress                               # concurrency tests (jcstress, quick mode)
 ./gradlew jar                                    # the jar; its Tempo-Link base follows the git remote origin
