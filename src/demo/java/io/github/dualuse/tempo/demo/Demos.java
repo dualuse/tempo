@@ -37,17 +37,17 @@ public final class Demos {
     }
 
     static final List<Entry> ALL = Arrays.asList(
-            new Entry("simple", "FirstTrace", "a trace, its spans, and the four response headers"),
-            new Entry("simple", "StopwatchSteps", "phases and laps: a stopwatch log line and Runtime/Server-Timing"),
+            new Entry("simple", "FirstTrace", "a trace, spans opened with static calls, and the four response headers"),
+            new Entry("simple", "StopwatchSteps", "phases, a span timed by hand, an unnamed span, Runtime/Server-Timing"),
             new Entry("simple", "AttributesAndFailures", "numbers on spans, failed and cancelled work, Tempo.current() in a helper"),
 
-            new Entry("medium", "LevelsAndOptIn", "coarse by default, detail on request, a hot loop folded into one aggregate"),
-            new Entry("medium", "WorkerPool", "handing tasks to a thread pool: queue wait, CPU time, caller-runs, rejection"),
-            new Entry("medium", "MetricsAndListeners", "feeding histograms and metrics from spans, queue wait without a trace"),
+            new Entry("medium", "LevelsAndOptIn", "spans always, steps and ticks on request, a hot loop folded, totals"),
+            new Entry("medium", "WorkerPool", "Tempo.executor: queue wait, CPU time, caller-runs, rejection, Future.cancel"),
+            new Entry("medium", "MetricsAndListeners", "listeners and totals: metrics from spans, queue wait of undrawn tasks"),
             new Entry("medium", "ResponseHeaders", "headers under a byte limit, Tempo-Link, JSON in the body, reading a trace"),
 
             new Entry("complex", "SearchRequest", "a search request fanned out to an I/O pool and a compute pool, with early exit"),
-            new Entry("complex", "IngestPipeline", "an upload processed by a staged pipeline with bounded queues and backpressure"),
+            new Entry("complex", "IngestPipeline", "an upload through hand-written stage workers, bounded queues, backpressure"),
             new Entry("complex", "BatchUpload", "a batch of items in parallel: nested fan-out, a failure, rejection, a deadline"),
             new Entry("complex", "PoolDiagnosis", "one pool or two? the same load under both layouts, compared from the traces"));
 
