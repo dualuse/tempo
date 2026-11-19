@@ -69,13 +69,11 @@ public class TempoBenchmark {
         @Param({"1000", "16000"})
         int cycle;
         Tempo.Trace trace;
-        Tempo.Span root;
         int used;
 
         @Setup(Level.Trial)
         public void setUp() {
             trace = Tempo.trace(ROOT, UNBUDGETED);
-            root = trace;
         }
 
         @TearDown(Level.Trial)
@@ -84,15 +82,14 @@ public class TempoBenchmark {
             trace.release();
         }
 
-        Tempo.Span root() {
+        Tempo.Trace cycled() {
             if (++used == cycle) {
                 trace.close();
                 trace.release();
                 trace = Tempo.trace(ROOT, UNBUDGETED);
-                root = trace;
                 used = 0;
             }
-            return root;
+            return trace;
         }
     }
 
@@ -102,13 +99,11 @@ public class TempoBenchmark {
         @Param({"1000", "8000"})
         int cycle;
         Tempo.Trace trace;
-        Tempo.Span root;
         int used;
 
         @Setup(Level.Trial)
         public void setUp() {
             trace = Tempo.trace(ROOT, UNBUDGETED);
-            root = trace;
         }
 
         @TearDown(Level.Trial)
@@ -117,15 +112,14 @@ public class TempoBenchmark {
             trace.release();
         }
 
-        Tempo.Span root() {
+        Tempo.Trace cycled() {
             if (++used == cycle) {
                 trace.close();
                 trace.release();
                 trace = Tempo.trace(ROOT, UNBUDGETED);
-                root = trace;
                 used = 0;
             }
-            return root;
+            return trace;
         }
     }
 
@@ -165,12 +159,10 @@ public class TempoBenchmark {
     @State(Scope.Thread)
     public static class SpansOnly {
         Tempo.Trace trace;
-        Tempo.Span root;
 
         @Setup(Level.Trial)
         public void setUp() {
             trace = Tempo.trace(ROOT, UNBUDGETED);
-            root = trace;
         }
 
         @TearDown(Level.Trial)
@@ -184,12 +176,10 @@ public class TempoBenchmark {
     @State(Scope.Thread)
     public static class Folding {
         Tempo.Trace trace;
-        Tempo.Span root;
 
         @Setup(Level.Trial)
         public void setUp() {
             trace = Tempo.trace(ROOT, new Tempo.Options().budget(0)).records(Tempo.STEP);
-            root = trace;
         }
 
         @TearDown(Level.Trial)
@@ -206,7 +196,7 @@ public class TempoBenchmark {
 
     @Benchmark
     public void span(Cycling s) {
-        s.root().span(CHILD).close();
+        s.cycled().span(CHILD).close();
     }
 
     /**
@@ -215,14 +205,14 @@ public class TempoBenchmark {
      */
     @Benchmark
     public void spanStatic(Cycling s) {
-        s.root(); // cycles the trace like the others
+        s.cycled(); // cycles the trace like the others
         Tempo.span(CHILD).close();
     }
 
     /** The compact form, {@code Tempo.run(name, body)}: a recorded span around a body that does nothing. */
     @Benchmark
     public void run(Cycling s) {
-        s.root();
+        s.cycled();
         Tempo.run(CHILD, BODY);
     }
 
@@ -235,7 +225,7 @@ public class TempoBenchmark {
 
     @Benchmark
     public void spanNotInlined(Cycling s) {
-        open(s.root()).close();
+        open(s.cycled()).close();
     }
 
     @CompilerControl(CompilerControl.Mode.DONT_INLINE)
@@ -246,24 +236,24 @@ public class TempoBenchmark {
     /** One boundary: ends the previous phase and opens the next at a single clock read, with its own handle. */
     @Benchmark
     public Tempo.Phase phase(Cycling s) {
-        return s.root().phase(CHILD);
+        return s.cycled().phase(CHILD);
     }
 
     /** One phase named after the fact, from the last boundary to now. */
     @Benchmark
     public Tempo.Span done(Cycling s) {
-        return s.root().done(CHILD);
+        return s.cycled().done(CHILD);
     }
 
     @Benchmark
     public void setLong(Cycling s) {
-        s.root().set(KEY, 42L);
+        s.cycled().set(KEY, 42L);
     }
 
     /** Cost promise 3: an unrecorded tick through a span, {@code s.tick(name)}, in a trace of spans only: a branch. */
     @Benchmark
     public Tempo.Span tickUnrecorded(SpansOnly s) {
-        Tempo.Span d = s.root.tick(CHILD);
+        Tempo.Span d = s.trace.tick(CHILD);
         d.close();
         return d;
     }
@@ -334,7 +324,7 @@ public class TempoBenchmark {
     /** A duration measured elsewhere, added to the totals of its name: {@code s.add(name, nanos)}. */
     @Benchmark
     public Tempo.Span add(SpansOnly s) {
-        return s.root.add(CHILD, 1000);
+        return s.trace.add(CHILD, 1000);
     }
 
     /**
@@ -343,7 +333,7 @@ public class TempoBenchmark {
      */
     @Benchmark
     public Tempo.Span stepUndrawn(SpansOnly s) {
-        Tempo.Span d = s.root.step(CHILD);
+        Tempo.Span d = s.trace.step(CHILD);
         d.close();
         return d;
     }
@@ -351,7 +341,7 @@ public class TempoBenchmark {
     /** Explicit handle, a trace of steps over its budget: a folded step (two clock reads, an aggregate update). */
     @Benchmark
     public Tempo.Span folded(Folding s) {
-        Tempo.Span d = s.root.step(CHILD);
+        Tempo.Span d = s.trace.step(CHILD);
         d.close();
         return d;
     }
@@ -435,9 +425,8 @@ public class TempoBenchmark {
         @Setup(Level.Trial)
         public void setUp() {
             trace = Tempo.trace(ROOT, new Tempo.Options().headerBytes(1 << 16));
-            Tempo.Span root = trace;
             for (int i = 0; i < 30; i++) {
-                try (Tempo.Span parent = root.span(CHILD)) {
+                try (Tempo.Span parent = Tempo.span(CHILD)) {
                     for (int j = 0; j < 9; j++) {
                         Tempo.Span c = parent.span(j % 2 == 0 ? CHILD : KEY);
                         if (j % 3 == 0) c.set(KEY, 1000L * i + j);
