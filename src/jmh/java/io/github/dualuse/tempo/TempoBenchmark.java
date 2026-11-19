@@ -19,17 +19,20 @@ import org.openjdk.jmh.infra.Control;
 
 import java.util.List;
 import java.util.concurrent.AbstractExecutorService;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.function.Supplier;
 
 /**
  * Recording cost. Run with {@code -prof gc} and read {@code gc.alloc.rate.norm} (B/op).
  *
  * <p>The cycling benchmarks close, release and replace their trace every {@code cycle} operations,
- * so their B/op includes the per-trace setup divided by {@code cycle}. {@link AllocationGate} separates
- * the two and gates them in CI ({@code ./gradlew jmhGate}).
+ * so their B/op includes the per-trace setup divided by {@code cycle}. {@link CostGate} separates
+ * the two and gates them in CI ({@code ./gradlew jmhGate}), together with the times of the cost promises
+ * as ratios to {@link #baselineNanoTime()} in the same run.
  */
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
@@ -45,6 +48,9 @@ public class TempoBenchmark {
     /** For the traces that draw their tasks (records steps), without CPU time, as at the level of spans. */
     static final Tempo.Options DRAWN = new Tempo.Options().budget(Integer.MAX_VALUE).cpu(false);
     static final Runnable NOTHING = () -> { };
+    static final Tempo.ThrowingRunnable<RuntimeException> BODY = () -> { };
+    static final Callable<Integer> ANSWER = () -> 42;   // a cached Integer: the body allocates nothing
+    static final Supplier<Integer> SUPPLY = () -> 42;
 
     /** A pool that runs every task at once on the submitting thread. */
     static final class Inline extends AbstractExecutorService {
@@ -155,8 +161,9 @@ public class TempoBenchmark {
         }
     }
 
+    /** A trace that records spans only, for the whole trial: steps are undrawn, ticks unrecorded. */
     @State(Scope.Thread)
-    public static class Coarse {
+    public static class SpansOnly {
         Tempo.Trace trace;
         Tempo.Span root;
 
@@ -202,11 +209,28 @@ public class TempoBenchmark {
         s.root().span(CHILD).close();
     }
 
-    /** Cost promise 4: a span through the static API, which finds its parent through the ThreadLocal. */
+    /**
+     * A recorded span through the static API, which finds its parent through the ThreadLocal: cost promise
+     * 1 (0 B) and 4 (at most 6.4 times {@link #baselineNanoTime()}).
+     */
     @Benchmark
     public void spanStatic(Cycling s) {
         s.root(); // cycles the trace like the others
         Tempo.span(CHILD).close();
+    }
+
+    /** The compact form, {@code Tempo.run(name, body)}: a recorded span around a body that does nothing. */
+    @Benchmark
+    public void run(Cycling s) {
+        s.root();
+        Tempo.run(CHILD, BODY);
+    }
+
+    /** A step in a trace that records steps: drawn, one row (cost promise 1). */
+    @Benchmark
+    public void stepDrawn(Drawing s) {
+        s.cycle();
+        Tempo.step(CHILD).close();
     }
 
     @Benchmark
@@ -236,9 +260,9 @@ public class TempoBenchmark {
         s.root().set(KEY, 42L);
     }
 
-    /** Explicit handle, a trace of spans only: an unrecorded tick, the true no-op path. */
+    /** Cost promise 3: an unrecorded tick through a span, {@code s.tick(name)}, in a trace of spans only: a branch. */
     @Benchmark
-    public Tempo.Span tickDisabled(Coarse s) {
+    public Tempo.Span tickUnrecorded(SpansOnly s) {
         Tempo.Span d = s.root.tick(CHILD);
         d.close();
         return d;
@@ -270,9 +294,23 @@ public class TempoBenchmark {
         Tempo.runnable(CHILD, NOTHING).run();
     }
 
+    /** A drawn callable task called on the submitting thread: one {@code CallableTask}, which is also its future. */
+    @Benchmark
+    public Integer callableInline(Drawing s) throws Exception {
+        s.cycle();
+        return Tempo.callable(CHILD, ANSWER).call();
+    }
+
+    /** A drawn supplier task got on the submitting thread: one {@code SupplierTask}. */
+    @Benchmark
+    public Integer supplierInline(Drawing s) {
+        s.cycle();
+        return Tempo.supplier(CHILD, SUPPLY).get();
+    }
+
     /** A task a trace of spans does not draw, run on the submitting thread: two clock reads, its totals, one object. */
     @Benchmark
-    public void taskUndrawn(Coarse s) {
+    public void taskUndrawn(SpansOnly s) {
         Tempo.runnable(CHILD, NOTHING).run();
     }
 
@@ -286,9 +324,25 @@ public class TempoBenchmark {
         return EXECUTOR.submit(NOTHING);
     }
 
-    /** Explicit handle, a trace of spans only: an undrawn step (two clock reads, no row, its total). */
+    /** A callable submitted to {@code Tempo.executor}: one task, which is the future returned (cost promise 2). */
     @Benchmark
-    public Tempo.Span stepUndrawn(Coarse s) {
+    public Future<Integer> executorCall(Drawing s) {
+        s.cycle();
+        return EXECUTOR.submit(ANSWER);
+    }
+
+    /** A duration measured elsewhere, added to the totals of its name: {@code s.add(name, nanos)}. */
+    @Benchmark
+    public Tempo.Span add(SpansOnly s) {
+        return s.root.add(CHILD, 1000);
+    }
+
+    /**
+     * Cost promise 3: an undrawn step through a span, in a trace of spans only: two clock reads and its
+     * totals, no row, 0 B.
+     */
+    @Benchmark
+    public Tempo.Span stepUndrawn(SpansOnly s) {
         Tempo.Span d = s.root.step(CHILD);
         d.close();
         return d;
@@ -314,9 +368,9 @@ public class TempoBenchmark {
         return Tempo.tick(CHILD);
     }
 
-    /** A static tick in a trace of spans only: the ThreadLocal read and the level check. */
+    /** Cost promise 3: a static tick in a trace of spans only, which may add the ThreadLocal read to the branch. */
     @Benchmark
-    public Tempo.Span tickStatic(Coarse s) {
+    public Tempo.Span tickStatic(SpansOnly s) {
         return Tempo.tick(CHILD);
     }
 
