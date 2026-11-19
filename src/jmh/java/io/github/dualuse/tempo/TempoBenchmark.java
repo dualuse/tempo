@@ -17,6 +17,10 @@ import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Warmup;
 import org.openjdk.jmh.infra.Control;
 
+import java.util.List;
+import java.util.concurrent.AbstractExecutorService;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 
@@ -36,8 +40,23 @@ public class TempoBenchmark {
 
     static final Tempo.Name ROOT = Tempo.name("bench"), CHILD = Tempo.name("child"), KEY = Tempo.name("key"),
             RATIO = Tempo.name("ratio");
-    /** Handoffs count against the budget; the cycling benchmarks record every one of theirs. */
+    /** Drawn tasks count against the budget; the cycling benchmarks record every one of theirs. */
     static final Tempo.Options UNBUDGETED = new Tempo.Options().budget(Integer.MAX_VALUE);
+    /** For the traces that draw their tasks (records steps), without CPU time, as at the level of spans. */
+    static final Tempo.Options DRAWN = new Tempo.Options().budget(Integer.MAX_VALUE).cpu(false);
+    static final Runnable NOTHING = () -> { };
+
+    /** A pool that runs every task at once on the submitting thread. */
+    static final class Inline extends AbstractExecutorService {
+        @Override public void execute(Runnable r) { r.run(); }
+        @Override public void shutdown() { }
+        @Override public List<Runnable> shutdownNow() { return List.of(); }
+        @Override public boolean isShutdown() { return false; }
+        @Override public boolean isTerminated() { return false; }
+        @Override public boolean awaitTermination(long timeout, TimeUnit unit) { return true; }
+    }
+
+    static final ExecutorService EXECUTOR = Tempo.executor(new Inline(), CHILD);
 
     @State(Scope.Thread)
     public static class Cycling {
@@ -101,6 +120,38 @@ public class TempoBenchmark {
                 used = 0;
             }
             return root;
+        }
+    }
+
+    /**
+     * Like {@link CyclingTwice}, in a trace that records steps, so its tasks are drawn: a task run inline
+     * takes two rows (its record at the submit and its run) and two events (link and queue wait).
+     */
+    @State(Scope.Thread)
+    public static class Drawing {
+        @Param({"1000", "8000"})
+        int cycle;
+        Tempo.Trace trace;
+        int used;
+
+        @Setup(Level.Trial)
+        public void setUp() {
+            trace = Tempo.trace(ROOT, DRAWN).records(Tempo.STEP);
+        }
+
+        @TearDown(Level.Trial)
+        public void tearDown() {
+            trace.close();
+            trace.release();
+        }
+
+        void cycle() {
+            if (++used == cycle) {
+                trace.close();
+                trace.release();
+                trace = Tempo.trace(ROOT, DRAWN).records(Tempo.STEP);
+                used = 0;
+            }
         }
     }
 
@@ -193,25 +244,46 @@ public class TempoBenchmark {
         return d;
     }
 
-    /** Submit side of a handoff: the handoff row and the one {@code Handoff} object. */
+    /** Submit side of a drawn task: its record and the one {@code Task} object (cost promise 2). */
     @Benchmark
-    public Tempo.Handoff handoff(Cycling s) {
-        return s.root().handoff(CHILD);
-    }
-
-    /** A handoff begun and closed on the submitting thread (caller runs): a child span plus the handoff. */
-    @Benchmark
-    public void handoffInline(CyclingTwice s) {
-        s.root().handoff(CHILD).begin().close();
+    public Tempo.Task task(Drawing s) {
+        s.cycle();
+        return Tempo.task(CHILD);
     }
 
     /**
-     * A handoff past the budget begun and closed on the submitting thread: no row, the one {@code Handoff}
-     * object, the submit counted in its aggregate and the task folded into the lane's share of it.
+     * A drawn task run on the submitting thread (caller runs): its record at the submit, its run as a
+     * child span with its queue wait, and the one {@code RunnableTask} object.
      */
     @Benchmark
-    public void handoffFolded(Folding s) {
-        s.root.handoff(CHILD).begin().close();
+    public void taskInline(Drawing s) {
+        s.cycle();
+        Tempo.runnable(CHILD, NOTHING).run();
+    }
+
+    /**
+     * A task past the budget run on the submitting thread: no row, the one {@code RunnableTask}, the submit
+     * counted in its aggregate and the run folded into the lane's share of it.
+     */
+    @Benchmark
+    public void taskFolded(Folding s) {
+        Tempo.runnable(CHILD, NOTHING).run();
+    }
+
+    /** A task a trace of spans does not draw, run on the submitting thread: two clock reads, its totals, one object. */
+    @Benchmark
+    public void taskUndrawn(Coarse s) {
+        Tempo.runnable(CHILD, NOTHING).run();
+    }
+
+    /**
+     * A submit to {@code Tempo.executor} over a pool that runs it at once: a drawn task that is also the
+     * future returned, so one object (cost promise 2).
+     */
+    @Benchmark
+    public Future<?> executorSubmit(Drawing s) {
+        s.cycle();
+        return EXECUTOR.submit(NOTHING);
     }
 
     /** Explicit handle, a trace of spans only: an undrawn step (two clock reads, no row, its total). */
@@ -249,14 +321,14 @@ public class TempoBenchmark {
     }
 
     /**
-     * Handoffs across threads: {@code submit} creates a handoff per op and passes it through a ring to
+     * Tasks across threads: {@code submit} creates a drawn task per op and passes it through a ring to
      * {@code work}, which begins and closes it on its own thread. A group op is one of either side, so
-     * the group's B/op is half the bytes per handoff; the submit side cycles its trace every 1000.
+     * the group's B/op is half the bytes per task; the submit side cycles its trace every 1000.
      */
     @State(Scope.Group)
     public static class Pipe {
         static final int SIZE = 16;
-        final AtomicReferenceArray<Tempo.Handoff> ring = new AtomicReferenceArray<>(SIZE);
+        final AtomicReferenceArray<Tempo.Task> ring = new AtomicReferenceArray<>(SIZE);
         long put, take; // each used by one side only
         Tempo.Trace trace;
         int used;
@@ -275,10 +347,10 @@ public class TempoBenchmark {
                 p.trace.close();
                 p.trace.release();
             }
-            p.trace = Tempo.trace(ROOT, UNBUDGETED);
+            p.trace = Tempo.trace(ROOT, DRAWN).records(Tempo.STEP);
             p.used = 0;
         }
-        Tempo.Handoff h = p.trace.handoff(CHILD);
+        Tempo.Task h = Tempo.task(CHILD);
         int i = (int) (p.put & (Pipe.SIZE - 1));
         while (p.ring.get(i) != null) if (c.stopMeasurement) return;
         p.ring.lazySet(i, h);
@@ -289,11 +361,11 @@ public class TempoBenchmark {
     @Group("across")
     public void work(Pipe p, Control c) {
         int i = (int) (p.take & (Pipe.SIZE - 1));
-        Tempo.Handoff h;
+        Tempo.Task h;
         while ((h = p.ring.get(i)) == null) if (c.stopMeasurement) return;
         p.ring.lazySet(i, null);
         p.take++;
-        h.begin().close();
+        h.tryBegin().close();
     }
 
     /**

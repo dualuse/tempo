@@ -12,7 +12,7 @@ import static org.openjdk.jcstress.annotations.Expect.ACCEPTABLE;
 import static org.openjdk.jcstress.annotations.Expect.ACCEPTABLE_INTERESTING;
 import static org.openjdk.jcstress.annotations.Expect.FORBIDDEN;
 
-/** jcstress tests of the lane state (IDLE, ACTIVE, RETIRED), the commit protocol and the handoff state. */
+/** jcstress tests of the lane state (IDLE, ACTIVE, RETIRED) and the commit protocol; {@link TaskStress} has the task state. */
 public final class LaneStress {
 
     static final Tempo.Name N = Tempo.name("stress"), K = Tempo.name("stress-key");
@@ -124,91 +124,6 @@ public final class LaneStress {
         @Arbiter
         public void arbiter(II_Result r) {
             r.r2 = first.retired() && (late == null || late.retired()) ? 1 : 0;
-        }
-    }
-
-    /**
-     * Handoff.begin() on a worker races release(): the task begins and its lane retires once it ends, or
-     * it is refused (NOOP). Result: begun (1) or not, and every task lane retired (1).
-     */
-    @JCStressTest
-    @Outcome(id = {"1, 1", "0, 1"}, expect = ACCEPTABLE, desc = "Every task lane retired")
-    @Outcome(expect = FORBIDDEN, desc = "A task lane left unretired")
-    @State
-    public static class Begin {
-        final Tempo.Context ctx = new Tempo.Context(new Tempo.Options());
-        final Tempo.Handoff handoff;
-
-        {
-            Tempo.Lane root = lane(ctx);
-            root.openRoot(N, 0, -1); // stays open: the submitter's root
-            handoff = root.handoff(N, 0);
-        }
-
-        @Actor
-        public void worker(II_Result r) {
-            Tempo.Span s = handoff.begin();
-            r.r1 = s == Tempo.NOOP ? 0 : 1;
-            s.close();
-        }
-
-        @Actor
-        public void release() {
-            ctx.release();
-        }
-
-        @Arbiter
-        public void arbiter(II_Result r) {
-            int retired = 1;
-            for (Tempo.Lane l : ctx.lanesById()) if (l.id != 0 && !l.retired()) retired = 0;
-            r.r2 = retired;
-        }
-    }
-
-    /**
-     * A worker runs a wrapped task while the submitter cancels its handoff (an early exit). Exactly one of
-     * them wins: the cancel, and the body never runs and the task is recorded as cancelled before it began;
-     * or the begin, and the body runs, the task is recorded as run and the cancel says it lost. Neither is
-     * misuse. Result: the cancel won (1) or not, the body ran (1) or not, and the record: 1 run, 2
-     * cancelled before it began, 0 anything else; plus 4 if misuse was counted.
-     */
-    @JCStressTest
-    @Outcome(id = "1, 0, 2", expect = ACCEPTABLE, desc = "Cancelled before it began: the body did not run")
-    @Outcome(id = "0, 1, 1", expect = ACCEPTABLE, desc = "Begun first: the body ran, the cancel lost")
-    @Outcome(expect = FORBIDDEN, desc = "Both or neither won, the record disagrees with the body, or misuse")
-    @State
-    public static class Cancel {
-        final Tempo.Context ctx = new Tempo.Context(new Tempo.Options());
-        final Tempo.Handoff handoff;
-        final Runnable task;
-        volatile int ran;
-
-        {
-            Tempo.Lane root = lane(ctx);
-            root.openRoot(N, 0, -1); // stays open: the submitter's root
-            handoff = root.handoff(N, 0);
-            task = handoff.runnable(() -> ran = 1);
-        }
-
-        @Actor
-        public void worker() {
-            task.run();
-        }
-
-        @Actor
-        public void submitter(III_Result r) {
-            r.r1 = handoff.cancel() ? 1 : 0;
-        }
-
-        @Arbiter
-        public void arbiter(III_Result r) {
-            r.r2 = ran;
-            int[] record = {0};
-            Tempo.Snapshot.of(ctx).forEachSpan(v -> {
-                if (!v.handoff()) return;
-                record[0] = v.neverStarted() ? 0 : v.cancelled() && v.durationNanos() == 0 ? 2 : v.cancelled() ? 0 : 1;
-            });
-            r.r3 = record[0] + (ctx.misuses.get() > 0 ? 4 : 0);
         }
     }
 }

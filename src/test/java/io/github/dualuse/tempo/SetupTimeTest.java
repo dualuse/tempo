@@ -1,6 +1,6 @@
 package io.github.dualuse.tempo;
 
-import io.github.dualuse.tempo.Tempo.Handoff;
+import io.github.dualuse.tempo.Tempo.Task;
 import io.github.dualuse.tempo.Tempo.Name;
 import io.github.dualuse.tempo.Tempo.Options;
 import io.github.dualuse.tempo.Tempo.Span;
@@ -181,19 +181,19 @@ class SetupTimeTest {
         Recording started = new Recording(); // STEP from the start: the start reads it
         Trace a = Tempo.trace(SEARCH, new Options().cpuClock(started)).records(STEP);
         assertEquals(List.of(me), started.threads);
-        Handoff h = a.handoff(MATCH);
-        assertNull(onThread("worker", () -> h.begin().close()));
+        Task h = Tempo.task(MATCH);
+        assertNull(onThread("worker", () -> h.tryBegin().close()));
         a.close();
         assertEquals(List.of(me, "worker", "worker", me), started.threads);
 
         Recording raised = new Recording(); // SPAN, then raised by the handler: the raise reads it
         Trace b = Tempo.trace(SEARCH, new Options().cpuClock(raised));
-        Handoff early = b.handoff(MATCH); // submitted before the raise, begun after it
         assertEquals(List.of(), raised.threads);
-        b.records(STEP);
+        b.records(STEP);                // before the first task: a task counts like a step
         assertEquals(STEP, b.records());
         assertEquals(List.of(me), raised.threads);
-        assertNull(onThread("worker", () -> early.begin().close()));
+        Task later = Tempo.task(MATCH);
+        assertNull(onThread("worker", () -> later.tryBegin().close()));
         b.close();
         assertEquals(me, raised.threads.get(0));
         assertEquals(List.of(me, "worker", "worker", me), raised.threads); // the root's own from the widening on
@@ -209,8 +209,8 @@ class SetupTimeTest {
 
         Recording coarse = new Recording(); // SPAN throughout: never
         Trace e = Tempo.trace(SEARCH, new Options().cpuClock(coarse));
-        Handoff g = e.handoff(MATCH);
-        assertNull(onThread("worker", () -> g.begin().close()));
+        Task g = Tempo.task(MATCH);
+        assertNull(onThread("worker", () -> g.tryBegin().close()));
         e.close();
         assertEquals(List.of(), coarse.threads);
     }
@@ -226,10 +226,10 @@ class SetupTimeTest {
             };
             Trace t = Tempo.trace(SEARCH, new Options().clock(clock).cpuClock(costly).budget(budget)).records(STEP);
             clock.add(10);
-            Handoff h = t.handoff(MATCH); // submitted at 17: the root's CPU read came first
+            Task h = Tempo.task(MATCH); // submitted at 17: the root's CPU read came first
             clock.add(30);
             assertNull(onThread("worker", () -> {
-                Span m = h.begin();              // begins at 47, then reads CPU: 54
+                Span m = h.tryBegin();              // begins at 47, then reads CPU: 54
                 cpu[0] += 3;
                 clock.add(5);
                 m.close();                       // ends at 59, then reads CPU: 66
@@ -267,10 +267,10 @@ class SetupTimeTest {
             };
             Trace t = trace[0] = Tempo.trace(SEARCH, new Options().clock(clock).cpu(false).budget(budget)).records(STEP);
             base.addAndGet(10);
-            Handoff h = t.handoff(MATCH); // submitted at 10
+            Task h = Tempo.task(MATCH); // submitted at 10
             base.addAndGet(30);
             assertNull(onThread("worker", () -> {
-                Span m = h.begin();              // wins the handoff at 40, then sets the worker's lane up: 1040
+                Span m = h.tryBegin();              // wins the handoff at 40, then sets the worker's lane up: 1040
                 base.addAndGet(5);
                 m.close();                       // 1045
             }));

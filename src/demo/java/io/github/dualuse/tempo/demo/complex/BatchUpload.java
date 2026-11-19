@@ -73,30 +73,29 @@ public final class BatchUpload {
         io.prestartAllCoreThreads(); // a service's pools are warm when a request arrives
         cpu.prestartAllCoreThreads();
 
-        Tempo.Trace t = Tempo.trace(UPLOAD, new Tempo.Options().strict(true).cpu(true));
+        // STEP: the items and the tiles are tasks, which a trace draws when it records steps.
+        Tempo.Trace t = Tempo.trace(UPLOAD, new Tempo.Options().strict(true).cpu(true)).records(Tempo.STEP);
         List<Item> items = new ArrayList<>();
         try (t) {
             Tempo.Span root = t;
             long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(DEADLINE_MS); // from the request's start
             for (int i = 0; i < ITEMS; i++) {
                 final int index = i;
-                Tempo.Handoff h = root.handoff(ITEM).set(INDEX, index);
-                Callable<String> run = h.callable(() -> process(index, cpu));
-                // The deadline is enforced where a worker takes the item, before the handoff begins: an item
+                Tempo.CallableTask<String> h = Tempo.callable(ITEM, () -> process(index, cpu));
+                h.set(INDEX, index);
+                // The deadline is enforced where a worker takes the item, before the task begins: an item
                 // taken too late is cancelled, however late the request thread itself wakes up. Each item keeps
                 // an io thread for at least 16 ms (11 ms for the corrupt one), so no thread starts a fourth
                 // item before 43 ms: at most 12 items start before the 40 ms deadline. If the request thread
-                // cancelled the item first, this cancel loses, and callable() throws CancellationException.
-                // Handoff.NOOP (an untraced request) takes no part in the race: its cancel() is always false,
-                // so the deadline is checked for it on its own; this check runs in the task itself, before its
-                // body, so for NOOP it is exact as it stands.
+                // cancelled the item first, this cancel loses, and call() throws CancellationException. The
+                // race is the same in an untraced request.
                 Item it = new Item(index, h);
                 it.task = io.submit(() -> {
-                    if (System.nanoTime() - deadline > 0 && (h.cancel() || h == Tempo.Handoff.NOOP)) {
+                    if (System.nanoTime() - deadline > 0 && h.cancel()) {
                         it.cancelled = true;
                         throw new CancellationException("not started by the deadline");
                     }
-                    return run.call();
+                    return h.call();
                 });
                 items.add(it);
             }
@@ -115,18 +114,14 @@ public final class BatchUpload {
                 }
             }
 
-            // Past the deadline, the request thread cancels every item that has not begun. The handoff decides
+            // Past the deadline, the request thread cancels every item that has not begun. The task decides
             // the race with a worker taking the item right now, and with that worker's own deadline check:
             // exactly one cancel or begin wins, so the two paths never both handle one item. A won cancel
-            // means the item never runs (callable() skips it); a lost one, that it began, or that its worker
+            // means the item never runs (call() skips it); a lost one, that it began, or that its worker
             // cancelled it already. The cancelled items stay in the io queue, where they cost a worker
-            // nothing: ThreadPoolExecutor.remove would only free the slots of a bounded queue sooner. A NOOP
-            // handoff (untraced) takes no part in the race, so there remove() decides it: it takes the item out
-            // of the io queue only if no worker took it (Future.cancel alone would also succeed on a running
-            // item, whose body runs on, and the drain would report it as not started).
+            // nothing: ThreadPoolExecutor.remove would only free the slots of a bounded queue sooner.
             for (Item it : items) {
-                boolean won = it.handoff == Tempo.Handoff.NOOP ? io.remove((Runnable) it.task) : it.handoff.cancel();
-                if (won) {
+                if (it.handoff.cancel()) {
                     it.cancelled = true;      // the trace: cancelled before it began (^c)
                     it.task.cancel(false);    // the result: cancelled, for whoever waits on it
                 }
@@ -177,12 +172,12 @@ public final class BatchUpload {
     /** One item of the batch, as the request thread tracks it. */
     static final class Item {
         final int index;
-        final Tempo.Handoff handoff;
+        final Tempo.Task handoff;
         Future<String> task;
         volatile boolean cancelled; // by the request thread, or by the io thread that took it past the deadline
         String descriptor, error;
 
-        Item(int index, Tempo.Handoff handoff) {
+        Item(int index, Tempo.Task handoff) {
             this.index = index;
             this.handoff = handoff;
         }
@@ -192,7 +187,7 @@ public final class BatchUpload {
 
     /** Fetches, decodes and describes one item; runs inside the item's handoff on an {@code io} thread. */
     static String process(int index, ThreadPoolExecutor cpu) throws Exception {
-        Tempo.Span item = Tempo.current(); // the item's task span, begun by h.callable on this thread
+        Tempo.Span item = Tempo.current(); // the item's task span, begun by h.call() on this thread
         int bytes = sizeOf(index), tiles = (bytes + TILE_BYTES - 1) / TILE_BYTES;
         try (Tempo.Span f = item.span(FETCH)) {
             Demo.io(FETCH_MS);
@@ -239,9 +234,11 @@ public final class BatchUpload {
      * before the submit; other io threads submit too, so it can be stale by the time the pool refuses.
      */
     static <T> Future<T> compute(ThreadPoolExecutor pool, Tempo.Span parent, Tempo.Name name, Callable<T> work) {
-        Tempo.Handoff h = parent.handoff(name).set(QUEUED, pool.getQueue().size());
+        Tempo.CallableTask<T> h = Tempo.callable(name, work); // under parent, the innermost span here
+        h.set(QUEUED, pool.getQueue().size());
         try {
-            return pool.submit(h.callable(work));
+            pool.submit(h);
+            return h; // the task is a future of its own
         } catch (RejectedExecutionException full) {
             h.reject();
             FutureTask<T> inline = new FutureTask<>(() -> parent.call(name, work::call));

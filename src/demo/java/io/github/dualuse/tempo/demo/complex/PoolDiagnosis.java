@@ -33,7 +33,7 @@ import java.util.concurrent.ThreadPoolExecutor;
  * <p>It shows many concurrent traces read in code: the demo prints every request's response, then walks
  * each trace with {@link Tempo.Trace#forEachSpan} and sums what a {@link Tempo.SpanView} says about
  * every task: its queue wait, its run time, its CPU time and the thread it ran on. A table and a
- * verdict close the output. It builds on {@code WorkerPool} (handoffs, queue wait, CPU per task).
+ * verdict close the output. It builds on {@code WorkerPool} (tasks, queue wait, CPU per task).
  * Save the output once, so every view below reads the same run:
  *
  * <pre>
@@ -142,15 +142,17 @@ public final class PoolDiagnosis {
             for (int c = 0; c < CANDIDATES; c++) {
                 // The pool's busy threads and queue depth at submit: tools/tempo --pools draws them as
                 // pool-wide gauges, so one trace shows how full the pool was for everyone.
-                Tempo.Handoff h = s.handoff(LOAD).set(ACTIVE, loads.getActiveCount())
-                        .set(QUEUED, loads.getQueue().size());
-                pending.add(loads.submit(h.callable(() -> {
+                Tempo.CallableTask<Future<?>> load = Tempo.callable(LOAD, () -> {
                     Demo.io(LOAD_MS);
-                    // Still inside the load task: the match it hands off nests under this load.
-                    Tempo.Handoff m = Tempo.current().handoff(MATCH).set(ACTIVE, matches.getActiveCount())
-                            .set(QUEUED, matches.getQueue().size());
-                    return matches.submit(m.runnable(() -> Demo.cpu(MATCH_MICROS)));
-                })));
+                    // Still inside the load task: the match it submits nests under this load.
+                    Tempo.RunnableTask m = Tempo.runnable(MATCH, () -> Demo.cpu(MATCH_MICROS));
+                    m.set(ACTIVE, matches.getActiveCount()).set(QUEUED, matches.getQueue().size());
+                    matches.execute(m);
+                    return m; // the task is its own future
+                });
+                load.set(ACTIVE, loads.getActiveCount()).set(QUEUED, loads.getQueue().size());
+                loads.submit(load);
+                pending.add(load);
             }
             // A future completes only after its task's span closed, so the trace closes with no task open.
             Tempo.Span join = s.span(JOIN).waiting();

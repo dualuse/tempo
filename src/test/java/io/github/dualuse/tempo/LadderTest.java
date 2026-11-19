@@ -1,6 +1,6 @@
 package io.github.dualuse.tempo;
 
-import io.github.dualuse.tempo.Tempo.Handoff;
+import io.github.dualuse.tempo.Tempo.Task;
 import io.github.dualuse.tempo.Tempo.Name;
 import io.github.dualuse.tempo.Tempo.Snapshot;
 import io.github.dualuse.tempo.Tempo.Span;
@@ -43,7 +43,7 @@ class LadderTest {
      */
     static Snapshot ladderTrace() {
         try (GoldenTest.Script s = new GoldenTest.Script("ladder")) {
-            Trace t = s.on(0, 0, () -> Tempo.trace(RENDER, s.options().cpu(true)));
+            Trace t = s.on(0, 0, () -> Tempo.trace(RENDER, s.options().cpu(true)).records(Tempo.STEP));
             Span root = t;
             Span parse = s.on(0, 100, () -> root.span(PARSE).set(BYTES, 5120));
             s.run(0, 2100, parse::close);
@@ -65,10 +65,10 @@ class LadderTest {
             }
             s.run(0, 29000, flow::close);
             s.run(0, 30200, layout::close);
-            Handoff[] tiles = new Handoff[5];
+            Task[] tiles = new Task[5];
             for (int i = 0; i < tiles.length; i++) {
                 int k = i;
-                tiles[i] = s.on(0, 30300 + 50 * i, () -> root.handoff(TILE).set(QUEUED, k));
+                tiles[i] = s.on(0, 30300 + 50 * i, () -> Tempo.task(TILE).set(QUEUED, k));
             }
             long[] begin = {30400, 30500, 33400, 34600, 37000}, run = {3000, 4100, 3200, 2300, 2800};
             for (int i = 0; i < tiles.length; i++) {

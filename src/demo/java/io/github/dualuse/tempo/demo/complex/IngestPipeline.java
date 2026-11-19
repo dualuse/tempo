@@ -47,7 +47,7 @@ public final class IngestPipeline {
 
     static final Tempo.Name UPLOAD = Tempo.name("PUT /upload"), RECEIVE = Tempo.name("receive"),
             READ = Tempo.name("read"), DRAIN = Tempo.name("drain"),
-            // one handoff per stage worker: the span its lane hangs from
+            // one task per stage worker: the span its lane hangs from
             DECODER = Tempo.name("decoder"), DESCRIBER = Tempo.name("describer"), WRITER = Tempo.name("writer"),
             FRAMES = Tempo.name("frames"), BYTES = Tempo.name("bytes");
 
@@ -105,12 +105,12 @@ public final class IngestPipeline {
             BlockingQueue<Frame> toDecode = new ArrayBlockingQueue<>(QUEUE), toDescribe = new ArrayBlockingQueue<>(QUEUE),
                     toStore = new ArrayBlockingQueue<>(QUEUE);
 
-            // Each stage worker joins the trace for this upload: one handoff per worker, submitted here.
+            // Each stage worker joins the trace for this upload: one task per worker, submitted here.
             List<Future<?>> stages = new ArrayList<>();
             for (int i = 0; i < DECODERS; i++)
-                stages.add(start(decoders, root.handoff(DECODER), s -> decode(t, s, toDecode, toDescribe)));
-            stages.add(start(describers, root.handoff(DESCRIBER), s -> describe(t, s, toDescribe, toStore)));
-            stages.add(start(writers, root.handoff(WRITER), s -> store(t, s, toStore)));
+                stages.add(start(decoders, DECODER, s -> decode(t, s, toDecode, toDescribe)));
+            stages.add(start(describers, DESCRIBER, s -> describe(t, s, toDescribe, toStore)));
+            stages.add(start(writers, WRITER, s -> store(t, s, toStore)));
 
             try (Tempo.Span r = root.span(RECEIVE)) {
                 long bytes = 0;
@@ -168,12 +168,13 @@ public final class IngestPipeline {
     }
 
     /**
-     * Submits a stage worker's loop for this upload. {@code callable} begins the handoff on the worker when
-     * the loop starts there (the queue wait ends, the worker's lane joins the trace) and flags the stage
-     * failed if the loop throws; inside, {@code Tempo.current()} is the stage's span.
+     * Submits a stage worker's loop for this upload as a task under the calling thread's innermost span.
+     * The task begins on the worker when the loop starts there (the queue wait ends, the worker's lane
+     * joins the trace) and flags the stage failed if the loop throws; inside, {@code Tempo.current()} is
+     * the stage's span.
      */
-    static Future<?> start(ExecutorService pool, Tempo.Handoff h, Stage stage) {
-        return pool.submit(h.callable(() -> {
+    static Future<?> start(ExecutorService pool, Tempo.Name name, Stage stage) {
+        return pool.submit(Tempo.callable(name, () -> {
             stage.run(Tempo.current());
             return null;
         }));

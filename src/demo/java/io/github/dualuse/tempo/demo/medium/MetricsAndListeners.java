@@ -126,7 +126,7 @@ public final class MetricsAndListeners {
                 }
             }
 
-            // Shard tasks get no handoff and so no lane: no rows, no Handoff per task.
+            // Shard tasks are plain lambdas, not Tempo tasks: no lane, no rows, no task object.
             try (Tempo.Span index = s.span(INDEX)) {
                 List<Future<?>> tasks = new ArrayList<>();
                 for (int shard = 0; shard < SHARDS; shard++) {

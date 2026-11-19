@@ -19,8 +19,8 @@ import java.util.function.ToLongFunction;
  * result through a small writer pool that runs a task on the caller's thread when it is full, and
  * notifies three subscribers through a pool that refuses work when it is full.
  *
- * <p>It shows a {@code Handoff} captured at submit and its queue wait, a blocking join marked
- * {@code waiting()}, CPU time per pool task at {@code STEP}, and the three ways a handoff ends other
+ * <p>It shows a {@code Task} made at submit and its queue wait, a blocking join marked
+ * {@code waiting()}, CPU time per pool task at {@code STEP}, and the three ways a task ends other
  * than running on a pool thread: inline (caller-runs), rejected ({@code reject()}) and skipped by an
  * early exit ({@code cancel()}, which says whether it won the race with the worker).
  *
@@ -70,18 +70,18 @@ public final class WorkerPool {
     /** The request handler. */
     static void match(Tempo.Span s, ThreadPoolExecutor work, ThreadPoolExecutor store, ThreadPoolExecutor notify)
             throws Exception {
-        // Scatter. The handoff is taken here, at submit, because the queue wait runs from submit to the
-        // moment a pool thread begins the task; taken inside the task it could not see the queue. It is
-        // the one object Tempo allocates while recording (32 bytes). Its attributes describe the submit:
+        // Scatter. The task is made here, at submit, because the queue wait runs from submit to the
+        // moment a pool thread begins the task; made inside the task it could not see the queue. It is
+        // the one object Tempo allocates for it, and also its Future. Its attributes describe the submit:
         // which shard, and how many tasks were already waiting in the pool's queue.
-        List<Future<Boolean>> tasks = new ArrayList<>();
-        List<Tempo.Handoff> handoffs = new ArrayList<>();
+        List<Tempo.CallableTask<Boolean>> tasks = new ArrayList<>();
         for (int shard = 0; shard < SHARDS; shard++) {
             int n = shard;
-            Tempo.Handoff h = s.handoff(MATCH).set(SHARD, n).set(QUEUED, work.getQueue().size());
-            // callable() wraps the task in h.begin() and close(): the span opens on the pool thread.
-            handoffs.add(h);
-            tasks.add(work.submit(h.callable(() -> matchShard(n))));
+            // The pool calls the task: its span opens on the pool thread.
+            Tempo.CallableTask<Boolean> task = Tempo.callable(MATCH, () -> matchShard(n));
+            task.set(SHARD, n).set(QUEUED, work.getQueue().size());
+            tasks.add(task);
+            work.submit(task);
         }
 
         // Gather. The request thread blocks here; waiting() tells the viewers so: they draw the join as
@@ -94,48 +94,43 @@ public final class WorkerPool {
             }
         }
 
-        // Early exit: the hit is all the request needs. Each later shard's handoff is cancelled. Cancel and
-        // begin race for a handoff and exactly one wins, so cancel() returning true proves the task never
-        // began, nor will: callable() skips it even if a worker takes it this very moment, and it shows as
+        // Early exit: the hit is all the request needs. Each later shard's task is cancelled. Cancel and
+        // begin race for a task and exactly one wins, so cancel() returning true proves the task never
+        // began, nor will: it skips its body even if a worker takes it this very moment, and it shows as
         // cancelled before it began (flag c), with no run time. false means it is running: it is left to
-        // finish, past the join, before the response. Future.cancel completes the future for anyone who
-        // waits on it. The cancelled tasks stay in the queue at no cost; ThreadPoolExecutor.remove would only
-        // free the slots of a bounded queue sooner. Handoff.NOOP (an untraced request) takes no part in the
-        // race and its cancel() is always false, so there remove() decides it: it takes the task out of the
-        // queue only if no worker took it. Future.cancel alone would succeed on a running shard too, whose
-        // body runs on, and count it as skipped.
+        // finish, past the join, before the response. A won cancel completes the task's future for anyone
+        // who waits on it. The cancelled tasks stay in the queue at no cost; ThreadPoolExecutor.remove would
+        // only free the slots of a bounded queue sooner. The race is the same in an untraced request.
         int skipped = 0;
         for (int n = hit + 1; n < SHARDS; n++) {
-            Tempo.Handoff h = handoffs.get(n);
-            Future<Boolean> task = tasks.get(n);
-            boolean won = h == Tempo.Handoff.NOOP ? work.remove((Runnable) task) : h.cancel();
-            if (won) {
-                task.cancel(false);
-                skipped++;
-            }
+            if (tasks.get(n).cancel()) skipped++;
         }
         s.set(HIT, hit).set(SKIPPED, skipped);
 
         List<Future<?>> pending = new ArrayList<>();
 
         // The writer pool has one thread and room for one queued write. When both are taken,
-        // CallerRunsPolicy runs the write right here on the request thread: in Tempo-Timing the handoff
+        // CallerRunsPolicy runs the write right here on the request thread: in Tempo-Timing the task
         // becomes a plain child of the request, with no queue wait, and the request is slowed down
-        // (backpressure). No span or handoff may be opened on this thread between handoff() and submit(),
+        // (backpressure). No span or task may be opened on this thread between runnable() and execute(),
         // or the write is no longer recognised as inline; attributes are fine.
         for (int i = 0; i < WRITES; i++) {
-            Tempo.Handoff h = s.handoff(STORE).set(QUEUED, store.getQueue().size());
-            pending.add(store.submit(h.runnable(() -> Demo.io(WRITE_MS))));
+            Tempo.RunnableTask write = Tempo.runnable(STORE, () -> Demo.io(WRITE_MS));
+            write.set(QUEUED, store.getQueue().size());
+            store.execute(write);
+            pending.add(write);
         }
 
         // The notifier refuses work when it is full (AbortPolicy). The refused task never runs, so the
-        // request marks its handoff rejected; otherwise it would show as still waiting in a queue.
+        // request marks it rejected; otherwise it would show as still waiting in a queue.
         for (int i = 0; i < SUBSCRIBERS; i++) {
-            Tempo.Handoff h = s.handoff(NOTIFY).set(QUEUED, notify.getQueue().size());
+            Tempo.RunnableTask send = Tempo.runnable(NOTIFY, () -> Demo.io(NOTIFY_MS));
+            send.set(QUEUED, notify.getQueue().size());
             try {
-                pending.add(notify.submit(h.runnable(() -> Demo.io(NOTIFY_MS))));
+                notify.execute(send);
+                pending.add(send);
             } catch (RejectedExecutionException full) {
-                h.reject();
+                send.reject();
             }
         }
 

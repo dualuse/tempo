@@ -127,7 +127,7 @@ class RenderTest {
         try (Span d = s.step(SCORE)) {
             clock.add(100);
         }
-        s.handoff(LOAD).begin().close();                    // inline task
+        Tempo.task(LOAD).tryBegin().close();                    // inline task
         clock.add(250_000_000 - 100);
         s.phase(MATCH).label("match");
         clock.add(1_500_000_000);

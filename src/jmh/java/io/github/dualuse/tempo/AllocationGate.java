@@ -19,13 +19,17 @@ import java.util.TreeMap;
  *
  * <p>A cycling benchmark pays a fixed per-trace setup every {@code cycle} operations, so its B/op is
  * {@code perOp + setup / cycle}. The gate applies to {@code perOp}, solved from the two cycle lengths;
- * the setup is reported, and {@code traceLifecycle} is held to a ceiling of its own. A handoff allocates
- * exactly one small object, so the handoff benchmarks are gated at its size instead of zero.
+ * the setup is reported, and {@code traceLifecycle} is held to a ceiling of its own.
  *
- * <p>A recorded span takes a handle from its thread's pool, which a released trace refills. So 0 B per
- * recorded span in steady state is the gate of {@code span}, {@code spanStatic}, {@code spanNotInlined},
- * {@code phase} and {@code handoffInline}: a handle allocated per span, in one trace or in every trace,
- * grows with the cycle and shows in {@code perOp}.
+ * <p>Cost promise 1: a recorded span takes a handle from its thread's pool, which a released trace
+ * refills. So 0 B per recorded span in steady state is the gate of {@code span}, {@code spanStatic},
+ * {@code spanNotInlined}, {@code phase} and {@code taskInline}: a handle allocated per span, in one trace
+ * or in every trace, grows with the cycle and shows in {@code perOp}.
+ *
+ * <p>Cost promise 2: a task is the one object its submit allocates, drawn ({@code task}, {@code
+ * taskInline}), folded ({@code taskFolded}) or undrawn ({@code taskUndrawn}), and through {@code
+ * Tempo.executor} ({@code executorSubmit}), where it is also the future. These are gated at the size of
+ * that one object: a {@code Task} without a body, or a {@code RunnableTask}, which is also its future.
  *
  * <p>Rendering the 300-span trace of {@code Rendered} is held to ceilings: the encoder alone
  * ({@code snapshotToHeader}) to its one output String (3,440 characters, 3.5 KB) plus about 2 KB of
@@ -40,10 +44,10 @@ public final class AllocationGate {
 
     static final double PER_OP = 0.01;   // B/op
     static final double SETUP = 1024;    // B per trace start + close + release
-    static final double HANDOFF = 32;    // B per handoff: exactly one small object
+    static final double TASK = 48, RUNNABLE_TASK = 56; // B per task: exactly one object (64-bit JVM, compressed oops)
     static final double ENCODE = 6 * 1024, RENDER = 24 * 1024, JSON = 2560; // B per render of the 300-span trace
     static final String GATED = "span|spanStatic|spanNotInlined|phase|done|setLong|tickDisabled|traceLifecycle"
-            + "|handoff|handoffInline|handoffFolded|tickNoTrace|tickStatic|stepUndrawn|folded"
+            + "|task|taskInline|taskFolded|taskUndrawn|executorSubmit|tickNoTrace|tickStatic|stepUndrawn|folded"
             + "|snapshotToHeader|toHeader|snapshotWriteJson";
 
     public static void main(String[] args) throws RunnerException {
@@ -71,8 +75,7 @@ public final class AllocationGate {
                 int c1 = Collections.min(byCycle.keySet()), c2 = Collections.max(byCycle.keySet());
                 double b1 = byCycle.get(c1), b2 = byCycle.get(c2);
                 double perOp = (b2 * c2 - b1 * c1) / (c2 - c1), setup = (b1 - perOp) * c1;
-                double gate = e.getKey().startsWith("handoff") ? HANDOFF + PER_OP : PER_OP;
-                ok &= check(e.getKey(), perOp, gate, String.format(" B/op net of %.0f B per trace", setup));
+                ok &= check(e.getKey(), perOp, gate(e.getKey()), String.format(" B/op net of %.0f B per trace", setup));
             } else if (e.getKey().equals("traceLifecycle")) {
                 ok &= check(e.getKey(), byCycle.get(0), SETUP, " B/trace");
             } else if (e.getKey().equals("snapshotWriteJson")) {
@@ -81,7 +84,7 @@ public final class AllocationGate {
                 double gate = e.getKey().equals("toHeader") ? RENDER : ENCODE;
                 ok &= check(e.getKey(), byCycle.get(0), gate, " B/render");
             } else {
-                ok &= check(e.getKey(), byCycle.get(0), e.getKey().startsWith("handoff") ? HANDOFF + PER_OP : PER_OP, " B/op");
+                ok &= check(e.getKey(), byCycle.get(0), gate(e.getKey()), " B/op");
             }
         }
         int expected = GATED.split("\\|").length;
@@ -90,6 +93,13 @@ public final class AllocationGate {
             ok = false;
         }
         System.exit(ok ? 0 : 1);
+    }
+
+    /** The per-op gate of a benchmark: nothing, or the one object of a task. */
+    private static double gate(String name) {
+        if (name.equals("task")) return TASK + PER_OP;
+        if (name.startsWith("task") || name.equals("executorSubmit")) return RUNNABLE_TASK + PER_OP;
+        return PER_OP;
     }
 
     private static double allocNorm(RunResult r) {

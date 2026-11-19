@@ -1,6 +1,6 @@
 package io.github.dualuse.tempo;
 
-import io.github.dualuse.tempo.Tempo.Handoff;
+import io.github.dualuse.tempo.Tempo.Task;
 import io.github.dualuse.tempo.Tempo.Name;
 import io.github.dualuse.tempo.Tempo.Options;
 import io.github.dualuse.tempo.Tempo.Snapshot;
@@ -24,6 +24,7 @@ import java.util.TreeMap;
 
 import static io.github.dualuse.tempo.Tempo.Header.MAX_DEPTH;
 import static io.github.dualuse.tempo.Tempo.NOOP;
+import static io.github.dualuse.tempo.Tempo.STEP;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
@@ -149,24 +150,24 @@ class HeaderTest {
      */
     @Test
     void inlineHandoffIsAPlainChildWhateverItsWait() {
-        Trace t = Tempo.trace(SEARCH, opts());
+        Trace t = Tempo.trace(SEARCH, opts().cpu(false)).records(STEP);
         Span root = t;
         clock.add(1000);
-        Handoff now = root.handoff(LOAD);
+        Task now = Tempo.task(LOAD);
         clock.add(999);
-        Span a = now.begin();
+        Span a = now.tryBegin();
         clock.add(2000);
         a.close();
-        Handoff slow = root.handoff(MATCH);
+        Task slow = Tempo.task(MATCH);
         clock.add(3000);
-        Span b = slow.begin();
+        Span b = slow.tryBegin();
         clock.add(1000);
         b.close();
-        Handoff later = root.handoff(DECODE);
+        Task later = Tempo.task(DECODE);
         clock.add(1000);
         root.span(SCORE).close();
         clock.add(1000);
-        Span c = later.begin();
+        Span c = later.tryBegin();
         clock.add(1000);
         c.close();
         t.close();
@@ -176,10 +177,10 @@ class HeaderTest {
     /** Rejected or cancelled on the submitting thread before it began, a task keeps its wait, even of 0 ns. */
     @Test
     void taskRejectedOnTheSubmittingThreadKeepsItsWait() {
-        Trace t = Tempo.trace(SEARCH, opts());
+        Trace t = Tempo.trace(SEARCH, opts().cpu(false)).records(STEP);
         clock.add(1000);
-        t.handoff(LOAD).reject();
-        Handoff h = t.handoff(MATCH);
+        Tempo.task(LOAD).reject();
+        Task h = Tempo.task(MATCH);
         clock.add(500);
         h.cancel();
         clock.add(1000);
@@ -190,9 +191,9 @@ class HeaderTest {
     /** A task cancelled before it began nominally sits on its parent's thread, whichever thread cancelled it. */
     @Test
     void taskCancelledBeforeItBeganSitsOnItsParentsThread() throws InterruptedException {
-        Trace t = Tempo.trace(SEARCH, opts());
+        Trace t = Tempo.trace(SEARCH, opts().cpu(false)).records(STEP);
         clock.add(1000);
-        Handoff h = t.handoff(LOAD);
+        Task h = Tempo.task(LOAD);
         clock.add(4000);
         assertNull(TempoTest.onThread("canceller", h::cancel));
         clock.add(1000);
@@ -208,18 +209,18 @@ class HeaderTest {
      */
     @Test
     void recordsDeeperThan35FoldIntoTheirDepth35Ancestor() throws InterruptedException {
-        Trace t = Tempo.trace(SEARCH, opts());
+        Trace t = Tempo.trace(SEARCH, opts().cpu(false)).records(STEP);
         Span s = t;
         for (int d = 1; d < 34; d++) s = s.span(LOAD);
-        Handoff h = s.handoff(MATCH); // depth 34
-        Handoff[] next = new Handoff[1];
+        Task h = Tempo.task(MATCH); // depth 34
+        Task[] next = new Task[1];
         assertNull(TempoTest.onThread("worker", () -> {
-            try (Span m = h.begin(); Span x = m.span(DECODE)) { // depths 34 and 35
-                next[0] = x.handoff(MATCH);                        // depth 36: left out
+            try (Span m = h.tryBegin(); Span x = m.span(DECODE)) { // depths 34 and 35
+                next[0] = Tempo.task(MATCH);                        // depth 36: left out
                 x.span(SCORE).close();                             // depth 36: left out
             }
         }));
-        assertNull(TempoTest.onThread("worker-2", () -> next[0].begin().span(LOAD).close())); // 36 and 37
+        assertNull(TempoTest.onThread("worker-2", () -> next[0].tryBegin().span(LOAD).close())); // 36 and 37
         t.close();
         Map<String, Object> got = WireDecoder.decode(t.toHeader());
         assertEquals(3L, got.get("dropped"));
@@ -238,7 +239,7 @@ class HeaderTest {
     @Test
     void overTheLimitTheLadderFoldsFirst() {
         try (GoldenTest.Script s = new GoldenTest.Script(1794567890123L, "http-1", "worker")) {
-            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options()));
+            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options().cpu(false)).records(STEP));
             Span root = s.on(0, 0, () -> t.set(BYTES, 7));
             Span d = s.on(0, 1000, () -> root.span(DECODE).set(SCORE, 0.5));
             for (int i = 0; i < 40; i++) {
@@ -246,7 +247,7 @@ class HeaderTest {
                 s.run(0, 1150 + 100 * i + (i == 7 ? 20 : 0), l::close);
             }
             s.run(0, 6000, d::close);
-            Handoff h = s.on(0, 6000, () -> root.handoff(MATCH));
+            Task h = s.on(0, 6000, () -> Tempo.task(MATCH));
             Span m = s.on(1, 6500, h::begin);
             Span x = s.on(1, 6600, () -> m.span(SCORE).fail());
             Span y = s.on(1, 6700, () -> x.span(RATIO));
@@ -334,10 +335,10 @@ class HeaderTest {
     /** A folded task still open at the render is in no aggregate yet, but folded all the same. */
     @Test
     void anOpenFoldedTaskCountsAsFolded() {
-        Trace t = Tempo.trace(SEARCH, opts().budget(0));
-        Handoff h = t.handoff(LOAD);
+        Trace t = Tempo.trace(SEARCH, opts().budget(0).cpu(false)).records(STEP);
+        Task h = Tempo.task(LOAD);
         clock.add(1000);
-        Span x = h.begin(); // caller-runs, past the budget
+        Span x = h.tryBegin(); // caller-runs, past the budget
         clock.add(1000);
         String main = name(Thread.currentThread().getName());
         assertEquals("v1;w=mwevdy2z;x=1.0;l=0;T=" + main + ";N=search;S=00.0.2^o;e=1", t.toHeader()); // rendered while recording
@@ -453,7 +454,7 @@ class HeaderTest {
             List<List<Span>> stacks = new ArrayList<>();
             for (int i = 0; i < 4; i++) stacks.add(new ArrayList<>());
             stacks.get(0).add(t);
-            List<Handoff> pending = new ArrayList<>();
+            List<Task> pending = new ArrayList<>();
             long[] cpu = {0};
             for (int step = 0, steps = rnd.nextInt(10, 400); step < steps; step++) {
                 s.clock.add(rnd.nextInt(4) == 0 ? 0 : rnd.nextInt(1, 5000));
@@ -463,7 +464,7 @@ class HeaderTest {
                 int op = rnd.nextInt(12);
                 if (op >= 9) { // begin or cancel a pending handoff on thread k
                     if (pending.isEmpty()) continue;
-                    Handoff h = pending.remove(rnd.nextInt(pending.size()));
+                    Task h = pending.remove(rnd.nextInt(pending.size()));
                     if (op == 11) {
                         s.at(k, () -> {
                             h.cancel();
@@ -472,7 +473,7 @@ class HeaderTest {
                     } else {
                         Span b = s.at(k, () -> {
                             boolean caller = callerRuns(h);
-                            Span x = h.begin();
+                            Span x = h.tryBegin();
                             if (caller && x != NOOP) inline.add((long) h.lane.id << 32 | h.row());
                             return x;
                         });
@@ -526,7 +527,7 @@ class HeaderTest {
                             }
                             return null;
                         default:
-                            Handoff x = h.handoff(task);
+                            Task x = Tempo.task(task);
                             if (rnd.nextBoolean()) x.set(key, rnd.nextInt(100));
                             pending.add(x);
                             return null;
@@ -550,7 +551,7 @@ class HeaderTest {
      * Whether {@code h}, begun now, runs inline: on its submitter's thread, which has recorded no row
      * since the handoff's and whose innermost open span is still the handoff's parent.
      */
-    private static boolean callerRuns(Handoff h) {
+    private static boolean callerRuns(Task h) {
         Tempo.Lane l = h.lane;
         int r = h.row();
         if (l == null || Thread.currentThread() != l.owner || l.depth == 0 || l.rowCount != r + 1) return false;

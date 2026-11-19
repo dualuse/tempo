@@ -123,11 +123,13 @@ public final class ResponseHeaders {
             List<Future<String>> matches = new ArrayList<>();
             for (int i = 0; i < 4; i++) {
                 String doc = "doc-" + (17 + 9 * i);
-                Tempo.Handoff h = s.handoff(MATCH).set(QUEUED, cpu.getQueue().size());
-                matches.add(cpu.submit(h.callable(() -> {
+                Tempo.CallableTask<String> match = Tempo.callable(MATCH, () -> {
                     Demo.cpu(1_500); // match one candidate
                     return doc;
-                })));
+                });
+                match.set(QUEUED, cpu.getQueue().size());
+                cpu.submit(match);
+                matches.add(match);
             }
             try (Tempo.Span join = s.span(JOIN).waiting()) {
                 for (Future<String> f : matches) hits.add(f.get());
@@ -220,9 +222,9 @@ public final class ResponseHeaders {
             Tempo.Span s = t;
             List<Future<?>> shards = new ArrayList<>();
             for (int i = 0; i < SHARDS; i++) {
-                Tempo.Handoff h = s.handoff(SHARD).set(DOCS, DOCS_PER_SHARD);
+                Tempo.Task h = Tempo.task(SHARD).set(DOCS, DOCS_PER_SHARD);
                 shards.add(index.submit(() -> {
-                    try (Tempo.Span shard = h.begin()) {
+                    try (Tempo.Span shard = h.tryBegin()) {
                         for (int d = 0; d < DOCS_PER_SHARD; d++) {
                             try (Tempo.Span tokenize = shard.step(TOKENIZE)) {
                                 Demo.cpu(5);

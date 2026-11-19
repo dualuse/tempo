@@ -150,17 +150,15 @@ public final class SearchRequest {
 
         root.phase(DESCRIBE).label("Describe");
 
-        // The handoff is taken where the task is submitted; callable() begins it where it runs. The request
-        // thread blocks meanwhile, and says so: waiting() sets the join apart from run time.
-        Tempo.Handoff fp = root.handoff(FINGERPRINT);
-        Future<Long> signature = cpu.submit(fp.callable(() -> Demo.cpu(1_500)));
+        // The task is made where it is submitted, and begins where the pool calls it. The request thread
+        // blocks meanwhile, and says so: waiting() sets the join apart from run time.
+        Future<Long> signature = cpu.submit(Tempo.callable(FINGERPRINT, () -> Demo.cpu(1_500)));
         try (Tempo.Span w = root.span(AWAIT).waiting()) {
             signature.get();
         }
 
         Tempo.Phase lookup = root.phase(LOOKUP).label("Index Lookup");
-        Tempo.Handoff q = root.handoff(QUERY);
-        Future<int[]> found = io.submit(q.callable(() -> {
+        Future<int[]> found = io.submit(Tempo.callable(QUERY, () -> {
             Demo.io(3);
             return candidates();
         }));
@@ -172,7 +170,7 @@ public final class SearchRequest {
 
         Tempo.Phase reranking = root.phase(RERANK).label("Rerank");
         Rerank rerank = new Rerank();
-        for (int id : ids) rerank.submit(root, LOAD, io, h -> () -> load(rerank, id, h));
+        for (int id : ids) rerank.submit(LOAD, io, h -> () -> load(rerank, id, h));
 
         List<Integer> hits = new ArrayList<>();
         try (Tempo.Span w = root.span(AWAIT).waiting()) {
@@ -198,7 +196,7 @@ public final class SearchRequest {
     // ------------------------------------------------------------------ the tasks
 
     /** On {@code io-N}: reads one candidate, then hands its data to a match on {@code cpu}. */
-    void load(Rerank rerank, int id, Tempo.Handoff h) {
+    void load(Rerank rerank, int id, Tempo.Task h) {
         // tryBegin() records the queue wait; the span is the root of io-N's lane, and its handle stays on
         // io-N. It is null when the early exit took the task back first: then there is nothing to do.
         Tempo.Span l = h.tryBegin();
@@ -211,13 +209,13 @@ public final class SearchRequest {
                 Demo.io(LOAD_MS);
             }
             l.set(BYTES, 4_096 + id % 512);
-            // Handed off inside the load span: the match's parent is this load, on another thread.
-            rerank.submit(l, MATCH, cpu, m -> () -> match(rerank, id, m));
+            // Submitted inside the load span: the match's parent is this load, on another thread.
+            rerank.submit(MATCH, cpu, m -> () -> match(rerank, id, m));
         }
     }
 
     /** On {@code cpu-N}: a hot loop of one detail span per feature. Past the budget, they fold. */
-    void match(Rerank rerank, int id, Tempo.Handoff h) {
+    void match(Rerank rerank, int id, Tempo.Task h) {
         Tempo.Span m = h.tryBegin();
         if (m == null) return; // taken back by the early exit before it began
         try (m) {
@@ -236,39 +234,35 @@ public final class SearchRequest {
 
     /**
      * One request's tasks on both pools, and the results it collects. Submitting and stopping share a
-     * lock, so no load hands off a match once the request has stopped.
+     * lock, so no load submits a match once the request has stopped.
      */
     static final class Rerank {
         final BlockingQueue<Match> results = new LinkedBlockingQueue<>();
         private final List<Queued> tasks = new ArrayList<>(); // guarded by this
         private boolean stopped;                              // guarded by this
 
-        /** Hands a task to {@code pool} from {@code parent}'s thread, unless the request has stopped. */
-        synchronized void submit(Tempo.Span parent, Tempo.Name name, ThreadPoolExecutor pool,
-                                 Function<Tempo.Handoff, Runnable> task) {
+        /** Submits a task to {@code pool} under the calling thread's innermost span, unless the request has stopped. */
+        synchronized void submit(Tempo.Name name, ThreadPoolExecutor pool, Function<Tempo.Task, Runnable> task) {
             if (stopped) return;
             // The pool's queue length at submit: tools/tempo --pools draws it as the pool-wide signal.
-            Tempo.Handoff h = parent.handoff(name).set(QUEUED, pool.getQueue().size());
-            tasks.add(new Queued(pool.submit(task.apply(h)), h, pool));
+            Tempo.Task h = Tempo.task(name).set(QUEUED, pool.getQueue().size());
+            tasks.add(new Queued(pool.submit(task.apply(h)), h));
         }
 
         /**
-         * Stops the fan-out and cancels every task that has not begun; returns how many. The handoff decides
-         * the race with a worker: cancel() wins only if the task has not begun, and then the wrapper skips
-         * its body even if a worker takes it right now, so the trace shows it cancelled before it began. A
-         * lost cancel means the task is running: it is left to finish. The cancelled tasks stay in the
-         * queues, where they cost a worker nothing; ThreadPoolExecutor.remove would only free the slots of a
-         * bounded queue sooner, and these queues are unbounded. Handoff.NOOP (an untraced request) takes no
-         * part in the race, so there remove() decides it: it takes the task out of its queue only if no
-         * worker took it (Future.cancel alone would also succeed on a running task, whose body runs on).
+         * Stops the fan-out and cancels every task that has not begun; returns how many. The task decides
+         * the race with a worker: cancel() wins only if the task has not begun, and then tryBegin() returns
+         * null even if a worker takes it right now, so the trace shows it cancelled before it began. A lost
+         * cancel means the task is running: it is left to finish. The cancelled tasks stay in the queues,
+         * where they cost a worker nothing; ThreadPoolExecutor.remove would only free the slots of a bounded
+         * queue sooner, and these queues are unbounded. The race is the same in an untraced request.
          */
         synchronized int stop() {
             stopped = true;
             int n = 0;
             for (Queued q : tasks) {
-                boolean won = q.handoff == Tempo.Handoff.NOOP ? q.pool.remove((Runnable) q.task) : q.handoff.cancel();
-                if (won) {
-                    q.task.cancel(false); // completes the future for anyone who waits on it
+                if (q.handoff.cancel()) {
+                    q.task.cancel(false); // completes the pool's future for anyone who waits on it
                     n++;
                 }
             }
@@ -287,13 +281,11 @@ public final class SearchRequest {
 
     static final class Queued {
         final Future<?> task;
-        final Tempo.Handoff handoff;
-        final ThreadPoolExecutor pool;
+        final Tempo.Task handoff;
 
-        Queued(Future<?> task, Tempo.Handoff handoff, ThreadPoolExecutor pool) {
+        Queued(Future<?> task, Tempo.Task handoff) {
             this.task = task;
             this.handoff = handoff;
-            this.pool = pool;
         }
     }
 

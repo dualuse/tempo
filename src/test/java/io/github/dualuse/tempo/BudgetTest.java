@@ -1,6 +1,7 @@
 package io.github.dualuse.tempo;
 
-import io.github.dualuse.tempo.Tempo.Handoff;
+import io.github.dualuse.tempo.Tempo.RunnableTask;
+import io.github.dualuse.tempo.Tempo.Task;
 import io.github.dualuse.tempo.Tempo.Name;
 import io.github.dualuse.tempo.Tempo.Options;
 import io.github.dualuse.tempo.Tempo.Span;
@@ -123,14 +124,14 @@ class BudgetTest {
         Trace t = Tempo.trace(SEARCH, opts(128)).records(STEP); // blocks of 2
         Span s = t;
         int lanes = 10;
-        Handoff[] hs = new Handoff[lanes];
-        for (int i = 0; i < lanes; i++) hs[i] = s.handoff(MATCH);
+        Task[] hs = new Task[lanes];
+        for (int i = 0; i < lanes; i++) hs[i] = Tempo.task(MATCH);
         assertEquals(128 - lanes, t.ctx.unspent()); // a handoff counts against the budget too
         for (int i = 0; i < lanes; i++) {
             int before = 128 - lanes - i;
-            Handoff h = hs[i];
+            Task h = hs[i];
             assertNull(onThread("worker-" + i, () -> {
-                try (Span w = h.begin()) {
+                try (Span w = h.tryBegin()) {
                     w.step(LOAD).close();
                     assertEquals(before - 2, t.ctx.unspent()); // the lane holds the rest of its block while open
                 }
@@ -160,7 +161,7 @@ class BudgetTest {
             CountDownLatch go = new CountDownLatch(1);
             List<Future<?>> fs = new ArrayList<>();
             for (int i = 0; i < tasks; i++) {
-                Runnable task = t.handoff(MATCH).runnable(() -> {
+                Runnable task = Tempo.runnable(MATCH, () -> {
                     for (int k = 0; k < perTask; k++) Tempo.current().step(LOAD).close();
                 });
                 fs.add(pool.submit(() -> {
@@ -256,12 +257,12 @@ class BudgetTest {
         Span c = s.span(MATCH).cancel(); // cancelled, but not a task: it counts
         clock.add(2);
         c.close();
-        Handoff h = s.handoff(MATCH);
+        Task h = Tempo.task(MATCH);
         clock.add(4);
-        Span b = h.begin();               // inline task: waited 4, ran 5
+        Span b = h.tryBegin();               // inline task: waited 4, ran 5
         clock.add(5);
         b.close();
-        Handoff g = s.handoff(MATCH);
+        Task g = Tempo.task(MATCH);
         clock.add(6);
         g.cancel();                       // a cancelled task: its wait counts, its row does not
         spans(s, MATCH, 1, 7);            // recorded, then folded
@@ -331,39 +332,39 @@ class BudgetTest {
     void foldedHandoffsKeepTheirWaitsThreadsAndSharedFlags() throws Exception {
         Trace t = Tempo.trace(SEARCH, opts(1)).records(STEP);
         Span s = t;
-        Handoff first = s.handoff(MATCH); // the budget
-        Handoff[] load = new Handoff[3];
+        RunnableTask first = Tempo.runnable(MATCH, () -> clock.add(1)); // the budget
+        Task[] load = new Task[3];
         for (int i = 0; i < 3; i++) {
             clock.add(10);
-            load[i] = s.handoff(LOAD);    // submitted at 10, 20, 30
+            load[i] = Tempo.task(LOAD);    // submitted at 10, 20, 30
         }
         clock.add(10);
         assertNull(onThread("w1", () -> {
             clock.add(5);
-            Span x = load[0].begin();     // waited 35
+            Span x = load[0].tryBegin();     // waited 35
             clock.add(15);
             x.fail().close();
         }));
         assertNull(onThread("w2", () -> {
-            Span x = load[1].begin();     // waited 40
+            Span x = load[1].tryBegin();     // waited 40
             clock.add(5);
             x.fail().close();
         }));
-        Span x = load[2].begin();         // caller-runs, waited 35
+        Span x = load[2].tryBegin();         // caller-runs, waited 35
         clock.add(10);
         x.fail().close();
         Span rerank = s.span(RERANK);
-        Handoff m1 = rerank.handoff(MATCH), m2 = rerank.handoff(MATCH);
+        Task m1 = Tempo.task(MATCH), m2 = Tempo.task(MATCH);
         clock.add(2);
         assertNull(onThread("w1", () -> {
-            m1.begin().fail().close();    // waited 2
+            m1.tryBegin().fail().close();    // waited 2
             clock.add(3);
-            Span y = m2.begin();          // waited 5
+            Span y = m2.tryBegin();          // waited 5
             clock.add(4);
             y.close();
         }));
         rerank.close();
-        assertNull(onThread("w1", () -> first.runnable(() -> clock.add(1)).run()));
+        assertNull(onThread("w1", first::run));
         t.close();
         assertEquals(lines(
                 "search 0+85",
@@ -387,21 +388,21 @@ class BudgetTest {
         Trace t = Tempo.trace(SEARCH, opts(0).cpu(false)).records(STEP);
         Span rerank = t.span(RERANK);
         clock.add(10_000);
-        Handoff a = rerank.handoff(LOAD);
+        Task a = Tempo.task(LOAD);
         clock.add(10_000);
-        Handoff b = rerank.handoff(LOAD);
+        Task b = Tempo.task(LOAD);
         clock.add(10_000);
         a.cancel();                                    // waited 20
         clock.add(20_000);
         assertNull(onThread("canceller", b::reject));  // waited 30
         clock.add(10_000);
-        rerank.handoff(MATCH);                         // never started: 60 and 70
+        Tempo.task(MATCH);                         // never started: 60 and 70
         clock.add(10_000);
-        rerank.handoff(MATCH);
+        Tempo.task(MATCH);
         clock.add(5_000);
-        rerank.handoff(DECODE);                        // never started, the first of its aggregate: exact
+        Tempo.task(DECODE);                        // never started, the first of its aggregate: exact
         clock.add(5_000);
-        Handoff e = rerank.handoff(DECODE);
+        Task e = Tempo.task(DECODE);
         clock.add(5_000);
         e.cancel();                                    // waited 5
         clock.add(5_000);
@@ -432,21 +433,21 @@ class BudgetTest {
     void foldedHandoffsStillQueuedWaitFromTheirOwnSubmit() throws Exception {
         Trace t = Tempo.trace(SEARCH, opts(0).cpu(false)).records(STEP);
         Span root = t;
-        Handoff a = root.handoff(LOAD);                    // at 0
+        Task a = Tempo.task(LOAD);                    // at 0
         clock.add(10_000);
-        root.handoff(LOAD);                                // at 10: never starts, waits 90
+        Tempo.task(LOAD);                                // at 10: never starts, waits 90
         clock.add(10_000);
-        Handoff c = root.handoff(LOAD);                    // at 20
+        Task c = Tempo.task(LOAD);                    // at 20
         clock.add(10_000);
-        root.handoff(LOAD);                                // at 30: never starts, waits 70
+        Tempo.task(LOAD);                                // at 30: never starts, waits 70
         clock.add(10_000);
         assertNull(onThread("w1", () -> {
-            Span x = c.begin();                            // at 40: waited 20, ran 10
+            Span x = c.tryBegin();                            // at 40: waited 20, ran 10
             clock.add(10_000);
             x.close();
         }));
         clock.add(10_000);
-        Span x = a.begin();                                // at 60, inline: waited 60, ran 5
+        Span x = a.tryBegin();                                // at 60, inline: waited 60, ran 5
         clock.add(5_000);
         x.close();
         clock.add(35_000);
@@ -463,11 +464,11 @@ class BudgetTest {
     @Test
     void foldedHandoffStillQueuedBesideOneThatRan() throws Exception {
         Trace t = Tempo.trace(SEARCH, opts(0).cpu(false)).records(STEP);
-        Handoff a = t.handoff(LOAD);                // at 0
+        Task a = Tempo.task(LOAD);                // at 0
         clock.add(1_000);
-        a.begin().close();                                 // caller-runs: waited 1, ran 0
+        a.tryBegin().close();                                 // caller-runs: waited 1, ran 0
         clock.add(89_000);
-        t.handoff(LOAD);                            // at 90: never starts, waits 10
+        Tempo.task(LOAD);                            // at 90: never starts, waits 10
         clock.add(10_000);
         t.close();
         assertEquals(lines(
@@ -475,11 +476,11 @@ class BudgetTest {
                 "  load 0+0 agg*2 min=0 max=0 maxAt=0 extent=100000 handoff~11000/10000"), tree(t));
 
         Trace u = Tempo.trace(SEARCH, opts(0).cpu(false)).records(STEP);
-        Handoff b = u.handoff(LOAD);                // at 0
+        Task b = Tempo.task(LOAD);                // at 0
         clock.add(50_000);
-        u.handoff(LOAD);                            // at 50: never starts, waits 50
+        Tempo.task(LOAD);                            // at 50: never starts, waits 50
         clock.add(10_000);
-        b.begin().close();                                 // at 60: waited 60
+        b.tryBegin().close();                                 // at 60: waited 60
         clock.add(40_000);
         u.close();
         assertEquals(lines(
@@ -494,12 +495,12 @@ class BudgetTest {
     @Test
     void foldedHandoffsKeptForTheRenderArePrunedOnceTheyBegin() throws Exception {
         Trace t = Tempo.trace(SEARCH, opts(0).cpu(false)).records(STEP);
-        Handoff first = t.handoff(LOAD);            // never starts
-        for (int i = 0; i < 10_000; i++) t.handoff(LOAD).begin().close();
+        Task first = Tempo.task(LOAD);            // never starts
+        for (int i = 0; i < 10_000; i++) Tempo.task(LOAD).tryBegin().close();
         java.lang.reflect.Field head = Tempo.Lane.class.getDeclaredField("waiting");
         head.setAccessible(true);
         int kept = 0;
-        for (Handoff h = (Handoff) head.get(first.lane); h != null; h = h.next) kept++;
+        for (Task h = (Task) head.get(first.lane); h != null; h = h.next) kept++;
         assertTrue(kept <= 16, "handoffs kept: " + kept);
         clock.add(10_000);
         t.close();
@@ -516,11 +517,11 @@ class BudgetTest {
     @Test
     void spansInAFoldedTaskOutsideTheTraceAreAggregateOnly() throws Exception {
         Trace t = Tempo.trace(SEARCH, opts(0).cpu(false)).records(STEP);
-        Handoff h = t.handoff(MATCH);
-        Handoff[] g = new Handoff[1];
+        Task h = Tempo.task(MATCH);
+        Task[] g = new Task[1];
         assertNull(onThread("w1", () -> {
             clock.add(10_000);
-            try (Span x = h.begin()) {
+            try (Span x = h.tryBegin()) {
                 Span d = x.span(DECODE);
                 assertEquals(Tempo.Lane.FRAME, d.row);
                 clock.add(5_000);
@@ -528,12 +529,12 @@ class BudgetTest {
                 Span l = x.step(LOAD);
                 clock.add(3_000);
                 l.close();
-                g[0] = x.handoff(LOAD);
+                g[0] = Tempo.task(LOAD);
             }
         }));
         assertNull(onThread("w2", () -> {
             clock.add(2_000);
-            Span y = g[0].begin();
+            Span y = g[0].tryBegin();
             clock.add(4_000);
             y.close();
         }));
@@ -561,23 +562,23 @@ class BudgetTest {
     void foldedHandoffsOfASpanFormOneAggregateAcrossItsPhases() throws Exception {
         Trace t = Tempo.trace(SEARCH, opts(0)).records(STEP);
         Span s = t;
-        Handoff h1 = s.handoff(LOAD);
+        Task h1 = Tempo.task(LOAD);
         clock.add(5);
-        Span x = h1.begin(); // caller-runs
+        Span x = h1.tryBegin(); // caller-runs
         clock.add(5);
         x.close();
-        Handoff h2 = s.handoff(LOAD);
+        Task h2 = Tempo.task(LOAD);
         assertNull(onThread("w1", () -> {
             clock.add(2);
-            Span y = h2.begin();
+            Span y = h2.tryBegin();
             clock.add(8);
             y.close();
         }));
         s.done(DECODE);
-        Handoff h3 = s.handoff(LOAD);
+        Task h3 = Tempo.task(LOAD);
         assertNull(onThread("w1", () -> {
             clock.add(1);
-            h3.begin().close();
+            h3.tryBegin().close();
         }));
         clock.add(1);
         t.close();
@@ -595,7 +596,7 @@ class BudgetTest {
         int threads = 8, tasks = 2000, budget = 100;
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         try {
-            Trace t = Tempo.trace(SEARCH, new Options().budget(budget));
+            Trace t = Tempo.trace(SEARCH, new Options().budget(budget).cpu(false)).records(STEP);
             java.util.concurrent.atomic.AtomicBoolean stop = new java.util.concurrent.atomic.AtomicBoolean();
             java.util.concurrent.atomic.AtomicReference<Throwable> thrown = new java.util.concurrent.atomic.AtomicReference<>();
             Thread renderer = new Thread(() -> {
@@ -611,7 +612,7 @@ class BudgetTest {
             renderer.start();
             List<Future<?>> fs = new ArrayList<>();
             for (int i = 0; i < tasks; i++) {
-                Runnable task = t.handoff(MATCH).runnable(() -> Tempo.current().span(LOAD).close());
+                Runnable task = Tempo.runnable(MATCH, () -> Tempo.current().span(LOAD).close());
                 fs.add(pool.submit(task));
             }
             for (Future<?> f : fs) f.get();
@@ -641,12 +642,12 @@ class BudgetTest {
     void foldedTasksPastTheLaneCapAreDropped() throws Exception {
         Trace t = Tempo.trace(SEARCH, opts(0).lanes(2).cpu(false)).records(STEP);
         Span root = t;
-        Handoff a = root.handoff(MATCH), b = root.handoff(MATCH), c = root.handoff(MATCH);
+        Task a = Tempo.task(MATCH), b = Tempo.task(MATCH), c = Tempo.task(MATCH);
         clock.add(4_000);
-        assertNull(onThread("w1", () -> a.begin().close()));
+        assertNull(onThread("w1", () -> a.tryBegin().close()));
         clock.add(3_000);
-        assertNull(onThread("w2", () -> assertSame(NOOP, b.begin())));
-        c.begin().close(); // caller-runs
+        assertNull(onThread("w2", () -> assertSame(NOOP, b.tryBegin())));
+        c.tryBegin().close(); // caller-runs
         t.close();
         assertEquals(lines(
                 "search 0+7000",

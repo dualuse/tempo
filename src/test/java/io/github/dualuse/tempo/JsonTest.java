@@ -5,7 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.annotation.JsonSerialize;
 import com.fasterxml.jackson.dataformat.cbor.databind.CBORMapper;
 import com.fasterxml.jackson.dataformat.smile.databind.SmileMapper;
-import io.github.dualuse.tempo.Tempo.Handoff;
+import io.github.dualuse.tempo.Tempo.Task;
 import io.github.dualuse.tempo.Tempo.Name;
 import io.github.dualuse.tempo.Tempo.Options;
 import io.github.dualuse.tempo.Tempo.Snapshot;
@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.SplittableRandom;
 
+import static io.github.dualuse.tempo.Tempo.STEP;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
@@ -101,14 +102,14 @@ class JsonTest {
     @Test
     void exactText() throws IOException {
         try (GoldenTest.Script s = new GoldenTest.Script(1794567890123L, "http \"1\"", "cpu\t2")) {
-            Trace t = s.on(0, 0, () -> Tempo.trace(TempoTest.SEARCH, s.options()));
+            Trace t = s.on(0, 0, () -> Tempo.trace(TempoTest.SEARCH, s.options().cpu(false)).records(STEP));
             Span root = t;
             Span q = s.on(0, 10, () -> root.span(QUOTED).set(RATIO, 0.000001).set(K, 2.0).set(BIG, 1e20)
                     .set(NEG, -0.0).set(NAN, Double.NaN).set(K, 7.25));
             s.run(0, 1010, q::close);
             Span b = s.on(0, 1012, () -> root.span(BROKEN));
             s.run(0, 1015, b::close);
-            Handoff h = s.on(0, 1020, () -> root.handoff(TempoTest.LOAD));
+            Task h = s.on(0, 1020, () -> Tempo.task(TempoTest.LOAD));
             Span l = s.on(1, 1520, h::begin);
             s.run(1, 2020, () -> l.fail().close());
             s.run(0, 3000, t::close);
@@ -136,7 +137,7 @@ class JsonTest {
         try (GoldenTest.Script s = new GoldenTest.Script(0, "main", "pool")) {
             Trace t = s.on(0, 0, () -> Tempo.trace(TempoTest.SEARCH, s.options().budget(2)).records(Tempo.STEP));
             Span root = t;
-            Handoff h = s.on(0, 50, () -> root.handoff(TempoTest.MATCH));
+            Task h = s.on(0, 50, () -> Tempo.task(TempoTest.MATCH));
             for (int i = 0; i < 3; i++) {
                 long at = 100 + 100 * i;
                 Span d = s.on(0, at, () -> root.step(TempoTest.DECODE));

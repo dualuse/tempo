@@ -1,6 +1,6 @@
 package io.github.dualuse.tempo;
 
-import io.github.dualuse.tempo.Tempo.Handoff;
+import io.github.dualuse.tempo.Tempo.Task;
 import io.github.dualuse.tempo.Tempo.Name;
 import io.github.dualuse.tempo.Tempo.Options;
 import io.github.dualuse.tempo.Tempo.Span;
@@ -238,18 +238,18 @@ class GoldenTest {
     @Test
     void handoff() {
         try (Script s = new Script("handoff")) {
-            Trace t = s.cpu(-1).on(0, 0, () -> Tempo.trace(SEARCH, s.options().cpu(true)));
+            Trace t = s.cpu(-1).on(0, 0, () -> Tempo.trace(SEARCH, s.options().cpu(true)).records(STEP));
             Span root = t;
             Span describe = s.cpu(0).on(0, 50, () -> root.span(DESCRIBE).cpu());
-            Handoff infer1 = s.on(0, 100, () -> describe.handoff(INFER)), infer2 = s.on(0, 140, () -> describe.handoff(INFER));
+            Task infer1 = s.on(0, 100, () -> Tempo.task(INFER)), infer2 = s.on(0, 140, () -> Tempo.task(INFER));
 
             Span i1 = s.cpu(0).on(1, 220, infer1::begin);
             Span encode = s.cpu(0).on(1, 230, () -> i1.span(ENCODE).cpu());
             s.cpu(990).run(1, 1230, encode::close);
-            Handoff load = s.on(1, 1300, () -> i1.handoff(LOAD));
+            Task load = s.on(1, 1300, () -> Tempo.task(LOAD));
             Span l = s.cpu(0).on(2, 1330, load::begin);
             s.cpu(50).run(2, 2130, l::close);
-            Handoff match = s.on(1, 2200, () -> i1.handoff(MATCH));
+            Task match = s.on(1, 2200, () -> Tempo.task(MATCH));
             s.cpu(4800).run(1, 5220, i1::close);
             Span m = s.cpu(0).on(1, 5300, match::begin); // its own thread again: a child that ends after its parent
             s.cpu(880).run(1, 6200, m::close);
@@ -260,10 +260,10 @@ class GoldenTest {
             s.run(0, 14000, fingerprint::close);
             s.cpu(1200).run(0, 30050, describe::close);
             Span rerank = s.on(0, 30100, () -> root.span(RERANK));
-            Handoff load2 = s.on(0, 30110, () -> rerank.handoff(LOAD));
+            Task load2 = s.on(0, 30110, () -> Tempo.task(LOAD));
             Span l2 = s.cpu(0).on(2, 30110, load2::begin);
             s.cpu(300).run(2, 34110, l2::close);
-            Handoff match2 = s.on(0, 34200, () -> rerank.handoff(MATCH));
+            Task match2 = s.on(0, 34200, () -> Tempo.task(MATCH));
             Span m2 = s.cpu(0).on(1, 34207, match2::begin);
             s.cpu(2950).run(1, 37207, m2::close);
             s.run(0, 39100, rerank::close);
@@ -275,20 +275,20 @@ class GoldenTest {
     @Test
     void handoffNotRun() {
         try (Script s = new Script("handoff-not-run")) {
-            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options().cpu(true)));
+            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options().cpu(true)).records(STEP));
             Span rerank = s.on(0, 1000, () -> t.span(RERANK));
-            Handoff a = s.on(0, 1010, () -> rerank.handoff(LOAD)), b = s.on(0, 1020, () -> rerank.handoff(LOAD)),
-                    c = s.on(0, 1030, () -> rerank.handoff(LOAD)), d = s.on(0, 1040, () -> rerank.handoff(LOAD));
+            Task a = s.on(0, 1010, () -> Tempo.task(LOAD)), b = s.on(0, 1020, () -> Tempo.task(LOAD)),
+                    c = s.on(0, 1030, () -> Tempo.task(LOAD)), d = s.on(0, 1040, () -> Tempo.task(LOAD));
             Span la = s.cpu(0).on(1, 1025, a::begin);
             Span lb = s.cpu(0).on(2, 1040, b::begin);
             s.cpu(150).run(2, 4040, lb::close);
             s.cpu(200).run(1, 5025, la::close);
-            Span ld = s.cpu(0).on(1, 5040, () -> d.begin().cancel()); // cancelled while running
+            Span ld = s.cpu(0).on(1, 5040, () -> d.tryBegin().cancel()); // cancelled while running
             s.cpu(100).run(1, 7540, ld::close);
-            Handoff e = s.on(0, 5100, () -> rerank.handoff(MATCH));
+            Task e = s.on(0, 5100, () -> Tempo.task(MATCH));
             Span me = s.cpu(0).on(3, 5140, e::begin);
             s.cpu(5900).run(3, 11140, me::close);
-            s.on(0, 8100, () -> rerank.handoff(MATCH)); // never started
+            s.on(0, 8100, () -> Tempo.task(MATCH)); // never started
             s.cpu(-1).run(0, 9030, c::cancel);           // cancelled before it started
             s.run(0, 28000, rerank::close);
             Span encode = s.on(0, 28100, () -> t.span(ENCODE));
@@ -306,15 +306,15 @@ class GoldenTest {
                 + "S=00.0.6y0:9=512:8=1/11.a.rs/12.ua.rs@1~0/13.uk.rs@2~0/14.uk.2s/15.2s.2s/16.2s.2s/17.2s.2s/18.2s.2s;e=9";
         Name snake = Tempo.name("snake_case");
         try (Script s = new Script("names")) {
-            Trace t = s.on(0, 0, () -> Tempo.trace(GET_SEARCH, s.options()));
+            Trace t = s.on(0, 0, () -> Tempo.trace(GET_SEARCH, s.options().cpu(false)).records(STEP));
             Span root = t;
             s.run(0, 0, () -> root.set(Tempo.name("bytes read"), 512).set(snake, 1));
             Span grosse = s.on(0, 10, () -> root.span(Tempo.name("Größe")));
             s.run(0, 1010, grosse::close);
-            Handoff h1 = s.on(0, 1100, () -> root.handoff(Tempo.name("日本語")));
+            Task h1 = s.on(0, 1100, () -> Tempo.task(Tempo.name("日本語")));
             Span w1 = s.on(1, 1100, h1::begin);
             s.run(1, 2100, w1::close);
-            Handoff h2 = s.on(0, 2200, () -> root.handoff(Tempo.name("🚀 launch")));
+            Task h2 = s.on(0, 2200, () -> Tempo.task(Tempo.name("🚀 launch")));
             Span w2 = s.on(2, 2200, h2::begin);
             s.run(2, 3200, w2::close);
             String[] small = {"?", "a.b-c", "100%", "x:y;z/w=v", "snake_case"};
@@ -339,18 +339,18 @@ class GoldenTest {
                 + "S=00.0.12kw/11.a.334/12.35m.ffk@1~0/23.1e.ccg@2~2s/34.6y.p0@3~0/23.1e.bko/35.2s.1jk@0~0/16.fic.jag"
                 + "/24.2s.7ps@3~0/27.7sk.asw;e=a";
         try (Script s = new Script("threads")) {
-            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options()));
+            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options().cpu(false)).records(STEP));
             Span root = t;
             Span decode = s.on(0, 10, () -> root.span(DECODE));
             s.run(0, 4010, decode::close);
-            Handoff hd = s.on(0, 4100, () -> root.handoff(DESCRIBE));
+            Task hd = s.on(0, 4100, () -> Tempo.task(DESCRIBE));
             Span d = s.on(1, 4100, hd::begin);
-            Handoff hi = s.on(1, 4150, () -> d.handoff(INFER));
+            Task hi = s.on(1, 4150, () -> Tempo.task(INFER));
             Span i1 = s.on(1, 4200, () -> d.span(INFER));
             Span i2 = s.on(2, 4250, hi::begin);
-            Handoff he = s.on(1, 4300, () -> i1.handoff(ENCODE));
+            Task he = s.on(1, 4300, () -> Tempo.task(ENCODE));
             Span e = s.on(0, 4300, he::begin); // back on the request thread, which is inside the trace
-            Handoff hl = s.on(2, 4400, () -> i2.handoff(LOAD));
+            Task hl = s.on(2, 4400, () -> Tempo.task(LOAD));
             Span l = s.on(3, 4400, hl::begin);
             s.run(3, 5300, l::close);
             s.run(0, 6300, e::close);
@@ -358,7 +358,7 @@ class GoldenTest {
             s.run(2, 20250, i2::close);
             s.run(1, 24100, d::close);
             Span index = s.on(0, 24200, () -> root.span(INDEX));
-            Handoff hl2 = s.on(0, 24300, () -> index.handoff(LOAD));
+            Task hl2 = s.on(0, 24300, () -> Tempo.task(LOAD));
             Span l2 = s.on(3, 24300, hl2::begin);
             s.run(3, 34300, l2::close);
             Span match = s.on(0, 34400, () -> index.span(MATCH));
@@ -384,13 +384,13 @@ class GoldenTest {
                 apply = Tempo.name("apply"), check = Tempo.name("check"), seal = Tempo.name("seal"),
                 rows = Tempo.name("rows");
         try (Script s = new Script("phases")) {
-            Trace t = s.on(0, 0, () -> Tempo.trace(batch, s.options()));
+            Trace t = s.on(0, 0, () -> Tempo.trace(batch, s.options().cpu(false)).records(STEP));
             Span root = t;
             s.run(0, 100, () -> root.phase(parse).set(rows, 1200));
             Span r = s.on(0, 150, () -> root.span(read));
             s.run(0, 600, () -> root.phase(store));                     // read crosses this boundary
             s.run(0, 900, r::close);
-            Handoff h = s.on(0, 950, () -> root.handoff(flush));
+            Task h = s.on(0, 950, () -> Tempo.task(flush));
             Span w = s.on(1, 1000, h::begin);
             s.run(1, 1000, () -> w.phase(compress));
             s.run(1, 1500, () -> w.phase(write));
@@ -467,7 +467,7 @@ class GoldenTest {
                 + "S=00.0.1b2g^o/11.u.1jk^f/12.1li.99c/23.1e.93s^w/14.9c4.0^m/11.0.0^fm/15.0.1040^o/26.2s.zzk@1~1o^o"
                 + "/27.2s.zyg^ow;e=9";
         try (Script s = new Script("failed-open")) {
-            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options()));
+            Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options().cpu(false)).records(STEP));
             Span root = t;
             Span decode = s.on(0, 30, () -> root.span(DECODE).fail());
             s.run(0, 2030, decode::close);
@@ -478,7 +478,7 @@ class GoldenTest {
             s.run(0, 14200, () -> root.span(DESCRIBE));
             s.run(0, 14200, () -> root.span(DECODE).fail()); // heals describe
             Span rerank = s.on(0, 14200, () -> root.span(RERANK)); // heals decode
-            Handoff h = s.on(0, 14300, () -> rerank.handoff(LOAD));
+            Task h = s.on(0, 14300, () -> Tempo.task(LOAD));
             Span load = s.on(1, 14360, h::begin);
             s.run(0, 14400, () -> rerank.span(JOIN).waiting());
             assertHeader("failed-open", closest, s.render(61000, t));
@@ -500,8 +500,8 @@ class GoldenTest {
         try (Script s = new Script("live-and-folded")) {
             Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options().budget(4)).records(STEP)); // the four handoffs
             Span rerank = s.on(0, 100, () -> t.span(RERANK));
-            Handoff m1 = s.on(0, 200, () -> rerank.handoff(MATCH)), m2 = s.on(0, 300, () -> rerank.handoff(MATCH)),
-                    l1 = s.on(0, 400, () -> rerank.handoff(LOAD)), l2 = s.on(0, 3500, () -> rerank.handoff(LOAD));
+            Task m1 = s.on(0, 200, () -> Tempo.task(MATCH)), m2 = s.on(0, 300, () -> Tempo.task(MATCH)),
+                    l1 = s.on(0, 400, () -> Tempo.task(LOAD)), l2 = s.on(0, 3500, () -> Tempo.task(LOAD));
             Span w1 = s.on(1, 250, m1::begin);
             s.run(1, 300, () -> {
                 Span x = w1;
@@ -540,7 +540,7 @@ class GoldenTest {
         try (Script s = new Script("aggregates")) {
             Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options().budget(2).cpu(true)).records(STEP));
             Span rerank = s.on(0, 500, () -> t.span(RERANK));
-            Handoff a = s.on(0, 600, () -> rerank.handoff(LOAD)), b = s.on(0, 650, () -> rerank.handoff(LOAD));
+            Task a = s.on(0, 600, () -> Tempo.task(LOAD)), b = s.on(0, 650, () -> Tempo.task(LOAD));
             Span la = s.on(3, 610, a::begin);
             s.run(3, 2610, la::close);
             Span lb = s.on(3, 2610, b::begin);
@@ -551,7 +551,7 @@ class GoldenTest {
                 long submit = i <= 20 ? 5000 + 2050 * i : i < 39 ? 50600 + 2300 * (i - 21) : 93050;
                 long wait = i == 0 ? 650 : i == 1 ? 700 : i == 39 ? 250 : 200;
                 long dur = i == 1 ? 900 : i == 20 ? 4500 : 1700, cpu = i == 0 ? 1700 : i == 1 ? 900 : i == 2 ? 1400 : -1;
-                Handoff h = s.on(0, submit, () -> rerank.handoff(LOAD));
+                Task h = s.on(0, submit, () -> Tempo.task(LOAD));
                 Span l = s.cpu(cpu < 0 ? -1 : 0).on(3, submit + wait, h::begin);
                 s.cpu(cpu).run(3, submit + wait + dur, l::close);
             }
@@ -562,8 +562,8 @@ class GoldenTest {
                 long submit = thread == 1 ? 5100 + 5500 * k : k == 0 ? 12100 : k < 19 ? 21800 + 5300 * (k - 1) : 118950;
                 long wait = thread == 1 && k == 1 ? 900 : thread == 2 && k == 19 ? 2500 : 700;
                 long dur = thread == 1 ? (k == 0 ? 2000 : k == 1 ? 3950 : 3650) : k == 0 ? 9000 : 3650;
-                Handoff h = s.on(0, submit, () -> rerank.handoff(MATCH));
-                Span m = s.cpu(0).on(thread, submit + wait, () -> h.begin().fail());
+                Task h = s.on(0, submit, () -> Tempo.task(MATCH));
+                Span m = s.cpu(0).on(thread, submit + wait, () -> h.tryBegin().fail());
                 s.cpu(thread == 1 && k == 1 ? 1950 : dur).run(thread, submit + wait + dur, m::close);
             }
             // 400 scores: sum 800, min 1 (first), max 9 at +179000, the last ending at +180000
@@ -595,28 +595,28 @@ class GoldenTest {
     @Test
     void searchExample() {
         try (Script s = new Script("search-example")) {
-            Trace t = s.cpu(-1).on(0, 0, () -> Tempo.trace(GET_SEARCH, s.options().cpu(true).budget(5)));
+            Trace t = s.cpu(-1).on(0, 0, () -> Tempo.trace(GET_SEARCH, s.options().cpu(true).budget(5)).records(STEP));
             Span root = t;
             Span decode = s.on(0, 120, () -> root.span(DECODE));
             s.run(0, 8420, decode::close);
             Span describe = s.cpu(0).on(0, 8450, () -> root.span(DESCRIBE).cpu());
             s.cpu(40100).run(0, 49650, describe::close);
-            Handoff fingerprint = s.on(0, 8460, () -> root.handoff(FINGERPRINT));
+            Task fingerprint = s.on(0, 8460, () -> Tempo.task(FINGERPRINT));
             Span f = s.cpu(0).on(1, 8770, fingerprint::begin);
             s.cpu(22000).run(1, 31670, f::close);
             Span index = s.cpu(-1).on(0, 49700, () -> root.span(INDEX).set(K, 40));
             s.run(0, 80200, index::close);
             Span rerank = s.on(0, 80250, () -> root.span(RERANK));
-            Handoff load1 = s.on(0, 80300, () -> rerank.handoff(LOAD)), load2 = s.on(0, 80310, () -> rerank.handoff(LOAD)),
-                    match1 = s.on(0, 86500, () -> rerank.handoff(MATCH)), match2 = s.on(0, 94000, () -> rerank.handoff(MATCH));
+            Task load1 = s.on(0, 80300, () -> Tempo.task(LOAD)), load2 = s.on(0, 80310, () -> Tempo.task(LOAD)),
+                    match1 = s.on(0, 86500, () -> Tempo.task(MATCH)), match2 = s.on(0, 94000, () -> Tempo.task(MATCH));
             // cpu-2 begins before io-1, so the thread table reads http-7, cpu-1, cpu-2, io-1
-            Span m1 = s.cpu(0).on(1, 86520, () -> match1.begin().set(SCORE, 0.83));
+            Span m1 = s.cpu(0).on(1, 86520, () -> match1.tryBegin().set(SCORE, 0.83));
             s.cpu(9350).run(1, 95920, m1::close);
-            Span m2 = s.cpu(0).on(2, 94015, () -> match2.begin().set(SCORE, 0.41));
+            Span m2 = s.cpu(0).on(2, 94015, () -> match2.tryBegin().set(SCORE, 0.41));
             s.cpu(8700).run(2, 102815, m2::close);
-            Span l1 = s.cpu(-1).on(3, 80345, () -> load1.begin().set(BYTES, 48213));
+            Span l1 = s.cpu(-1).on(3, 80345, () -> load1.tryBegin().set(BYTES, 48213));
             s.run(3, 86445, l1::close);
-            Span l2 = s.on(3, 86510, () -> load2.begin().fail());
+            Span l2 = s.on(3, 86510, () -> load2.tryBegin().fail());
             s.run(3, 93910, l2::close);
 
             // load, folded: begins every 1500 from 94440 to the slowest (4100) submitted at 124400, then
@@ -624,7 +624,7 @@ class GoldenTest {
             for (int i = 0; i < 36; i++) {
                 long begin = i <= 20 ? 94440 + 1500 * i : 128900 + 1850 * (i - 21), wait = i == 35 ? 400 : 40;
                 long dur = i == 20 ? 4100 : i == 35 ? 600 : 1450;
-                Handoff h = s.on(0, begin - wait, () -> rerank.handoff(LOAD));
+                Task h = s.on(0, begin - wait, () -> Tempo.task(LOAD));
                 Span l = s.cpu(i == 0 ? 0 : -1).on(3, begin, h::begin);
                 s.cpu(i == 0 ? 2100 : -1).run(3, begin + dur, l::close);
             }
@@ -637,7 +637,7 @@ class GoldenTest {
                 long begin = thread == 1 ? cpu1[k] : k == 0 ? 102860 : 107000 + 4100 * (k - 1);
                 long wait = thread == 2 && k == 0 ? 60 : 24;
                 long dur = thread == 1 ? (k == 13 ? 9400 : k == 17 ? 2100 : 4000) : k == 0 ? 4100 : 4000;
-                Handoff h = s.on(0, begin - wait, () -> rerank.handoff(MATCH));
+                Task h = s.on(0, begin - wait, () -> Tempo.task(MATCH));
                 Span m = s.cpu(0).on(thread, begin, h::begin);
                 s.cpu(thread == 2 && k == 0 ? dur - 700 : dur).run(thread, begin + dur, m::close);
             }
