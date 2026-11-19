@@ -25,7 +25,9 @@ node tests/check_site_headless.mjs   # Tempo Timeline in headless Chrome: sample
   1. A recorded span allocates 0 B once warm: its handle comes from the thread's pool. So do
      phases, attributes, flags and steps.
   2. A task allocates one object, itself: the `RunnableTask`, `CallableTask` or supplier task,
-     which through `Tempo.executor` is also the `Future`.
+     which through `Tempo.executor` is also the `Future`. Running it allocates nothing, on the
+     submitting thread or on a thread of its own once that thread has its lane in the trace; the
+     lane, set up once per trace and thread, reuses the arrays of the thread's earlier lanes.
   3. A tick the trace does not record costs about a branch through `s.tick(name)`; the static
      `Tempo.tick(name)` may add the `ThreadLocal` read. A step the trace does not draw allocates
      nothing.

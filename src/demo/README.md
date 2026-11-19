@@ -104,7 +104,7 @@ to its end (`tools/tempo` prints this legend under the lanes too; `--ascii` draw
 |---|---|
 | `├── name ──┤` | a span, its name centred in its bar |
 | `job ├─ fetch ─┼ parse ┼·┤` | a span with phases: its name in front of the bar, each phase named in its section, `┼` at a boundary, `·` for time in no phase |
-| `*1` | a phase too narrow for its name, named in the footnote line under the lanes |
+| `*1` | a phase too narrow for its name, named in the footnote line under the lanes; one too narrow even for that has its `*1` after its span's name |
 | `░` | queue wait: a task submitted but not yet begun |
 | `├╌╌ join ╌╌┤` | a blocking wait (a span marked `waiting()`, such as a join) |
 | `▚` | an aggregate: many spans folded into one record, labelled `name ×N`, `┃` at its slowest |

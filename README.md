@@ -96,9 +96,10 @@ warns (`try`); `@SuppressWarnings("try")` on the method silences it, or `run` an
 it.
 
 To annotate the innermost open span from deep in a call stack, `Tempo.current()` returns it,
-as in `Tempo.current().set("hits", n)`; outside a trace it returns `Tempo.NOOP`, a handle that
-records nothing. That is the only static way to reach a span: there is no static `set`, `fail`
-or phase.
+as in `Tempo.current().set("hits", n)`. Outside a trace it returns `Tempo.NOOP`, a handle that
+records nothing, or, while a span or step timed only for a global listener is open (see below),
+that span, which keeps no attributes. That is the only static way to reach a span: there is no
+static `set`, `fail` or phase.
 
 **Names.** `Tempo.name("parse")` interns a name. Kept in a `static final` field and passed
 instead of the string, it is the fast path, with no lookup per span. Every method that takes a
@@ -186,15 +187,16 @@ try (Tempo.Span s = Tempo.span("startup")) {
 }                                                    // closing the span ends warm-up
 ```
 
-Run in a trace named `boot`, it is drawn like this (`tools/tempo --ascii`): the phases on their
-span's bar, with the span's name in front of it.
+Run in a trace named `boot`, it is drawn like this (`tools/tempo --ascii --width 72`): the
+phases on their span's bar, with the span's name in front of it. Here the span starts with the
+trace, so its name stands in a name column left of the time axis.
 
 ```
-             ms 0                 10                 20
-                +-----------------+------------------+------------------
-main            |------------------------ boot ------------------------|
-                   startup |init-|-------- loading --------| warm-up |
-                                     |--------- fetch ----------|
+                     ms 0                 10                20
+                        +-----------------+-----------------+-----------
+main                    |-------------------- boot --------------------|
+                startup |init-|------ loading ------|---- warm-up ----|
+                                     |------- fetch --------|
 ```
 
 - `s.phase(name)` starts a phase at its call; the time before the first phase, and after
@@ -235,9 +237,11 @@ Tempo.span("upload").phase("connect").start(t0).lap(t1).phase("send").stop(t2).c
 ```
 
 Each time must lie in its window: from the parent's start to now, laps in order, the stop not
-before the last boundary. A time outside is clamped into it, the span is flagged, and the
-misuse is counted (strict mode throws). A span timed by hand stays the thread's innermost open
-span until `close()`. The only lanes are threads: there are no named or pseudo-lanes.
+before the last boundary nor before the end of a child. A time outside is clamped into it, the
+span is flagged, and the misuse is counted (strict mode throws). A span timed by hand stays the
+thread's innermost open span until `close()`. A child still open at the stop, or opened after
+it, is misuse too, and the span then ends with that child, so a span always holds its
+children. The only lanes are threads: there are no named or pseudo-lanes.
 
 ### Tasks and thread pools
 
@@ -256,8 +260,9 @@ Future<Score> f = MATCH.submit(() -> match(q, c));   // a "match" task under the
 ```
 
 Every submit becomes a task of the executor's name, handed to `pool.execute`. The task is
-itself the `Future` that `submit` returns, so a submit allocates one object. A submit the pool
-refuses is recorded as rejected, and the `RejectedExecutionException` is thrown on.
+itself the `Future` that `submit` returns, so a submit allocates one object; `invokeAll` and
+`invokeAny` make one task per element in the same way. A submit the pool refuses is recorded
+as rejected, and the `RejectedExecutionException` is thrown on.
 
 Without such an executor, `Tempo.runnable`, `Tempo.callable` and `Tempo.supplier` make the
 task where the work is submitted. Each is the `Runnable`, `Callable` or `Supplier` itself, and
@@ -271,8 +276,12 @@ CompletableFuture<Page> page = CompletableFuture.supplyAsync(Tempo.supplier("ren
 
 A task's parent is the innermost open span of the thread that made it. One that runs on the
 submitting thread (caller runs) becomes a plain child. `set` and `fail` on a task apply to its
-record at the submit; `elapsedNanos()` is its queue wait. A task submitted to `Tempo.executor`
-keeps its own name.
+record at the submit. Its `startNanos()` is its submit and `waitNanos()` its queue wait, which
+is also its `elapsedNanos()`: the task object times its wait, its span times its run. A task
+submitted to `Tempo.executor` goes in as it is, under its own name, and is the future
+returned. A task's body runs at most once through `run()`, as a `FutureTask`'s; a second
+`call()` or `get()` of a callable or supplier task is misuse and calls the body again,
+unrecorded. A null body is misuse and does nothing.
 
 **Cancelling and early exits.** Begin and cancel race for a task, and exactly one of them
 wins, inside a trace or not, with no lock and no help from the executor. `task.cancel()`
@@ -361,12 +370,16 @@ another trace. A call through it while it sits in the pool is ignored and counte
 call after it was issued again reaches the new span, undetected. So keep a handle inside the
 block that opened it. Steps folded past the budget or not drawn share one handle per depth.
 
+`Span`, `Phase` and `Task` share a base type, `Timing`: each has a `name()`, a `startNanos()`
+(from the trace's start) and an `elapsedNanos()`, and takes `set` and `fail`.
+
 Misuse, such as a span used on another thread, after close or after release, a span opened
 under one with others open above it, a `done(name)` that names another phase, a clamped time,
 or `records` called too late, is healed and counted, and the record is flagged `m` where there
-is one. Outside strict mode Tempo never throws. `Options.strict(true)` throws an
-`AssertionError` at the offending call instead, and never pools a handle, so every stale use
-throws: use it in tests.
+is one. Outside strict mode Tempo never throws; a task cancelled before it began still throws
+`CancellationException` from `call()` or `get()`, as its `Future` does, since it has no result.
+`Options.strict(true)` throws an `AssertionError` at the offending call instead, and never pools
+or shares a handle, so every stale use throws: use it in tests.
 
 ### Options
 
@@ -549,7 +562,7 @@ cpu
 | `├─ name ─┤` | A span's run time, its name centred (`\|- name -\|` with `--ascii`). |
 | `┼` | A phase boundary inside a span's bar; each phase's name is centred in its section. |
 | `·` | Unphased time of a span that has phases. |
-| `*1` | A phase too narrow for its name, named in a footnote line under the lanes. |
+| `*1` | A phase too narrow for its name, named in a footnote line under the lanes. One too narrow even for that has its `*1` after its span's name. |
 | `░` | Queue wait of a task, drawn dim in front of its run. |
 | `├╌╌┤` | Blocking wait (join, future get), flag `w`. |
 | `▚` with `×N` and `┃` | Aggregate of N folded spans over its extent; `┃` marks where the slowest one started. |

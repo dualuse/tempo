@@ -23,14 +23,16 @@ were taken on.
 | Promise | Benchmarks | Measured | Gate |
 |---|---|---|---|
 | 1. 0 B per recorded span, steady state | `span`, `spanStatic`, `spanNotInlined`, `run`, `stepDrawn`, `phase`, `done`, `setLong` | 0.0000 to 0.0003 B/op | 0.01 B/op |
-| 2. One object per task | `task`, `supplierInline` | 48.0002, 48.0004 B/op | 48.01 B/op: a `Task` or `SupplierTask` |
-| | `taskInline`, `callableInline`, `taskFolded`, `taskUndrawn` | 56.0005 to 56.0007 B/op | 56.01 B/op: a `RunnableTask` or `CallableTask`, also its future |
-| | `executorSubmit`, `executorCall` (through `Tempo.executor`) | 56.0004, 56.0005 B/op | 56.01 B/op: the task, which is the future returned |
+| 2. One object per task | `task`, `supplierInline` | 48.0001, 48.0004 B/op | 48.01 B/op: a `Task` or `SupplierTask` |
+| | `taskInline`, `callableInline`, `taskFolded`, `taskUndrawn` | 56.0004 to 56.0007 B/op | 56.01 B/op: a `RunnableTask` or `CallableTask`, also its future |
+| | `executorSubmit`, `executorCall`, `executorCallableTask` (through `Tempo.executor`) | 56.0005 B/op | 56.01 B/op: the task, which is the future returned |
+| | `across` (a `Task` begun on another thread), per op of either side | 24.0014 B/op, setup 630 B per trace | 24.01 B/op, setup 1,024 B |
+| | `acrossUndrawn` (a `RunnableTask` run on another thread), per op of either side | 28.0001 B/op, setup 630 B per trace | 28.01 B/op, setup 1,024 B |
 | 3. An unrecorded tick costs about a branch | `tickUnrecorded` (`s.tick`) | 1.4 ns = 0.14 x `baselineNanoTime`, 0 B | 0.5 x, 0.01 B/op |
-| | `tickStatic` (`Tempo.tick`, in a trace) | 1.6 ns = 0.16 x, 0 B | 1 x, 0.01 B/op |
-| | `tickNoTrace` (`Tempo.tick`, no trace) | 1.1 ns = 0.11 x, 0 B | 1 x, 0.01 B/op |
-| 3. An undrawn step allocates nothing | `stepUndrawn` | 29.0 ns = 2.83 x, 0.0002 B/op | 0.01 B/op; time reported |
-| 4. A recorded static span costs at most 6.4 clock reads | `spanStatic` | 37.5 ns = 3.66 x `baselineNanoTime` (10.2 ns) | 6.4 x |
+| | `tickStatic` (`Tempo.tick`, in a trace) | 1.8 ns = 0.18 x, 0 B | 1 x, 0.01 B/op |
+| | `tickNoTrace` (`Tempo.tick`, no trace) | 1.2 ns = 0.12 x, 0 B | 1 x, 0.01 B/op |
+| 3. An undrawn step allocates nothing | `stepUndrawn` | 27.4 ns = 2.74 x, 0.0002 B/op | 0.01 B/op; time reported |
+| 4. A recorded static span costs at most 6.4 clock reads | `spanStatic` | 37.4 ns = 3.73 x `baselineNanoTime` (10.0 ns) | 6.4 x |
 
 Promise 1 holds because a recorded span takes its handle from its thread's pool, which a
 released trace refills. A handle allocated per span, in one trace or in every trace, would grow
@@ -39,10 +41,18 @@ with the cycle length and show in the per-op figure (see below).
 Promise 2: sizes are for a 64-bit JVM with compressed oops. A task carries its lane, name,
 submit time, state and queue wait, 48 B; a supplier task adds its body within the same 48 B. A
 runnable or callable task also holds its body, its outcome and the thread that runs it, as a
-`FutureTask` does, 56 B. Running a task allocates nothing, drawn, folded or undrawn.
+`FutureTask` does, 56 B. Running a task allocates nothing, drawn, folded or undrawn, on the
+submitting thread or on another one. The `across` groups run the task on a thread of their own,
+as a pool thread would; a group op is one of either side, so the gate is half the task's size.
+That thread sets up its lane of each trace once, at its first task of the trace: the lane
+object and a weak reference to it for the thread's slot (248 B). Its arrays come from the
+thread's lanes of earlier traces, which hand them back when their trace is released. The gate
+solves this per-trace setup out of the per-task figure, from two cycle lengths, and holds the
+setup of both threads (the submitter's trace and the worker's lane) to 1,024 B per trace.
 
 Promise 3: a tick costs less than half a clock read, so it reads no clock. The static form adds
-the `ThreadLocal` read. A step is always timed, so a step the trace does not draw costs its two
+the `ThreadLocal` read. Each tick benchmark opens and closes its tick, so a tick that opened a
+frame by mistake would show its clock reads. A step is always timed, so a step the trace does not draw costs its two
 clock reads and an update of its totals, and nothing else.
 
 Promise 4: `span` (through a span handle) is reported beside `spanStatic`; the `ThreadLocal`
@@ -52,28 +62,33 @@ read of the static form is within the noise.
 
 `gc.alloc.rate.norm` per operation, from one `./gradlew jmhGate` run on the machine below. The
 cycling benchmarks start a new trace every `cycle` operations; the gate solves the
-per-operation bytes from two cycle lengths and reports the per-trace setup apart.
+per-operation bytes from two cycle lengths and reports the per-trace setup apart. A trace's
+setup is its `Trace`, its context and its root lane; the lane's arrays come from the thread's
+lanes of earlier traces.
 
 | Benchmark | Measured | Gate |
 |---|---|---|
-| `span`, `spanStatic`, `spanNotInlined`, `run` | 0.0003 B/op (984 B per trace) | 0.01 B/op |
-| `stepDrawn` | 0.0002 B/op (984 B per trace) | 0.01 B/op |
-| `phase` | 0.0002 B/op (2,696 B per trace) | 0.01 B/op |
-| `done` | 0.0001 B/op (2,696 B per trace) | 0.01 B/op |
-| `setLong` | 0.0000 B/op (1,256 B per trace) | 0.01 B/op |
+| `span`, `spanStatic`, `spanNotInlined`, `run` | 0.0002 to 0.0003 B/op (400 B per trace) | 0.01 B/op |
+| `stepDrawn` | 0.0003 B/op (400 B per trace) | 0.01 B/op |
+| `phase` | 0.0002 B/op (400 B per trace) | 0.01 B/op |
+| `done` | 0.0001 B/op (400 B per trace) | 0.01 B/op |
+| `setLong` | 0.0000 B/op (400 B per trace) | 0.01 B/op |
 | `tickUnrecorded`, `tickStatic`, `tickNoTrace` | 0.0000 B/op | 0.01 B/op |
 | `stepUndrawn` | 0.0002 B/op | 0.01 B/op |
 | `folded` | 0.0003 B/op | 0.01 B/op |
 | `add` | 0.0000 B/op | 0.01 B/op |
-| `task` | 48.0002 B/op (984 B per trace) | 48.01 B/op: the one `Task` |
-| `supplierInline` | 48.0004 B/op (1,256 B per trace) | 48.01 B/op: the one `SupplierTask` |
-| `taskInline` | 56.0005 B/op (1,256 B per trace) | 56.01 B/op: the one `RunnableTask` |
-| `callableInline` | 56.0005 B/op (1,256 B per trace) | 56.01 B/op: the one `CallableTask` |
+| `task` | 48.0001 B/op (400 B per trace) | 48.01 B/op: the one `Task` |
+| `supplierInline` | 48.0004 B/op (400 B per trace) | 48.01 B/op: the one `SupplierTask` |
+| `taskInline` | 56.0004 B/op (400 B per trace) | 56.01 B/op: the one `RunnableTask` |
+| `callableInline` | 56.0005 B/op (400 B per trace) | 56.01 B/op: the one `CallableTask` |
 | `taskFolded` | 56.0007 B/op | 56.01 B/op |
 | `taskUndrawn` | 56.0005 B/op | 56.01 B/op |
-| `executorSubmit` | 56.0004 B/op (1,256 B per trace) | 56.01 B/op |
-| `executorCall` | 56.0005 B/op (1,256 B per trace) | 56.01 B/op |
-| `traceLifecycle` | 984 B per trace | 1,024 B |
+| `executorSubmit` | 56.0005 B/op (400 B per trace) | 56.01 B/op |
+| `executorCall` | 56.0005 B/op (400 B per trace) | 56.01 B/op |
+| `executorCallableTask` | 56.0005 B/op (400 B per trace) | 56.01 B/op: the `CallableTask` itself |
+| `across` | 24.0014 B/op (630 B per trace, both threads) | 24.01 B/op; 1,024 B per trace |
+| `acrossUndrawn` | 28.0001 B/op (630 B per trace, both threads) | 28.01 B/op; 1,024 B per trace |
+| `traceLifecycle` | 400 B per trace | 1,024 B |
 | `snapshotToHeader` (300 spans) | 5,304 B per render | 6,144 B |
 | `toHeader` (300 spans) | 22,712 B per render | 24,576 B |
 | `snapshotWriteJson` (300 spans, into a reused builder) | 1,960 B per render | 2,560 B |
@@ -103,25 +118,28 @@ into the same builder; a link limited as a whole also compresses each step with 
 ## Times
 
 Apple M3 Max, macOS, Amazon Corretto 24.0.2, JMH 1.37, one fork, 3 × 1 s warm-up,
-5 × 1 s measurement, `cycle=1000`, 2026-11-19. The ratios in the promise table above come from
-the `./gradlew jmhGate` run of the same day (`baselineNanoTime` 10.2 ns there).
+5 × 1 s measurement, `cycle=1000`, 2026-11-19. The rows `baselineNanoTime`, `span`,
+`spanStatic`, the ticks, `phase`, `done`, `setLong`, `executorCall`, `executorCallableTask`,
+`across`, `acrossUndrawn` and `traceLifecycle` are from a later run of the same day, after the
+review fixes. The ratios in the promise table above come from the `./gradlew jmhGate` run of
+that day (`baselineNanoTime` 10.0 ns there).
 
 | Benchmark | ns/op | Note |
 |---|---|---|
-| `baselineNanoTime` | 10.0 ± 0.1 | one `System.nanoTime()` |
-| `span` | 36.4 ± 3.1 | open + close through a span handle, two clock reads |
-| `spanStatic` | 36.9 ± 6.8 | `Tempo.span(name).close()`: the same, parent found through the `ThreadLocal` |
+| `baselineNanoTime` | 9.8 ± 0.8 | one `System.nanoTime()` |
+| `span` | 36.4 ± 1.6 | open + close through a span handle, two clock reads |
+| `spanStatic` | 37.4 ± 2.6 | `Tempo.span(name).close()`: the same, parent found through the `ThreadLocal` |
 | `spanNotInlined` | 36.4 ± 3.3 | `span` with the open call kept out of line |
 | `run` | 36.4 ± 5.6 | `Tempo.run(name, body)` around an empty body |
 | `stepDrawn` | 36.4 ± 3.5 | a step in a trace that records steps: a row, like a span |
 | `stepUndrawn` | 27.8 ± 4.3 | a step in a trace of spans only: two clock reads and its totals, no row |
 | `folded` | 28.9 ± 1.3 | a step past the budget: two clock reads and an aggregate update |
-| `tickUnrecorded` | 1.39 ± 0.14 | `s.tick(name)` in a trace of spans only: a branch |
-| `tickStatic` | 1.56 ± 0.14 | `Tempo.tick(name)` in a trace of spans only: the `ThreadLocal` read and the branch |
-| `tickNoTrace` | 1.11 ± 0.11 | `Tempo.tick(name)` without a trace |
-| `phase` | 23.4 ± 0.4 | one boundary: the open phase ends and the next starts at one clock read |
-| `done` | 16.4 ± 4.6 | a phase named after the fact, from the last boundary to now |
-| `setLong` | 4.7 ± 0.2 | a long attribute |
+| `tickUnrecorded` | 1.40 ± 0.06 | `s.tick(name)` in a trace of spans only, opened and closed: a branch |
+| `tickStatic` | 1.87 ± 0.06 | `Tempo.tick(name)` in a trace of spans only, opened and closed: the `ThreadLocal` read and the branch |
+| `tickNoTrace` | 1.26 ± 0.02 | `Tempo.tick(name)` without a trace, opened and closed |
+| `phase` | 23.1 ± 1.2 | one boundary: the open phase ends and the next starts at one clock read |
+| `done` | 17.5 ± 0.3 | a phase named after the fact, from the last boundary to now |
+| `setLong` | 3.9 ± 0.3 | a long attribute |
 | `add` | 3.7 ± 0.1 | `s.add(name, nanos)`: a duration into the totals |
 | `task` | 22.1 ± 1.7 | submit side of a drawn task: its record and the one `Task` |
 | `taskInline` | 67.7 ± 19.7 | a drawn `RunnableTask` run on the submitting thread: submit, begin, close |
@@ -130,10 +148,12 @@ the `./gradlew jmhGate` run of the same day (`baselineNanoTime` 10.2 ns there).
 | `taskFolded` | 65.5 ± 15.0 | the same past the budget: no row, the task folded |
 | `taskUndrawn` | 49.5 ± 11.9 | the same in a trace of spans only: no record at the submit, its totals |
 | `executorSubmit` | 68.9 ± 4.7 | `submit(Runnable)` to `Tempo.executor` over a pool that runs it at once |
-| `executorCall` | 67.7 ± 4.5 | `submit(Callable)` to the same |
-| `across` | 152 ± 37 | a drawn task submitted on one thread and begun and closed on another, through a ring; per op of either side |
+| `executorCall` | 71.6 ± 3.2 | `submit(Callable)` to the same |
+| `executorCallableTask` | 69.9 ± 7.1 | `submit` of a `Tempo.callable` task to the same: the task itself goes to the pool |
+| `across` | 156 ± 40 | a drawn task submitted on one thread and begun and closed on another, through a ring; per op of either side |
+| `acrossUndrawn` | 152 ± 47 | an undrawn `RunnableTask` submitted on one thread and run on another, through a ring; per op of either side |
 | `cpuTime` | 474 ± 47 | one read of the thread's CPU time, as taken at lane roots and by `Span.cpu()` |
-| `traceLifecycle` | 102 ± 6 | start, close, release; the root starts as `trace` is entered, so its time includes this setup |
+| `traceLifecycle` | 99 ± 7 | start, close, release; the root starts as `trace` is entered, so its time includes this setup |
 | `snapshotToHeader` | 14,829 ± 1,761 | encoder alone, 300 spans |
 | `snapshotToHeaderLadder` | 47,118 ± 894 | the same under 1,000 bytes: the value read back, the largest group (the root's 30 children) folded, re-encoded |
 | `snapshotToLinkLadder` | 90,054 ± 7,929 | a link of at most 1,000 bytes: each step also compressed |
