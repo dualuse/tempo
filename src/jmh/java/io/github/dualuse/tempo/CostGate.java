@@ -24,7 +24,10 @@ import java.util.TreeMap;
  * <p>Allocation is {@code gc.alloc.rate.norm}. A cycling benchmark pays a fixed per-trace setup every
  * {@code cycle} operations, so its B/op is {@code perOp + setup / cycle}. The gate applies to {@code
  * perOp}, solved from the two cycle lengths; the setup is reported, and {@code traceLifecycle} is held to
- * a ceiling of its own.
+ * a ceiling of its own. Each B/op is the lowest of the measurement iterations: an allocation per
+ * operation shows in every iteration, while the JVM's own one-off allocations (a few hundred bytes, seen
+ * in the thread's allocation counter of a loop that allocates nothing) land in one and would otherwise
+ * be read as per-trace setup at the shorter cycle.
  *
  * <p>Time is gated only as a ratio to {@link TempoBenchmark#baselineNanoTime()}, one {@code
  * System.nanoTime()}, measured in the same run on the same machine: absolute times differ between
@@ -215,7 +218,7 @@ public final class CostGate {
 
     private static double allocNorm(RunResult r) {
         for (Map.Entry<String, Result> e : r.getSecondaryResults().entrySet())
-            if (e.getKey().endsWith("gc.alloc.rate.norm")) return e.getValue().getScore();
+            if (e.getKey().endsWith("gc.alloc.rate.norm")) return e.getValue().getStatistics().getMin();
         throw new IllegalStateException("no gc.alloc.rate.norm for " + r.getParams().getBenchmark());
     }
 
