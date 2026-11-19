@@ -559,13 +559,13 @@ value, and the link comes out shorter. On the bundled samples the `z.` payload i
 
 | Sample | Value | `z.` payload | Ratio |
 |---|---|---|---|
-| `small` | 895 | 717 | 0.80 |
-| `pipeline` | 1140 | 873 | 0.77 |
-| `diff/before` | 1990 | 1409 | 0.71 |
-| `diff/after` | 2067 | 1492 | 0.72 |
-| `find-healthy` | 2218 | 1532 | 0.69 |
-| `find-saturated` | 2226 | 1580 | 0.71 |
-| `batch/find-01` … `30` | | | 0.69–0.80 |
+| `small` | 902 | 719 | 0.80 |
+| `pipeline` | 1148 | 874 | 0.76 |
+| `diff/before` | 1997 | 1412 | 0.71 |
+| `diff/after` | 2073 | 1490 | 0.72 |
+| `find-healthy` | 2225 | 1532 | 0.69 |
+| `find-saturated` | 2233 | 1583 | 0.71 |
+| `batch/find-01` … `30` | | | 0.70–0.73 |
 
 The link adds the base and `#t=` (28 characters with the default base). Small values
 do not compress: on the golden vectors, values of 27–415 characters give `z.` payloads

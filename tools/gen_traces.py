@@ -3,7 +3,7 @@
 
 Two shapes, both produced by a small discrete-event simulation of thread pools:
 
-  find      GET /search on a request thread with label-after phases
+  find      GET /search on a request thread whose span has the phases
             decode, scale, describe (per-crop "infer" on the cpu pool),
             index (per-collection "query" on the io pool) and rerank
             (per-candidate "load" on the io pool, then per-image "match" on
@@ -16,7 +16,12 @@ Two shapes, both produced by a small discrete-event simulation of thread pools:
             Detail spans beyond --budget fold into aggregates.
 
   pipeline  PUT /video with a 4-stage frame pipeline (read, decode, describe,
-            store) across io and cpu pools, with per-stage aggregates.
+            store) across io and cpu pools, with per-stage aggregates, in the
+            phase pipeline of the request's span.
+
+Phases are records with flag p (FORMAT.md 6.7): sections of the request's span. The
+handoffs and blocking waits are children of the request's span, as a recorder writes
+them, whatever phase they fall in.
 
 Examples:
   gen_traces.py --seed 3 --candidates 48 --saturation 1.2           # header
@@ -293,7 +298,7 @@ def find_trace(seed=1, candidates=40, cpu=4, io=8, saturation=0.5, budget=48, cr
 
     t = int(rng.random() * 300) + 40                        # routing before the first phase
     d = int(lognorm(rng, 6000, 0.4))
-    phases.append(("decode", t, t + d, {"cpu": int(d * 0.93), "attrs": {"bytes": int(lognorm(rng, 180000, 0.6))}}))
+    phases.append(("decode", t, t + d, {"attrs": {"bytes": int(lognorm(rng, 180000, 0.6))}}))
     t += d + 15
     d = int(lognorm(rng, 1500, 0.3))
     phases.append(("scale", t, t + d, {"attrs": {"px": 512 if rng.random() < 0.7 else 768}}))
@@ -410,30 +415,23 @@ def build_find(rng, request_thread, pools, jobs, phases, waits, render, budget, 
 
     busy = sum(e - s for _, s, e, _ in phases) - sum(e - s for p, s, e in waits if ":" not in p)
     root = Span("GET /search", 0, render, 0, cpu=int(busy * 0.9))
-    by_name = {}
     for name, s, e, extra in phases:
-        by_name[name] = root.add(Span(name, s, e - s, None, cpu=extra.get("cpu"), attrs=extra.get("attrs")))
+        root.add(Span(name, s, e - s, None, attrs=extra.get("attrs"), flags="p"))
     for p, s, e in waits:
         if ":" in p:
-            p, child = p.split(":")
-            by_name[p].add(Span(child, s, e - s, None))
+            root.add(Span(p.split(":")[1], s, e - s, None))
         elif e > s:
-            by_name[p].add(Span("await", s, e - s, None, flags="w"))
+            root.add(Span("await", s, e - s, None, flags="w"))
     live = set()
-    left, folded = budget, 0
-    for phase in ("describe", "index", "rerank"):
-        spans = []
-        for p, j in jobs:
-            if p != phase:
-                continue
-            s = handoff_span(j, render, tid)
-            if s is None:
-                continue
-            if "o" in s.flags:
-                live.add(s.thread)
-            spans.append(s)
-        left, f = fold(by_name[phase], spans, left)
-        folded += f
+    spans = []
+    for _, j in jobs:
+        s = handoff_span(j, render, tid)
+        if s is None:
+            continue
+        if "o" in s.flags:
+            live.add(s.thread)
+        spans.append(s)
+    _, folded = fold(root, spans, budget)
     wall = WALL_BASE + seed * 7919
     return to_doc(root, names, wall, folded=folded, live=live)
 
@@ -497,13 +495,12 @@ def pipeline_trace(seed=1, frames=120, cpu=4, io=4, saturation=0.3, budget=32, i
         th.mark(j)
     names, index = th.table()
     root = Span("PUT /video", 0, render, 0)
-    by_name = {}
     for name, s, e, extra in phases:
-        by_name[name] = root.add(Span(name, s, e - s, None, attrs=extra.get("attrs")))
-    by_name["pipeline"].add(Span("await", pstart + 5 + 3 * min(inflight, frames), end - pstart - 3 * min(inflight, frames),
-                                 None, flags="w"))
+        root.add(Span(name, s, e - s, None, attrs=extra.get("attrs"), flags="p"))
+    root.add(Span("await", pstart + 5 + 3 * min(inflight, frames), end - pstart - 3 * min(inflight, frames),
+                  None, flags="w"))
     spans = [handoff_span(j, render, lambda job: index[(job.pool, job.thread)]) for j in jobs]
-    _, folded = fold(by_name["pipeline"], spans, budget)
+    _, folded = fold(root, spans, budget)
     return to_doc(root, names, WALL_BASE + seed * 7919, folded=folded)
 
 
