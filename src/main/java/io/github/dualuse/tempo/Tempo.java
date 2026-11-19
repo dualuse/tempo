@@ -556,7 +556,9 @@ public final class Tempo {
         private Context(int level, boolean listening) {
             id = -1;
             epoch = wall = 0;
-            clock = SYSTEM_CLOCK;
+            // Not Tempo.SYSTEM_CLOCK: this runs in Context's class initializer, which must not start Tempo's,
+            // or Tempo.NOOP would be built while Context.NONE is still null.
+            clock = System::nanoTime;
             cpuClock = null;
             strict = false;
             budget = block = headerBytes = maxLanes = 0;
