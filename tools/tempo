@@ -539,7 +539,7 @@ def normalize_doc(obj):
     threads = obj.get("threads", [])
     if not isinstance(threads, list) or not all(isinstance(t, str) for t in threads):
         raise TempoFormatError("E_JSON", "threads must be a list of strings")
-    threads = [t or "?" for t in threads] or ["?"]
+    threads = threads or ["?"]
     doc["threads"] = threads
     live = obj.get("live", [])
     if not isinstance(live, list):
@@ -595,7 +595,7 @@ def normalize_doc(obj):
             for k, val in attrs.items():
                 if isinstance(val, bool) or not isinstance(val, (int, float)):
                     raise TempoFormatError("E_JSON", "span %d attribute %r is not a number" % (i, k))
-                clean[k or "?"] = val
+                clean[k] = val
             out["attrs"] = clean
         agg = s.get("agg")
         if agg is not None:
@@ -1445,8 +1445,16 @@ def draw_lane(spans, scale, p, rowof=None, names=None, notes=None):
         if s.handoff and not s.agg and not s.not_run and s.wait > 0 and scale.rd(s.start) < c0:
             wa, wc0 = s.start, scale.rd(s.start)
         # the name of a span with phases stands in front of the bar (and its wait),
-        # one space apart, or in the name column when the front has no room
-        front = s.name if (s.phases and not s.agg and not s.not_run) else ""
+        # one space apart, or in the name column when the front has no room; after
+        # it the references of phases too narrow even for a reference of their own
+        phased = s.phases and not s.agg and not s.not_run
+        outside = _outside_refs(s, c0, c1, scale, notes) if phased else []
+        refs = " ".join(outside)
+        front = s.name if phased else ""
+        if front and refs:
+            front += " " + refs
+        elif refs:
+            front = refs
         l0 = wc0 - len(front) - 1 if front else wc0
         in_column = l0 < 0
         lab0 = 0 if in_column else max(0, l0 - 1)
@@ -1472,11 +1480,12 @@ def draw_lane(spans, scale, p, rowof=None, names=None, notes=None):
         cells = rows[r]
         failed = "f" in s.flags
         if front:
+            name = s.name if phased else ""
             if in_column:
-                names[r] = (front, "fail_lbl" if failed else "lbl")
+                names[r] = (name, refs, "fail_lbl" if failed else "lbl")
             else:
                 for i, ch in enumerate(front):
-                    cells[l0 + i] = (ch, "fail_lbl" if failed else "lbl")
+                    cells[l0 + i] = (ch, "fail_lbl" if failed else ("lbl" if i < len(name) else "ref"))
         if s.not_run:
             for c in range(c0, c1):
                 cells[c] = (g["wait"], "wait")
@@ -1512,6 +1521,33 @@ def draw_lane(spans, scale, p, rowof=None, names=None, notes=None):
     return rows
 
 
+def _phase_cells(s, c0, c1, scale):
+    """The phases of span `s`, drawn over cells [c0, c1), in start order, each with the
+    cells [a, b] of its boundaries."""
+    out = []
+    for ph in sorted(s.phases, key=lambda ph: (ph.start, ph.id)):
+        a = min(c1 - 1, max(c0, scale.rd(ph.start)))
+        b = min(c1 - 1, max(c0, scale.rd(ph.start + ph.dur)))
+        out.append((ph, a, b))
+    return out
+
+
+def _outside_refs(s, c0, c1, scale, notes):
+    """The references of the named phases of `s` whose sections are too narrow even
+    for a reference: they stand after the span's name, in front of the bar or in the
+    name column. A bar of one cell has no room for any phase. Numbers the references
+    of every phase too narrow for its name."""
+    out = []
+    for ph, a, b in _phase_cells(s, c0, c1, scale):
+        inside = b - a - 1 if c1 - c0 > 1 else -1
+        if not ph.name or len(ph.name) <= inside:
+            continue
+        ref = notes.ref(ph.name)  # numbered here, so in phase order, for _bar too
+        if len(ref) > inside and ref not in out:
+            out.append(ref)
+    return out
+
+
 def _bar(cells, s, c0, c1, scale, p, notes):
     """The box-plot bar of a span over cells [c0, c1), with its phases or its name."""
     g = p.g
@@ -1525,16 +1561,14 @@ def _bar(cells, s, c0, c1, scale, p, notes):
     fill = g["wbar"] if blocking else g["bar"]
     cells[c0] = (g["bar_l"], st)
     cells[c1 - 1] = (g["bar_r"], st)
-    phases = sorted(s.phases, key=lambda ph: (ph.start, ph.id))
+    phases = _phase_cells(s, c0, c1, scale)
     for c in range(c0 + 1, c1 - 1):
         cells[c] = (g["unphased"], "unphased") if phases else (fill, st)
     if not phases:
         if s.name:
             _centre(cells, c0 + 1, c1 - 1, s.name, lst, g)
         return
-    for ph in phases:
-        a = min(c1 - 1, max(c0, scale.rd(ph.start)))
-        b = min(c1 - 1, max(c0, scale.rd(ph.start + ph.dur)))
+    for ph, a, b in phases:
         pst = "fail" if "f" in ph.flags else "phase"
         for c in (a, b):
             if c0 < c < c1 - 1:
@@ -1543,10 +1577,10 @@ def _bar(cells, s, c0, c1, scale, p, notes):
             cells[c] = (g["bar"], pst)
         if ph.name and not _centre(cells, a + 1, b, ph.name, "fail_lbl" if pst == "fail" else "phase_lbl", g,
                                    cut=False):
-            # a phase too narrow even for a reference stays unnamed at this width
-            ref = notes.refs.get(ph.name) or "*%d" % (len(notes.order) + 1)
-            if len(ref) <= b - a - 1:
-                _centre(cells, a + 1, b, notes.ref(ph.name), "fail_lbl" if pst == "fail" else "ref", g)
+            # a phase too narrow even for its reference has it in front (_outside_refs)
+            ref = notes.refs.get(ph.name)
+            if ref and len(ref) <= b - a - 1:
+                _centre(cells, a + 1, b, ref, "fail_lbl" if pst == "fail" else "ref", g)
 
 
 def _centre(cells, a, b, text, style, g, cut=True):
@@ -1620,8 +1654,10 @@ def view_lanes(trace, flt, p, width):
     lw = min(max([len(x) for x in labels] + [8]) + 2, max(10, width // 4))
     # the name column, between the lane labels and the time axis, holds the names of
     # spans with phases that start too near the left edge to have their name in front
+    # each pass may widen the column, which narrows the time axis; the last pass draws
+    # at the column's final width, and a name that then needs more is shortened
     nw = 0
-    for _ in range(3):
+    for last in (False, False, False, True):
         scale = Scale(t0, t1, max(10, width - lw - nw))
         notes = Notes()
         drawn = {}
@@ -1629,9 +1665,10 @@ def view_lanes(trace, flt, p, width):
             for k in keys:
                 names = {}
                 drawn[k] = (draw_lane(by_lane.get(k, []), scale, p, names=names, notes=notes), names)
-        need = max([len(t) for _, names in drawn.values() for t, _ in names.values()] or [0])
+        need = max([len(_column_text(t, r)) for _, names in drawn.values() for t, r, _ in names.values()]
+                   or [0])
         want = min(need + 1, max(6, width // 6)) if need else 0
-        if want <= nw:
+        if last or want <= nw:
             break
         nw = want
     cw = scale.w
@@ -1657,8 +1694,8 @@ def view_lanes(trace, flt, p, width):
                 head = (lab if i == 0 else "").ljust(lw)
                 line = pad(p, head, lw, "live" if (live and i == 0) else None)
                 if nw:
-                    text, st = names.get(i, ("", None))
-                    line += pad(p, fit(text, nw - 1, g), nw, st)
+                    text, refs, st = names.get(i, ("", "", None))
+                    line += _column(p, text, refs, nw, st)
                 out.append(line + p.cells(cells))
         if grouped:
             act = pool_activity(trace, [s for s in spans if s.pool == pool], scale)
@@ -1691,6 +1728,23 @@ def view_lanes(trace, flt, p, width):
     out.extend(legend_lines(items, width, p))
     out.extend(notices(trace, p, width))
     return out
+
+
+def _column_text(name, refs):
+    return name + " " + refs if name and refs else name or refs
+
+
+def _column(p, name, refs, n, style):
+    """A name in the name column, n wide: the span's name, shortened if need be, then
+    whole the references of its phases too narrow to hold one."""
+    if not refs:
+        return pad(p, fit(name, n - 1, p.g), n, style)
+    room = n - 1 - len(refs) - (1 if name else 0)
+    if name and room < 1:
+        name, room = "", n - 1 - len(refs)
+    head = fit(name, room, p.g) + " " if name else ""
+    refs = refs[:max(0, n - 1 - len(head))]
+    return p.c(head.rstrip(" "), style) + (" " if head else "") + pad(p, refs, n - len(head), "ref")
 
 
 def _short(v):
@@ -2762,7 +2816,8 @@ lanes:
   |-init-|--- loading ---|, with the span's name in front of the bar, or in a
   name column left of the time axis when the bar starts at the left edge;
   unphased time is dots. A phase too narrow for its name shows *1, named
-  below the chart. An unnamed span is labelled by its phases only, as
+  below the chart; one too narrow even for that has its *1 after the span's
+  name. An unnamed span is labelled by its phases only, as
   (open|copy) in the other views. --tree lists a phase as :name under its
   span, the per-path tables as span:name (:name for the root), with its
   start and duration only: it has no self time and no children. The critical

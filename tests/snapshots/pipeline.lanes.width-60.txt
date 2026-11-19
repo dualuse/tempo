@@ -3,7 +3,7 @@ PUT /video  ·  790.221 ms  ·  2026-11-13 09:00:39.595 UTC
                       ms 0                     500
                          ┬─────────────────────┬────────────
 http
-  http-10      PUT /vid… ├─┼────────── pipeline ───────────┤
+  http-10      *1 *2 *3  ├─┼────────── pipeline ───────────┤
                            ├╌╌╌╌╌╌╌╌╌╌╌╌ await ╌╌╌╌╌╌╌╌╌╌╌╌┤
 cpu
   cpu-1                    ░│
@@ -39,9 +39,12 @@ io
 (pool unknown)
   (mixed)                   store ×120▚▚▚▚▚▚▚▚▚▚▚┃▚▚▚▚▚▚▚▚▚▚
 
-├─┤ span  ┼ phase boundary  ·· unphased time  ░ queue wait
-├╌┤ blocking wait  ▚ aggregate ×count, ┃ slowest  ✗ failed
-⊘ cancelled  ▶ open  ∅ never started  ● live lane
+*1 upload  *2 probe  *3 commit
+
+├─┤ span  ┼ phase boundary  ·· unphased time
+*1 phase named below  ░ queue wait  ├╌┤ blocking wait
+▚ aggregate ×count, ┃ slowest  ✗ failed  ⊘ cancelled  ▶ open
+∅ never started  ● live lane
 ▄ this request's queued handoffs
 x=: 456 spans folded into aggregates, 0 dropped (not on the
     wire)

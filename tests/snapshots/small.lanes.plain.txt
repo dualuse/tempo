@@ -1,26 +1,27 @@
 GET /search  ·  48.675 ms  ·  2026-11-13 09:00:55.433 UTC  ·  20 spans and 6 phases on 9 threads
-                        ms 0                10               20               30               40
-                           ┬────────────────┬────────────────┬────────────────┬────────────────┬──────────────
+                           ms 0               10              20               30              40
+                              ┬───────────────┬───────────────┬────────────────┬───────────────┬──────────────
 http
-  http-6       GET /search ├─ decode ──┼*1┼───────── describe ─────────┼index─┼────────── rerank ──────────┼─┤
-                                          ├╌╌╌╌╌╌╌╌╌ await ╌╌╌╌╌╌╌╌╌╌┤ ├await┤
-                                                                      │       ├╌╌╌╌╌╌╌╌ await ╌╌╌╌╌╌╌╌┤
+  http-6       GET /search *2 ├─ decode ──┼*1┼──────── describe ─────────┼index┼───────── rerank ──────────┼─┤
+                                             ├╌╌╌╌╌╌╌╌╌ await ╌╌╌╌╌╌╌╌╌┤ ├awa…┤
+                                                                        │      ├╌╌╌╌╌╌╌╌ await ╌╌╌╌╌╌╌╌┤
 cpu
-  cpu-1                                                                         ├match┤    ├match┤
-  cpu-2                                   ├───────── infer ──────────┤           ├match─┤   ├─ match ─┤
-  cpu-3                                                                            ├mat…┤
-  cpu-4                                                                             ├mat…┤
+  cpu-1                                                                          ├match┤    ├mat…┤
+  cpu-2                                      ├───────── infer ─────────┤           ├mat…┤    ├─ match ─┤
+  cpu-3                                                                             ├mat…┤
+  cpu-4                                                                              ├ma…┤
 io
-  io-1                                                                        ├─┤
-                                                                              ░░░├─┤
-  io-2                                                                 ├que…┤ ├lo…┤
-  io-3                                                                 ├query┤
-                                                                              ├─── load ───┤
-  io-4                                                                        ├┤
-                                                                              ░░├─ load ──┤
-  queued ≤2                                                                   ██▅▃
+  io-1                                                                         ├──┤
+                                                                               ░░░░├┤
+  io-2                                                                   ├que…┤
+                                                                               ├lo…┤
+  io-3                                                                   ├que…┤
+                                                                               ├─── load ───┤
+  io-4                                                                         ├┤
+                                                                               ░░├─ load ──┤
+  queued ≤2                                                                    ▇█▅▃
 
-*1 scale
+*1 scale  *2 encode
 
 ├─┤ span  ┼ phase boundary  ·· unphased time  *1 phase named below  ░ queue wait  ├╌┤ blocking wait
 ▚ aggregate ×count, ┃ slowest  ✗ failed  ⊘ cancelled  ▶ open  ∅ never started  ● live lane

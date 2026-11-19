@@ -1,54 +1,53 @@
 GET /search  ·  87.728 ms  ·  2026-11-13 09:01:27.109 UTC  ·  57 spans and 6 phases on 17 threads
-                        ms 0                 20                 40                 60                 80
-                           ┬─────────────────┬──────────────────┬──────────────────┬──────────────────┬───────
+                              ms 0                20                40               60                80
+                                 ┬────────────────┬─────────────────┬────────────────┬─────────────────┬──────
 http
-  http-8       GET /search ├*1─┼┼──── describe ─────┼─── index ────┼──────────────── rerank ─────────────────┤
-                                ├╌╌╌╌╌ await ╌╌╌╌╌┤ ├╌╌╌ await ╌╌╌┤
-                                                   │               ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ await ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+  http-8       GET /search *2 *3 ├*1┼─┼─── describe ────┼─── index ────┼────────────── rerank ───────────────┤
+                                      ├╌╌╌╌ await ╌╌╌╌╌┤               ├╌╌╌╌╌╌╌╌╌╌╌╌╌ await ╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+                                                        │
+                                                        ├╌╌ await ╌╌╌┤
 cpu
-  cpu-1                                                               ░├─┤
-                                                                      ░░░░├─┤
-                                                                          ░░░├─┤
-  cpu-2                                                              ├ma…┤
-                                                                        ░░├──┤
-                                                                          ░░░░├ma…┤
-  cpu-3                         ├───── infer ─────┤
+  cpu-1                                                                  ░├┤
+                                                                         ░░░├──┤
+                                                                            ░░░░├┤
+  cpu-2                                                                 ├──┤
+                                                                           ░├ma…┤
+                                                                            ░░░░░├──┤
+  cpu-3                               ├──── infer ─────┤
   cpu-4
-  cpu-5                                                              ░░├─┤
-                                                                         ░├match─┤
-  cpu-6                                                             ├──┤
-                                                                      ░░├──┤
-  cpu-7                                                              ├ma…┤
-                                                                       ░░░├──┤
-                                                                          ░░░░├──┤
-  cpu-8                                                              ├ma…┤
-                                                                        ░░├─┤
-                                                                         ░░░░├ma…┤
-  (mixed)                                                                 ▚▚▚▚▚▚▚▚▚┃match ×30▚▚▚▚▚▚▚▚▚▚▚▚▚
-  queued ≤13.1                                                       ▁▃▂▄▄███▇▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▄
+  cpu-5                                                                 ░░├─┤
+                                                                           ░░├match┤
+  cpu-6                                                                ├──┤
+                                                                         ░░├──┤
+  cpu-7                                                                 ├──┤ ░░░░├─┤
+                                                                          ░░├ma…┤
+  cpu-8                                                                 ├ma…┤
+                                                                           ░░├┤
+                                                                            ░░░├ma…┤
+  (mixed)                                                                    ▚▚▚▚▚▚▚▚┃match ×30▚▚▚▚▚▚▚▚▚▚▚
+  queued ≤13.1                                                         ▁▁▃▃▄▅███▇▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▅
 io
-  io-1                                              ├─── query ───┤  ├┤
-                                                                   ├┤ ░├─ load ──┤
-  io-2                                              ├─┤            ├┤  ░├load┤
-                                                                   ░░├─┤
-  io-3                                              ├query┤        ├─┤  ░├┤   ░░├─✗
-                                                                     ░├─┤
-  io-4                                              ├que…┤         ├─┤  ├┤
-                                                                     ░├✗  ├ load ─┤
-  io-5                                              ├─┤            ├─┤   ░├─┤
-                                                                     ░├──┤
-  io-6                                                             ├┤ ░├┤
+  io-1                                                  ├── query ───┤ │ ░├─ load ─┤
+                                                                        ├┤
+  io-2                                                  ├─┤            │  ░├lo…┤
+                                                                       ░├─┤
+  io-3                                                  ├query┤        ├┤  ░├┤   ░├─✗
                                                                         ░├─┤
-  io-7                                                             │  ░░├┤
-                                                                   ░│     ├─┤
-                                                                    ░├─┤
-  io-8                                                             ├load─┤
-                                                                         ░│
-                                                                          │
-  (mixed)                                                                 ▚▚┃load ×20▚
-  queued ≤3                                                        ▃▆█▇▆▆▆▆▅▅▅▇▇▅▅▅▅▅▅▂
+  io-4                                                  ├que…┤         ├┤  ├┤
+                                                                        ░├✗ ░├ load ┤
+  io-5                                                  ├─┤            ├┤  ░├─┤
+                                                                        ░├─┤
+  io-6                                                                 │ ├┤
+                                                                           ├─┤
+  io-7                                                                 │ ░░├┤
+                                                                       │    ░├┤
+                                                                       ░├─┤
+  io-8                                                                 ├lo…┤ │
+                                                                            │
+  (mixed)                                                                    ▚▚┃load ×…▚
+  queued ≤3                                                           ▃▆█▇▆▆▆▅▅▅▆▇▅▅▅▅▅▅
 
-*1 decode
+*1 decode  *2 scale  *3 encode
 
 ├─┤ span  ┼ phase boundary  ·· unphased time  *1 phase named below  ░ queue wait  ├╌┤ blocking wait
 ▚ aggregate ×count, ┃ slowest  ✗ failed  ⊘ cancelled  ▶ open  ∅ never started  ● live lane

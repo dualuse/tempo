@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -431,6 +432,22 @@ class LinkInput(unittest.TestCase):
                 self.assertEqual(tempo_ref.decode_link(url).value,
                                  tempo_ref.strip_ws(read(os.path.join(GOLDEN, name + ".header"))))
 
+    def test_empty_names_survive_a_round_trip_through_json(self):
+        header = "v1;T=:w;N=a:b:;S=00.0.5/11.1.2@1:2=7;e=2"
+        code, out, err = cli(["--to", "json"], stdin=header)
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out)
+        self.assertEqual(doc["threads"], ["", "w"])
+        self.assertEqual(doc["spans"][1]["attrs"], {"": 7})
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            fh.write(out)
+        try:
+            code, url, err = cli(["--to", "link", fh.name])
+        finally:
+            os.unlink(fh.name)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(tempo_ref.decode_link(url).value, header)
+
     def test_to_link_base(self):
         code, url, err = cli(["--to", "link", "--base", "http://localhost:8000/tempo/",
                               os.path.join(SAMPLES, "small.header")])
@@ -720,10 +737,10 @@ class Drawing(unittest.TestCase):
             "                               |-- scan --|            |parse-|*1-|",
             "                                       sync | push |",
             "pool",
-            "  pool-1                      fetch __|-|----- read ------|..........|",
+            "  pool-1                   fetch *2 __|-|----- read ------|..........|",
             "  queued <=1                        @@=",
             "",
-            "*1 check",
+            "*1 check  *2 open",
             "",
             "|-| span  | phase boundary  .. unphased time  *1 phase named below",
             "_ queue wait  |~| blocking wait  % aggregate xcount, # slowest  X failed",
@@ -738,21 +755,38 @@ class Drawing(unittest.TestCase):
             "                              ├── scan ───┤            ├parse─┼*1─┤",
             "                                       sync ├push─┤",
             "pool",
-            "  pool-1                     fetch ░░░├┼───── read ──────┼···········┤"])
+            "  pool-1                  fetch *2 ░░░├┼───── read ──────┼···········┤"])
 
     def test_narrow(self):
         # the name column keeps at most a sixth of the width; more phases need
-        # references, numbered as they are drawn; a phase too narrow even for a
-        # reference (check, open) stays unnamed
-        self.assertEqual(self.lanes("--width", "40").splitlines()[4:12], [
-            "main      star… ├─┼─ loading ─┼warm-up┼┤",
-            "                    ├scan┤      ├*2┼─┤",
-            "                     sync ├*1┤",
+        # references, numbered in phase order; a phase too narrow even for its
+        # reference (init, check, open) has it after its span's name, in front of
+        # the bar or in the name column, which shortens the name, not the references
+        self.assertEqual(self.lanes("--width", "40").splitlines()[4:13], [
+            "main      s… *1 ├─┼─ loading ─┼warm-up┼┤",
+            "                    ├scan┤   *4 ├*3┼─┤",
+            "                     sync ├*2┤",
             "pool",
-            "  pool-1        fetch ░├┼─ read ─┼····┤",
+            "  pool-1  f… *5       ░├┼─ read ─┼····┤",
             "  queued…             █▂",
             "",
-            "*1 push  *2 parse"])
+            "*1 init  *2 push  *3 parse  *4 check",
+            "*5 open"])
+
+    def test_every_named_phase_is_named_or_referenced(self):
+        # at any width each named phase shows its name or a reference that the
+        # footnote resolves, in the bar or after its span's name
+        for width in range(30, 120, 7):
+            for glyphs in ((), ("--ascii",)):
+                out = self.lanes("--width", str(width), *glyphs)
+                foot = dict(re.findall(r"(\*\d+) (\S+)", out.split("\n\n")[1]))
+                shown = set(foot.values())
+                for word in re.findall(r"[a-z]+(?:-[a-z]+)*", out.split("\n\n")[0]):
+                    shown.add(word)
+                with self.subTest(width=width, glyphs=glyphs):
+                    for name in ("init", "loading", "warm-up", "scan", "push", "parse", "check",
+                                 "read", "open"):
+                        self.assertIn(name, shown)
 
     def test_no_name_column_without_need(self):
         # a root without phases has its name in its bar; stage, with phases, has room
