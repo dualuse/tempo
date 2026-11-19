@@ -12,8 +12,8 @@ const TempoParse = (function () {
   const BAD_CHAR_RE = /[^0-9A-Za-z.\/:;=@~*+^_%-]/;
   const PURE_RE = /^[0-9A-Za-z.\/:;=@~*+^_%-]+$/;
   const WS_RE = /[\t\n\x0b\x0c\r ]/g;
-  const FLAG_ORDER = "fconwm";
-  const FLAG_NAMES = { f: "failed", c: "cancelled", o: "open", n: "never started", w: "blocking wait", m: "misuse healed" };
+  const FLAG_ORDER = "fconwmp";
+  const FLAG_NAMES = { f: "failed", c: "cancelled", o: "open", n: "never started", w: "blocking wait", m: "misuse healed", p: "phase" };
   const MAX_DEPTH = 35;
   const RECORD_RE = /^([0-9a-z])([0-9a-z]+)\.([0-9a-z]+)\.([0-9a-z]+)(?:@([0-9a-z]+|_))?(?:~([0-9a-z]+)(?:\.([0-9a-z]+))?)?(?:\*([0-9a-z]+))?(?:\+([0-9a-z]+)\.([0-9a-z]+)\.([0-9a-z]+)\.([0-9a-z]+)\.([0-9a-z]+))?(?:\^([a-z]+))?((?::[0-9a-z]+=-?[0-9]+(?:\.[0-9]+)?)*)$/;
   const ATTR_RE = /:([0-9a-z]+)=(-?[0-9]+(?:\.[0-9]+)?)/g;
@@ -29,9 +29,9 @@ const TempoParse = (function () {
     E_NAME: "Bad name",
     E_RECORD: "A record does not match the record expression",
     E_INDEX: "Name, thread, attribute-key or l= index out of range",
-    E_ROOT: "First record not a plain depth-0 record, or a second root",
+    E_ROOT: "First record not a plain depth-0 record (with @, ~, + or flag p), or a second root",
     E_DEPTH: "Depth grows by more than one",
-    E_FLAG: "Unknown flag",
+    E_FLAG: "Unknown flag, or a phase where none can be",
     E_AGG: "Aggregate rules broken",
     E_INPUT: "No Tempo trace found in the input",
     E_JSON: "JSON form is not a valid trace",
@@ -64,7 +64,7 @@ const TempoParse = (function () {
 
   let utf8Decoder = null;
   function decodeName(text) {
-    if (!text) fail("E_NAME", "empty name");
+    if (!text) return "";   // the empty name: an unnamed span
     if (!NAME_RE.test(text)) fail("E_NAME", "bad name " + JSON.stringify(text));
     const bytes = [];
     for (let i = 0; i < text.length;) {
@@ -81,7 +81,7 @@ const TempoParse = (function () {
   }
 
   function encodeName(name) {
-    if (name === null || name === undefined || name === "") name = "?";
+    if (name === null || name === undefined) name = "?";
     const bytes = new TextEncoder().encode(String(name));
     let out = "";
     for (const b of bytes) {
@@ -189,21 +189,24 @@ const TempoParse = (function () {
     const cur = new Array(MAX_DEPTH + 2).fill(0);
     const path = new Array(MAX_DEPTH + 1).fill(null);
     let prevDepth = -1;
-    let prevAgg = false;
+    let prevAgg = false, prevPhase = false;
     records.forEach(function (rec, i) {
       const m = RECORD_RE.exec(rec);
       if (!m) fail("E_RECORD", "record " + i + " " + JSON.stringify(rec) + " is malformed");
       const depth = parseInt(m[1], 36);
       const thrS = m[5], waitS = m[6], wmaxS = m[7], cpuS = m[8], flagsS = m[14], attrsS = m[15];
       const isAgg = m[9] !== undefined;
+      const isPhase = flagsS !== undefined && flagsS.indexOf("p") >= 0;
       if (i === 0) {
         if (depth !== 0) fail("E_ROOT", "first record has depth " + depth);
         if (thrS !== undefined || waitS !== undefined || isAgg) fail("E_ROOT", "root record carries @, ~ or +");
         if (parseInt(m[3], 36) !== 0) fail("E_ROOT", "root startDelta is not 0");
+        if (isPhase) fail("E_ROOT", "root record is a phase");
       } else {
         if (depth === 0) fail("E_ROOT", "record " + i + " is a second root");
         if (depth > prevDepth + 1) fail("E_DEPTH", "record " + i + " jumps from depth " + prevDepth + " to " + depth);
         if (prevAgg && depth > prevDepth) fail("E_AGG", "record " + i + " is a child of an aggregate");
+        if (prevPhase && depth > prevDepth) fail("E_FLAG", "record " + i + " is a child of a phase");
       }
       const nameIdx = parseInt(m[2], 36);
       if (nameIdx >= names.length) fail("E_INDEX", "record " + i + " name index " + nameIdx + " out of range");
@@ -230,6 +233,7 @@ const TempoParse = (function () {
       if (cpuS !== undefined) span.cpu = parseInt(cpuS, 36);
       if (flagsS !== undefined) {
         for (const f of flagsS) if (FLAG_ORDER.indexOf(f) < 0) fail("E_FLAG", "record " + i + ": unknown flag " + JSON.stringify(f));
+        if (isPhase && (isAgg || waitS !== undefined || flagsS.indexOf("n") >= 0)) fail("E_FLAG", "record " + i + ": a phase with +, ~ or n");
         span.flags = FLAG_ORDER.split("").filter(function (f) { return flagsS.indexOf(f) >= 0; }).join("");
       }
       if (attrsS) {
@@ -256,6 +260,7 @@ const TempoParse = (function () {
       path[depth] = span;
       prevDepth = depth;
       prevAgg = isAgg;
+      prevPhase = isPhase;
       spans.push(span);
     });
     return spans;
@@ -276,6 +281,7 @@ const TempoParse = (function () {
     doc.threads = threads;
     doc.live = Array.isArray(input.live) ? input.live.filter(isInt) : [];
     doc.truncated = input.truncated === true;
+    const out = [];
     doc.spans = input.spans.map(function (s, i) {
       if (!s || typeof s !== "object") fail("E_JSON", "span " + i + " is not an object");
       if (s.id !== i) fail("E_JSON", "span " + i + " has id " + s.id + " (ids must equal the array index)");
@@ -300,6 +306,11 @@ const TempoParse = (function () {
         if (isInt(g.waitSum) && isInt(g.waitMax)) { agg.waitSum = g.waitSum; agg.waitMax = g.waitMax; }
         o.agg = agg;
       }
+      // phases (FORMAT.md §6.7): never the root, never the parent of anything, never a handoff or an aggregate
+      const flags = o.flags || "";
+      if (flags.indexOf("p") >= 0 && (i === 0 || o.agg || o.wait !== undefined || flags.indexOf("n") >= 0)) fail("E_JSON", "span " + i + " cannot be a phase");
+      if (i > 0 && (out[s.parent].flags || "").indexOf("p") >= 0) fail("E_JSON", "span " + i + " is a child of a phase");
+      out.push(o);
       return o;
     });
     if (!doc.spans.length) fail("E_JSON", "a trace needs at least the root span");
@@ -320,6 +331,7 @@ const TempoParse = (function () {
         while (stack.length && stack[stack.length - 1] !== s.parent) stack.pop();
         if (!stack.length) throw new Error("span " + i + ": parent " + s.parent + " is not on the current path");
         if (spans[s.parent].agg) throw new Error("span " + i + ": an aggregate cannot have children");
+        if ((spans[s.parent].flags || "").indexOf("p") >= 0) throw new Error("span " + i + ": a phase cannot have children");
         depthOf[i] = depthOf[s.parent] + 1;
         if (depthOf[i] > MAX_DEPTH) throw new Error("span " + i + " deeper than " + MAX_DEPTH);
       }
@@ -327,7 +339,7 @@ const TempoParse = (function () {
       threadOf[i] = s.thread;
     });
     const nameIdx = new Map();
-    const nm = function (n) { return n === null || n === undefined || n === "" ? "?" : n; };
+    const nm = function (n) { return n === null || n === undefined ? "?" : n; };
     for (const s of spans) if (!nameIdx.has(nm(s.name))) nameIdx.set(nm(s.name), nameIdx.size);
     for (const s of spans) for (const k of Object.keys(s.attrs || {})) if (!nameIdx.has(nm(k))) nameIdx.set(nm(k), nameIdx.size);
 

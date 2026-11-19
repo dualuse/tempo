@@ -113,6 +113,33 @@ for (const p of samples) {
   check("sample " + p, same(got, want), firstDiff(got, want));
 }
 
+// ---------------------------------------------------------------- phases and unnamed spans
+{
+  check("flag set is fconwmp", P.FLAG_ORDER === "fconwmp" && P.FLAG_NAMES.p === "phase");
+  const d = P.decode("v1;T=a:;N=r::x;S=00.0.k/11.0.5/22.0.2^p/21.2.3^p;e=4");
+  check("empty name in N= and T= decodes to \"\"", d.threads[1] === "" && d.spans[1].name === "" && d.spans[2].name === "x", JSON.stringify(d));
+  check("empty name re-encodes as an empty entry", P.encode(d) === "v1;T=a:;N=r::x;S=00.0.k/11.0.5/22.0.2^p/21.2.3^p;e=4", P.encode(d));
+  check("a null name is still written ?", P.encodeName(null) === "%3F" && P.encodeName("") === "");
+  check("flags normalise with p last", P.decode("v1;T=a;N=r:x;S=00.0.k/11.0.5^pf;e=2").spans[1].flags === "fp");
+  const rules = [
+    ["p on the root", "v1;T=a;N=r;S=00.0.k^p;e=1", "E_ROOT"],
+    ["p with ~", "v1;T=a;N=r:x;S=00.0.k/11.0.5~1^p;e=2", "E_FLAG"],
+    ["p with +", "v1;T=a;N=r:x;S=00.0.k/11.0.5+2.1.4.5.0^p;e=2", "E_FLAG"],
+    ["p with n", "v1;T=a;N=r:x;S=00.0.k/11.0.5^np;e=2", "E_FLAG"],
+    ["a child of a phase", "v1;T=a;N=r:x;S=00.0.k/11.0.5^p/21.0.1;e=3", "E_FLAG"],
+    ["a phase of a phase", "v1;T=a;N=r:x;S=00.0.k/11.0.5^p/21.0.1^p;e=3", "E_FLAG"],
+    ["a truncated child of a phase is not looked at", "v1;T=a;N=r:x;S=00.0.k/11.0.5^p/21.0.1", null]
+  ];
+  for (const [label, value, code] of rules) check("phase rule: " + label, codeOf(() => P.decode(value)) === code, "got " + codeOf(() => P.decode(value)));
+  const base = { v: 1, threads: ["a"] };
+  const js = (spans) => codeOf(() => P.normalizeJson(Object.assign({ spans: spans }, base)));
+  const r = { id: 0, parent: -1, name: "r", start: 0, dur: 10, thread: 0 };
+  check("JSON: a phase root is E_JSON", js([Object.assign({}, r, { flags: "p" })]) === "E_JSON");
+  check("JSON: a child of a phase is E_JSON", js([r, { id: 1, parent: 0, name: "x", start: 0, dur: 5, thread: 0, flags: "p" }, { id: 2, parent: 1, name: "y", start: 0, dur: 1, thread: 0 }]) === "E_JSON");
+  check("JSON: a phase handoff is E_JSON", js([r, { id: 1, parent: 0, name: "x", start: 0, dur: 5, thread: 0, wait: 1, flags: "p" }]) === "E_JSON");
+  check("JSON: phases and unnamed spans are fine", js([r, { id: 1, parent: 0, name: "", start: 0, dur: 5, thread: 0 }, { id: 2, parent: 1, name: "x", start: 0, dur: 5, thread: 0, flags: "p" }]) === null);
+}
+
 // ---------------------------------------------------------------- input extraction
 const example = P.stripWs(read("testdata/golden/search-example.header"));
 const exampleDoc = JSON.parse(read("testdata/golden/search-example.json"));

@@ -62,6 +62,12 @@ for (const p of ALL) {
   for (const s of m.spans) {
     if (s.self < 0 || s.self > s.dur) bad = "span " + s.id + " self " + s.self + " outside 0.." + s.dur;
     if (A.has(s, "w") && s.self !== 0) bad = "blocking span " + s.id + " has self " + s.self;
+    if (s.isPhase) {
+      // a phase is no tree child: no self time, no children, no row of its own
+      if (s.self !== 0 || s.children.length || s.phases.length || s.parent.children.includes(s) || !s.parent.phases.includes(s) || s.row !== s.parent.row) bad = "phase " + s.id + " treated as a child";
+      continue;
+    }
+    if (s.children.some((c) => c.isPhase)) bad = "span " + s.id + " has a phase among its children";
     // a plain span whose same-thread children all lie inside it: self = dur - sum(children)
     const same = s.children.filter((c) => c.thread === s.thread && !c.notRun);
     if (!s.isAgg && !A.has(s, "w") && same.every((c) => c.runStart >= s.runStart && c.runEnd <= s.runEnd)) {
@@ -144,8 +150,8 @@ check("critical path: saturated pool shows more queue wait than healthy", share[
   check("diff deltas are after - before, sorted by |Δsum|", !bad, bad || "");
   const root = rows.find((r) => r.key === "");
   check("diff root delta is the duration change", root && root.dSum === after.root.dur - before.root.dur);
-  const w = (k) => rows.find((r) => r.key === k).dWait;
-  check("diff: splitting the shared pool cuts the queue wait of loads and matches", w("rerank/load") < 0 && w("rerank/match") < 0, w("rerank/load") + " " + w("rerank/match"));
+  const w = (k) => rows.find((r) => r.ref === "span:" + k).dWait;
+  check("diff: splitting the shared pool cuts the queue wait of loads and matches", w("load") < 0 && w("match") < 0, w("load") + " " + w("match"));
   const healthy = load("samples/find-healthy.header"), pipe = load("samples/pipeline.header");
   const cross = A.diff(healthy, pipe);
   check("diff of unrelated traces keeps one-sided paths", cross.some((r) => r.a && !r.b) && cross.some((r) => !r.a && r.b));
@@ -171,8 +177,8 @@ check("critical path: saturated pool shows more queue wait than healthy", share[
     if (r.n > 30 || r.n < 1) bad = r.key + " n=" + r.n;
   }
   check("stats: p50 <= p95 <= max for every path", !bad, bad || "");
-  const match = rows.find((r) => r.key === "rerank/match");
-  const direct = models.map((m) => m.spans.filter((s) => s.key === "rerank/match").reduce((a, s) => a + s.dur, 0)).filter((x, i) => models[i].spans.some((s) => s.key === "rerank/match")).sort((a, b) => a - b);
+  const match = rows.find((r) => r.ref === "span:match");
+  const direct = models.map((m) => m.spans.filter((s) => s.key === "match").reduce((a, s) => a + s.dur, 0)).filter((x, i) => models[i].spans.some((s) => s.key === "match")).sort((a, b) => a - b);
   check("stats: per-path sum matches a direct computation", match && match.sum.max === direct[direct.length - 1] && match.n === direct.length);
   check("stats: one trace gives p50 = p95 = max", A.stats([models[0]]).every((r) => r.sum.p50 === r.sum.max && r.sum.p95 === r.sum.max));
 }
@@ -183,7 +189,8 @@ check("critical path: saturated pool shows more queue wait than healthy", share[
   const sat = kinds("samples/find-saturated.header");
   check("findings: saturated trace reports never-started and open matches and queue waits", sat.includes("never") && sat.includes("open") && sat.includes("wait") && sat.includes("live"), sat.join(","));
   check("findings: healthy trace reports failed loads", kinds("samples/find-healthy.header").includes("failed"));
-  check("findings: stragglers in the split-pool trace", kinds("samples/diff/after.header").includes("straggler"));
+  const late = A.findings(json([sp(0, -1, "r", 0, 100, 0), sp(1, 0, "late", 10, 200, 1, { wait: 0 }), sp(2, 0, "a", 0, 50, 0, { flags: "p" })]));
+  check("findings: a child that ends after its parent is a straggler", late.some((f) => f.kind === "straggler" && f.id === 1), JSON.stringify(late));
   check("findings: truncated vector", kinds("testdata/golden/truncated-cut.header")[0] === "truncated");
   const m = json([
     sp(0, -1, "r", 0, 10000, 0),
@@ -218,9 +225,56 @@ check("critical path: saturated pool shows more queue wait than healthy", share[
   check("pools: healthy cpu peak is an estimate, capped at 8 threads, spans-only peak beside it", ok.runEstimated && ok.peakRun === 8 && ok.peakRunSpans <= 8 && ok.peakRunSpans > 0, ok.peakRun + " " + ok.peakRunSpans);
 }
 
+// ---------------------------------------------------------------- phases (FORMAT.md §6.7)
+{
+  // root 0..1000 with phases a 0..400 and b 400..900 (100 unphased at the end); a same-thread child
+  // 300..600 crosses the boundary; an unnamed span 600..800 labelled by its phases x, y
+  const m = json([
+    sp(0, -1, "GET /x", 0, 1000, 0),
+    sp(1, 0, "a", 0, 400, 0, { flags: "p", attrs: { rows: 3 } }),
+    sp(2, 0, "cross", 300, 300, 0),
+    sp(3, 0, "b", 400, 500, 0, { flags: "fp" }),
+    sp(4, 0, "", 600, 200, 0),
+    sp(5, 4, "x", 600, 50, 0, { flags: "p" }),
+    sp(6, 4, "y", 650, 150, 0, { flags: "p" }),
+    sp(7, 0, "fan", 700, 400, 1, { wait: 10 })
+  ]);
+  const [root, a, cross, b, un, x, y, fan] = m.spans;
+  check("phases: not children of their span", root.children.map((s) => s.id).join() === "2,4,7" && root.phases.map((s) => s.id).join() === "1,3");
+  check("phases: self time of the span ignores them", root.self === 1000 - 300 - 200, "got " + root.self);
+  check("phases: a phase has no self time", a.self === 0 && b.self === 0 && x.self === 0);
+  check("phases: drawn on their span's row", a.row === root.row && x.row === un.row && un.row === root.row + 1, [a.row, root.row, x.row, un.row].join());
+  check("phases: an unnamed span is titled by its phases", un.unnamed && un.title === "x · y" && un.key === "x · y" && x.key === "x · y/x", un.title + " " + un.key + " " + x.key);
+  const cp = A.criticalPath(m);
+  check("phases: never on the critical path", cp.segments.every((g) => !m.spans[g.id].isPhase) && cp.total === 1000, JSON.stringify(cp.segments));
+  const rows = A.byPath(m);
+  const ra = rows.find((r) => r.ref === "phase:a");
+  check("phases: a row of their own per path, durations only", ra && ra.phase && ra.count === 1 && ra.sum === 400 && ra.self === 0 && ra.cpuSum === 0 && ra.handoffs === 0);
+  check("phases: a failed phase is a finding, never a straggler", A.findings(m).some((f) => f.kind === "failed" && f.id === 3) && !A.findings(m).some((f) => f.kind === "straggler" && m.spans[f.id].isPhase));
+  check("phases: not tasks of a pool", A.pools(m).every((p) => p.tasks <= 1));
+  const chrome = A.toChrome(m);
+  const pev = chrome.traceEvents.filter((e) => e.cat === "phase");
+  check("phases: own Chrome track per thread", pev.length === 4 && pev.every((e) => e.tid === 10001) && chrome.traceEvents.some((e) => e.ph === "M" && e.tid === 10001 && e.args.name === "http-1 · phases"));
+  check("phases: no frames in folded stacks", !/;(a|b|x|y) \d+$/m.test(A.toFolded(m)) && /^GET \/x;x · y \d+$/m.test(A.toFolded(m)), A.toFolded(m));
+  // a span and a phase of the same path stay apart, also across traces
+  const twin = json([sp(0, -1, "r", 0, 100, 0), sp(1, 0, "load", 0, 40, 0, { flags: "p" }), sp(2, 0, "load", 10, 20, 1, { wait: 0 })]);
+  const tr = A.byPath(twin).filter((r) => r.key === "load");
+  check("phases: a phase and a span of one path are two rows", tr.length === 2 && tr.some((r) => r.phase && r.sum === 40) && tr.some((r) => !r.phase && r.sum === 20));
+  const d = A.diff(twin, twin);
+  check("phases: diff keeps the phase and the span apart", d.filter((r) => r.key === "load").length === 2);
+  check("phases: stats keep the phase and the span apart", A.stats([twin, twin]).filter((r) => r.key === "load").length === 2);
+}
+{
+  const m = load("testdata/golden/phases.header");
+  const ph = m.spans.filter((s) => s.isPhase);
+  check("phases vector: 10 phases, none a child", ph.length === 10 && m.spans.every((s) => s.children.every((c) => !c.isPhase)));
+  check("phases vector: the handoff's phases sit on its worker", m.spans[5].lane === m.spans[4].lane && m.spans[4].thread === 1);
+  check("phases vector: unnamed span titled by its phases", m.spans[8].title === "open · copy");
+}
+
 // ---------------------------------------------------------------- converters
 let convOk = 0;
-for (const p of SAMPLES.concat(["testdata/golden/search-example.header", "testdata/golden/handoff-not-run.header", "testdata/golden/names.header"])) {
+for (const p of SAMPLES.concat(["testdata/golden/search-example.header", "testdata/golden/handoff-not-run.header", "testdata/golden/names.header", "testdata/golden/phases.header"])) {
   const m = load(p);
   const chrome = JSON.parse(JSON.stringify(A.toChrome(m)));
   const xs = chrome.traceEvents.filter((e) => e.ph === "X");

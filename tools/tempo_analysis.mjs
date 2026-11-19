@@ -6,6 +6,9 @@ import TempoParse from "./tempo_parse.mjs";
 // ==== BEGIN TEMPO ANALYSIS ====
 // Viewer analysis: span model, self-time, critical path, findings, pools, per-path aggregates,
 // diff, multi-trace statistics and converters. Copied verbatim into tools/tempo_analysis.mjs.
+// A phase (flag p, FORMAT.md §6.7) is a section of its parent's timeline, never a tree child: it
+// sits in its parent's `phases`, not in `children`, has no lane row of its own, no self time and no
+// critical-path share, and only its own start and duration are reported.
 const TempoAnalysis = (function (P) {
   "use strict";
 
@@ -28,6 +31,7 @@ const TempoAnalysis = (function (P) {
   function model(doc) {
     const spans = doc.spans.map(function (s) {
       const isAgg = !!s.agg;
+      const isPhase = has(s, "p");
       const isHandoff = !isAgg && s.wait !== undefined;
       // never started, or cancelled before it started (a handoff, or an aggregate of them, with dur 0)
       const notRun = has(s, "n") || (has(s, "c") && s.dur === 0 && (isHandoff || (isAgg && s.agg.waitSum !== undefined)));
@@ -38,22 +42,25 @@ const TempoAnalysis = (function (P) {
         wait: isAgg ? (s.agg.waitSum !== undefined ? s.agg.waitSum : undefined) : s.wait,
         waitMax: isAgg ? s.agg.waitMax : s.wait,
         cpu: s.cpu, flags: s.flags || "", attrs: s.attrs || null, agg: s.agg || null, src: s,
-        isAgg: isAgg, isHandoff: isHandoff, notRun: notRun,
+        isAgg: isAgg, isHandoff: isHandoff, isPhase: isPhase, notRun: notRun,
         runStart: runStart, runEnd: runEnd, end: runEnd,
-        offCpu: s.cpu !== undefined ? Math.max(0, s.dur - s.cpu) : undefined,
-        children: [], parent: null, depth: 0, key: "", label: "",
+        offCpu: s.cpu !== undefined && !isPhase ? Math.max(0, s.dur - s.cpu) : undefined,
+        children: [], phases: [], parent: null, depth: 0, key: "", label: "", title: s.name, unnamed: s.name === "",
         lane: notRun ? LANE_LIMBO : s.thread, row: 0, self: 0, pool: null
       };
     });
     const root = spans[0] || null;
     for (const s of spans) {
-      if (s.parentId >= 0) {
-        s.parent = spans[s.parentId];
-        s.parent.children.push(s);
-        s.depth = s.parent.depth + 1;
-        s.key = s.parent.parentId < 0 ? s.name : s.parent.key + "/" + s.name;
-      }
-      s.label = s.parentId < 0 ? s.name : s.key;
+      if (s.parentId < 0) continue;
+      s.parent = spans[s.parentId];
+      (s.isPhase ? s.parent.phases : s.parent.children).push(s);
+      s.depth = s.parent.depth + 1;
+    }
+    // An unnamed span is labelled by its phases ("open · copy"), so titles wait for the phases.
+    for (const s of spans) {
+      if (s.unnamed) s.title = s.phases.length ? s.phases.map(function (p) { return p.name || "(unnamed)"; }).join(" · ") : "(unnamed)";
+      if (s.parent) s.key = s.parent.parentId < 0 ? s.title : s.parent.key + "/" + s.title;
+      s.label = s.parentId < 0 ? s.title : s.key;
       s.pool = s.thread >= 0 ? poolOf(doc.threads[s.thread]) : null;
     }
     // never-started work and mixed-thread aggregates: infer the pool from same-name siblings
@@ -69,14 +76,16 @@ const TempoAnalysis = (function (P) {
     }
     for (const s of spans) s.self = selfTime(s);
     packRows(spans);
+    for (const s of spans) if (s.isPhase) { s.lane = s.parent.lane; s.row = s.parent.row; }
     const end = spans.reduce(function (e, s) { return Math.max(e, s.end); }, 0);
     return { doc: doc, spans: spans, root: root, threads: doc.threads, end: end, live: new Set(doc.live || []) };
   }
 
   // Self-time: run time minus same-thread children (overlap with this span's run) and zero for
-  // blocking waits (flag w). Cross-thread children are never subtracted.
+  // blocking waits (flag w). Cross-thread children are never subtracted, phases neither (they are
+  // not children); a phase itself has no self time (0).
   function selfTime(s) {
-    if (has(s, "w") || s.notRun) return 0;
+    if (has(s, "w") || s.notRun || s.isPhase) return 0;
     if (s.isAgg) return s.dur;
     let sub = 0;
     for (const c of s.children) {
@@ -88,9 +97,11 @@ const TempoAnalysis = (function (P) {
   }
 
   // Rows inside a lane: a child sits below its same-lane parent; overlapping siblings move down.
+  // Phases take no row: they are drawn on their parent's.
   function packRows(spans) {
     const rows = new Map();   // lane -> array of rows, each an array of [lo, hi]
     for (const s of spans) {
+      if (s.isPhase) continue;
       if (!rows.has(s.lane)) rows.set(s.lane, []);
       const laneRows = rows.get(s.lane);
       let r = s.parent && s.parent.lane === s.lane ? s.parent.row + 1 : 0;
@@ -172,15 +183,22 @@ const TempoAnalysis = (function (P) {
   }
 
   // ------------------------------------------------------------ per-path aggregates
+  //
+  // One row per path. Phases get rows of their own (phase: true), apart from a child span of the
+  // same path: `ref` is the key rows are matched by across traces, `key` the path shown. A phase row
+  // counts the phase's durations only; its self time stays 0 and is not shown.
+
+  function refOf(s) { return (s.isPhase ? "phase:" : "span:") + s.key; }
 
   function byPath(m) {
     const rows = new Map();
     for (const s of m.spans) {
-      let r = rows.get(s.key);
+      const ref = refOf(s);
+      let r = rows.get(ref);
       if (!r) {
-        r = { key: s.key, label: s.label, name: s.name, depth: s.depth, records: 0, count: 0, sum: 0, self: 0, min: Infinity, max: 0,
+        r = { ref: ref, key: s.key, label: s.label, name: s.name, phase: s.isPhase, depth: s.depth, records: 0, count: 0, sum: 0, self: 0, min: Infinity, max: 0,
               waitSum: 0, waitMax: 0, handoffs: 0, cpuSum: 0, cpuDur: 0, offCpu: 0, notStarted: 0, failed: 0, firstId: s.id };
-        rows.set(s.key, r);
+        rows.set(ref, r);
       }
       const n = s.isAgg ? s.agg.count : 1;
       r.records += 1;
@@ -193,7 +211,7 @@ const TempoAnalysis = (function (P) {
         r.max = Math.max(r.max, s.isAgg ? s.agg.max : s.dur);
       }
       if (s.wait !== undefined) { r.waitSum += s.wait; r.waitMax = Math.max(r.waitMax, s.waitMax || 0); r.handoffs += n; }
-      if (s.cpu !== undefined) { r.cpuSum += s.cpu; r.cpuDur += s.dur; r.offCpu += s.offCpu; }
+      if (s.cpu !== undefined && !s.isPhase) { r.cpuSum += s.cpu; r.cpuDur += s.dur; r.offCpu += s.offCpu; }
       if (has(s, "f")) r.failed += n;
     }
     for (const r of rows.values()) if (r.min === Infinity) r.min = 0;
@@ -203,21 +221,21 @@ const TempoAnalysis = (function (P) {
   // ------------------------------------------------------------ diff of two traces
 
   function diff(ma, mb) {
-    const a = new Map(byPath(ma).map(function (r) { return [r.key, r]; }));
-    const b = new Map(byPath(mb).map(function (r) { return [r.key, r]; }));
-    const keys = [];
-    for (const k of a.keys()) keys.push(k);
-    for (const k of b.keys()) if (!a.has(k)) keys.push(k);
+    const a = new Map(byPath(ma).map(function (r) { return [r.ref, r]; }));
+    const b = new Map(byPath(mb).map(function (r) { return [r.ref, r]; }));
+    const refs = [];
+    for (const k of a.keys()) refs.push(k);
+    for (const k of b.keys()) if (!a.has(k)) refs.push(k);
     const v = function (r, f) { return r ? r[f] : 0; };
-    const rows = keys.map(function (k) {
-      const ra = a.get(k) || null, rb = b.get(k) || null;
+    const rows = refs.map(function (ref) {
+      const ra = a.get(ref) || null, rb = b.get(ref) || null, k = (ra || rb).key;
       return {
-        key: k, label: k === "" ? (ra || rb).label : k, a: ra, b: rb,
+        ref: ref, key: k, phase: (ra || rb).phase, label: k === "" ? (ra || rb).label : k, a: ra, b: rb,
         dCount: v(rb, "count") - v(ra, "count"), dSum: v(rb, "sum") - v(ra, "sum"), dSelf: v(rb, "self") - v(ra, "self"),
         dWait: v(rb, "waitSum") - v(ra, "waitSum"), dCpu: v(rb, "cpuSum") - v(ra, "cpuSum"), dOffCpu: v(rb, "offCpu") - v(ra, "offCpu")
       };
     });
-    rows.sort(function (x, y) { return Math.abs(y.dSum) - Math.abs(x.dSum) || Math.abs(y.dWait) - Math.abs(x.dWait) || (x.key < y.key ? -1 : 1); });
+    rows.sort(function (x, y) { return Math.abs(y.dSum) - Math.abs(x.dSum) || Math.abs(y.dWait) - Math.abs(x.dWait) || (x.ref < y.ref ? -1 : 1); });
     return rows;
   }
 
@@ -239,15 +257,15 @@ const TempoAnalysis = (function (P) {
     const acc = new Map();
     models.forEach(function (m) {
       for (const r of byPath(m)) {
-        let a = acc.get(r.key);
-        if (!a) { a = { key: r.key, label: r.key === "" ? "(root)" : r.key, names: new Set(), sum: [], self: [], wait: [], waitMax: [], count: [], cpu: [] }; acc.set(r.key, a); }
+        let a = acc.get(r.ref);
+        if (!a) { a = { ref: r.ref, key: r.key, phase: r.phase, names: new Set(), sum: [], self: [], wait: [], waitMax: [], count: [], cpu: [] }; acc.set(r.ref, a); }
         if (r.key === "") a.names.add(r.label);
         a.sum.push(r.sum); a.self.push(r.self); a.wait.push(r.waitSum); a.waitMax.push(r.waitMax); a.count.push(r.count); a.cpu.push(r.cpuSum);
       }
     });
     return Array.from(acc.values()).map(function (a) {
       return {
-        key: a.key, label: a.key === "" ? Array.from(a.names).join(" | ") : a.key, n: a.sum.length, traces: models.length,
+        ref: a.ref, key: a.key, phase: a.phase, label: a.key === "" ? Array.from(a.names).join(" | ") : a.key, n: a.sum.length, traces: models.length,
         sum: summary(a.sum), self: summary(a.self), wait: summary(a.wait), waitMax: summary(a.waitMax), count: summary(a.count), cpu: summary(a.cpu)
       };
     });
@@ -273,13 +291,13 @@ const TempoAnalysis = (function (P) {
       if (has(s, "n")) add("never", s, s.label + times, "never started; queued " + (s.isAgg ? s.agg.waitMax : s.wait) + " µs until render", s.wait || 0);
       if (has(s, "c") && !has(s, "n")) add("cancelled", s, s.label + times, s.notRun ? "cancelled before it started" : "cancelled while running", 0);
       if (has(s, "m")) add("misuse", s, s.label + times, "the recorder healed a misuse here", 0);
-      if (s.parent && !has(s, "n") && !has(s, "o") && s.end > s.parent.end) add("straggler", s, s.label + times, "ends " + (s.end - s.parent.end) + " µs after its parent", s.end - s.parent.end);
+      if (s.parent && !s.isPhase && !has(s, "n") && !has(s, "o") && s.end > s.parent.end) add("straggler", s, s.label + times, "ends " + (s.end - s.parent.end) + " µs after its parent", s.end - s.parent.end);
     }
     const waits = m.spans.filter(function (s) { return (s.waitMax || 0) >= minWait && !has(s, "n"); })
       .sort(function (a, b) { return b.waitMax - a.waitMax; }).slice(0, opts.topWaits || 5);
     for (const s of waits) add("wait", s, s.label + (s.isAgg ? " ×" + s.agg.count : ""), (s.isAgg ? "worst of " + s.agg.count + " waited " : "waited ") + s.waitMax + " µs in queue" + (s.pool ? " (" + s.pool + ")" : ""), s.waitMax);
     const off = m.spans.filter(function (s) {
-      if (!s.pool || !isCpuPool(s.pool) || s.notRun) return false;
+      if (!s.pool || !isCpuPool(s.pool) || s.notRun || s.isPhase) return false;
       if (has(s, "w") && s.thread >= 0 && s.dur >= minOffCpu) return true;
       return s.offCpu !== undefined && s.offCpu >= minOffCpu && s.offCpu >= 0.2 * s.dur;
     }).sort(function (a, b) { return (b.offCpu !== undefined ? b.offCpu : b.dur) - (a.offCpu !== undefined ? a.offCpu : a.dur); }).slice(0, opts.topOffCpu || 5);
@@ -302,6 +320,7 @@ const TempoAnalysis = (function (P) {
     };
     m.threads.forEach(function (t, i) { get(poolOf(t)).threads.push(i); });
     for (const s of m.spans) {
+      if (s.isPhase) continue;   // a section of its span's time, not a task
       const task = !s.parent || s.isHandoff || s.isAgg || s.thread !== s.parent.thread;
       if (!task || !s.pool || (s.isAgg && s.parent && s.thread === s.parent.thread && s.wait === undefined)) continue;
       const p = get(s.pool);
@@ -357,14 +376,21 @@ const TempoAnalysis = (function (P) {
   // ------------------------------------------------------------ converters
 
   // Chrome Trace Event JSON (Perfetto, chrome://tracing). Times in µs from the root start.
+  // Phases go on a track of their own per thread ("<thread> · phases"): children may cross phase
+  // boundaries, which the thread's own track could not nest.
+  const PHASE_TID = 10000;
   function toChrome(m) {
     const ev = [];
     const pid = 1;
-    const tidOf = function (s) { return s.lane === LANE_LIMBO ? 9001 : s.thread < 0 ? 9000 : s.thread + 1; };
-    ev.push({ ph: "M", pid: pid, name: "process_name", args: { name: m.root ? m.root.name : "trace" } });
+    const tidOf = function (s) { return s.isPhase ? PHASE_TID + s.thread + 1 : s.lane === LANE_LIMBO ? 9001 : s.thread < 0 ? 9000 : s.thread + 1; };
+    ev.push({ ph: "M", pid: pid, name: "process_name", args: { name: m.root ? m.root.title : "trace" } });
+    const phased = new Set(m.spans.filter(function (s) { return s.isPhase; }).map(function (s) { return s.thread; }));
     m.threads.forEach(function (t, i) {
       ev.push({ ph: "M", pid: pid, tid: i + 1, name: "thread_name", args: { name: t } });
-      ev.push({ ph: "M", pid: pid, tid: i + 1, name: "thread_sort_index", args: { sort_index: i } });
+      ev.push({ ph: "M", pid: pid, tid: i + 1, name: "thread_sort_index", args: { sort_index: 2 * i } });
+      if (!phased.has(i)) return;
+      ev.push({ ph: "M", pid: pid, tid: PHASE_TID + i + 1, name: "thread_name", args: { name: t + " · phases" } });
+      ev.push({ ph: "M", pid: pid, tid: PHASE_TID + i + 1, name: "thread_sort_index", args: { sort_index: 2 * i + 1 } });
     });
     if (m.spans.some(function (s) { return s.thread < 0; })) ev.push({ ph: "M", pid: pid, tid: 9000, name: "thread_name", args: { name: "mixed threads (aggregates)" } });
     if (m.spans.some(function (s) { return s.notRun; })) ev.push({ ph: "M", pid: pid, tid: 9001, name: "thread_name", args: { name: "not started" } });
@@ -376,12 +402,17 @@ const TempoAnalysis = (function (P) {
       if (s.flags) args.flags = s.flags;
       if (s.attrs) for (const k of Object.keys(s.attrs)) args["attr." + k] = s.attrs[k];
       if (s.agg) for (const k of Object.keys(s.agg)) args["agg." + k] = s.agg[k];
-      const cat = s.isAgg ? "aggregate" : s.isHandoff ? "handoff" : "span";
-      if (s.notRun) {
-        ev.push({ ph: "X", name: s.name + " (queued)", cat: "queue", ts: s.start, dur: Math.max(0, s.end - s.start), pid: pid, tid: tidOf(s), args: args });
+      if (s.isPhase) {
+        args.phase_of = s.parent.title;
+        ev.push({ ph: "X", name: s.title, cat: "phase", ts: s.start, dur: s.dur, pid: pid, tid: tidOf(s), args: args });
         continue;
       }
-      ev.push({ ph: "X", name: s.isAgg ? s.name + " ×" + s.agg.count : s.name, cat: cat, ts: s.isAgg ? s.start : s.runStart, dur: s.isAgg ? s.agg.extent : s.dur, pid: pid, tid: tidOf(s), args: args });
+      const cat = s.isAgg ? "aggregate" : s.isHandoff ? "handoff" : "span";
+      if (s.notRun) {
+        ev.push({ ph: "X", name: s.title + " (queued)", cat: "queue", ts: s.start, dur: Math.max(0, s.end - s.start), pid: pid, tid: tidOf(s), args: args });
+        continue;
+      }
+      ev.push({ ph: "X", name: s.isAgg ? s.title + " ×" + s.agg.count : s.title, cat: cat, ts: s.isAgg ? s.start : s.runStart, dur: s.isAgg ? s.agg.extent : s.dur, pid: pid, tid: tidOf(s), args: args });
       if (s.isHandoff && s.parent && s.thread >= 0) {
         ev.push({ ph: "s", id: flow, name: "handoff", cat: "handoff", ts: s.start, pid: pid, tid: tidOf(s.parent) });
         ev.push({ ph: "f", bp: "e", id: flow, name: "handoff", cat: "handoff", ts: s.runStart, pid: pid, tid: tidOf(s) });
@@ -394,12 +425,14 @@ const TempoAnalysis = (function (P) {
   }
 
   // Collapsed stacks (flamegraph.pl, speedscope): "root;child;leaf <self µs>", merged per stack.
+  // Phases are not frames: their time stays with their span.
   function toFolded(m) {
     const clean = function (n) { return String(n).replace(/;/g, ":").replace(/[\r\n]+/g, " "); };
     const stackOf = new Map();
     const totals = new Map();
     for (const s of m.spans) {
-      const st = s.parent ? stackOf.get(s.parent.id) + ";" + clean(s.name) : clean(s.name);
+      if (s.isPhase) continue;
+      const st = s.parent ? stackOf.get(s.parent.id) + ";" + clean(s.title) : clean(s.title);
       stackOf.set(s.id, st);
       if (s.self > 0) totals.set(st, (totals.get(st) || 0) + s.self);
     }
