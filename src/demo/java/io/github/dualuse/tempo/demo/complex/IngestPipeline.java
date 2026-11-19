@@ -8,9 +8,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
-import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -20,12 +19,15 @@ import java.util.regex.Pattern;
  * feeds one store thread that writes in batches of 16. Bounded queues connect the stages; when one is
  * full, its producer blocks, and that blocked put is what the trace calls backpressure.
  *
- * <p>It shows long-running stage workers joining the request's trace (one handoff per worker, begun on
- * the worker, so each worker records one lane), per-frame detail spans that run past the trace's budget
- * and fold into one aggregate per stage lane, end of stream with poison pills, a summary for the response
- * body built from {@code t.total(name)}, a size-limited header next to the full trace as JSON in the
- * body, and backpressure as {@code waiting()} spans that show where the pipeline is throttled. The header's
- * aggregates carry count, sum, min and max. It builds on {@code WorkerPool} and {@code MetricsAndListeners}.
+ * <p>It shows hand-written stage workers, threads of the service that take jobs from a queue of their
+ * own: the request puts a job with a bare task ({@code Tempo.task}) on each worker's queue, and the
+ * worker begins it with {@code tryBegin()}, which ends the queue wait and joins the request's trace, so
+ * each worker records one lane. It also shows per-frame steps that run past the trace's budget and fold
+ * into one aggregate per stage lane, end of stream with poison pills, a summary for the response body
+ * built from {@code t.total(name)} (count, sum, mean and slowest), a size-limited header next to the
+ * full trace as JSON in the body, and backpressure as {@code waiting()} steps that show where the
+ * pipeline is throttled. The header's aggregates carry count, sum, min and max. It builds on {@code
+ * WorkerPool} and {@code MetricsAndListeners}.
  *
  * <pre>
  * ./gradlew -q demo -Pdemo=IngestPipeline                      the story, the response and its body
@@ -40,14 +42,14 @@ import java.util.regex.Pattern;
  * stream; {@code drain} on {@code main} waiting until every stage has finished, so no lane is still live
  * ({@code l=}) when the response is rendered. Or open the printed Tempo-Link.
  */
-@SuppressWarnings("try") // many spans here only time their block, so the block never names the span
+@SuppressWarnings("try") // many spans here only time their block, so the block never names the span; see src/demo/README.md
 public final class IngestPipeline {
     private IngestPipeline() {
     }
 
     static final Tempo.Name UPLOAD = Tempo.name("PUT /upload"), RECEIVE = Tempo.name("receive"),
             READ = Tempo.name("read"), DRAIN = Tempo.name("drain"),
-            // one task per stage worker: the span its lane hangs from
+            // one task per stage worker and upload: the span its lane hangs from
             DECODER = Tempo.name("decoder"), DESCRIBER = Tempo.name("describer"), WRITER = Tempo.name("writer"),
             FRAMES = Tempo.name("frames"), BYTES = Tempo.name("bytes");
 
@@ -62,7 +64,7 @@ public final class IngestPipeline {
     static final int READ_MS = 1, DECODE_US = 1_500, DESCRIBE_US = 4_000, STORE_US = 100, FLUSH_MS = 3;
 
     /**
-     * Detail spans recorded one by one; the rest fold. 120 frames make over 480 of them, so the budget
+     * Steps drawn one by one; the rest fold. 120 frames make over 480 of them, so the budget
      * keeps the trace, and its JSON, bounded however long the stream is. It still records more than a
      * header of {@link #HEADER_BYTES} can hold, so the header folds further.
      */
@@ -80,66 +82,144 @@ public final class IngestPipeline {
     /** End of stream: a stage that takes it finishes its work, passes it on and returns. */
     static final Frame END = new Frame(0);
 
-    /** A stage's loop, run on its worker inside the stage's span. */
+    /** A stage's loop for one upload, run on its worker inside the stage's span; returns the frames it handled. */
     interface Stage {
-        void run(Tempo.Span stage) throws InterruptedException;
+        int run() throws InterruptedException;
     }
 
-    public static void main(String[] args) throws Exception {
-        // Dedicated stage workers, started with the service. Each upload runs one loop on every worker, so a
-        // second upload's loops would wait in the pool queues (its handoffs' queue wait would show it).
-        ThreadPoolExecutor decoders = Demo.pool("decode", DECODERS), describers = Demo.pool("describe", 1),
-                writers = Demo.pool("store", 1);
-        try {
-            upload(decoders, describers, writers);
-        } finally {
-            Demo.shutdown(decoders, describers, writers);
+    /** One upload's work for one worker: the task made where the request submits it, and the loop. */
+    static final class Job {
+        final Tempo.Task task;
+        final Stage stage;
+        final CompletableFuture<Integer> done = new CompletableFuture<>();
+
+        Job(Tempo.Task task, Stage stage) {
+            this.task = task;
+            this.stage = stage;
         }
     }
 
-    static void upload(ExecutorService decoders, ExecutorService describers, ExecutorService writers) throws Exception {
+    /** Tells a worker to stop: the service is shutting down. */
+    static final Job STOP = new Job(null, null);
+
+    /**
+     * A stage worker of the service: a thread that takes jobs from its own queue, one upload's loop at a
+     * time. A second upload's job would wait in the queue (its task's queue wait would show it).
+     */
+    static final class Worker {
+        final BlockingQueue<Job> jobs = new LinkedBlockingQueue<>();
+        final Thread thread;
+
+        Worker(String name) {
+            thread = new Thread(this::work, name);
+            thread.setDaemon(true);
+            thread.start();
+        }
+
+        /**
+         * Queues this upload's loop. The task is made here, on the request thread, under its innermost
+         * open span: that is the task's parent, and its queue wait starts now.
+         */
+        Job submit(Tempo.Name name, Stage stage) {
+            Job job = new Job(Tempo.task(name), stage);
+            jobs.add(job);
+            return job;
+        }
+
+        void stop() throws InterruptedException {
+            jobs.add(STOP);
+            thread.join(10_000);
+        }
+
+        private void work() {
+            try {
+                for (Job job; (job = jobs.take()) != STOP; ) run(job);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        /**
+         * tryBegin() ends the task's queue wait and opens its span on this thread, the root of this
+         * worker's lane in the request's trace. It is null if the task was cancelled first: then the job is
+         * skipped. The job completes only after the span closed, so the request's trace closes with no task
+         * open.
+         */
+        private static void run(Job job) {
+            Tempo.Span stage = job.task.tryBegin();
+            if (stage == null) {
+                job.done.cancel(false);
+                return;
+            }
+            int frames;
+            try (stage) {
+                frames = job.stage.run();
+                stage.set(FRAMES, frames);
+            } catch (Exception e) {
+                stage.fail(e); // still this stage's span right after it closed
+                job.done.completeExceptionally(e);
+                return;
+            }
+            job.done.complete(frames);
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        // Dedicated stage workers, started with the service.
+        List<Worker> decoders = new ArrayList<>();
+        for (int i = 1; i <= DECODERS; i++) decoders.add(new Worker("decode-" + i));
+        Worker describer = new Worker("describe-1"), writer = new Worker("store-1");
+        try {
+            upload(decoders, describer, writer);
+        } finally {
+            for (Worker w : decoders) w.stop();
+            describer.stop();
+            writer.stop();
+        }
+    }
+
+    static void upload(List<Worker> decoders, Worker describer, Worker writer) throws Exception {
         Tempo.Trace t = Tempo.trace(UPLOAD, new Tempo.Options().budget(BUDGET)
                 .headerBytes(HEADER_BYTES).strict(true)).records(Tempo.STEP);
         try (t) {
-            Tempo.Span root = t.set(FRAMES, FRAME_COUNT);
+            t.set(FRAMES, FRAME_COUNT);
             BlockingQueue<Frame> toDecode = new ArrayBlockingQueue<>(QUEUE), toDescribe = new ArrayBlockingQueue<>(QUEUE),
                     toStore = new ArrayBlockingQueue<>(QUEUE);
 
-            // Each stage worker joins the trace for this upload: one task per worker, submitted here.
-            List<Future<?>> stages = new ArrayList<>();
-            for (int i = 0; i < DECODERS; i++)
-                stages.add(start(decoders, DECODER, s -> decode(t, s, toDecode, toDescribe)));
-            stages.add(start(describers, DESCRIBER, s -> describe(t, s, toDescribe, toStore)));
-            stages.add(start(writers, WRITER, s -> store(t, s, toStore)));
+            // Each stage worker joins the trace for this upload: one job, and so one task, per worker.
+            List<Job> stages = new ArrayList<>();
+            for (Worker w : decoders) stages.add(w.submit(DECODER, () -> decode(toDecode, toDescribe)));
+            stages.add(describer.submit(DESCRIBER, () -> describe(toDescribe, toStore)));
+            stages.add(writer.submit(WRITER, () -> store(toStore)));
 
-            try (Tempo.Span r = root.span(RECEIVE)) {
+            try (Tempo.Span r = Tempo.span(RECEIVE)) {
                 long bytes = 0;
                 for (int i = 0; i < FRAME_COUNT; i++) {
                     Frame f = new Frame(40_000 + i % 7 * 1_000);
-                    try (Tempo.Span c = r.step(READ)) {
+                    try (Tempo.Span c = Tempo.step(READ)) {
                         Demo.io(READ_MS); // the next chunk of the request body
                         c.set(BYTES, f.bytes);
                     }
                     bytes += f.bytes;
-                    put(t, r, toDecode, f);
+                    put(toDecode, f);
                 }
-                for (int i = 0; i < DECODERS; i++) put(t, r, toDecode, END); // one pill per decoder
+                for (int i = 0; i < DECODERS; i++) put(toDecode, END); // one pill per decoder
                 r.set(BYTES, bytes);
             }
 
             // The response waits for the last stage: no worker still records into this trace when it renders.
-            try (Tempo.Span d = root.span(DRAIN).waiting()) {
-                for (Future<?> f : stages) f.get();
+            try (Tempo.Span d = Tempo.span(DRAIN).waiting()) {
+                for (Job j : stages) j.done.get();
             }
         }
 
-        // The numbers a client logs, from the aggregates: every frame counts, recorded as a row or folded.
+        // The numbers a client logs, from the totals: every frame counts, drawn as a row or folded.
         StringBuilder body = new StringBuilder("{\"frames\":").append(FRAME_COUNT).append(",\"summary\":{");
         for (Tempo.Name n : new Tempo.Name[] {DECODE, DESCRIBE, STORE}) {
             Tempo.Total a = t.total(n);
             body.append('"').append(n).append("\":").append(stats(a)).append(',');
-            Demo.say(String.format(Locale.ROOT, "%-9s %d frames, %s ms in all, slowest %s ms", n, a.count(), ms(a.sum()),
-                    ms(a.max())));
+            Demo.say(String.format(Locale.ROOT, "%-9s %d frames, %s ms in all, %s ms mean, slowest %s ms", n, a.count(),
+                    ms(a.sum()), ms(a.mean()), ms(a.max())));
         }
         Tempo.Total flushes = t.total(FLUSH), pressure = t.total(BACKPRESSURE);
         body.append("\"flush\":").append(stats(flushes)).append(",\"backpressure\":").append(stats(pressure)).append("},");
@@ -168,41 +248,29 @@ public final class IngestPipeline {
     }
 
     /**
-     * Submits a stage worker's loop for this upload as a task under the calling thread's innermost span.
-     * The task begins on the worker when the loop starts there (the queue wait ends, the worker's lane
-     * joins the trace) and flags the stage failed if the loop throws; inside, {@code Tempo.current()} is
-     * the stage's span.
+     * Hands a frame to the next stage; a put that has to wait for room is backpressure, a step under
+     * whatever span the caller has open (receive on the request thread, the stage's span on a worker).
      */
-    static Future<?> start(ExecutorService pool, Tempo.Name name, Stage stage) {
-        return pool.submit(Tempo.callable(name, () -> {
-            stage.run(Tempo.current());
-            return null;
-        }));
-    }
-
-    /** Hands a frame to the next stage; a put that has to wait for room is backpressure. */
-    static void put(Tempo.Trace t, Tempo.Span s, BlockingQueue<Frame> next, Frame f) throws InterruptedException {
+    static void put(BlockingQueue<Frame> next, Frame f) throws InterruptedException {
         if (next.offer(f)) return;
-        try (Tempo.Span b = s.step(BACKPRESSURE).waiting()) {
+        try (Tempo.Span b = Tempo.step(BACKPRESSURE).waiting()) {
             next.put(f);
         }
     }
 
-    static void decode(Tempo.Trace t, Tempo.Span stage, BlockingQueue<Frame> in, BlockingQueue<Frame> out)
-            throws InterruptedException {
+    static int decode(BlockingQueue<Frame> in, BlockingQueue<Frame> out) throws InterruptedException {
         int n = 0;
         for (Frame f; (f = in.take()) != END; n++) {
-            try (Tempo.Span d = stage.step(DECODE)) {
+            try (Tempo.Span d = Tempo.step(DECODE)) {
                 Demo.cpu(DECODE_US);
             }
-            put(t, stage, out, f);
+            put(out, f);
         }
-        put(t, stage, out, END);
-        stage.set(FRAMES, n);
+        put(out, END);
+        return n;
     }
 
-    static void describe(Tempo.Trace t, Tempo.Span stage, BlockingQueue<Frame> in, BlockingQueue<Frame> out)
-            throws InterruptedException {
+    static int describe(BlockingQueue<Frame> in, BlockingQueue<Frame> out) throws InterruptedException {
         int n = 0;
         for (int ends = 0; ends < DECODERS; ) { // done once every decoder has passed its pill on
             Frame f = in.take();
@@ -210,32 +278,32 @@ public final class IngestPipeline {
                 ends++;
                 continue;
             }
-            try (Tempo.Span d = stage.step(DESCRIBE)) {
+            try (Tempo.Span d = Tempo.step(DESCRIBE)) {
                 Demo.cpu(DESCRIBE_US);
             }
-            put(t, stage, out, f);
+            put(out, f);
             n++;
         }
-        put(t, stage, out, END);
-        stage.set(FRAMES, n);
+        put(out, END);
+        return n;
     }
 
-    static void store(Tempo.Trace t, Tempo.Span stage, BlockingQueue<Frame> in) throws InterruptedException {
+    static int store(BlockingQueue<Frame> in) throws InterruptedException {
         List<Frame> batch = new ArrayList<>(BATCH);
         int n = 0;
         for (Frame f; (f = in.take()) != END; n++) {
-            try (Tempo.Span s = stage.step(STORE)) {
+            try (Tempo.Span s = Tempo.step(STORE)) {
                 Demo.cpu(STORE_US); // serialize the frame into the batch
             }
             batch.add(f);
-            if (batch.size() == BATCH) flush(stage, batch);
+            if (batch.size() == BATCH) flush(batch);
         }
-        if (!batch.isEmpty()) flush(stage, batch); // end of stream: the last, partial batch
-        stage.set(FRAMES, n);
+        if (!batch.isEmpty()) flush(batch); // end of stream: the last, partial batch
+        return n;
     }
 
-    static void flush(Tempo.Span stage, List<Frame> batch) {
-        try (Tempo.Span w = stage.step(FLUSH)) {
+    static void flush(List<Frame> batch) {
+        try (Tempo.Span w = Tempo.step(FLUSH)) {
             Demo.io(FLUSH_MS); // one write for the whole batch
             w.set(FRAMES, batch.size());
         }
@@ -256,6 +324,9 @@ public final class IngestPipeline {
 
         Demo.check(Demo.count(t, v -> v.name() == DECODER && v.handoff() && v.thread().startsWith("decode-")) == DECODERS
                 && Demo.count(t, v -> v.name() == DECODER && "decode-1".equals(v.thread())) == 1, "one lane per decode worker");
+        Demo.check(Demo.count(t, v -> (v.name() == DECODER || v.name() == DESCRIBER || v.name() == WRITER)
+                        && v.handoff() && v.parent() == 0 && v.waitNanos() >= 0) == DECODERS + 2,
+                "each stage task hangs from the request's root, where it was submitted, with its queue wait");
         Demo.check(Demo.count(t, v -> v.name() == DESCRIBER && v.handoff() && "describe-1".equals(v.thread())) == 1,
                 "describe runs in a lane of its own");
         Demo.check(Demo.count(t, v -> v.name() == WRITER && v.handoff() && "store-1".equals(v.thread())) == 1,
@@ -285,7 +356,8 @@ public final class IngestPipeline {
     // ------------------------------------------------------------------ small helpers
 
     static String stats(Tempo.Total a) {
-        return String.format(Locale.ROOT, "{\"count\":%d,\"ms\":%s,\"maxMs\":%s}", a.count(), ms(a.sum()), ms(a.max()));
+        return String.format(Locale.ROOT, "{\"count\":%d,\"ms\":%s,\"meanMs\":%s,\"maxMs\":%s}",
+                a.count(), ms(a.sum()), ms(a.mean()), ms(a.max()));
     }
 
     static String ms(long nanos) {

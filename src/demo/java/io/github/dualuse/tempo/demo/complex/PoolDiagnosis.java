@@ -30,10 +30,13 @@ import java.util.concurrent.ThreadPoolExecutor;
  *       the cores.</li>
  * </ul>
  *
- * <p>It shows many concurrent traces read in code: the demo prints every request's response, then walks
- * each trace with {@link Tempo.Trace#forEachSpan} and sums what a {@link Tempo.SpanView} says about
- * every task: its queue wait, its run time, its CPU time and the thread it ran on. A table and a
- * verdict close the output. It builds on {@code WorkerPool} (tasks, queue wait, CPU per task).
+ * <p>It shows many concurrent traces read in code: the demo prints every request's response, then reads
+ * each trace twice. {@link Tempo.Trace#total} gives the queue wait of all loads and of all matches in one
+ * call each; {@link Tempo.Trace#forEachSpan} walks every task and sums what a {@link Tempo.SpanView} says
+ * about it: its run time, its CPU time and the thread it ran on. A table and a verdict close the output.
+ * The tasks are made with {@code Tempo.callable} and {@code Tempo.runnable} rather than through an
+ * executor, so that each carries the pool's load at its submit. It builds on {@code WorkerPool} (tasks,
+ * queue wait, CPU per task).
  * Save the output once, so every view below reads the same run:
  *
  * <pre>
@@ -55,6 +58,7 @@ import java.util.concurrent.ThreadPoolExecutor;
  * request 1 of A and press Compare with B's. A load hands its match on before it ends, so the match
  * nests under the load and outlives it: {@code --findings} calls it a straggler, as expected.
  */
+@SuppressWarnings("try") // the join block never names its span; see src/demo/README.md
 public final class PoolDiagnosis {
     private PoolDiagnosis() {
     }
@@ -102,8 +106,10 @@ public final class PoolDiagnosis {
         for (int r = 0; r < REQUESTS; r++) {
             Demo.check(ra.loads[r] == CANDIDATES && rb.loads[r] == CANDIDATES
                             && ra.matches[r] == CANDIDATES && rb.matches[r] == CANDIDATES,
-                    "every request handed off one load and one match per candidate");
+                    "every request submitted one load and one match per candidate");
         }
+        Demo.check(ra.totalsAgree && rb.totalsAgree,
+                "t.total(name).waitSum() equals the queue waits of that name's tasks read one by one");
         Demo.check(ra.ranCleanly && rb.ranCleanly,
                 "every task began, none failed or was cancelled, each match nests under its load, CPU was measured on each");
         Demo.check(ra.loadThreads.stream().allMatch(t -> t.startsWith("shared-"))
@@ -137,7 +143,7 @@ public final class PoolDiagnosis {
         // STEP measures the CPU time of every task, which the diagnosis needs.
         Tempo.Trace t = Tempo.trace(SEARCH, new Tempo.Options().strict(true)).records(Tempo.STEP);
         try (t) {
-            Tempo.Span s = t.set(POOLS, pools);     // tells the layouts apart in a viewer
+            t.set(POOLS, pools);     // tells the layouts apart in a viewer
             List<Future<Future<?>>> pending = new ArrayList<>();
             for (int c = 0; c < CANDIDATES; c++) {
                 // The pool's busy threads and queue depth at submit: tools/tempo --pools draws them as
@@ -155,11 +161,8 @@ public final class PoolDiagnosis {
                 pending.add(load);
             }
             // A future completes only after its task's span closed, so the trace closes with no task open.
-            Tempo.Span join = s.span(JOIN).waiting();
-            try {
+            try (Tempo.Span join = Tempo.span(JOIN).waiting()) {
                 for (Future<Future<?>> f : pending) f.get().get();
-            } finally {
-                join.close();
             }
         }
         return t;
@@ -172,7 +175,7 @@ public final class PoolDiagnosis {
         final int[] loads = new int[REQUESTS], matches = new int[REQUESTS];
         final Set<String> loadThreads = new HashSet<>(), matchThreads = new HashSet<>();
         final Map<String, long[]> pools = new TreeMap<>(); // pool -> {tasks, cpu, wall}
-        boolean ranCleanly = true;
+        boolean ranCleanly = true, totalsAgree = true;
 
         double cpuRatio(String pool) {
             long[] p = pools.get(pool);
@@ -200,8 +203,16 @@ public final class PoolDiagnosis {
         Reading r = new Reading();
         for (int i = 0; i < traces.size(); i++) {
             int request = i;
+            Tempo.Trace t = traces.get(i);
+            // The totals: every load's and every match's queue wait, in one call each.
+            Tempo.Total loads = t.total(LOAD), matches = t.total(MATCH);
+            r.loadWait += loads.waitSum();
+            r.matchWait += matches.waitSum();
+            r.matchWaitMax = Math.max(r.matchWaitMax, matches.waitMax());
+            // The walk: the same waits, and what only a single task knows (its thread, its CPU time).
+            long[] waits = new long[2]; // loads, matches
             List<Tempo.Name> names = new ArrayList<>(); // by span id, which is the visiting order
-            traces.get(i).forEachSpan(v -> {
+            t.forEachSpan(v -> {
                 names.add(v.name());
                 if (v.id() == 0) r.latency[request] = v.durationNanos();
                 if (!v.handoff()) return;
@@ -214,15 +225,16 @@ public final class PoolDiagnosis {
                 pool[2] += v.durationNanos();
                 if (v.name() == LOAD) {
                     r.loads[request]++;
-                    r.loadWait += v.waitNanos();
+                    waits[0] += v.waitNanos();
                     r.loadThreads.add(thread);
                 } else if (v.name() == MATCH) {
                     r.matches[request]++;
-                    r.matchWait += v.waitNanos();
-                    r.matchWaitMax = Math.max(r.matchWaitMax, v.waitNanos());
+                    waits[1] += v.waitNanos();
                     r.matchThreads.add(thread);
                 }
             });
+            r.totalsAgree &= waits[0] == loads.waitSum() && waits[1] == matches.waitSum()
+                    && loads.count() == CANDIDATES && matches.count() == CANDIDATES;
         }
         return r;
     }

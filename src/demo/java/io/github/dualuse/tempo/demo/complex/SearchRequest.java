@@ -11,11 +11,11 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Function;
 import java.util.function.Predicate;
 
 /**
@@ -26,13 +26,14 @@ import java.util.function.Predicate;
  * good hits and takes back the work that has not started; one load, from cold storage, is still
  * running when the response goes out.
  *
- * <p>It shows the whole lifecycle in a service: a filter that starts every trace {@code SPAN} and
- * times the routing before the handler, an opt-in ({@code tempo=1}) that raises the trace to
- * {@code STEP} once, handoffs from the request thread and from a pool thread (the chain
- * request → {@code io-N} → {@code cpu-N}, with a queue wait on each hop), blocking waits, a hot loop
- * that spends the detail budget and folds, an early exit that takes back every task that has not begun
- * (each cancel either wins, and the task never runs, or loses to a task already running), a straggler,
- * and the four response headers. It puts together what
+ * <p>It shows the whole lifecycle in a service: a filter that starts every trace {@code SPAN}, times
+ * the routing before the handler and widens the trace to {@code STEP} once on an opt-in ({@code
+ * tempo=1}); a handler that reaches the request's span with {@code Tempo.current()} to mark its phases;
+ * tasks from the request thread and from a pool thread (the chain request → {@code io-N} → {@code
+ * cpu-N}, with a queue wait on each hop), through {@code Tempo.executor} and as {@code Tempo.runnable}
+ * task objects; blocking waits; a hot loop that spends the budget and folds; an early exit that takes
+ * back every task that has not begun ({@code Task.cancel()} either wins, and the task never runs, or
+ * loses to a task already running); a straggler; and the four response headers. It puts together what
  * {@code WorkerPool}, {@code LevelsAndOptIn} and {@code ResponseHeaders} show one at a time.
  *
  * <pre>
@@ -44,14 +45,14 @@ import java.util.function.Predicate;
  * Look for: {@code load} on {@code io-*} and {@code match} on {@code cpu-*}, each after its
  * queue wait ({@code ░} in the lanes, {@code ~} in the header), the matches waiting longer and longer
  * because three threads cannot keep up with the loads; {@code score ×N} aggregates inside the
- * matches, and {@code x=} in the header; handoffs past the budget fold too ({@code match ×1});
+ * matches, and {@code x=} in the header; tasks past the budget fold too ({@code match ×1});
  * the tasks cancelled by the early exit ({@code ⊘}, flag {@code c}); the cold load still open
  * ({@code ▶}, flag {@code o}) on a live lane ({@code ●}). In {@code --tree}, CPU against wall time:
  * {@code match} is on CPU nearly all of its time, {@code load} hardly at all. {@code Runtime} and
- * {@code Server-Timing} list the labelled phases, {@code Routing} to {@code Rerank}. Or open the printed
- * {@code Tempo-Link} in a browser.
+ * {@code Server-Timing} list the labelled phases, {@code Routing} to {@code Rerank}, which the lanes
+ * draw on the bar of {@code GET /search}. Or open the printed {@code Tempo-Link} in a browser.
  */
-@SuppressWarnings("try") // a span opened only to time its block is never named inside it
+@SuppressWarnings("try") // a span opened only to time its block is never named inside it; see src/demo/README.md
 public final class SearchRequest {
     static final Tempo.Name SEARCH = Tempo.name("GET /search"), ROUTING = Tempo.name("routing"),
             DECODE = Tempo.name("decode"), DESCRIBE = Tempo.name("describe"), FINGERPRINT = Tempo.name("fingerprint"),
@@ -71,8 +72,11 @@ public final class SearchRequest {
     static final int HEADER_LIMIT = 6_000, TEMPO_BYTES = 3_500;
 
     // The service: two pools, and the slow tier of the storage. A latch stands in for the slow read, so
-    // the demo decides when it answers: after the response, every time.
+    // the demo decides when it answers: after the response, every time. Two executors, made once, turn
+    // every submit into a task of their name; the loads and matches are task objects made by hand, so
+    // that each carries the pool's queue length at its submit.
     final ThreadPoolExecutor io = Demo.pool("io", 4), cpu = Demo.pool("cpu", 3);
+    final ExecutorService fingerprints = Tempo.executor(cpu, FINGERPRINT), index = Tempo.executor(io, QUERY);
     final CountDownLatch coldStorage = new CountDownLatch(1);
 
     public static void main(String[] args) throws Exception {
@@ -84,7 +88,7 @@ public final class SearchRequest {
             Demo.respond(r.runtime, r.serverTiming, r.tempoTiming, r.tempoLink);
 
             // The cold read answers now. Its load sets bytes and closes its span in a trace the filter has
-            // released: both are no-ops. (It hands off no match: the request stopped the fan-out.) A misuse
+            // released: both are no-ops. (It submits no match: the request stopped the fan-out.) A misuse
             // would have thrown in the task under strict, and join() would rethrow it.
             service.coldStorage.countDown();
             r.leftBehind.join();
@@ -105,7 +109,10 @@ public final class SearchRequest {
 
     // ------------------------------------------------------------------ the filter and the handler
 
-    /** In front of every handler: starts the trace, times the routing, renders the headers at the end. */
+    /**
+     * In front of every handler: starts the trace, times the routing, reads the opt-in, renders the
+     * headers at the end.
+     */
     Response filter(String query) throws Exception {
         // SPAN, before anyone has read the request: cheap enough for every request in production.
         Tempo.Trace t = Tempo.trace(SEARCH, new Tempo.Options().strict(true).headerBytes(TEMPO_BYTES));
@@ -113,7 +120,12 @@ public final class SearchRequest {
         try (t) {
             t.phase(ROUTING).label("Routing"); // the time before the handler
             Demo.cpu(1_000); // authenticate, match the route
-            r = handle(t, query);
+            // The opt-in gate: once, and before the first step or task, or records refuses (strict:
+            // throws). At STEP every task measures its CPU time; the first CPU read in a JVM sets that
+            // clock up (it takes milliseconds), and records() does it here, on the request thread: in the
+            // first such request of a JVM it shows in the routing phase, never as a task's queue wait.
+            if (query.contains("tempo=1")) t.records(Tempo.STEP);
+            r = handle(query);
         }
         // One snapshot for all four headers, so they agree. The tasks still running go on recording into
         // the trace, but not into the snapshot.
@@ -135,45 +147,43 @@ public final class SearchRequest {
         return r;
     }
 
-    /** The handler. Each step is a phase of the root, labelled for the {@code Runtime} header. */
-    Response handle(Tempo.Trace t, String query) throws Exception {
-        Tempo.Span root = t;
+    /**
+     * The handler. Each of its steps is a phase of the request's span, labelled for the {@code Runtime}
+     * header. The filter opened that span and hands the handler nothing: {@code Tempo.current()} is the
+     * explicit way to reach it.
+     */
+    Response handle(String query) throws Exception {
+        Tempo.Span request = Tempo.current();
 
-        // The opt-in gate: once, and before the first detail span, or raise refuses (strict: throws). At
-        // STEP every task measures its CPU time; the first CPU read in a JVM sets that clock up (it takes
-        // milliseconds), and raise() does it here, on the request thread: in the first such request of a
-        // JVM it shows in the routing phase, never as a task's queue wait.
-        if (query.contains("tempo=1")) t.records(Tempo.STEP);
-
-        root.phase(DECODE).label("Decode");
+        request.phase(DECODE).label("Decode");
         Demo.cpu(1_000);
 
-        root.phase(DESCRIBE).label("Describe");
+        request.phase(DESCRIBE).label("Describe");
 
         // The task is made where it is submitted, and begins where the pool calls it. The request thread
         // blocks meanwhile, and says so: waiting() sets the join apart from run time.
-        Future<Long> signature = cpu.submit(Tempo.callable(FINGERPRINT, () -> Demo.cpu(1_500)));
-        try (Tempo.Span w = root.span(AWAIT).waiting()) {
+        Future<Long> signature = fingerprints.submit(() -> Demo.cpu(1_500));
+        try (Tempo.Span w = Tempo.span(AWAIT).waiting()) {
             signature.get();
         }
 
-        Tempo.Phase lookup = root.phase(LOOKUP).label("Index Lookup");
-        Future<int[]> found = io.submit(Tempo.callable(QUERY, () -> {
+        Tempo.Phase lookup = request.phase(LOOKUP).label("Index Lookup");
+        Future<int[]> found = index.submit(() -> {
             Demo.io(3);
             return candidates();
-        }));
+        });
         int[] ids;
-        try (Tempo.Span w = root.span(AWAIT).waiting()) {
+        try (Tempo.Span w = Tempo.span(AWAIT).waiting()) {
             ids = found.get();
         }
         lookup.set(CANDIDATES, ids.length); // a number on the phase
 
-        Tempo.Phase reranking = root.phase(RERANK).label("Rerank");
+        Tempo.Phase reranking = request.phase(RERANK).label("Rerank");
         Rerank rerank = new Rerank();
-        for (int id : ids) rerank.submit(LOAD, io, h -> () -> load(rerank, id, h));
+        for (int id : ids) rerank.submit(LOAD, io, () -> load(rerank, id));
 
         List<Integer> hits = new ArrayList<>();
-        try (Tempo.Span w = root.span(AWAIT).waiting()) {
+        try (Tempo.Span w = Tempo.span(AWAIT).waiting()) {
             while (hits.size() < WANTED) {
                 Match m = rerank.results.poll(10, TimeUnit.SECONDS);
                 if (m == null) break;
@@ -183,7 +193,7 @@ public final class SearchRequest {
         }
         int cancelled = rerank.stop(); // enough hits: take back whatever has not begun
         reranking.set(HITS, hits.size()).set(CANCELLED, cancelled);
-        root.done();
+        request.done();
         Demo.say("early exit at " + hits.size() + " good hits: " + cancelled + " loads and matches cancelled before they began");
 
         Response r = new Response();
@@ -195,39 +205,33 @@ public final class SearchRequest {
 
     // ------------------------------------------------------------------ the tasks
 
-    /** On {@code io-N}: reads one candidate, then hands its data to a match on {@code cpu}. */
-    void load(Rerank rerank, int id, Tempo.Task h) {
-        // tryBegin() records the queue wait; the span is the root of io-N's lane, and its handle stays on
-        // io-N. It is null when the early exit took the task back first: then there is nothing to do.
-        Tempo.Span l = h.tryBegin();
-        if (l == null) return;
-        try (l) {
-            if (id == COLD_ID) {
-                l.set(COLD, 1);
-                awaitColdStorage();
-            } else {
-                Demo.io(LOAD_MS);
-            }
-            l.set(BYTES, 4_096 + id % 512);
-            // Submitted inside the load span: the match's parent is this load, on another thread.
-            rerank.submit(MATCH, cpu, m -> () -> match(rerank, id, m));
+    /**
+     * On {@code io-N}: reads one candidate, then submits a match of its data to {@code cpu}. It runs only
+     * if the early exit did not take its task back first. Inside a task, {@code Tempo.current()} is the
+     * task's span, the root of io-N's lane.
+     */
+    void load(Rerank rerank, int id) {
+        if (id == COLD_ID) {
+            Tempo.current().set(COLD, 1);
+            awaitColdStorage();
+        } else {
+            Demo.io(LOAD_MS);
         }
+        Tempo.current().set(BYTES, 4_096 + id % 512);
+        // Submitted inside the load: the match's parent is this load, on another thread.
+        rerank.submit(MATCH, cpu, () -> match(rerank, id));
     }
 
-    /** On {@code cpu-N}: a hot loop of one detail span per feature. Past the budget, they fold. */
-    void match(Rerank rerank, int id, Tempo.Task h) {
-        Tempo.Span m = h.tryBegin();
-        if (m == null) return; // taken back by the early exit before it began
-        try (m) {
-            for (int f = 0; f < FEATURES; f++) {
-                try (Tempo.Span s = m.step(SCORE)) {
-                    Demo.cpu(SCORE_MICROS);
-                }
+    /** On {@code cpu-N}: a hot loop of one step per feature. Past the budget, they fold. */
+    void match(Rerank rerank, int id) {
+        for (int f = 0; f < FEATURES; f++) {
+            try (Tempo.Span s = Tempo.step(SCORE)) {
+                Demo.cpu(SCORE_MICROS);
             }
-            double similarity = (id % 10) / 10.0;
-            m.set(SIMILARITY, similarity);
-            rerank.results.add(new Match(id, similarity));
         }
+        double similarity = (id % 10) / 10.0;
+        Tempo.current().set(SIMILARITY, similarity);
+        rerank.results.add(new Match(id, similarity));
     }
 
     // ------------------------------------------------------------------ the fan-out and the early exit
@@ -238,54 +242,42 @@ public final class SearchRequest {
      */
     static final class Rerank {
         final BlockingQueue<Match> results = new LinkedBlockingQueue<>();
-        private final List<Queued> tasks = new ArrayList<>(); // guarded by this
-        private boolean stopped;                              // guarded by this
+        private final List<Tempo.RunnableTask> tasks = new ArrayList<>(); // guarded by this
+        private boolean stopped;                                          // guarded by this
 
         /** Submits a task to {@code pool} under the calling thread's innermost span, unless the request has stopped. */
-        synchronized void submit(Tempo.Name name, ThreadPoolExecutor pool, Function<Tempo.Task, Runnable> task) {
+        synchronized void submit(Tempo.Name name, ThreadPoolExecutor pool, Runnable body) {
             if (stopped) return;
+            Tempo.RunnableTask task = Tempo.runnable(name, body);
             // The pool's queue length at submit: tools/tempo --pools draws it as the pool-wide signal.
-            Tempo.Task h = Tempo.task(name).set(QUEUED, pool.getQueue().size());
-            tasks.add(new Queued(pool.submit(task.apply(h)), h));
+            task.set(QUEUED, pool.getQueue().size());
+            pool.execute(task);
+            tasks.add(task); // the task is its own future
         }
 
         /**
          * Stops the fan-out and cancels every task that has not begun; returns how many. The task decides
-         * the race with a worker: cancel() wins only if the task has not begun, and then tryBegin() returns
-         * null even if a worker takes it right now, so the trace shows it cancelled before it began. A lost
-         * cancel means the task is running: it is left to finish. The cancelled tasks stay in the queues,
-         * where they cost a worker nothing; ThreadPoolExecutor.remove would only free the slots of a bounded
-         * queue sooner, and these queues are unbounded. The race is the same in an untraced request.
+         * the race with a worker: cancel() wins only if the task has not begun, and then its body never
+         * runs, even if a worker takes it right now, so the trace shows it cancelled before it began, and its
+         * future is cancelled for anyone who waits on it. A lost cancel means the task is running: it is
+         * left to finish. The cancelled tasks stay in the queues, where they cost a worker nothing;
+         * ThreadPoolExecutor.remove would only free the slots of a bounded queue sooner, and these queues
+         * are unbounded. The race is the same in an untraced request.
          */
         synchronized int stop() {
             stopped = true;
             int n = 0;
-            for (Queued q : tasks) {
-                if (q.handoff.cancel()) {
-                    q.task.cancel(false); // completes the pool's future for anyone who waits on it
-                    n++;
-                }
-            }
+            for (Tempo.RunnableTask t : tasks) if (t.cancel()) n++;
             return n;
         }
 
         /** Waits for every task that was not cancelled; a misuse thrown in one (strict) surfaces here. */
         void join() throws Exception {
-            List<Queued> all;
+            List<Tempo.RunnableTask> all;
             synchronized (this) {
                 all = new ArrayList<>(tasks);
             }
-            for (Queued q : all) if (!q.task.isCancelled()) q.task.get(10, TimeUnit.SECONDS);
-        }
-    }
-
-    static final class Queued {
-        final Future<?> task;
-        final Tempo.Task handoff;
-
-        Queued(Future<?> task, Tempo.Task handoff) {
-            this.task = task;
-            this.handoff = handoff;
+            for (Tempo.RunnableTask t : all) if (!t.isCancelled()) t.get(10, TimeUnit.SECONDS);
         }
     }
 
@@ -334,33 +326,33 @@ public final class SearchRequest {
 
     static void check(Response r, String requestThread) {
         List<Row> rows = Row.all(r.snapshot);
-        Demo.check(r.trace.records() == Tempo.STEP, "the opt-in raised the trace to STEP");
+        Demo.check(r.trace.records() == Tempo.STEP, "the opt-in widened the trace to STEP");
         Demo.check(r.hits.size() == WANTED, "the request found " + WANTED + " good hits and stopped");
 
         Demo.check(count(rows, v -> v.depth == 0 && requestThread.equals(v.thread)) == 1, "the root runs on " + requestThread);
-        Demo.check(count(rows, v -> v.name == FINGERPRINT && v.handoff && v.thread.startsWith("cpu-")) == 1
-                && count(rows, v -> v.name == QUERY && v.handoff && v.thread.startsWith("io-")) == 1,
-                "fingerprint ran on cpu-*, query on io-*, each one handoff");
+        Demo.check(count(rows, v -> v.name == FINGERPRINT && v.task && v.thread.startsWith("cpu-")) == 1
+                && count(rows, v -> v.name == QUERY && v.task && v.thread.startsWith("io-")) == 1,
+                "fingerprint ran on cpu-*, query on io-*, each one task");
         Demo.check(count(rows, v -> v.name == AWAIT && v.waiting && requestThread.equals(v.thread)) == 3,
                 "the request thread blocked three times, each wait flagged w");
 
-        // The chain. The first match handoff comes before any score span, so the budget still has room
-        // for it to be a row of its own.
-        Demo.check(count(rows, v -> v.name == MATCH && v.handoff && !v.aggregate && v.ran()
+        // The chain. The first match task comes before any score step, so the budget still has room for it
+        // to be a row of its own.
+        Demo.check(count(rows, v -> v.name == MATCH && v.task && !v.aggregate && v.ran()
                         && v.thread.startsWith("cpu-") && v.parent.name == LOAD && v.parent.thread.startsWith("io-")
                         && v.parent.parent.depth == 0 && requestThread.equals(v.parent.parent.thread)) > 0,
-                "a match on cpu-* was handed off inside a load on io-*, which the request handed off");
-        Demo.check(count(rows, v -> v.name == MATCH && v.handoff && v.waitMax >= 1_000_000) > 0,
+                "a match on cpu-* was submitted inside a load on io-*, which the request submitted");
+        Demo.check(count(rows, v -> v.name == MATCH && v.task && v.waitMax >= 1_000_000) > 0,
                 "some match waited 1 ms or more in the cpu queue: three io threads outpace three cpu threads");
 
-        // The early exit. Cancelled before it began: a handoff with flag c and no run time.
-        long cancelled = rows.stream().filter(v -> (v.name == LOAD || v.name == MATCH) && v.handoff && v.cancelled)
+        // The early exit. Cancelled before it began: a task with flag c and no run time.
+        long cancelled = rows.stream().filter(v -> (v.name == LOAD || v.name == MATCH) && v.task && v.cancelled)
                 .mapToLong(v -> v.count).sum();
         Demo.check(r.cancelled > 0, "the early exit took back at least one queued task");
         // If the request thread was descheduled while it submitted, the cpu lanes spent the budget first and
         // later loads folded under rerank. Such a group mixes loads that ran with loads taken back, and an
         // aggregate keeps only the flags all its occurrences share: it carries no c.
-        boolean loadsFolded = count(rows, v -> v.name == LOAD && v.handoff && v.aggregate) > 0;
+        boolean loadsFolded = count(rows, v -> v.name == LOAD && v.task && v.aggregate) > 0;
         Demo.check(loadsFolded ? cancelled > 0 && cancelled <= r.cancelled : cancelled == r.cancelled,
                 "each task taken back shows cancelled (^c)" + (loadsFolded
                         ? ", except in a folded group that also holds loads that ran: an aggregate keeps only the flags all its tasks share"
@@ -368,7 +360,7 @@ public final class SearchRequest {
         Demo.check(count(rows, v -> v.misuse || v.healed) == 0, "no misuse, nothing healed");
 
         // The budget, 512 by default, is spent before the exit, whatever the timing: four matches have
-        // ended, and 2 + 48 handoffs + 4 x (1 handoff + 128 score spans) is more than 512.
+        // ended, and 2 + 48 tasks + 4 x (1 task + 128 score steps) is more than 512.
         Demo.check(count(rows, v -> v.name == SCORE && v.aggregate) > 0, "past the budget, score spans folded into aggregates");
         Demo.check(Demo.folded(r.tempoTiming) > 0, "the header counts the folded spans in x=");
         int total = Demo.bytes(r.runtime) + Demo.bytes(r.serverTiming) + Demo.bytes(r.tempoTiming)
@@ -412,7 +404,7 @@ public final class SearchRequest {
     static long[] cpuAndWall(List<Row> rows, Tempo.Name name) {
         long[] sum = new long[2];
         for (Row v : rows) {
-            if (v.name != name || !v.handoff || v.open || v.cpu < 0) continue;
+            if (v.name != name || !v.task || v.open || v.cpu < 0) continue;
             sum[0] += v.cpu;
             sum[1] += v.dur;
         }
@@ -444,7 +436,7 @@ public final class SearchRequest {
         Tempo.Name name;
         String thread;
         int depth;
-        boolean handoff, aggregate, open, cancelled, neverStarted, waiting, misuse, healed;
+        boolean task, aggregate, open, cancelled, neverStarted, waiting, misuse, healed;
         long count, dur, waitMax, cpu;
         final Map<Tempo.Name, Long> attrs = new HashMap<>();
 
@@ -465,7 +457,7 @@ public final class SearchRequest {
                 r.name = v.name();
                 r.thread = v.thread();
                 r.depth = v.depth();
-                r.handoff = v.handoff();
+                r.task = v.handoff();
                 r.aggregate = v.aggregate();
                 r.open = v.open();
                 r.cancelled = v.cancelled();
