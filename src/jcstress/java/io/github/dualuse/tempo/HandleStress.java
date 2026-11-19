@@ -6,6 +6,7 @@ import org.openjdk.jcstress.annotations.JCStressTest;
 import org.openjdk.jcstress.annotations.Outcome;
 import org.openjdk.jcstress.annotations.State;
 import org.openjdk.jcstress.infra.results.III_Result;
+import org.openjdk.jcstress.infra.results.II_Result;
 
 import static org.openjdk.jcstress.annotations.Expect.ACCEPTABLE;
 import static org.openjdk.jcstress.annotations.Expect.ACCEPTABLE_INTERESTING;
@@ -117,6 +118,48 @@ public final class HandleStress {
             r.r1 = issued == h ? 1 : 0;
             r.r2 = (int) second.total(M.id).count();
             r.r3 = first.misuses.get() + second.misuses.get();
+        }
+    }
+
+    /**
+     * {@link StaleSet} for a phase: the owner sets an attribute on an ended phase while release() retires
+     * the lane and pools the phase's handle. The set lands before the lane retires, or is refused and
+     * counted as misuse, never lost; the handle ends pooled and detached. Result: 1 recorded or 2 refused
+     * and counted; the handle detached (1).
+     */
+    @JCStressTest
+    @Outcome(id = {"1, 1", "2, 1"}, expect = ACCEPTABLE, desc = "Recorded or refused; the handle pooled")
+    @Outcome(expect = FORBIDDEN, desc = "A set lost or counted twice, or the handle left bound")
+    @State
+    public static class StalePhaseSet {
+        final Tempo.ThreadSlot slot = new Tempo.ThreadSlot();
+        final Tempo.Context ctx = new Tempo.Context(new Tempo.Options());
+        final Tempo.Lane lane = lane(ctx, slot);
+        final Tempo.Phase p;
+
+        {
+            lane.openRoot(N, 0, -1);
+            lane.openSpan(N, 0);
+            p = lane.phase(1, N, 0);
+            lane.close(1);
+            lane.close(0);
+        }
+
+        @Actor
+        public void owner() {
+            p.owner = Thread.currentThread(); // the actor thread stands in for the lane's owner
+            p.set(K, 42);
+        }
+
+        @Actor
+        public void release() {
+            ctx.release();
+        }
+
+        @Arbiter
+        public void arbiter(II_Result r) {
+            r.r1 = lane.eventCount + 2 * ctx.misuses.get();
+            r.r2 = p.lane == Tempo.Lane.POOLED && p.ctx == Tempo.Context.NONE ? 1 : 0;
         }
     }
 }

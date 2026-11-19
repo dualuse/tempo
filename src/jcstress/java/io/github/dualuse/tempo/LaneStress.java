@@ -12,7 +12,10 @@ import static org.openjdk.jcstress.annotations.Expect.ACCEPTABLE;
 import static org.openjdk.jcstress.annotations.Expect.ACCEPTABLE_INTERESTING;
 import static org.openjdk.jcstress.annotations.Expect.FORBIDDEN;
 
-/** jcstress tests of the lane state (IDLE, ACTIVE, RETIRED) and the commit protocol; {@link TaskStress} has the task state. */
+/**
+ * jcstress tests of the lane state (IDLE, ACTIVE, RETIRED), the commit protocol, the pooled arrays of a
+ * retired lane, and the widening of what a trace records; {@link TaskStress} has the task state.
+ */
 public final class LaneStress {
 
     static final Tempo.Name N = Tempo.name("stress"), K = Tempo.name("stress-key");
@@ -124,6 +127,118 @@ public final class LaneStress {
         @Arbiter
         public void arbiter(II_Result r) {
             r.r2 = first.retired() && (late == null || late.retired()) ? 1 : 0;
+        }
+    }
+
+    /**
+     * {@code records(STEP)} races a step opened on another thread. The step reads the level in the same
+     * atomic step that fixes it: either the widening came first and the step is drawn, or the step came
+     * first and the widening is refused. Result: widened (1), the step drawn (1).
+     */
+    @JCStressTest
+    @Outcome(id = {"1, 1", "0, 0"}, expect = ACCEPTABLE, desc = "Widened before a drawn step, or refused after an undrawn one")
+    @Outcome(expect = FORBIDDEN, desc = "Widened after an undrawn step, or refused before a drawn one")
+    @State
+    public static class WidenStep {
+        final Tempo.Context ctx = new Tempo.Context(new Tempo.Options().cpu(false));
+        final Tempo.Lane lane = lane(ctx);
+
+        {
+            lane.openRoot(N, 0, -1);
+        }
+
+        @Actor
+        public void widen(II_Result r) {
+            synchronized (ctx) {
+                r.r1 = ctx.widen(Tempo.STEP) ? 1 : 0;
+            }
+        }
+
+        @Actor
+        public void step(II_Result r) {
+            r.r2 = lane.openStep(N, 0).row != Tempo.Lane.FRAME ? 1 : 0;
+        }
+    }
+
+    /** {@link WidenStep} for a tick, which is recorded only at {@code TICK}. Result: widened (1), the tick recorded (1). */
+    @JCStressTest
+    @Outcome(id = {"1, 1", "0, 0"}, expect = ACCEPTABLE, desc = "Widened before a recorded tick, or refused after an unrecorded one")
+    @Outcome(expect = FORBIDDEN, desc = "Widened after an unrecorded tick, or refused before a recorded one")
+    @State
+    public static class WidenTick {
+        final Tempo.Context ctx = new Tempo.Context(new Tempo.Options().cpu(false));
+        final Tempo.Lane lane = lane(ctx);
+
+        {
+            lane.openRoot(N, 0, -1);
+        }
+
+        @Actor
+        public void widen(II_Result r) {
+            synchronized (ctx) {
+                r.r1 = ctx.widen(Tempo.TICK) ? 1 : 0;
+            }
+        }
+
+        @Actor
+        public void tick(II_Result r) {
+            r.r2 = lane.openTick(N, 0) != Tempo.NOOP ? 1 : 0;
+        }
+    }
+
+    /**
+     * A retired lane's arrays go to its owner's next lane. The owner records 5 spans of N in a lane of a
+     * second trace, which takes the arrays of the first trace's lane if release() has retired it by then,
+     * while a reader totals N in the first trace, which has 3. The reader sees the first trace's 3 or,
+     * released, none: never the second trace's spans. Result: the reader's count, the second trace's
+     * count, and whether the second lane took the first one's arrays (1).
+     */
+    @JCStressTest
+    @Outcome(id = {"3, 5, 0", "0, 5, 0"}, expect = ACCEPTABLE, desc = "The first trace's count, or none once released")
+    @Outcome(id = {"3, 5, 1", "0, 5, 1"}, expect = ACCEPTABLE_INTERESTING, desc = "The same, the arrays reused")
+    @Outcome(expect = FORBIDDEN, desc = "The reader saw the second trace's spans, or the second trace lost some")
+    @State
+    public static class Reuse {
+        final Tempo.ThreadSlot slot = new Tempo.ThreadSlot();
+        final Tempo.Context first = new Tempo.Context(new Tempo.Options()), second = new Tempo.Context(new Tempo.Options());
+        final Tempo.Lane a = first.register(new Tempo.Lane(first, slot));
+        Tempo.Lane b;
+
+        {
+            a.openRoot(K, 0, -1);
+            for (int i = 0; i < 3; i++) {
+                a.openSpan(N, 0);
+                a.close(1);
+            }
+            a.close(0);
+        }
+
+        @Actor
+        public void owner() {
+            Tempo.Lane l = second.register(new Tempo.Lane(second, slot));
+            l.openRoot(K, 0, -1);
+            for (int i = 0; i < 5; i++) {
+                l.openSpan(N, 0);
+                l.close(1);
+            }
+            l.close(0);
+            b = l;
+        }
+
+        @Actor
+        public void release() {
+            first.release();
+        }
+
+        @Actor
+        public void reader(III_Result r) {
+            r.r1 = (int) first.total(N.id).count();
+        }
+
+        @Arbiter
+        public void arbiter(III_Result r) {
+            r.r2 = (int) second.total(N.id).count();
+            r.r3 = b.rows == a.rows ? 1 : 0;
         }
     }
 }
