@@ -422,6 +422,44 @@ class TaskTest {
         }
     }
 
+    /**
+     * A timed invokeAll that gives up before executing its tasks (at once, with no time) must not leave
+     * one remembered: a later execute of a plain future is still a task of its own.
+     */
+    @Test
+    void anExecuteAfterAnInvokeAllWithNoTimeIsStillATask() throws Exception {
+        ExecutorService pool = worker("worker-1");
+        ExecutorService match = Tempo.executor(pool, MATCH);
+        CountDownLatch busy = new CountDownLatch(1), finish = new CountDownLatch(1);
+        try {
+            pool.execute(() -> {
+                busy.countDown();
+                try {
+                    finish.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            assertTrue(busy.await(10, TimeUnit.SECONDS));
+            Trace t = Tempo.trace(SEARCH, opts()).records(STEP);
+            Callable<Integer> one = () -> 1, two = () -> 2;
+            for (Future<Integer> f : match.invokeAll(List.of(one, two), 0, TimeUnit.NANOSECONDS))
+                assertTrue(f.isCancelled());
+            finish.countDown();
+            java.util.concurrent.FutureTask<Integer> plain = new java.util.concurrent.FutureTask<>(() -> 3);
+            match.execute(plain);
+            match.submit(() -> { }).get();
+            assertEquals(3, plain.get());
+            t.close();
+            String tree = tree(t);
+            assertEquals(2, tree.split("handoff~0 @worker-1", -1).length - 1, tree);
+            assertEquals(0, t.misuses());
+        } finally {
+            finish.countDown();
+            match.shutdownNow();
+        }
+    }
+
     @Test
     void timingsHaveANameAndAStart() throws Exception {
         Trace t = Tempo.trace(SEARCH, opts());

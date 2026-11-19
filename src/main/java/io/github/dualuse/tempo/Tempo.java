@@ -12,6 +12,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
@@ -6862,6 +6863,17 @@ public final class Tempo {
             if (!ours(c)) return new CallTask<>(name, null, c, Task.QUIET);
             ((TaskFuture<?>) c).quiet();
             return (RunnableFuture<T>) c;
+        }
+
+        /** As the JDK's; a timed call that gives up before executing every task leaves none remembered. */
+        @Override
+        public <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks, long timeout, TimeUnit unit)
+                throws InterruptedException {
+            try {
+                return super.invokeAll(tasks, timeout, unit);
+            } finally {
+                SLOT.get().made = null;
+            }
         }
 
         /** Like {@link #task(Runnable, Object)}; remembered for the {@link #execute} that follows. */
