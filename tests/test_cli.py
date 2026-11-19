@@ -720,6 +720,20 @@ DRAWING = {"v": 1, "unit": "us", "folded": 0, "dropped": 0, "threads": ["main", 
                {"id": 12, "parent": 10, "name": "check", "start": 3200, "dur": 400, "thread": 0, "flags": "fp"}]}
 
 
+# a root with nine phases of 5 ms, four of 50 us and a long rest: at most widths each of
+# the first thirteen is too narrow even for its reference, and the root starts at the
+# left edge, so its name and their references share the name column
+CUT_PHASES = [("accept", 5000), ("decode", 5000), ("validate", 5000), ("authorize", 5000),
+              ("lookup", 5000), ("expand", 5000), ("score", 5000), ("merge", 5000),
+              ("render", 5000), ("flush", 50), ("audit", 50), ("notify", 50), ("close", 50),
+              ("rest", 200000)]
+CUT = {"v": 1, "unit": "us", "threads": ["main"], "spans": [
+    {"id": 0, "parent": -1, "name": "GET /search", "start": 0,
+     "dur": sum(d for _, d in CUT_PHASES), "thread": 0}] + [
+    {"id": i + 1, "parent": 0, "name": n, "start": sum(d for _, d in CUT_PHASES[:i]), "dur": d,
+     "thread": 0, "flags": "p"} for i, (n, d) in enumerate(CUT_PHASES)]}
+
+
 class Drawing(unittest.TestCase):
     maxDiff = None
 
@@ -787,6 +801,66 @@ class Drawing(unittest.TestCase):
                     for name in ("init", "loading", "warm-up", "scan", "push", "parse", "check",
                                  "read", "open"):
                         self.assertIn(name, shown)
+
+    def test_every_footnote_reference_is_on_the_chart(self):
+        # each reference the footnote resolves stands on the chart, whole (alone or as
+        # an end or the inside of a range), and each one on the chart is resolved
+        for doc in (DRAWING, CUT):
+            for width in range(30, 141, 3):
+                for glyphs in ((), ("--ascii",)):
+                    code, out, err = cli(["--no-color", "--width", str(width)] + list(glyphs),
+                                         stdin=json.dumps(doc))
+                    self.assertEqual(code, 0, err)
+                    chart, foot = out.split("\n\n")[:2]
+                    listed = set(int(k) for k in re.findall(r"\*(\d+) ", foot))
+                    shown = set()
+                    for a, b in re.findall(r"\*(\d+)[-–]\*(\d+)", chart):
+                        shown.update(range(int(a), int(b) + 1))
+                    shown.update(int(k) for k in re.findall(r"\*(\d+)", chart))
+                    with self.subTest(doc=doc["spans"][0]["name"], width=width, glyphs=glyphs):
+                        self.assertEqual(shown, listed)
+
+    def test_name_column_keeps_the_name_and_whole_references(self):
+        # many phases too narrow even for a reference: the root keeps its name, cut but
+        # never dropped, and its references, never split, become the range *1–*13 (every
+        # number in between is one of its own phases); the column may outgrow a sixth
+        # of the width for that
+        def lanes(width, *glyphs):
+            code, out, err = cli(["--no-color", "--width", str(width)] + list(glyphs),
+                                 stdin=json.dumps(CUT))
+            self.assertEqual(code, 0, err)
+            return out.splitlines()[1:9]
+        foot = ["*1 accept  *2 decode  *3 validate  *4 authorize  *5 lookup",
+                "*6 expand  *7 score  *8 merge  *9 render  *10 flush  *11 audit",
+                "*12 notify  *13 close"]
+        self.assertEqual(lanes(66), [
+            "                       ms 0               100             200",
+            "                          ┬───────────────┬───────────────┬───────",
+            "main           GE… *1–*13 ├┼┼┼┼┼┼┼──────────── rest ─────────────┤",
+            ""] + foot + [""])
+        self.assertEqual(lanes(66, "--ascii"), [
+            "                        ms 0              100             200",
+            "                           +--------------+---------------+-------",
+            "main            GE~ *1-*13 ||||||||------------ rest ------------|",
+            ""] + foot + [""])
+        foot = ["*1 accept  *2 decode  *3 validate  *4 authorize  *5 lookup  *6 expand",
+                "*7 score  *8 merge  *9 render  *10 flush  *11 audit  *12 notify",
+                "*13 close"]
+        self.assertEqual(lanes(72), [
+            "                        ms 0                 100               200",
+            "                           ┬─────────────────┬─────────────────┬────────",
+            "main           GET… *1–*13 ├┼┼┼┼┼┼┼┼────────────── rest ───────────────┤",
+            ""] + foot + [""])
+        self.assertEqual(lanes(72, "--ascii"), [
+            "                         ms 0                100               200",
+            "                            +----------------+-----------------+--------",
+            "main            GET~ *1-*13 |||||||||-------------- rest --------------|",
+            ""] + foot + [""])
+        for width in range(30, 141, 3):
+            for glyphs in ((), ("--ascii",)):
+                with self.subTest(width=width, glyphs=glyphs):
+                    [row] = [x for x in lanes(width, *glyphs) if x.startswith("main")]
+                    self.assertRegex(row, r"^main +G[^*]* \*\d")
 
     def test_no_name_column_without_need(self):
         # a root without phases has its name in its bar; stage, with phases, has room
@@ -1062,6 +1136,15 @@ class Layout(unittest.TestCase):
     def test_width_from_columns_when_piped(self):
         code, out, err = cli([os.path.join(SAMPLES, "small.header")], env={"COLUMNS": "64"})
         self.assertTrue(max(len(line) for line in out.splitlines()) <= 64)
+
+    def test_focus_help_names_spans_of_the_samples(self):
+        text = " ".join(tempo.build_parser().format_help().split())
+        [example] = re.findall(r"--focus PATH only the subtree\(s\) at PATH, e\.g\. (\S+) or (\S+)", text)
+        for path in example:
+            for sample in ("find-healthy", "find-saturated", "small"):
+                with self.subTest(path=path, sample=sample):
+                    code, out, err = cli(["--focus", path, os.path.join(SAMPLES, sample + ".header")])
+                    self.assertEqual(code, 0, err)
 
     def test_usage_errors(self):
         code, out, err = cli(["--threads", "(", os.path.join(SAMPLES, "small.header")])

@@ -1100,13 +1100,13 @@ UNI = {"bar": "─", "bar_l": "├", "bar_r": "┤", "bar_x": "┼", "bar_1": "�
        "unphased": "·", "wait": "░", "agg": "▚",
        "tick": "┃", "f": "✗", "c": "⊘", "o": "▶", "n": "∅", "m": "!",
        "live": "●", "axis": "─", "axis_tick": "┬", "end": "┊",
-       "ell": "…", "times": "×", "delta": "Δ", "arrow": "→", "le": "≤",
+       "ell": "…", "range": "–", "times": "×", "delta": "Δ", "arrow": "→", "le": "≤",
        "dot": "·", "tm": "├─ ", "tl": "└─ ", "tp": "│  ", "tb": "   ",
        "spark": " ▁▂▃▄▅▆▇█", "gauge": "•"}
 ASCII = {"bar": "-", "bar_l": "|", "bar_r": "|", "bar_x": "|", "bar_1": "|", "wbar": "~",
          "unphased": ".", "wait": "_", "agg": "%", "tick": "#",
          "f": "X", "c": "/", "o": ">", "n": "0", "m": "!", "live": "*", "axis": "-",
-         "axis_tick": "+", "end": ":", "ell": "~", "times": "x", "delta": "d", "arrow": "->",
+         "axis_tick": "+", "end": ":", "ell": "~", "range": "-", "times": "x", "delta": "d", "arrow": "->",
          "le": "<=", "dot": "-", "tm": "|- ", "tl": "`- ", "tp": "|  ", "tb": "   ",
          "spark": " .:-=+*#@", "gauge": "o"}
 
@@ -1446,15 +1446,17 @@ def draw_lane(spans, scale, p, rowof=None, names=None, notes=None):
             wa, wc0 = s.start, scale.rd(s.start)
         # the name of a span with phases stands in front of the bar (and its wait),
         # one space apart, or in the name column when the front has no room; after
-        # it the references of phases too narrow even for a reference of their own
+        # it the references of phases too narrow even for a reference of their own,
+        # all of them, as a list or, where that is too long, with ranges (_ref_forms)
         phased = s.phases and not s.agg and not s.not_run
         outside = _outside_refs(s, c0, c1, scale, notes) if phased else []
-        refs = " ".join(outside)
-        front = s.name if phased else ""
-        if front and refs:
-            front += " " + refs
-        elif refs:
-            front = refs
+        forms = _ref_forms(s, outside, notes, g)
+        name = s.name if phased else ""
+        front = _column_text(name, forms[0] if forms else "")
+        for refs in forms:
+            front = _column_text(name, refs)
+            if wc0 - len(front) - 1 >= 0:
+                break
         l0 = wc0 - len(front) - 1 if front else wc0
         in_column = l0 < 0
         lab0 = 0 if in_column else max(0, l0 - 1)
@@ -1480,9 +1482,8 @@ def draw_lane(spans, scale, p, rowof=None, names=None, notes=None):
         cells = rows[r]
         failed = "f" in s.flags
         if front:
-            name = s.name if phased else ""
             if in_column:
-                names[r] = (name, refs, "fail_lbl" if failed else "lbl")
+                names[r] = (name, forms, "fail_lbl" if failed else "lbl")
             else:
                 for i, ch in enumerate(front):
                     cells[l0 + i] = (ch, "fail_lbl" if failed else ("lbl" if i < len(name) else "ref"))
@@ -1545,6 +1546,38 @@ def _outside_refs(s, c0, c1, scale, notes):
         ref = notes.ref(ph.name)  # numbered here, so in phase order, for _bar too
         if len(ref) > inside and ref not in out:
             out.append(ref)
+    return out
+
+
+def _ref_forms(s, outside, notes, g):
+    """The ways to write the references `outside` of span `s`, each shorter than the one
+    before: the list (*4 *5 *6 *7), then with ranges (*4–*7) where every number in
+    between is a reference of a phase of `s` too (one wide enough for its reference
+    shows it in the bar), then, for many references, one range from the lowest to the
+    highest. A reference is never split, and each one stays on the chart."""
+    if not outside:
+        return []
+    forms = [" ".join(outside)]
+    nums = sorted(int(r[1:]) for r in outside)
+    own = set(int(notes.refs[ph.name][1:]) for ph in s.phases if ph.name in notes.refs)
+    runs = [[nums[0]]]
+    for k in nums[1:]:
+        if all(i in own for i in range(runs[-1][-1] + 1, k)):
+            runs[-1].append(k)
+        else:
+            runs.append([k])
+    parts = []
+    for run in runs:
+        listed = " ".join("*%d" % k for k in run)
+        ranged = "*%d%s*%d" % (run[0], g["range"], run[-1])
+        parts.append(ranged if len(ranged) < len(listed) else listed)
+    forms.append(" ".join(parts))
+    if len(nums) > 1:
+        forms.append("*%d%s*%d" % (nums[0], g["range"], nums[-1]))
+    out = []
+    for f in forms:
+        if not out or len(f) < len(out[-1]):
+            out.append(f)
     return out
 
 
@@ -1656,8 +1689,11 @@ def view_lanes(trace, flt, p, width):
     # spans with phases that start too near the left edge to have their name in front
     # each pass may widen the column, which narrows the time axis; the last pass draws
     # at the column's final width, and a name that then needs more is shortened
+    # the column keeps at most a sixth of the width, but always room for each span's
+    # name (at least its first letter and an ellipsis) and all its references; it only
+    # widens, so the passes end
     nw = 0
-    for last in (False, False, False, True):
+    while True:
         scale = Scale(t0, t1, max(10, width - lw - nw))
         notes = Notes()
         drawn = {}
@@ -1665,10 +1701,11 @@ def view_lanes(trace, flt, p, width):
             for k in keys:
                 names = {}
                 drawn[k] = (draw_lane(by_lane.get(k, []), scale, p, names=names, notes=notes), names)
-        need = max([len(_column_text(t, r)) for _, names in drawn.values() for t, r, _ in names.values()]
-                   or [0])
-        want = min(need + 1, max(6, width // 6)) if need else 0
-        if last or want <= nw:
+        entries = [(t, f) for _, names in drawn.values() for t, f, _ in names.values()]
+        need = max([len(_column_text(t, f[0] if f else "")) for t, f in entries] or [0])
+        least = max([_column_least(t, f) for t, f in entries] or [0])
+        want = min(need + 1, max(6, width // 6, least + 1)) if need else 0
+        if want <= nw:
             break
         nw = want
     cw = scale.w
@@ -1694,8 +1731,8 @@ def view_lanes(trace, flt, p, width):
                 head = (lab if i == 0 else "").ljust(lw)
                 line = pad(p, head, lw, "live" if (live and i == 0) else None)
                 if nw:
-                    text, refs, st = names.get(i, ("", "", None))
-                    line += _column(p, text, refs, nw, st)
+                    text, forms, st = names.get(i, ("", [], None))
+                    line += _column(p, text, forms, nw, st)
                 out.append(line + p.cells(cells))
         if grouped:
             act = pool_activity(trace, [s for s in spans if s.pool == pool], scale)
@@ -1734,17 +1771,32 @@ def _column_text(name, refs):
     return name + " " + refs if name and refs else name or refs
 
 
-def _column(p, name, refs, n, style):
-    """A name in the name column, n wide: the span's name, shortened if need be, then
-    whole the references of its phases too narrow to hold one."""
-    if not refs:
+def _column_least(name, forms):
+    """The fewest cells a column entry takes: its name cut to a letter and an ellipsis,
+    then its shortest form of references."""
+    if not forms:
+        return 0
+    return (min(len(name), 2) + 1 if name else 0) + len(forms[-1])
+
+
+def _column(p, name, forms, n, style):
+    """A name in the name column, n wide: the span's name, then all the references of
+    its phases too narrow to hold one, in the first of their `forms` (_ref_forms) next
+    to which the name stays whole, else keeps three cells, else the shortest. Only the
+    name is shortened, never to nothing; a reference is never cut."""
+    if not forms:
         return pad(p, fit(name, n - 1, p.g), n, style)
-    room = n - 1 - len(refs) - (1 if name else 0)
-    if name and room < 1:
-        name, room = "", n - 1 - len(refs)
-    head = fit(name, room, p.g) + " " if name else ""
-    refs = refs[:max(0, n - 1 - len(head))]
-    return p.c(head.rstrip(" "), style) + (" " if head else "") + pad(p, refs, n - len(head), "ref")
+
+    def room(refs):
+        return n - 1 - len(refs) - (1 if name else 0)
+
+    refs = next((f for f in forms if room(f) >= len(name)), None)
+    if refs is None:
+        refs = next((f for f in forms if room(f) >= min(len(name), 3)), forms[-1])
+    if not name:
+        return pad(p, refs, n, "ref")
+    head = fit(name, max(room(refs), min(len(name), 2)), p.g)
+    return p.c(head, style) + " " + pad(p, refs, n - len(head) - 1, "ref")
 
 
 def _short(v):
@@ -2865,7 +2917,7 @@ def build_parser():
     f = ap.add_argument_group("filters")
     f.add_argument("--threads", metavar="REGEX", help="only spans on threads matching REGEX")
     f.add_argument("--focus", metavar="PATH",
-                   help="only the subtree(s) at PATH, e.g. rerank or rerank/load")
+                   help="only the subtree(s) at PATH, e.g. load or fingerprint")
     f.add_argument("--depth", type=int, metavar="N", help="at most N levels below the root/focus")
     f.add_argument("--min-ms", type=float, metavar="X",
                    help="hide spans (and their subtrees) shorter than X ms")
