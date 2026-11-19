@@ -24,7 +24,7 @@ import java.util.concurrent.ThreadPoolExecutor;
  * <li>{@code toLink(base, maxBytes)} under a byte limit: a null base opens the viewer of
  * {@code Options.linkBase}, a base given per call opens another one;</li>
  * <li>a response object that holds a {@code Snapshot}, so its body renders after the trace is released;</li>
- * <li>reading a trace in code: {@code forEachSpan} for the tree, {@code forEachTop} for the legacy steps.</li>
+ * <li>reading a trace in code: {@code forEachSpan} for the tree, {@code forEachTop} for the labelled phases.</li>
  * </ul>
  *
  * <pre>
@@ -113,9 +113,9 @@ public final class ResponseHeaders {
         List<String> hits = new ArrayList<>();
         try (t) {
             Tempo.Span s = t;
+            s.phase(DECODE).label("Decode Query");
             Demo.cpu(2_000); // parse the query
-            s.done(DECODE, "Decode Query");
-            s.phase(RERANK).legacy();
+            s.phase(RERANK).label("rerank");
             try (Tempo.Span load = s.step(LOAD)) {
                 Demo.io(3); // read the candidates
                 load.set(BYTES, 48_213);
@@ -140,7 +140,7 @@ public final class ResponseHeaders {
         Tempo.Snapshot snap = t.snapshot();
 
         // One limit for the timing headers: the legacy ones are short and come first, the whole tree
-        // gets what is left. Count UTF-8 bytes, not chars: a legacy label may hold any character.
+        // gets what is left. Count UTF-8 bytes, not chars: a label may hold any character.
         String runtime = snap.toRuntime(3), serverTiming = snap.toServerTiming();
         int left = HEADER_LIMIT - Demo.bytes(runtime) - Demo.bytes(serverTiming);
         String tempoTiming = snap.toHeader(left);
@@ -197,17 +197,17 @@ public final class ResponseHeaders {
             if (v.name() == JOIN && v.waiting()) waits[0]++;
         });
 
-        // The legacy steps are what Runtime and Server-Timing print: a log line can use them too.
+        // The labelled phases are what Runtime and Server-Timing print: a log line can use them too.
         List<String> steps = new ArrayList<>();
         tempo.forEachTop((name, label, start, duration) -> {
             steps.add(name + (label == null ? "" : " \"" + label + "\""));
-            Demo.say(String.format(Locale.ROOT, "  legacy step %-22s %7.3f ms", steps.get(steps.size() - 1), ms(duration)));
+            Demo.say(String.format(Locale.ROOT, "  labelled phase %-22s %7.3f ms", steps.get(steps.size() - 1), ms(duration)));
         });
 
         Demo.check(matches[0] == 4 && onPool[0] == 4, "the four match tasks are handoffs that ran on cpu-* threads");
         Demo.check(waits[0] == 1, "join is marked as a blocking wait");
-        Demo.check(steps.equals(List.of("decode \"Decode Query\"", "rerank")),
-                "the legacy steps are decode (with its label) and rerank, in that order");
+        Demo.check(steps.equals(List.of("decode \"Decode Query\"", "rerank \"rerank\"")),
+                "the labelled phases are decode and rerank, in that order");
     }
 
     // ------------------------------------------------------------------ 3. a trace too large for its limit

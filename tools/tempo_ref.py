@@ -29,7 +29,7 @@ ALPHABET = frozenset("0123456789abcdefghijklmnopqrstuvwxyz"
                      "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
                      "./:;=@~*+^_%-")
 WHITESPACE = "\t\n\x0b\x0c\r "
-FLAG_ORDER = "fconwm"
+FLAG_ORDER = "fconwmp"
 MAX_DEPTH = 35
 
 RECORD_RE = re.compile(
@@ -81,7 +81,7 @@ def to_b36(n):
 
 def decode_name(text):
     if not text:
-        raise TempoFormatError("E_NAME", "empty name")
+        return ""                          # the empty name: an unnamed span
     if not NAME_RE.match(text):
         raise TempoFormatError("E_NAME", "bad name %r" % text)
     raw = bytearray()
@@ -101,7 +101,7 @@ def decode_name(text):
 
 
 def encode_name(name):
-    if name is None or name == "":
+    if name is None:
         name = "?"
     out = []
     for byte in name.encode("utf-8"):
@@ -219,7 +219,7 @@ def decode_records(records, names, threads):
     cur = [0] * (MAX_DEPTH + 2)
     path = [None] * (MAX_DEPTH + 1)   # span dict at each depth on the current path
     prev_depth = -1
-    prev_agg = False
+    prev_agg = prev_phase = False
     for i, rec in enumerate(records):
         m = RECORD_RE.match(rec)
         if not m:
@@ -228,6 +228,7 @@ def decode_records(records, names, threads):
          a_count, a_min, a_max, a_ext, a_at, flags_s, attrs_s) = m.groups()
         depth = int(depth_s, 36)
         is_agg = a_count is not None
+        is_phase = flags_s is not None and "p" in flags_s
         if i == 0:
             if depth != 0:
                 raise TempoFormatError("E_ROOT", "first record has depth %d" % depth)
@@ -235,6 +236,8 @@ def decode_records(records, names, threads):
                 raise TempoFormatError("E_ROOT", "root record carries @, ~ or +")
             if int(delta_s, 36) != 0:
                 raise TempoFormatError("E_ROOT", "root startDelta is not 0")
+            if is_phase:
+                raise TempoFormatError("E_ROOT", "root record is a phase")
         else:
             if depth == 0:
                 raise TempoFormatError("E_ROOT", "record %d is a second root" % i)
@@ -243,6 +246,8 @@ def decode_records(records, names, threads):
                                        % (i, prev_depth, depth))
             if prev_agg and depth > prev_depth:
                 raise TempoFormatError("E_AGG", "record %d is a child of an aggregate" % i)
+            if prev_phase and depth > prev_depth:
+                raise TempoFormatError("E_FLAG", "record %d is a child of a phase" % i)
 
         name_idx = int(name_s, 36)
         if name_idx >= len(names):
@@ -276,6 +281,8 @@ def decode_records(records, names, threads):
             for f in flags_s:
                 if f not in FLAG_ORDER:
                     raise TempoFormatError("E_FLAG", "record %d: unknown flag %r" % (i, f))
+            if is_phase and (is_agg or wait_s is not None or "n" in flags_s):
+                raise TempoFormatError("E_FLAG", "record %d: a phase with +, ~ or n" % i)
             span["flags"] = "".join(f for f in FLAG_ORDER if f in flags_s)
         if attrs_s:
             attrs = {}
@@ -300,6 +307,7 @@ def decode_records(records, names, threads):
         path[depth] = span
         prev_depth = depth
         prev_agg = is_agg
+        prev_phase = is_phase
         spans.append(span)
     return spans
 
@@ -330,6 +338,8 @@ def encode(doc):
                 raise ValueError("span %d: parent %r is not on the current path" % (i, p))
             if "agg" in spans[p]:
                 raise ValueError("span %d: an aggregate cannot have children" % i)
+            if "p" in spans[p].get("flags", ""):
+                raise ValueError("span %d: a phase cannot have children" % i)
             depth_of[i] = depth_of[p] + 1
             if depth_of[i] > MAX_DEPTH:
                 raise ValueError("span %d deeper than %d" % (i, MAX_DEPTH))
@@ -339,10 +349,10 @@ def encode(doc):
     # name table: span names in pre-order of first use, then attribute-only keys
     name_idx = {}
     for s in spans:
-        name_idx.setdefault(s["name"] or "?", len(name_idx))
+        name_idx.setdefault(s["name"], len(name_idx))
     for s in spans:
         for k in s.get("attrs", {}):
-            name_idx.setdefault(k or "?", len(name_idx))
+            name_idx.setdefault(k, len(name_idx))
 
     out = ["v1"]
     if doc.get("wall") is not None:
@@ -356,7 +366,7 @@ def encode(doc):
         if delta < 0:
             raise ValueError("span %d starts before its previous sibling or parent" % i)
         cur[d] = cur[d + 1] = s["start"]
-        r = [to_b36(d), to_b36(name_idx[s["name"] or "?"]), ".", to_b36(delta), ".", to_b36(s["dur"])]
+        r = [to_b36(d), to_b36(name_idx[s["name"]]), ".", to_b36(delta), ".", to_b36(s["dur"])]
         agg = s.get("agg")
         if i > 0 and s["thread"] != thread_of[s["parent"]]:
             if s["thread"] == -1:
@@ -382,7 +392,7 @@ def encode(doc):
             if num is None:
                 dropped += 1
                 continue
-            r.append(":%s=%s" % (to_b36(name_idx[k or "?"]), num))
+            r.append(":%s=%s" % (to_b36(name_idx[k]), num))
         recs.append("".join(r))
     if folded or dropped:
         out.append("x=%s.%s" % (to_b36(folded), to_b36(dropped)))
@@ -458,10 +468,11 @@ class _Ladder:
         return "waitSum" in s["agg"] if "agg" in s else "wait" in s
 
     def groups(self):
-        """Same parent, name and waits; each: [first record, records it folds...], folding two or more."""
+        """Same parent, name and waits, phases never; each: [first record, records it folds...], folding two or more."""
         by = collections.OrderedDict()
         for i, s in enumerate(self.spans[1:], 1):
-            by.setdefault((s["parent"], s["name"], self.waits(s)), []).append(i)
+            if "p" not in s.get("flags", ""):
+                by.setdefault((s["parent"], s["name"], self.waits(s)), []).append(i)
         groups = []
         for members in by.values():
             slowest = None

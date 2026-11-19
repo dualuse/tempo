@@ -92,29 +92,27 @@ class BudgetTest {
         assertEquals(0, t.misuses() + t.dropped());
     }
 
+    /** Phases are sections, not parents: the folded spans of a span form one aggregate under it, whatever phase they fall in. */
     @Test
-    void foldedSpansOfConsecutiveLapsLandUnderTheirOwnLap() {
+    void phasesDoNotSplitTheFoldedSpansOfTheirSpan() {
         Trace t = Tempo.trace(SEARCH, opts(1)).records(STEP);
         Span s = t;
         spans(s, LOAD, 0, 1);       // the first is recorded, the second folds
-        s.done(DECODE);             // a label-after lap: both move under it
+        s.done(DECODE);             // names the time so far
         spans(s, LOAD, 2, 0, 1);
         s.done(RERANK);
-        spans(s, LOAD, 3);          // after the last lap: the owner's
-        s.phase(MATCH);             // label first: folded spans nest under the open phase
+        spans(s, LOAD, 3);          // unphased
+        s.phase(MATCH);
         spans(s, LOAD, 4);
         s.done(MATCH);
         t.close();
         assertEquals(lines(
                 "search 0+18",
-                "  decode 0+3 lap",
-                "    load 0+0 step",
-                "    load 1+1 agg*1 min=1 max=1 maxAt=0 extent=1",
-                "  rerank 3+6 lap",
-                "    load 3+3 agg*3 min=0 max=2 maxAt=0 extent=5",
-                "  load 9+3 agg*1 min=3 max=3 maxAt=0 extent=3",
-                "  match 13+5 phase",
-                "    load 13+4 agg*1 min=4 max=4 maxAt=0 extent=4"), tree(t));
+                "  decode 0+3 phase",
+                "  load 0+0 step",
+                "  load 1+11 agg*6 min=0 max=4 maxAt=12 extent=16",
+                "  rerank 3+6 phase",
+                "  match 13+5 phase"), tree(t));
         assertEquals(6, t.folded());
         assertEquals("count=7 sum=11 mean=1 min=0 max=4 waitSum=0 waitMax=0", t.total(LOAD).toString());
         assertEquals(0, t.misuses() + t.dropped());
@@ -555,11 +553,12 @@ class BudgetTest {
     }
 
     /**
-     * Folded handoffs of a label-after lap move under it with their aggregate; the occurrence run inline
-     * on the submitting thread, kept in that lane by the index of its aggregate, stays with it.
+     * The folded handoffs of a span form one aggregate under it, whatever phase they were submitted in; the
+     * occurrence run inline on the submitting thread, kept in that lane by the index of its aggregate, is
+     * part of it.
      */
     @Test
-    void foldedHandoffsOfALapLandUnderTheLap() throws Exception {
+    void foldedHandoffsOfASpanFormOneAggregateAcrossItsPhases() throws Exception {
         Trace t = Tempo.trace(SEARCH, opts(0)).records(STEP);
         Span s = t;
         Handoff h1 = s.handoff(LOAD);
@@ -584,9 +583,8 @@ class BudgetTest {
         t.close();
         assertEquals(lines(
                 "search 0+22",
-                "  decode 0+20 lap",
-                "    load 0+13 agg*2 min=5 max=8 maxAt=10 extent=20 handoff~7/5 @_",
-                "  load 20+0 agg*1 min=0 max=0 maxAt=0 extent=1 handoff~1/1 @w1"), tree(t));
+                "  decode 0+20 phase",
+                "  load 0+13 agg*3 min=0 max=8 maxAt=10 extent=21 handoff~8/5 @_"), tree(t));
         assertEquals("count=3 sum=13 mean=4 min=0 max=8 waitSum=8 waitMax=5", t.total(LOAD).toString());
         assertEquals(0, t.misuses() + t.dropped());
     }

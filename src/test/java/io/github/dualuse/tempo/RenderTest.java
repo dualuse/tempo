@@ -21,7 +21,10 @@ import static io.github.dualuse.tempo.Tempo.NOOP;
 import static io.github.dualuse.tempo.TempoTest.onOtherThread;
 import static org.junit.jupiter.api.Assertions.*;
 
-/** The legacy renderers: {@code Runtime} text, generic {@code Server-Timing}, {@code forEachTop}, {@code printOnClose}. */
+/**
+ * The renderers of the labelled phases: {@code Runtime} text, generic {@code Server-Timing}, {@code
+ * forEachTop}, {@code printOnClose}.
+ */
 class RenderTest {
 
     static final Name SEARCH = TempoTest.SEARCH, LOAD = TempoTest.LOAD, MATCH = TempoTest.MATCH,
@@ -39,16 +42,15 @@ class RenderTest {
         TempoTest.assertNothingLeftOpen();
     }
 
-    /** Three legacy phases: two labelled laps and an unlabelled label-first phase; 1,751,234,572 ns in all. */
+    /** Three labelled phases of the root, back to back from its start; 1,751,234,572 ns in all. */
     private Trace threePhases(Trace t) {
-        Span s = t;
+        t.phase(DECODE).label("Decode Input #3");
         clock.add(1_234_567);
-        s.done(DECODE, "Decode Input #3");
+        t.phase(RERANK).label("Rerank & Filter = v2(a:b)");
         clock.add(250_000_000);
-        s.done(RERANK, "Rerank & Filter = v2(a:b)");
-        s.phase(MATCH).legacy();
+        t.phase(MATCH).label("match");
         clock.add(1_500_000_000);
-        s.done(MATCH);
+        t.done(MATCH);
         clock.add(5);
         t.close();
         return t;
@@ -77,59 +79,60 @@ class RenderTest {
                 t.toServerTiming());
 
         Trace u = Tempo.trace(SEARCH, opts());
+        u.phase(SCORE).label("Score");
         clock.add(7);
-        u.done(SCORE).legacy();
+        u.done();
         clock.add(493);
         u.close();
         assertEquals("-score-v2;dur=0.000, total;dur=0.001", u.toServerTiming());
     }
 
     @Test
-    void forEachTopVisitsTheLegacyPhasesInStartOrder() {
+    void forEachTopVisitsTheLabelledPhasesInStartOrder() {
         Trace t = threePhases(Tempo.trace(SEARCH, opts()));
         List<String> got = new ArrayList<>();
         t.forEachTop((name, label, start, dur) -> got.add(name + "|" + label + "|" + start + "+" + dur));
         assertEquals(List.of("Decode Input|Decode Input #3|0+1234567",
                 "Rerank & Filter=Top(10)|Rerank & Filter = v2(a:b)|1234567+250000000",
-                "match|null|251234567+1500000000"), got);
+                "match|match|251234567+1500000000"), got);
     }
 
     @Test
-    void aTraceWithoutLegacyPhasesPrintsTheTotalOnly() {
+    void aTraceWithoutLabelledPhasesPrintsTheTotalOnly() {
         Trace t = Tempo.trace(SEARCH, opts());
-        t.done(LOAD); // a lap, not legacy
+        t.phase(MATCH);
         clock.add(250_000_000);
+        t.done(LOAD); // a phase without a label, and one named after the fact
         t.close();
         assertEquals("0.250s", t.toRuntime(3));
         assertEquals("0.25s", t.toRuntime(-1));
         assertEquals("total;dur=250.000", t.toServerTiming());
-        t.forEachTop((name, label, start, dur) -> fail("no legacy phase"));
+        t.forEachTop((name, label, start, dur) -> fail("no labelled phase"));
     }
 
     @Test
-    void nonLegacyPhasesDoNotChangeTheRuntimeText() throws Exception {
+    void phasesWithoutALabelDoNotChangeTheRuntimeText() throws Exception {
         Trace plain = threePhases(Tempo.trace(SEARCH, opts()));
 
         Trace t = Tempo.trace(SEARCH, opts()).records(STEP);
         Span s = t;
-        s.phase(ROUTING);                                   // a top-level phase, not legacy
+        s.phase(ROUTING);                                   // a phase without a label
         clock.add(3_000);
-        s.done(ROUTING);
-        try (Span x = s.span(LOAD)) {                       // a span, adopted by the next lap
+        s.phase(DECODE).label("Decode Input #3");
+        try (Span x = s.span(LOAD)) {                       // a child of the root, which no phase adopts
+            x.phase(SCORE).label("Nested phase");           // labelled, but not a phase of the root
             clock.add(1_234_567);
-            x.done(SCORE, "Nested lap");                    // legacy, but not a child of the root
         }
-        s.done(DECODE, "Decode Input #3");
+        s.phase(RERANK).label("Rerank & Filter = v2(a:b)");
         try (Span d = s.step(SCORE)) {
             clock.add(100);
         }
         s.handoff(LOAD).begin().close();                    // inline task
         clock.add(250_000_000 - 100);
-        s.done(RERANK, "Rerank & Filter = v2(a:b)");
-        s.phase(MATCH).legacy();
+        s.phase(MATCH).label("match");
         clock.add(1_500_000_000);
-        s.done(MATCH);
-        assertThrows(IOException.class, () -> s.lap(LOAD, () -> { throw new IOException("failed lap"); }));
+        s.done();
+        s.phase(LOAD).fail();                               // a failed phase without a label, no time
         s.phase(ROUTING);                                   // still open at close
         clock.add(77);
         t.close();
@@ -143,7 +146,7 @@ class RenderTest {
                 t.toRuntime(3, total));
         assertEquals("1.751237644s = 0.001234567s (Decode Input #3) + 0.25s (Rerank & Filter = v2(a:b)) + 1.5s (match)",
                 t.toRuntime(-1));
-        assertTrue(TempoTest.tree(t).contains("legacy 'Nested lap'"), "the nested lap is legacy");
+        assertTrue(TempoTest.tree(t).contains("phase 'Nested phase'"), TempoTest.tree(t));
         assertEquals(0, t.misuses());
     }
 
@@ -151,9 +154,9 @@ class RenderTest {
     void anOpenTraceRendersUpToNow() throws Exception {
         Trace t = Tempo.trace(SEARCH, opts());
         Span s = t;
+        s.phase(DECODE).label("Decode");
         clock.add(100_000_000);
-        s.done(DECODE, "Decode");
-        s.phase(RERANK).legacy();                           // open and legacy
+        s.phase(RERANK).label("Rerank & Filter=Top(10)");   // open and labelled
         clock.add(20_000_000);
         assertEquals("0.120s = 0.100s (Decode) + 0.020s (Rerank & Filter=Top(10))", t.toRuntime(3));
         assertEquals("decode-input;dur=100.000, rerank-filter-top-10-;dur=20.000, total;dur=120.000", t.toServerTiming());
@@ -174,10 +177,11 @@ class RenderTest {
         Trace t = Tempo.trace(SEARCH, opts());
         StringBuilder expected = new StringBuilder("0.020s");
         for (int i = 0; i < 20; i++) {
+            t.phase(LOAD).label("Load #" + i);
             clock.add(1_000_000);
-            t.done(LOAD, "Load #" + i);
             expected.append(i == 0 ? " = " : " + ").append("0.001s (Load #").append(i).append(')');
         }
+        t.done();
         t.close();
         assertEquals(expected.toString(), t.toRuntime(3));
         assertEquals(expected.toString(), t.snapshot().toRuntime(3));
@@ -205,9 +209,9 @@ class RenderTest {
     void printOnCloseWritesOneLine() {
         List<String> out = new ArrayList<>();
         Trace t = Tempo.trace(SEARCH, opts()).printOnClose(out::add, "Batch #1: x=(a&b)");
+        t.phase(DECODE).label("Decode");
         clock.add(500_000_000);
-        t.done(DECODE, "Decode");
-        t.phase(RERANK).legacy();
+        t.phase(RERANK).label("Rerank & Filter=Top(10)");
         clock.add(1_000_000_000);
         assertEquals(List.of(), out);
         t.close();                                   // the root's close prints, not just Trace.close
@@ -257,8 +261,8 @@ class RenderTest {
         Trace t = Tempo.trace(SEARCH, opts());
         Span s = t;
         for (int i = 0; i < 5_000; i++) s.span(LOAD).set(SCORE, i).close();
-        s.done(DECODE, "Decode Input #3");
-        s.phase(MATCH).legacy();
+        s.phase(DECODE).label("Decode Input #3");
+        s.phase(MATCH).label("match");
         t.close();
         int calls = 1_000;
         Runnable reads = () -> {

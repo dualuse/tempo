@@ -67,7 +67,7 @@ class HeaderTest {
                 {"GET /search", "GET_%2Fsearch"}, {"snake_case", "snake%5Fcase"}, {"a.b-c", "a.b-c"},
                 {"100%", "100%25"}, {"x:y;z/w=v,\"\\", "x%3Ay%3Bz%2Fw%3Dv%2C%22%5C"}, {"Größe", "Gr%C3%B6%C3%9Fe"},
                 {"日本語", "%E6%97%A5%E6%9C%AC%E8%AA%9E"}, {"🚀 launch", "%F0%9F%9A%80_launch"},
-                {"?", "%3F"}, {"", "%3F"}, {null, "%3F"}, {"a\uD800b", "a%3Fb"}, {"\uDC00", "%3F"}, {"\uD83D", "%3F"},
+                {"?", "%3F"}, {"", ""}, {null, "%3F"}, {"a\uD800b", "a%3Fb"}, {"\uDC00", "%3F"}, {"\uD83D", "%3F"},
                 {"\u0000\u007f\u0080߿ࠀ￿", "%00%7F%C2%80%DF%BF%E0%A0%80%EF%BF%BF"}};
         for (String[] c : cases) assertEquals(c[1], name(c[0]), c[0]);
     }
@@ -398,7 +398,8 @@ class HeaderTest {
 
     /**
      * Random recordings on four threads (spans, detail and deep spans over a small budget, phases, laps,
-     * attributes, flags, CPU, handoffs begun elsewhere, inline, cancelled or never) on a clock moving in
+     * times given by hand, unnamed spans, attributes, flags, CPU, handoffs begun elsewhere, inline,
+     * cancelled or never) on a clock moving in
      * odd nanoseconds, rendered closed or while open: the decoder reads back exactly what the
      * {@link SpanView}s say, in microseconds; every limit of 256 bytes or more is kept; and every cut
      * of the value decodes to a prefix of its records, or is rejected as cut.
@@ -409,7 +410,7 @@ class HeaderTest {
         Map<String, Integer> seen = new TreeMap<>();
         for (int round = 0; round < 300; round++) roundTrip(rnd, round, seen);
         for (String what : new String[] {"records", "agg", "agg~", "@_", "wait", "inline", "@", "cpu", "attrs", "f", "c", "o", "n",
-                "w", "m", "live", "dropped"}) {
+                "w", "m", "p", "unnamed", "live", "dropped"}) {
             assertTrue(seen.getOrDefault(what, 0) > 10, () -> "too few " + seen);
         }
     }
@@ -435,11 +436,16 @@ class HeaderTest {
 
     /**
      * A random recording on four threads (spans, detail and deep spans over a small budget, phases, laps,
-     * attributes, flags, CPU, handoffs begun elsewhere, inline, cancelled or never) on a clock moving in
-     * odd nanoseconds, taken closed or while open, then closed and released. {@code inline} receives the
-     * handoffs ({@code lane << 32 | row}) begun as caller-runs.
+     * times given by hand, unnamed spans, attributes, flags, CPU, handoffs begun elsewhere, inline,
+     * cancelled or never) on a clock moving in odd nanoseconds, taken closed or while open, then closed and
+     * released. {@code inline} receives the handoffs ({@code lane << 32 | row}) begun as caller-runs.
      */
     static Snapshot randomSnapshot(SplittableRandom rnd, int round, Set<Long> inline) {
+        return randomSnapshot(rnd, round, inline, true);
+    }
+
+    /** {@link #randomSnapshot(SplittableRandom, int, Set)}; without {@code phases}, no phases and no unnamed spans. */
+    static Snapshot randomSnapshot(SplittableRandom rnd, int round, Set<Long> inline, boolean phases) {
         try (GoldenTest.Script s = new GoldenTest.Script(1794567890123L + round, "http-1", "cpu 1", "cpu-2", "io_1")) {
             int records = rnd.nextInt(3);
             Options o = s.options().budget(rnd.nextInt(10)).cpu(rnd.nextBoolean());
@@ -477,7 +483,6 @@ class HeaderTest {
                 if (stack.isEmpty()) continue;
                 int i = rnd.nextInt(4) == 0 ? rnd.nextInt(stack.size()) : stack.size() - 1;
                 Span h = stack.get(i);
-                boolean frame = h.row == Tempo.Lane.FRAME;
                 Name n = NAMES[rnd.nextInt(NAMES.length)], key = KEYS[rnd.nextInt(KEYS.length)];
                 Name task = NAMES[rnd.nextInt(2)]; // few task names, so folded handoffs share aggregates
                 Span opened = s.at(k, () -> {
@@ -501,13 +506,24 @@ class HeaderTest {
                             else if (f == 2) h.waiting();
                             else h.cpu();
                             return null;
-                        case 6:
+                        case 6: // a phase, which opens nothing, so the stack stays
+                            if (!phases) return null;
+                            Tempo.Phase p = h.phase(n);
+                            int w = rnd.nextInt(4);
+                            if (w == 0) p.set(key, rnd.nextInt(100));
+                            else if (w == 1) p.fail();
+                            else if (w == 2) p.label("label");
+                            return null;
                         case 7:
-                            if (frame) return null;
-                            if (op == 6) h.phase(n);
-                            else if (rnd.nextBoolean()) h.done(n);
-                            else h.done(n, "label");
-                            stack.subList(i + 1, stack.size()).clear();
+                            if (!phases) return null;
+                            switch (rnd.nextInt(7)) {
+                                case 0: h.done(); break;
+                                case 1: h.done(n); break; // names the time since the last boundary, or a mismatch
+                                case 2: h.lap(s.clock.t - rnd.nextInt(3000)); break;   // may lie before the last boundary
+                                case 3: h.start(s.clock.t - rnd.nextInt(20000)); break; // may lie before the parent
+                                case 4: h.stop(s.clock.t - rnd.nextInt(2000)); break;
+                                default: return h.span();                            // unnamed
+                            }
                             return null;
                         default:
                             Handoff x = h.handoff(task);
@@ -548,6 +564,7 @@ class HeaderTest {
         for (Object o : spans) {
             Map<?, ?> span = (Map<?, ?>) o;
             seen.merge("records", 1, Integer::sum);
+            if ("".equals(span.get("name"))) seen.merge("unnamed", 1, Integer::sum);
             for (String key : new String[] {"agg", "wait", "cpu", "attrs"}) if (span.containsKey(key)) seen.merge(key, 1, Integer::sum);
             if (span.containsKey("agg") && ((Map<?, ?>) span.get("agg")).containsKey("waitSum")) seen.merge("agg~", 1, Integer::sum);
             if ((Long) span.get("thread") < 0) seen.merge("@_", 1, Integer::sum);
@@ -578,7 +595,7 @@ class HeaderTest {
     /** Cuts every golden value at every position. */
     @Test
     void cutGoldenValuesNeverYieldAFalseRecord() {
-        for (String vector : new String[] {"search-example", "deep-nesting", "names", "handoff", "aggregates"}) {
+        for (String vector : new String[] {"search-example", "deep-nesting", "names", "handoff", "aggregates", "phases"}) {
             String v = GoldenTest.golden(vector);
             for (int cut = 0; cut <= v.length(); cut++) assertCut(v, cut);
         }
@@ -720,6 +737,7 @@ class HeaderTest {
             if (x.never) f.append('n');
             if ((x.flags & Tempo.WAIT) != 0) f.append('w');
             if ((x.flags & (Tempo.HEALED | Tempo.MISUSE)) != 0) f.append('m');
+            if ((x.flags & Tempo.PHASE) != 0) f.append('p');
             if (f.length() > 0) s.put("flags", f.toString());
             if (!x.attrs.isEmpty()) s.put("attrs", x.attrs);
             if (x.aggregate) {

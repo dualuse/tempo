@@ -36,7 +36,7 @@ final class WireDecoder {
     static final Pattern ATTR = Pattern.compile(":([0-9a-z]+)=(-?[0-9]+(?:\\.[0-9]+)?)");
     static final Pattern B36 = Pattern.compile("[0-9a-z]+"), NAME = Pattern.compile("(?:[A-Za-z0-9._-]|%[0-9A-Fa-f]{2})+");
     static final String ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ./:;=@~*+^_%-",
-            FLAGS = "fconwm";
+            FLAGS = "fconwmp";
     static final List<String> FIELDS = Arrays.asList("w", "x", "l", "T", "N", "S");
     static final int MAX_DEPTH = 35;
 
@@ -114,21 +114,23 @@ final class WireDecoder {
         long[] cur = new long[MAX_DEPTH + 2];
         List<Map<String, Object>> path = new ArrayList<>();
         int prevDepth = -1;
-        boolean prevAgg = false;
+        boolean prevAgg = false, prevPhase = false;
         for (int i = 0; i < records.size(); i++) {
             Matcher m = RECORD.matcher(records.get(i));
             if (!m.matches()) throw new Rejected("E_RECORD", "record " + i + " " + records.get(i));
             int depth = Character.digit(m.group(1).charAt(0), 36);
-            boolean agg = m.group(9) != null;
+            boolean agg = m.group(9) != null, phase = m.group(14) != null && m.group(14).indexOf('p') >= 0;
             long delta = b36(m.group(3), "E_RECORD");
             if (i == 0) {
                 if (depth != 0) throw new Rejected("E_ROOT", "first record at depth " + depth);
                 if (m.group(5) != null || m.group(6) != null || agg) throw new Rejected("E_ROOT", "root carries @, ~ or +");
                 if (delta != 0) throw new Rejected("E_ROOT", "root startDelta " + delta);
+                if (phase) throw new Rejected("E_ROOT", "root is a phase");
             } else {
                 if (depth == 0) throw new Rejected("E_ROOT", "second root at " + i);
                 if (depth > prevDepth + 1) throw new Rejected("E_DEPTH", "depth " + prevDepth + " to " + depth);
                 if (prevAgg && depth > prevDepth) throw new Rejected("E_AGG", "child of an aggregate at " + i);
+                if (prevPhase && depth > prevDepth) throw new Rejected("E_FLAG", "child of a phase at " + i);
             }
             long nameIdx = b36(m.group(2), "E_RECORD");
             if (nameIdx >= names.size()) throw new Rejected("E_INDEX", "name " + nameIdx);
@@ -163,6 +165,9 @@ final class WireDecoder {
             if (m.group(14) != null) {
                 StringBuilder f = new StringBuilder();
                 for (char c : m.group(14).toCharArray()) if (FLAGS.indexOf(c) < 0) throw new Rejected("E_FLAG", "flag " + c);
+                if (phase && (agg || m.group(6) != null || m.group(14).indexOf('n') >= 0)) {
+                    throw new Rejected("E_FLAG", "phase with +, ~ or n at " + i);
+                }
                 for (char c : FLAGS.toCharArray()) if (m.group(14).indexOf(c) >= 0) f.append(c);
                 span.put("flags", f.toString());
             }
@@ -192,6 +197,7 @@ final class WireDecoder {
             path.add(span);
             prevDepth = depth;
             prevAgg = agg;
+            prevPhase = phase;
             spans.add(span);
         }
         return spans;
@@ -203,8 +209,10 @@ final class WireDecoder {
         return out;
     }
 
+    /** A name of {@code T} or {@code N}; the empty one is an unnamed span's. */
     static String name(String text) {
-        if (text.isEmpty() || !NAME.matcher(text).matches()) throw new Rejected("E_NAME", "bad name " + text);
+        if (text.isEmpty()) return "";
+        if (!NAME.matcher(text).matches()) throw new Rejected("E_NAME", "bad name " + text);
         ByteArrayOutputStream raw = new ByteArrayOutputStream();
         for (int i = 0; i < text.length(); i++) {
             char c = text.charAt(i);

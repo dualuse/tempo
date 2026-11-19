@@ -12,11 +12,11 @@ import java.util.Locale;
  * fetch the file, parse it, validate the rows, store them. There is no request here, just a job with
  * consecutive steps, and Tempo takes the stopwatch's place.
  *
- * <p>It shows three ways to mark a step on one span: {@code phase(name)} names it before it runs,
- * {@code done(name)} or {@code done(name, "Label")} names it after it ran (a lap), and
- * {@code lap(name, body)} wraps a body. {@code legacy()} or a label picks a step for the {@code Runtime}
- * and {@code Server-Timing} headers. Spans opened during a step nest under it. {@code printOnClose}
- * writes the old log line, {@code forEachTop} reads the picked steps back.
+ * <p>Each step is a phase of the job's span, a section of its timeline: {@code phase(name)} names it
+ * before it runs, {@code done(name)} names the time since the last boundary after it ran. A label
+ * ({@code phase(name).label("Text")}) picks a step for the {@code Runtime} and {@code Server-Timing}
+ * headers. Spans opened during a step stay children of the job. {@code printOnClose} writes the old log
+ * line, {@code forEachTop} reads the picked steps back.
  *
  * <pre>
  * ./gradlew -q demo -Pdemo=StopwatchSteps                    the log line, a table of the steps, the headers
@@ -24,10 +24,9 @@ import java.util.Locale;
  * </pre>
  *
  * Look for: the log line {@code import: <total>s = ...s (fetch) + ...s (Parse Rows) + ...s (store)};
- * {@code validate} in the tree but not in {@code Runtime} or {@code Server-Timing}, because it was not
- * picked; {@code download} and {@code unpack} under {@code fetch}, the {@code write} spans under
- * {@code store}, and {@code rows=1200} on {@code store}. Or open the printed {@code Tempo-Link} in a
- * browser.
+ * {@code validate} in the tree but not in {@code Runtime} or {@code Server-Timing}, because it has no
+ * label; {@code download}, {@code unpack} and the {@code write} spans as children of the job, and
+ * {@code rows=1200} on {@code store}. Or open the printed {@code Tempo-Link} in a browser.
  */
 public final class StopwatchSteps {
     private StopwatchSteps() {
@@ -50,37 +49,34 @@ public final class StopwatchSteps {
         try (t) {
             Tempo.Span job = t;
 
-            // Label first: fetch runs from here to done(FETCH), and legacy() picks it for the headers now.
-            job.phase(FETCH).legacy();
-            try (Tempo.Span d = job.span(DOWNLOAD)) { // opened during the phase, so it nests under fetch
+            // Fetch runs from here to done(FETCH); its label picks it for the headers.
+            job.phase(FETCH).label("fetch");
+            try (Tempo.Span d = job.span(DOWNLOAD)) { // a child of the job, during the fetch phase
                 Demo.io(15);
                 d.set(BYTES, 48_213);
             }
             job.run(UNPACK, () -> Demo.cpu(2_000));
             job.done(FETCH);
 
-            // Label after: the work runs first, then done() names what ran since the last boundary; the
-            // label form also picks it for the headers.
+            job.phase(PARSE).label("Parse Rows");
             Demo.cpu(4_000);
-            job.done(PARSE, "Parse Rows");
+            job.done();
 
-            // A step that is recorded but not picked: it is in the tree, not in the legacy headers.
+            // Named after it ran, without a label: in the tree, not in the Runtime and Server-Timing headers.
             Demo.cpu(1_000);
             job.done(VALIDATE);
 
-            // lap() wraps a body; legacy() and phaseSet() then apply to that last lap.
-            long stored = job.lap(STORE, () -> {
-                long rows = 0;
-                for (int batch = 0; batch < 3; batch++) {
-                    try (Tempo.Span w = job.span(WRITE)) { // shown under the store lap
-                        Demo.io(4);
-                        w.set(ROWS, 400);
-                        rows += 400;
-                    }
+            Tempo.Phase store = job.phase(STORE).label("store");
+            long stored = 0;
+            for (int batch = 0; batch < 3; batch++) {
+                try (Tempo.Span w = job.span(WRITE)) { // children of the job, during the store phase
+                    Demo.io(4);
+                    w.set(ROWS, 400);
+                    stored += 400;
                 }
-                return rows;
-            });
-            job.legacy().phaseSet(ROWS, stored);
+            }
+            store.set(ROWS, stored);
+            job.done();
         } // the root closes here, and the log line is written
 
         // forEachTop walks the picked steps: the same numbers the Runtime header prints.
@@ -104,11 +100,10 @@ public final class StopwatchSteps {
         Demo.check(steps.equals(List.of("fetch", "parse", "store")),
                 "forEachTop visits the picked steps fetch, parse, store, and skips validate: " + steps);
         Demo.check(ordered[0], "forEachTop visits the steps in start order");
-        Demo.check(labels.get(0) == null && "Parse Rows".equals(labels.get(1)) && labels.get(2) == null,
-                "only done(PARSE, \"Parse Rows\") carries a label; legacy() steps have none: " + labels);
+        Demo.check(labels.equals(List.of("fetch", "Parse Rows", "store")), "each picked step has its label: " + labels);
         Demo.check(runtime.contains("s (fetch)") && runtime.contains("s (Parse Rows)") && runtime.contains("s (store)")
                         && !runtime.contains("validate"),
-                "Runtime prints each picked step under its label, or its name without one: " + runtime);
+                "Runtime prints each picked step under its label: " + runtime);
         Demo.check(serverTiming.startsWith("fetch;dur=") && serverTiming.contains(", parse;dur=")
                         && serverTiming.contains(", store;dur=") && serverTiming.contains(", total;dur=")
                         && !serverTiming.contains("validate"),
@@ -116,16 +111,15 @@ public final class StopwatchSteps {
         Demo.check(log.size() == 1 && log.get(0).startsWith("import: ") && log.get(0).contains("s (Parse Rows)"),
                 "printOnClose logged one line, prefixed import: " + log);
 
-        int fetch = Demo.id(t, FETCH), store = Demo.id(t, STORE);
-        Demo.check(Demo.count(t, v -> (v.name() == DOWNLOAD || v.name() == UNPACK) && v.parent() == fetch) == 2,
-                "download and unpack, opened during the fetch phase, are its children");
-        Demo.check(Demo.count(t, v -> v.name() == WRITE && v.parent() == store) == 3,
-                "the three write spans, opened during the store lap, are its children");
-        Demo.check(Demo.count(t, v -> v.name() == VALIDATE && v.phase() && !v.legacy()) == 1,
-                "validate is recorded as a lap, just not picked for the headers");
-        Demo.check(Demo.count(t, v -> v.name() == STORE && v.attributes() == 1
+        Demo.check(Demo.count(t, v -> (v.name() == DOWNLOAD || v.name() == UNPACK) && v.parent() == 0) == 2,
+                "download and unpack, opened during the fetch phase, are children of the job");
+        Demo.check(Demo.count(t, v -> v.name() == WRITE && v.parent() == 0) == 3,
+                "the three write spans, opened during the store phase, are children of the job");
+        Demo.check(Demo.count(t, v -> v.name() == VALIDATE && v.phase() && v.label() == null) == 1,
+                "validate is recorded as a phase, just not picked for the headers");
+        Demo.check(Demo.count(t, v -> v.name() == STORE && v.phase() && v.attributes() == 1
                         && v.attributeKey(0) == ROWS && v.longAttribute(0) == 1_200) == 1,
-                "phaseSet put rows=1200 on the store lap");
+                "set put rows=1200 on the store phase");
 
         t.release();
     }

@@ -48,7 +48,7 @@ public final class FirstTrace {
         Demo.check(Demo.count(t, v -> !thread.equals(v.thread())) == 0, "every span ran on " + thread);
         Demo.check(Demo.count(t, v -> v.failed() || v.open()) == 0, "no span failed or was left open");
 
-        Demo.say("Runtime: the total in seconds, plus the steps marked legacy (none here; see StopwatchSteps).");
+        Demo.say("Runtime: the total in seconds, plus the labelled phases (none here; see StopwatchSteps).");
         Demo.say("Server-Timing: the same in milliseconds, W3C format, shown by the browser's dev tools.");
         Demo.say("Tempo-Timing: the whole tree in one line (FORMAT.md); pipe this output into tools/tempo.");
         Demo.say("Tempo-Link: the same tree as a link that opens Tempo Timeline in the browser;");

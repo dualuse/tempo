@@ -48,7 +48,7 @@ import java.util.function.Predicate;
  * the tasks cancelled by the early exit ({@code ⊘}, flag {@code c}); the cold load still open
  * ({@code ▶}, flag {@code o}) on a live lane ({@code ●}). In {@code --tree}, CPU against wall time:
  * {@code match} is on CPU nearly all of its time, {@code load} hardly at all. {@code Runtime} and
- * {@code Server-Timing} list the legacy steps, {@code Routing} to {@code Rerank}. Or open the printed
+ * {@code Server-Timing} list the labelled phases, {@code Routing} to {@code Rerank}. Or open the printed
  * {@code Tempo-Link} in a browser.
  */
 @SuppressWarnings("try") // a span opened only to time its block is never named inside it
@@ -111,8 +111,8 @@ public final class SearchRequest {
         Tempo.Trace t = Tempo.trace(SEARCH, new Tempo.Options().strict(true).headerBytes(TEMPO_BYTES));
         Response r;
         try (t) {
+            t.phase(ROUTING).label("Routing"); // the time before the handler
             Demo.cpu(1_000); // authenticate, match the route
-            t.done(ROUTING, "Routing"); // a lap from the trace start: the time before the handler
             r = handle(t, query);
         }
         // One snapshot for all four headers, so they agree. The tasks still running go on recording into
@@ -122,7 +122,7 @@ public final class SearchRequest {
         r.snapshot = s;
         r.runtime = s.toRuntime(3);
         r.serverTiming = s.toServerTiming();
-        // The legacy headers first, then the Tempo headers from what is left. The two should carry the same
+        // Runtime and Server-Timing first, then the Tempo headers from what is left. The two should carry the same
         // value (FORMAT.md 9.5): toHeader() and toLink() both keep to headerBytes, so they do. If they do not
         // fit together, the response sends Tempo-Timing alone, within what is left.
         int left = HEADER_LIMIT - Demo.bytes(r.runtime) - Demo.bytes(r.serverTiming);
@@ -135,18 +135,20 @@ public final class SearchRequest {
         return r;
     }
 
-    /** The handler. Each step is a lap of the root, labelled for the legacy {@code Runtime} header. */
+    /** The handler. Each step is a phase of the root, labelled for the {@code Runtime} header. */
     Response handle(Tempo.Trace t, String query) throws Exception {
         Tempo.Span root = t;
 
         // The opt-in gate: once, and before the first detail span, or raise refuses (strict: throws). At
         // STEP every task measures its CPU time; the first CPU read in a JVM sets that clock up (it takes
         // milliseconds), and raise() does it here, on the request thread: in the first such request of a
-        // JVM it shows in this lap, never as a task's queue wait.
+        // JVM it shows in the routing phase, never as a task's queue wait.
         if (query.contains("tempo=1")) t.records(Tempo.STEP);
 
+        root.phase(DECODE).label("Decode");
         Demo.cpu(1_000);
-        root.done(DECODE, "Decode");
+
+        root.phase(DESCRIBE).label("Describe");
 
         // The handoff is taken where the task is submitted; callable() begins it where it runs. The request
         // thread blocks meanwhile, and says so: waiting() sets the join apart from run time.
@@ -155,8 +157,8 @@ public final class SearchRequest {
         try (Tempo.Span w = root.span(AWAIT).waiting()) {
             signature.get();
         }
-        root.done(DESCRIBE, "Describe");
 
+        Tempo.Phase lookup = root.phase(LOOKUP).label("Index Lookup");
         Tempo.Handoff q = root.handoff(QUERY);
         Future<int[]> found = io.submit(q.callable(() -> {
             Demo.io(3);
@@ -166,8 +168,9 @@ public final class SearchRequest {
         try (Tempo.Span w = root.span(AWAIT).waiting()) {
             ids = found.get();
         }
-        root.done(LOOKUP, "Index Lookup").phaseSet(CANDIDATES, ids.length); // a number on the lap
+        lookup.set(CANDIDATES, ids.length); // a number on the phase
 
+        Tempo.Phase reranking = root.phase(RERANK).label("Rerank");
         Rerank rerank = new Rerank();
         for (int id : ids) rerank.submit(root, LOAD, io, h -> () -> load(rerank, id, h));
 
@@ -181,7 +184,8 @@ public final class SearchRequest {
             w.set(HITS, hits.size());
         }
         int cancelled = rerank.stop(); // enough hits: take back whatever has not begun
-        root.done(RERANK, "Rerank").phaseSet(HITS, hits.size()).phaseSet(CANCELLED, cancelled);
+        reranking.set(HITS, hits.size()).set(CANCELLED, cancelled);
+        root.done();
         Demo.say("early exit at " + hits.size() + " good hits: " + cancelled + " loads and matches cancelled before they began");
 
         Response r = new Response();
@@ -352,7 +356,7 @@ public final class SearchRequest {
         // for it to be a row of its own.
         Demo.check(count(rows, v -> v.name == MATCH && v.handoff && !v.aggregate && v.ran()
                         && v.thread.startsWith("cpu-") && v.parent.name == LOAD && v.parent.thread.startsWith("io-")
-                        && v.parent.parent.name == RERANK && requestThread.equals(v.parent.parent.thread)) > 0,
+                        && v.parent.parent.depth == 0 && requestThread.equals(v.parent.parent.thread)) > 0,
                 "a match on cpu-* was handed off inside a load on io-*, which the request handed off");
         Demo.check(count(rows, v -> v.name == MATCH && v.handoff && v.waitMax >= 1_000_000) > 0,
                 "some match waited 1 ms or more in the cpu queue: three io threads outpace three cpu threads");
@@ -394,10 +398,10 @@ public final class SearchRequest {
         Demo.check(count(rows, v -> v.open && requestThread.equals(v.thread)) == 0,
                 "only pool threads had spans open at render: the request itself had ended");
 
-        // The legacy steps: the laps marked by done(name, label), in order, routing first.
+        // The labelled phases of the root, in order, routing first.
         List<Tempo.Name> tops = new ArrayList<>();
         r.snapshot.forEachTop((name, label, start, dur) -> tops.add(name));
-        Demo.check(tops.equals(List.of(ROUTING, DECODE, DESCRIBE, LOOKUP, RERANK)), "the legacy steps are " + tops);
+        Demo.check(tops.equals(List.of(ROUTING, DECODE, DESCRIBE, LOOKUP, RERANK)), "the labelled phases are " + tops);
         Demo.check(inOrder(r.runtime, "(Routing)", "(Decode)", "(Describe)", "(Index Lookup)", "(Rerank)"),
                 "Runtime lists the labels in order: " + r.runtime);
         Demo.check(inOrder(r.serverTiming, "routing;", "decode;", "describe;", "lookup;", "rerank;", "total;"),

@@ -75,7 +75,7 @@ class GoldenTest {
             names = files.map(p -> p.getFileName().toString()).filter(f -> f.endsWith(".header"))
                     .map(f -> f.substring(0, f.length() - ".header".length())).sorted().collect(Collectors.toList());
         }
-        assertEquals(23, names.size(), "golden vectors");
+        assertEquals(24, names.size(), "golden vectors");
         return names.stream().map(n -> DynamicTest.dynamicTest(n, () -> {
             Object want = Json.parse(read("golden/" + n + ".json"));
             Map<String, Object> got = WireDecoder.decode(read("golden/" + n + ".header"));
@@ -89,7 +89,7 @@ class GoldenTest {
                 .matcher(read("invalid/README.md"));
         List<String[]> cases = new ArrayList<>();
         while (m.find()) cases.add(new String[] {m.group(1), m.group(2)});
-        assertEquals(35, cases.size(), "invalid header vectors listed");
+        assertEquals(39, cases.size(), "invalid header vectors listed");
         return cases.stream().map(c -> DynamicTest.dynamicTest(c[0], () -> {
             WireDecoder.Rejected r = assertThrows(WireDecoder.Rejected.class, () -> WireDecoder.decode(read("invalid/" + c[0])));
             assertEquals(c[1], r.code, r.getMessage());
@@ -370,9 +370,52 @@ class GoldenTest {
     }
 
     /**
-     * Closest: a lane holds 35 open spans (depths 0 to 34), so {@code level-35} is a label-after lap of
-     * {@code level-34}, which starts where its parent does (331, not 338). And {@code level-3} with its
-     * subtree ends 1180 earlier, before its sibling {@code rerank} starts: one thread, one stack.
+     * Phases on the wire, records with {@code ^p}: label-first phases of the root, one with an attribute,
+     * and a child that crosses their boundary; phases of a task on a pool thread; an unnamed span labelled
+     * only by its phases (the empty name), one of them failed; a phase named after the fact; a span timed
+     * by hand; and a phase that a {@code done} naming another one ended ({@code ^mp}).
+     */
+    @Test
+    void phases() {
+        Name batch = Tempo.name("PUT /batch"), parse = Tempo.name("parse"), read = Tempo.name("read"),
+                store = Tempo.name("store"), flush = Tempo.name("flush"), compress = Tempo.name("compress"),
+                write = Tempo.name("write"), open = Tempo.name("open"), copy = Tempo.name("copy"),
+                verify = Tempo.name("verify"), replay = Tempo.name("replay"), fetch = Tempo.name("fetch"),
+                apply = Tempo.name("apply"), check = Tempo.name("check"), seal = Tempo.name("seal"),
+                rows = Tempo.name("rows");
+        try (Script s = new Script("phases")) {
+            Trace t = s.on(0, 0, () -> Tempo.trace(batch, s.options()));
+            Span root = t;
+            s.run(0, 100, () -> root.phase(parse).set(rows, 1200));
+            Span r = s.on(0, 150, () -> root.span(read));
+            s.run(0, 600, () -> root.phase(store));                     // read crosses this boundary
+            s.run(0, 900, r::close);
+            Handoff h = s.on(0, 950, () -> root.handoff(flush));
+            Span w = s.on(1, 1000, h::begin);
+            s.run(1, 1000, () -> w.phase(compress));
+            s.run(1, 1500, () -> w.phase(write));
+            s.run(0, 1800, root::done);
+            Span u = s.on(0, 1900, () -> root.span());
+            s.run(0, 1900, () -> u.phase(open));
+            s.run(0, 2000, () -> u.phase(copy).fail());
+            s.run(0, 2400, u::close);
+            s.run(1, 2600, w::close);
+            s.run(0, 2700, () -> root.done(verify));                    // from the last boundary, 1800
+            s.run(0, 2800, () -> root.span(replay).phase(fetch).start(s.base + 2_750_000).lap(s.base + 2_780_000)
+                    .phase(apply).stop(s.base + 2_790_000).close());
+            s.run(0, 2850, () -> root.phase(check));
+            s.run(0, 2900, () -> root.done(seal));                      // another phase is open: misuse
+            s.run(0, 3000, t::close);
+            assertHeader("phases", golden("phases"), s.render(3000, t));
+            assertEquals(1, s.on(0, 3000, t::misuses));
+        }
+    }
+
+    /**
+     * Closest: a lane holds 35 open spans (depths 0 to 34), so {@code level-35} is a phase of {@code
+     * level-34}, named after the fact, which starts where its span does (331, not 338) and is a phase on
+     * the wire. And {@code level-3} with its subtree ends 1180 earlier, before its sibling {@code rerank}
+     * starts: one thread, one stack.
      */
     @Test
     void deepNesting() {
@@ -383,7 +426,7 @@ class GoldenTest {
                 + "/55.7.1or8/66.7.1oqo/77.7.1oq4/88.7.1opk/99.7.1op0/aa.7.1oog/bb.7.1onw/cc.7.1onc/dd.7.1oms/ee.7.1om8"
                 + "/ff.7.1olo/gg.7.1ol4/hh.7.1okk/ii.7.1ok0/jj.7.1ojg/kk.7.1oiw/ll.7.1oic/mm.7.1ohs/nn.7.1oh8/oo.7.1ogo"
                 + "/pp.7.1og4/qq.7.1ofk/rr.7.1of0/ss.7.1oeg/tt.7.1odw/uu.7.1odc/vv.7.1ocs/ww.7.1oc8/xx.7.1obo/yy.7.1ob4"
-                + "/zz.0.1oak/310.1osw.1e/411.5.k/411.p.a/112.1tic.2bc/213.a.28k;e=15";
+                + "/zz.0.1oak^p/310.1osw.1e/411.5.k/411.p.a/112.1tic.2bc/213.a.28k;e=15";
         try (Script s = new Script("deep-nesting")) {
             Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options()));
             Span[] level = new Span[35];
@@ -415,28 +458,29 @@ class GoldenTest {
     /**
      * Closest: {@code rerank} stays open until the render, and while it is open on the request thread
      * nothing new can be a child of the root there. So the two zero-length misuse entries come before
-     * it: {@code describe} at 14100 is a {@code done} naming another phase than the open {@code index},
-     * and the failed {@code decode} at 14200 is healed at once when {@code rerank} starts as a phase.
+     * it, healed at once: {@code describe} when the failed {@code decode} opens beside it, and that
+     * {@code decode} when {@code rerank} opens.
      */
     @Test
     void failedOpen() {
         String closest = "v1;w=mwevdy35;l=0.1;T=http-9:io-4;N=search:decode:index:await:describe:rerank:load:join;"
-                + "S=00.0.1b2g^o/11.u.1jk^f/12.1li.99c/23.1e.93s^w/14.99c.0^m/11.2s.0^fm/15.0.1040^o/26.2s.zzk@1~1o^o"
+                + "S=00.0.1b2g^o/11.u.1jk^f/12.1li.99c/23.1e.93s^w/14.9c4.0^m/11.0.0^fm/15.0.1040^o/26.2s.zzk@1~1o^o"
                 + "/27.2s.zyg^ow;e=9";
         try (Script s = new Script("failed-open")) {
             Trace t = s.on(0, 0, () -> Tempo.trace(SEARCH, s.options()));
             Span root = t;
             Span decode = s.on(0, 30, () -> root.span(DECODE).fail());
             s.run(0, 2030, decode::close);
-            s.run(0, 2100, () -> root.phase(INDEX));
-            Span await = s.on(0, 2150, () -> root.span(AWAIT).waiting());
+            Span index = s.on(0, 2100, () -> root.span(INDEX));
+            Span await = s.on(0, 2150, () -> index.span(AWAIT).waiting());
             s.run(0, 13950, await::close);
-            s.run(0, 14100, () -> root.done(DESCRIBE));
-            s.run(0, 14200, () -> root.span(DECODE).fail());
-            s.run(0, 14200, () -> root.phase(RERANK));
-            Handoff h = s.on(0, 14300, () -> root.handoff(LOAD));
+            s.run(0, 14100, index::close);
+            s.run(0, 14200, () -> root.span(DESCRIBE));
+            s.run(0, 14200, () -> root.span(DECODE).fail()); // heals describe
+            Span rerank = s.on(0, 14200, () -> root.span(RERANK)); // heals decode
+            Handoff h = s.on(0, 14300, () -> rerank.handoff(LOAD));
             Span load = s.on(1, 14360, h::begin);
-            s.run(0, 14400, () -> root.span(JOIN).waiting());
+            s.run(0, 14400, () -> rerank.span(JOIN).waiting());
             assertHeader("failed-open", closest, s.render(61000, t));
             s.run(1, 61000, load::close);
             s.run(0, 61000, t::close);

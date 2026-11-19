@@ -21,7 +21,8 @@ A trace is a tree of **spans** that starts at one **root** span. Spans run on
 
 | Term | Meaning |
 |---|---|
-| span | A named interval: start, duration, thread, optional CPU time, flags and numeric attributes. |
+| span | A named interval: start, duration, thread, optional CPU time, flags and numeric attributes. The name may be empty (an unnamed span). |
+| phase | A labelled section of its parent span's timeline (§6.7): a record of its own, never the parent of anything. |
 | handoff | A span whose work was submitted to another thread (usually a pool). It has a submit time, a **queue wait** (submit to start) and a run time. |
 | aggregate | One record that stands for many same-named sibling spans that were folded to save space (a hot loop). It carries count, sum, min, max, extent and wait statistics. |
 | lane | The spans one thread recorded for this trace. A lane still running when the header was rendered is **live**. |
@@ -67,9 +68,9 @@ depth    = b36digit                      ; 0..35, exactly one character
 nameIdx  = b36
 startDelta = b36
 dur      = b36
-flag     = "f" / "c" / "o" / "n" / "w" / "m"
+flag     = "f" / "c" / "o" / "n" / "w" / "m" / "p"
 number   = ["-"] 1*DIGIT ["." 1*DIGIT]
-name     = 1*(ALPHA / DIGIT / "." / "-" / "_" / "%" HEXDIG HEXDIG)
+name     = *(ALPHA / DIGIT / "." / "-" / "_" / "%" HEXDIG HEXDIG)   ; may be empty
 b36      = 1*b36digit                    ; lowercase base 36
 b36digit = DIGIT / %x61-7A
 ```
@@ -106,7 +107,9 @@ Groups: 1 depth, 2 nameIdx, 3 startDelta, 4 dur, 5 thread, 6 wait (or wait sum),
 - a space is written `_`;
 - every other byte of the UTF-8 encoding, including a literal `_`, is written `%XX`.
   Encoders MUST use uppercase hex; decoders MUST accept either case;
-- a null or empty name is written as `?`, i.e. `%3F`.
+- the empty name, of an unnamed span, is written as nothing: in `N=search::decode` the
+  name at index 1 is empty. An encoder that has no name at all (a null) writes `?`,
+  i.e. `%3F`.
 
 So `GET /search` is `GET_%2Fsearch`, `snake_case` is `snake%5Fcase` and `Größe` is
 `Gr%C3%B6%C3%9Fe`.
@@ -136,6 +139,7 @@ So `GET /search` is `GET_%2Fsearch`, `snake_case` is `snake%5Fcase` and `Größe
 | `n` | Handoff that never started. |
 | `w` | Blocking wait (join, future get, queue take/put). |
 | `m` | Misuse detected and healed by the recorder (mismatched close, foreign-thread call, …). |
+| `p` | Phase: a section of the parent's timeline, not a child in the tree (§6.7). |
 
 **Numbers.** Attribute values are decimal. Integers are written as is. Fractional values
 are fixed-point with at most 6 fraction digits, rounded to nearest (ties to even, like
@@ -146,7 +150,8 @@ integral double and an integer are the same thing (`2.0` is written `2`).
 ## 5. Pre-order and the depth/startDelta rules
 
 Records list the tree depth-first, parents before children, siblings in start order.
-The decoder keeps one cursor per depth:
+A span's phases (§6.7) are records among its children, in the same start order. The
+decoder keeps one cursor per depth:
 
 ```
 start  = cur[depth] + startDelta
@@ -186,7 +191,7 @@ decode(input):
                                                 error E_FIELD
         T, N or S missing                       error E_MISSING
         w, x, l not of their grammar            error E_FIELD
-    threads = decode each name of T (§4)       error E_NAME on a bad name
+    threads = decode each name of T (§4)       error E_NAME on a bad name (an empty one is fine)
     names   = decode each name of N             error E_NAME
     live    = l indexes, each < len(threads)    error E_INDEX
 
@@ -198,19 +203,22 @@ decode(input):
         m = RECORD_REGEX.match(rec)             error E_RECORD if no match
         d = depth
         if i == 0:
-            d must be 0, startDelta 0, and no @, ~ or +      else E_ROOT
+            d must be 0, startDelta 0, no @, ~ or +, no flag p   else E_ROOT
         else:
             d == 0                              error E_ROOT (second root)
             d > prevDepth + 1                   error E_DEPTH
             previous record is an aggregate and d > prevDepth
                                                 error E_AGG
+            previous record is a phase (p) and d > prevDepth
+                                                error E_FLAG
         nameIdx < len(names)                    else E_INDEX
         start = cur[d] + startDelta; cur[d] = cur[d+1] = start
         parent = path[d-1]  (none for the root)
         thread = @ value if present, -1 for "@_" (aggregates only, else E_AGG),
                  else parent's thread, else 0 for the root
         thread < len(threads)                   else E_INDEX
-        flags: each in "fconwm"                 else E_FLAG
+        flags: each in "fconwmp"                else E_FLAG
+        flag p together with +, ~ or flag n     error E_FLAG
         attribute keys < len(names)             else E_INDEX
         aggregate: count >= 1, "~" must have both sum and max   else E_AGG
         plain record: "~" must have a single number             else E_AGG
@@ -293,7 +301,30 @@ show them (§6.5): cancelled or rejected before start, or never started, each wi
 and its wait until the cancellation or the render. A group of only such tasks is written
 like one of them: `^c` when all were cancelled, `^n` when none started, and no `@`.
 
-`dur / extent` is the effective parallelism of the group. An aggregate has no children.
+`dur / extent` is the effective parallelism of the group. An aggregate has no children
+and is never a phase.
+
+### 6.7 Phases
+
+A record with flag `p` is a **phase** of its parent: a labelled section of the parent's
+timeline from `start` to `start + dur`, on the parent's thread. A span's phases
+follow each other and do not overlap; time of the span outside them is unphased. A
+phase is not a tree child:
+
+- it has no children (a record nested under a phase is `E_FLAG`);
+- viewers draw it on its parent's bar, never as a nested box, and do not subtract it
+  from the parent's self time;
+- it has a start, a duration, flags (`f`, `o`, `m`, …) and attributes, and nothing
+  else to report: no self time, no children, no statistics beyond its own start and
+  duration.
+
+The parent's other children are spans as usual and may cross phase boundaries; they
+and the phases are siblings in start order. A phase is never a handoff or an
+aggregate (`~`, `+` or flag `n` with `p` is `E_FLAG`), and the root is never a phase
+(`E_ROOT`). A record without `@` runs on its parent's thread, so encoders write no `@`
+on a phase.
+
+A span may be unnamed, its name the empty one (§4), when its phases label it.
 
 ## 7. Encoding rules (canonical form)
 
@@ -305,7 +336,7 @@ use byte for byte:
 - `N` lists span names in pre-order of first use, then attribute keys that are not
   span names, in order of first use. Each name appears once.
 - No leading zeros in base-36 numbers. `@` only when the thread differs from the
-  parent's. Flags in the order `f c o n w m`, each once. Uppercase percent-escapes.
+  parent's. Flags in the order `f c o n w m p`, each once. Uppercase percent-escapes.
 - Siblings in start order (required anyway, since `startDelta` cannot be negative).
 
 Decoders MUST accept the non-canonical forms the grammar allows: lowercase hex escapes,
@@ -321,8 +352,9 @@ and names by their index in `T` and `N`). The encoder re-encodes after every cha
 stops at the first value that fits:
 
 1. **Fold same-name siblings.** A group is the children of one parent with one name that
-   are either all handoffs (a record with `~`, an aggregate with `~sum.max`) or all not.
-   In a group the failed single records (`^f`) and the slowest single record (the largest
+   are either all handoffs (a record with `~`, an aggregate with `~sum.max`) or all not;
+   phases (`^p`) are in no group and never fold. In a group the failed single records
+   (`^f`) and the slowest single record (the largest
    `dur`, the first of equals) stay as they are; the others, single records and
    aggregates alike, fold into one aggregate when they are two or more. Groups fold one
    at a time, the most records to fold first, ties by the position of the group's first
@@ -397,13 +429,13 @@ Span keys:
 |---|---|---|
 | `id` | always | Record index. |
 | `parent` | always | Parent `id`, `-1` for the root. |
-| `name` | always | Decoded name. |
+| `name` | always | Decoded name; `""` for an unnamed span. |
 | `start` | always | Absolute start in µs from the root start (submit time for handoffs, first occurrence for aggregates). |
 | `dur` | always | Run time; the sum for aggregates. |
 | `thread` | always | Thread index; `-1` for a mixed-thread aggregate. |
 | `wait` | handoffs | Queue wait. |
 | `cpu` | when measured | CPU time (sum for aggregates). |
-| `flags` | when any | String of flags in the order `fconwm`. |
+| `flags` | when any | String of flags in the order `fconwmp`. |
 | `attrs` | when any | Object of name → number. |
 | `agg` | aggregates | `count`, `min`, `max`, `extent`, `maxAt`, and `waitSum`, `waitMax` when the wire carries them. |
 
@@ -611,12 +643,12 @@ The full decoded JSON is `testdata/golden/search-example.json`.
 | `E_CUT` | Cut before the span list; nothing to decode. |
 | `E_FIELD` | Unknown, malformed, duplicate or out-of-order field. |
 | `E_MISSING` | `T=`, `N=` or `S=` missing from a value that is not cut. |
-| `E_NAME` | Bad name: empty, a character outside the name set, a bad `%` escape, or invalid UTF-8. |
+| `E_NAME` | Bad name: a character outside the name set, a bad `%` escape, or invalid UTF-8. The empty name is not an error. |
 | `E_RECORD` | A record does not match the record expression. |
 | `E_INDEX` | Name, thread, attribute-key or `l=` index out of range. |
-| `E_ROOT` | First record not a plain depth-0 record with startDelta 0, or a second depth-0 record. |
+| `E_ROOT` | First record not a plain depth-0 record with startDelta 0 (with `@`, `~`, `+` or flag `p`), or a second depth-0 record. |
 | `E_DEPTH` | Depth grows by more than one. |
-| `E_FLAG` | Unknown flag. |
+| `E_FLAG` | Unknown flag, or a phase where none can be: `p` with `+`, `~` or `n`, or a record nested under a `p` record. |
 | `E_AGG` | Aggregate rules broken: `@_` or `~sum.max` on a plain record, single `~` on an aggregate, count 0, or a child under an aggregate. |
 | `E_LINK` | Bad `Tempo-Link` (§9): no `t=` in the fragment or the query, a `z.` payload that is not base64url or not raw DEFLATE, an incomplete stream, bytes after it, or too large. The value inside a good link reports the codes above. |
 

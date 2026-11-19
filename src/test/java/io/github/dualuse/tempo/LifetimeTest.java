@@ -54,10 +54,11 @@ class LifetimeTest {
     void aSnapshotStaysCompleteAfterReleaseAndTheReuseOfItsChunks() throws Exception {
         Trace t = Tempo.trace(SEARCH, opts().budget(1)).records(STEP);
         Span s = t.set(BYTES, 7);
+        s.phase(DECODE).label("Decode #1");
         s.step(LOAD).close();
         clock.add(2);
         s.step(LOAD).close(); // folds
-        s.done(DECODE, "Decode #1");
+        s.done();
         Handoff h = s.handoff(MATCH).set(SCORE, 3);
         clock.add(1);
         assertNull(onThread("worker-1", () -> {
@@ -74,17 +75,17 @@ class LifetimeTest {
         Snapshot snap = t.snapshot();
         String expected = lines(
                 "search 0+12 bytes=7",
-                "  decode 0+2 lap legacy 'Decode #1'",
-                "    load 0+0 step",
-                "    load 2+0 agg*1 min=0 max=0 maxAt=0 extent=0",
+                "  decode 0+2 phase 'Decode #1'",
+                "  load 0+0 step",
+                "  load 2+0 agg*1 min=0 max=0 maxAt=0 extent=0",
                 "  match 2+4 agg*1 min=4 max=4 maxAt=0 extent=5 handoff~1/1 @worker-1", // folded: past the budget too
                 "  load 7+5");
         assertEquals(expected, tree(snap));
         assertEquals(lines(
                 "search 0+7 open bytes=7",
-                "  decode 0+2 lap legacy 'Decode #1'",
-                "    load 0+0 step",
-                "    load 2+0 agg*1 min=0 max=0 maxAt=0 extent=0",
+                "  decode 0+2 phase 'Decode #1'",
+                "  load 0+0 step",
+                "  load 2+0 agg*1 min=0 max=0 maxAt=0 extent=0",
                 "  match 2+4 agg*1 min=4 max=4 maxAt=0 extent=5 handoff~1/1 @worker-1",
                 "  load 7+0 open"), tree(early));
         t.release();

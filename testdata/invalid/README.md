@@ -22,7 +22,6 @@ are whitespace and are stripped like any other whitespace before decoding.
 | `bad-percent.header` | `E_NAME` | `%G1` is not a hex escape. |
 | `bad-utf8.header` | `E_NAME` | Escapes decode to invalid UTF-8. |
 | `raw-slash-name.header` | `E_NAME` | `/` must be written `%2F` inside a name. |
-| `empty-name.header` | `E_NAME` | Empty thread name between two colons. |
 | `record-uppercase.header` | `E_RECORD` | Uppercase digits in a record. |
 | `record-missing-dur.header` | `E_RECORD` | Record without a duration. |
 | `bad-attr-number.header` | `E_RECORD` | Attribute number `1.` has no fraction digits. |
@@ -35,7 +34,12 @@ are whitespace and are stripped like any other whitespace before decoding.
 | `second-root.header` | `E_ROOT` | A second depth-0 record. |
 | `root-thread.header` | `E_ROOT` | The root carries `@` (it is thread 0 by definition). |
 | `root-delta.header` | `E_ROOT` | The root startDelta is not 0. |
+| `phase-root.header` | `E_ROOT` | The root is a phase (`^p`): it must be a plain record. |
 | `unknown-flag.header` | `E_FLAG` | Flag `x` does not exist. |
+| `phase-aggregate.header` | `E_FLAG` | `^p` on an aggregate. |
+| `phase-wait.header` | `E_FLAG` | `^p` on a handoff (a record with `~`). |
+| `phase-never-started.header` | `E_FLAG` | `^p` together with `n`. |
+| `phase-children.header` | `E_FLAG` | A record nested under a phase. |
 | `mixed-thread-plain.header` | `E_AGG` | `@_` on a record that is not an aggregate. |
 | `aggregate-children.header` | `E_AGG` | A record nested under an aggregate. |
 | `wait-pair-plain.header` | `E_AGG` | `~sum.max` on a record that is not an aggregate. |

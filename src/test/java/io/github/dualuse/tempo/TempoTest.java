@@ -111,8 +111,7 @@ class TempoTest {
             b.append("  ".repeat(s.depth())).append(s.name()).append(' ').append(s.startNanos()).append('+').append(s.durationNanos());
             if (s.level() == STEP) b.append(" step");
             if (s.level() == TICK) b.append(" tick");
-            if (s.phase()) b.append(s.retro() ? " lap" : " phase");
-            if (s.legacy()) b.append(" legacy");
+            if (s.phase()) b.append(" phase");
             if (s.label() != null) b.append(" '").append(s.label()).append('\'');
             if (s.open()) b.append(" open");
             if (s.failed()) b.append(" failed");
@@ -276,9 +275,9 @@ class TempoTest {
     void aSpanWithAnOpenPhaseIsTheInnermost() {
         try (Trace t = Tempo.trace(SEARCH, strict())) {
             t.phase(DECODE);
-            t.span(LOAD).close(); // nests under the phase, as before
+            t.span(LOAD).close(); // a child of the span, beside the phase
             t.close();
-            assertEquals(lines("search 0+0", "  decode 0+0 phase", "    load 0+0"), tree(t));
+            assertEquals(lines("search 0+0", "  decode 0+0 phase", "  load 0+0"), tree(t));
             assertEquals(0, t.misuses());
         }
     }
@@ -430,7 +429,7 @@ class TempoTest {
                 }
             });
             assertEquals(1, n[0]);
-            assertTrue(t.toHeader().contains(";N=search:%3F:decode;"), t.toHeader()); // the wire form changes with the format
+            assertTrue(t.toHeader().contains(";N=search::decode;"), t.toHeader()); // the empty name
             assertEquals(2, t.misuses()); // the close of the trace healed the unnamed span, which then closed again
         }
     }
@@ -846,7 +845,8 @@ class TempoTest {
         s.set(BYTES, 1).set(SCORE, 0.5).fail().cancel().waiting().add(MATCH, 5);
         assertSame(NOOP, s.span(LOAD));
         assertSame(NOOP, s.step(LOAD));
-        assertSame(s, s.phase(RERANK).done(RERANK));
+        assertSame(Tempo.Phase.NOOP, s.phase(RERANK));
+        assertSame(s, s.done(RERANK));
         assertSame(NOOP, s.tick(LOAD));  // not counted
         s.close();
         assertEquals(11, t.misuses());
@@ -1003,56 +1003,63 @@ class TempoTest {
         }
     }
 
-    // ---- phases and laps ------------------------------------------------------------------------------
+    // ---- phases -----------------------------------------------------------------------------------------
 
     @Test
-    void phasesHaveExactDurationsAndNestTheSpansOpenedInThem() {
+    void phasesSectionTheSpanAndParentNothing() {
         Trace t = Tempo.trace(SEARCH, opts());
         Span s = t;
         clock.add(5);
-        assertSame(s, s.phase(DECODE));
+        Tempo.Phase decode = s.phase(DECODE);
+        assertNotSame(Tempo.Phase.NOOP, decode);
         clock.add(10);
         try (Span l = s.span(LOAD)) {
             clock.add(4);
         }
+        Span j = s.span(JOIN);       // crosses the next boundary
         clock.add(1);
-        s.phase(RERANK); // one clock read ends decode and starts rerank
-        clock.add(30);
+        Tempo.Phase rerank = s.phase(RERANK); // one clock read ends decode and starts rerank
+        assertNotSame(decode, rerank);
+        clock.add(5);
+        j.close();
+        clock.add(25);
         s.span(MATCH).close();
-        assertEquals(2, s.lapOrdinal());
         clock.add(10);
         t.close(); // ends the open phase normally: neither healed nor misuse
         assertEquals(lines(
                 "search 0+60",
                 "  decode 5+15 phase",
-                "    load 15+4",
+                "  load 15+4",
+                "  join 19+6",
                 "  rerank 20+40 phase",
-                "    match 50+0"), tree(t));
+                "  match 50+0"), tree(t));
+        assertEquals(15, decode.elapsedNanos());
+        assertEquals(40, rerank.elapsedNanos());
         assertEquals(0, t.misuses());
     }
 
     @Test
-    void currentIsThePhasesOwner() {
-        try (Trace t = Tempo.trace(SEARCH, opts())) {
+    void currentIsTheSpanNotItsPhase() {
+        try (Trace t = Tempo.trace(SEARCH, strict())) {
             Span s = t;
             s.phase(DECODE);
             assertSame(s, Tempo.current());
-            Tempo.current().span(LOAD).close();  // still nests under the phase
-            Tempo.current().phase(RERANK);        // a boundary of the owner, not a phase inside decode
+            Tempo.current().span(LOAD).close();  // a child of the span, beside the phase
+            Tempo.current().phase(RERANK);
             clock.add(3);
             Tempo.current().done(RERANK);
             t.close();
             assertEquals(lines(
                     "search 0+3",
                     "  decode 0+0 phase",
-                    "    load 0+0",
+                    "  load 0+0",
                     "  rerank 0+3 phase"), tree(t));
             assertEquals(0, t.misuses());
         }
     }
 
     @Test
-    void labelAfterLapsAdoptTheSpansOpenedDuringThem() {
+    void doneNamesTheTimeSinceTheLastBoundary() {
         Trace t = Tempo.trace(SEARCH, opts());
         Span s = t;
         clock.add(2);
@@ -1063,73 +1070,127 @@ class TempoTest {
             l.span(MATCH).close();
         }
         clock.add(5);
-        assertSame(s, s.done(DECODE));
+        assertSame(s, s.done(DECODE)); // from the span's start: nothing open, nothing before
         clock.add(5);
         try (Span m = s.span(MATCH)) {
             clock.add(7);
         }
         clock.add(3);
-        s.done(RERANK);
+        s.lap(RERANK);                 // a synonym
         clock.add(7);
-        s.span(LOAD).close(); // after the last lap: the root's own
+        s.span(LOAD).close();          // unphased time of the root
         clock.add(3);
         t.close();
         assertEquals(lines(
                 "search 0+40",
-                "  decode 0+15 lap",
-                "    load 2+8",
-                "      match 5+0",
-                "      match 10+0",
-                "  rerank 15+15 lap",
-                "    match 20+7",
+                "  decode 0+15 phase",
+                "  load 2+8",
+                "    match 5+0",
+                "    match 10+0",
+                "  rerank 15+15 phase",
+                "  match 20+7",
                 "  load 37+0"), tree(t));
         List<String> ids = new ArrayList<>();
         t.forEachSpan(v -> ids.add(v.id() + "<" + v.parent() + "@" + v.depth()));
-        assertEquals(List.of("0<-1@0", "1<0@1", "2<1@2", "3<2@3", "4<2@3", "5<0@1", "6<5@2", "7<0@1"), ids);
-        assertEquals(2, s.lapOrdinal());
+        assertEquals(List.of("0<-1@0", "1<0@1", "2<0@1", "3<2@2", "4<2@2", "5<0@1", "6<0@1", "7<0@1"), ids);
         assertEquals(0, t.misuses());
     }
 
     @Test
-    void timeAfterTheLastLapStaysSelfTimeOfTheOwner() {
+    void timeAfterTheLastPhaseStaysUnphased() {
         Trace t = Tempo.trace(SEARCH, opts());
         clock.add(1);
         try (Span r = t.span(RERANK)) {
             clock.add(4);
-            r.done(LOAD);       // the first lap of a span starts at its open
+            r.done(LOAD);       // the first named stretch starts at the span's start
             clock.add(2);
             r.done(MATCH);
-            clock.add(9);       // self-time of rerank, not part of a lap
+            clock.add(9);       // rerank's own, in no phase
         }
         t.close();
         assertEquals(lines(
                 "search 0+16",
                 "  rerank 1+15",
-                "    load 1+4 lap",
-                "    match 5+2 lap"), tree(t));
+                "    load 1+4 phase",
+                "    match 5+2 phase"), tree(t));
     }
 
     @Test
-    void doneEndsAnOpenPhaseAndTheNextLapStartsThere() {
+    void doneEndsTheOpenPhaseAndTheNextNameStartsThere() {
         Trace t = Tempo.trace(SEARCH, opts());
         Span s = t;
         clock.add(1);
         s.phase(DECODE);
         clock.add(8);
-        s.done(DECODE);
-        assertEquals(1, s.lapOrdinal()); // ending a phase is not another boundary
+        assertSame(s, s.done(DECODE));
         clock.add(2);
         s.span(LOAD).close();
         s.done(RERANK);
+        assertSame(s, s.done());        // nothing open: nothing to do
         clock.add(4);
         t.close();
         assertEquals(lines(
                 "search 0+15",
                 "  decode 1+8 phase",
-                "  rerank 9+2 lap",
-                "    load 11+0"), tree(t));
-        assertEquals(2, s.lapOrdinal());
+                "  rerank 9+2 phase",
+                "  load 11+0"), tree(t));
         assertEquals(0, t.misuses());
+    }
+
+    @Test
+    void aPhaseEndsAndContinuesTheSequenceFromItsHandle() {
+        Trace t = Tempo.trace(SEARCH, strict());
+        clock.add(1);
+        Span s = t.phase(DECODE).set(BYTES, 3).phase(RERANK).label("Rerank").done();
+        assertSame(t, s);
+        clock.add(2);
+        assertSame(t, t.phase(MATCH).lap());
+        clock.add(3);
+        t.close();
+        assertEquals(lines(
+                "search 0+6",
+                "  decode 1+0 phase bytes=3",
+                "  rerank 1+0 phase 'Rerank'",
+                "  match 3+0 phase"), tree(t));
+        assertEquals(0, t.misuses());
+    }
+
+    /**
+     * A phase's handle is pooled like a span's: once the trace is released, a call through it is ignored and
+     * counted in that trace, and the thread issues it to a phase of its next trace. Strict mode never pools
+     * one, so there a stale call always throws.
+     */
+    @Test
+    void aPhaseHandleIsPooledLikeASpans() throws Exception {
+        assertNull(onThread("phases", () -> {
+            Trace t = Tempo.trace(SEARCH, opts());
+            Tempo.Phase p = t.phase(DECODE);
+            t.close();
+            t.release();
+            assertEquals(1, Tempo.SLOT.get().pooled());
+            p.set(BYTES, 1).fail().label("x");
+            assertSame(Tempo.Phase.NOOP, p.phase(LOAD));
+            assertSame(NOOP, p.done());
+            assertEquals(0, p.elapsedNanos());
+            assertEquals(5, t.misuses());
+            Trace u = Tempo.trace(RERANK, opts());
+            assertSame(p, u.phase(MATCH)); // issued again
+            u.close();
+            u.release();
+        }));
+        assertNull(onThread("strict-phases", () -> {
+            Trace t = Tempo.trace(SEARCH, strict());
+            Tempo.Phase p = t.phase(DECODE);
+            t.close();
+            t.release();
+            assertEquals(0, Tempo.SLOT.get().pooled());
+            AssertionError e = assertThrows(AssertionError.class, () -> p.set(BYTES, 1));
+            assertTrue(e.getMessage().contains("released"), e.getMessage());
+            Trace u = Tempo.trace(RERANK, strict());
+            assertNotSame(p, u.phase(MATCH));
+            u.close();
+            u.release();
+        }));
     }
 
     @Test
@@ -1142,19 +1203,20 @@ class TempoTest {
         assertEquals(1, t.misuses());
         clock.add(3);
         s.span(MATCH).close();
-        s.done(LOAD); // starts at the phase's end and adopts only what came after the misuse entry
+        s.done(LOAD); // names the time since decode ended
         t.close();
         assertEquals(lines(
                 "search 0+8",
-                "  decode 0+5 phase",
-                "  rerank 5+0 lap misuse",
-                "  load 5+3 lap",
-                "    match 8+0"), tree(t));
+                "  decode 0+5 phase misuse",
+                "  load 5+3 phase",
+                "  match 8+0"), tree(t));
         assertEquals(1, t.misuses());
+        assertEquals(1, t.total(DECODE).count());
+        assertEquals(0, t.total(RERANK).count());
     }
 
     @Test
-    void strictThrowsOnMismatchedDoneAfterRecording() {
+    void strictThrowsOnMismatchedDoneAndKeepsThePhaseOpen() {
         Trace t = Tempo.trace(SEARCH, strict());
         Span s = t;
         s.phase(DECODE);
@@ -1165,136 +1227,66 @@ class TempoTest {
         t.close();
         assertEquals(lines(
                 "search 0+6",
-                "  decode 0+5 phase",
-                "  rerank 5+0 lap misuse"), tree(t));
+                "  decode 0+6 phase"), tree(t));
     }
 
     @Test
-    void boundariesHealASpanLeftOpen() {
-        Trace t = Tempo.trace(SEARCH, opts());
-        Span s = t;
-        s.span(LOAD);
-        clock.add(4);
-        s.phase(DECODE);
-        assertEquals(1, t.misuses());
-        s.span(MATCH);
-        clock.add(2);
-        s.done(DECODE); // ends match (healed) and the phase
-        assertEquals(2, t.misuses());
-        s.span(JOIN);
-        clock.add(3);
-        s.done(RERANK);
-        assertEquals(3, t.misuses());
-        t.close();
-        assertEquals(lines(
-                "search 0+9",
-                "  load 0+4 healed",
-                "  decode 4+2 phase",
-                "    match 4+2 healed",
-                "  rerank 6+3 lap",
-                "    join 6+3 healed"), tree(t));
-    }
-
-    @Test
-    void strictThrowsWhenABoundaryHeals() {
-        Trace t = Tempo.trace(SEARCH, strict());
-        Span s = t;
-        s.span(LOAD);
-        clock.add(4);
-        AssertionError e = assertThrows(AssertionError.class, () -> s.phase(DECODE));
-        assertEquals("Tempo misuse: phase started while a child span was open", e.getMessage());
-        s.span(MATCH);
-        assertThrows(AssertionError.class, () -> s.done(RERANK));
-        t.close();
-        assertEquals(lines(
-                "search 0+4",
-                "  load 0+4 healed",
-                "  decode 4+0 phase",
-                "    match 4+0 healed",
-                "  rerank 4+0 lap misuse"), tree(t)); // recorded in full; the heal is reported first
-    }
-
-    @Test
-    void failedLapIsFlaggedNeverLegacyAndRethrown() {
-        Trace t = Tempo.trace(SEARCH, opts());
-        Span s = t;
-        IOException io = new IOException("gone");
-        clock.add(3);
-        try {
-            s.lap(DECODE, () -> {
-                try (Span l = s.span(LOAD)) {
-                    clock.add(4);
-                }
-                throw io;
-            });
-            fail();
-        } catch (IOException e) {
-            assertSame(io, e);
-        }
-        int n = s.lap(RERANK, () -> {
-            clock.add(5);
-            return 42;
-        });
-        assertEquals(42, n);
-        int seven = NOOP.lap(MATCH, () -> 7);
-        assertEquals(7, seven);
-        t.close();
-        assertEquals(lines(
-                "search 0+12",
-                "  decode 0+7 lap failed",
-                "    load 3+4",
-                "  rerank 7+5 lap"), tree(t));
-        assertEquals(0, t.misuses());
-    }
-
-    @Test
-    void strictLapKeepsTheBodysThrowable() {
-        Trace t = Tempo.trace(SEARCH, strict());
-        Span s = t;
-        IOException io = new IOException("gone");
-        IOException thrown = assertThrows(IOException.class, () -> s.lap(DECODE, () -> {
-            s.span(LOAD); // left open by the throw
+    void boundariesLeaveTheSpansOpenInThem() {
+        for (Options o : new Options[] {opts(), strict()}) {
+            Trace t = Tempo.trace(SEARCH, o);
+            Span s = t;
+            Span load = s.span(LOAD);
+            clock.add(4);
+            s.phase(DECODE);       // load stays open: a child may cross a boundary
             clock.add(2);
-            throw io;
-        }));
-        assertSame(io, thrown);
-        assertEquals(1, io.getSuppressed().length);
-        assertTrue(io.getSuppressed()[0] instanceof AssertionError);
-        t.close();
-        assertEquals(lines(
-                "search 0+2",
-                "  decode 0+2 lap failed",
-                "    load 0+2 healed"), tree(t));
+            load.close();
+            clock.add(3);
+            s.done(DECODE);
+            load = s.span(LOAD);
+            s.done(MATCH);         // a named stretch, load still open
+            clock.add(1);
+            load.close();
+            t.close();
+            assertEquals(lines(
+                    "search 0+10",
+                    "  load 0+6",
+                    "  decode 4+5 phase",
+                    "  match 9+0 phase",
+                    "  load 9+1"), tree(t));
+            assertEquals(0, t.misuses());
+        }
     }
 
     @Test
-    void legacyLabelsAndPhaseAttributes() {
+    void labelsAndAttributesOnPhases() {
         Trace t = Tempo.trace(SEARCH, opts());
         Span s = t;
+        Tempo.Phase d = s.phase(DECODE).label("Decode Input #3 = v2(x)").set(BYTES, 7);
         clock.add(4);
-        s.done(DECODE, "Decode Input #3 = v2(x)");
-        s.phase(RERANK).phaseSet(BYTES, 7).legacy(); // on the open phase
+        Tempo.Phase r = s.phase(RERANK);
+        r.set(SCORE, 0.5).fail();
         clock.add(6);
-        s.done(RERANK, "Rerank & Match");
+        s.done();
+        r.label("Rerank & Match");       // after it ended
+        d.set(BYTES, 9);                 // after it ended: a repeated key keeps the last value on the wire
         clock.add(2);
-        s.done(MATCH).phaseSet(BYTES, 3);           // on the last lap
-        s.done(LOAD, null).legacy();
+        s.done(MATCH);
         t.close();
         assertEquals(lines(
                 "search 0+12",
-                "  decode 0+4 lap legacy 'Decode Input #3 = v2(x)'",
-                "  rerank 4+6 phase legacy 'Rerank & Match' bytes=7",
-                "  match 10+2 lap bytes=3",
-                "  load 12+0 lap legacy"), tree(t));
+                "  decode 0+4 phase 'Decode Input #3 = v2(x)' bytes=7 bytes=9",
+                "  rerank 4+6 phase 'Rerank & Match' failed score=0.5",
+                "  match 10+2 phase"), tree(t));
+        assertEquals("0.000000012s = 0.000000004s (Decode Input #3 = v2(x)) + 0.000000006s (Rerank & Match)", t.toRuntime(9));
         assertEquals(0, t.misuses());
     }
 
     @Test
-    void manyLabelsKeepTheirLaps() {
+    void manyLabelsKeepTheirPhases() {
         Trace t = Tempo.trace(SEARCH, opts());
         for (int i = 0; i < 20; i++) {
+            t.phase(LOAD).label("load #" + i);
             clock.add(1);
-            t.done(LOAD, "load #" + i);
         }
         t.close();
         List<String> labels = new ArrayList<>();
@@ -1303,7 +1295,7 @@ class TempoTest {
         for (int i = 0; i < 20; i++) assertEquals(i + ":load #" + i, labels.get(i + 1));
     }
 
-    /** A render racing the label table's growth never sees a committed lap without its label (stress, weak memory). */
+    /** A render racing the label table's growth reads every label it sees whole (stress, weak memory). */
     @Test
     void liveRenderSeesEveryCommittedLabel() throws Exception {
         String[] text = new String[64];
@@ -1314,7 +1306,7 @@ class TempoTest {
             for (int round = 0; round < 20000 && bad.get() == null; round++) {
                 Trace t = Tempo.trace(SEARCH, opts());
                 live.set(t);
-                for (String s : text) t.done(LOAD, s);
+                for (String s : text) t.phase(LOAD).label(s);
                 t.close();
             }
             live.set(null);
@@ -1323,7 +1315,9 @@ class TempoTest {
         while (owner.isAlive()) {
             Trace t = live.get();
             if (t != null) t.forEachSpan(v -> {
-                if (v.retro() && v.label() == null) bad.set("lap " + v.id() + " rendered without its label");
+                if (v.phase() && v.label() != null && !v.label().equals(text[v.id() - 1])) {
+                    bad.set("phase " + v.id() + " rendered with label " + v.label());
+                }
             });
         }
         owner.join();
@@ -1331,25 +1325,27 @@ class TempoTest {
     }
 
     @Test
-    void legacyAndPhaseSetNeedAPhaseOrLap() {
+    void phaseCallsOnAClosedSpanOrWithoutALabelAreMisuse() {
         try (Trace t = Tempo.trace(SEARCH, opts())) {
-            Span s = t;
-            s.done(DECODE);
-            try (Span j = s.span(JOIN)) {
-                j.legacy().phaseSet(BYTES, 1); // the root's lap is not this span's
-            }
-            assertEquals(2, t.misuses());
+            Span j = t.span(JOIN);
+            Tempo.Phase p = j.phase(LOAD);
+            j.close();                     // ends its phase too
+            assertSame(Tempo.Phase.NOOP, p.phase(MATCH));
+            assertSame(j, j.done(LOAD));
+            p.label(null);
+            p.set(BYTES, 1);               // allowed after it ended
+            assertEquals(3, t.misuses());
             t.close();
-            assertEquals(lines("search 0+0", "  decode 0+0 lap", "  join 0+0"), tree(t));
+            assertEquals(lines("search 0+0", "  join 0+0", "    load 0+0 phase bytes=1"), tree(t));
         }
         try (Trace t = Tempo.trace(SEARCH, strict())) {
-            AssertionError e = assertThrows(AssertionError.class, () -> t.legacy());
-            assertEquals("Tempo misuse: legacy() without a phase or lap", e.getMessage());
+            AssertionError e = assertThrows(AssertionError.class, () -> t.phase(LOAD).label(null));
+            assertEquals("Tempo misuse: null label", e.getMessage());
         }
     }
 
     @Test
-    void nullNamesInPhasesAndLaps() {
+    void nullNamesInPhases() {
         Trace t = Tempo.trace(SEARCH, opts());
         Span s = t;
         s.phase((Name) null);
@@ -1362,7 +1358,7 @@ class TempoTest {
         assertEquals(lines(
                 "search 0+5",
                 "  ? 0+2 phase misuse",
-                "  ? 2+3 lap misuse"), tree(t));
+                "  ? 2+3 phase misuse"), tree(t));
         Trace u = Tempo.trace(SEARCH, strict());
         assertThrows(AssertionError.class, () -> u.phase((Name) null));
         assertThrows(AssertionError.class, () -> u.done((Name) null));
@@ -1374,76 +1370,249 @@ class TempoTest {
     void phasesOnAForeignThreadOrNoopAreIgnored() throws Exception {
         try (Trace t = Tempo.trace(SEARCH, opts())) {
             Span s = t;
-            assertNull(onOtherThread(() -> s.phase(DECODE).done(DECODE).done(LOAD, "x").legacy().phaseSet(BYTES, 1)));
-            assertEquals(5, t.misuses());
-            assertSame(NOOP, NOOP.phase(DECODE).done(DECODE).done(LOAD, "x").legacy().phaseSet(BYTES, 1));
-            assertEquals(0, NOOP.lapOrdinal());
+            Tempo.Phase p = s.phase(DECODE);
+            assertNull(onOtherThread(() -> {
+                assertSame(Tempo.Phase.NOOP, s.phase(LOAD));
+                s.done();
+                s.done(LOAD);
+                s.lap(5L);
+                s.start(1L);
+                s.stop(2L);
+                p.set(BYTES, 1).fail().label("x");
+            }));
+            assertEquals(9, t.misuses());
+            assertSame(Tempo.Phase.NOOP, NOOP.phase(DECODE));
+            assertSame(NOOP, NOOP.phase(DECODE).set(BYTES, 1).fail().label("x").phase(LOAD).done());
+            assertSame(NOOP, NOOP.done(LOAD).lap(3L).start(1L).stop(2L).done().lap());
+            assertEquals(0, Tempo.Phase.NOOP.elapsedNanos());
             t.close();
-            assertEquals(lines("search 0+0"), tree(t));
+            assertEquals(lines("search 0+0", "  decode 0+0 phase"), tree(t));
+            assertEquals(9, t.misuses());
         }
     }
 
     @Test
-    void lapsWorkAtTheDepthCapAndPhasesAreDropped() {
+    void aPhaseIsARowNotADepth() {
         try (Trace t = Tempo.trace(SEARCH, opts())) {
             Span s = t;
             for (int d = 1; d < 35; d++) s = s.span(LOAD);
             clock.add(1);
-            s.phase(DECODE); // no room on the stack: dropped, but still a boundary
-            s.legacy().phaseSet(BYTES, 1);
+            s.phase(DECODE); // a row under the deepest span: it needs no room on the stack
             clock.add(2);
-            s.done(MATCH);   // a lap is not on the stack, so it fits
-            assertEquals(1, t.dropped());
+            s.done();
+            s.done(MATCH);
+            assertEquals(0, t.dropped());
             assertEquals(0, t.misuses());
-            assertEquals(2, s.lapOrdinal());
             List<String> deepest = new ArrayList<>();
             t.forEachSpan(v -> {
                 if (v.depth() == 35) deepest.add(v.name() + " " + v.startNanos() + "+" + v.durationNanos());
             });
-            assertEquals(List.of("match 1+2"), deepest);
+            assertEquals(List.of("decode 1+2", "match 3+0"), deepest);
         }
     }
 
     @Test
-    void strictStaysSilentOnCorrectPhasesAndLaps() throws Exception {
-        try (Trace t = Tempo.trace(SEARCH, strict())) {
-            Span s = t;
-            s.done(DECODE, "Decode");
-            s.phase(RERANK).phaseSet(BYTES, 1);
-            s.span(LOAD).close();
-            s.done(RERANK).legacy();
-            s.lap(MATCH, () -> 1);
+    void aPhasePastTheRowCapIsDroppedButStillABoundary() {
+        try (Trace t = Tempo.trace(SEARCH, opts())) {
+            for (int i = 1; i < Tempo.Lane.MAX_ROWS; i++) t.span(LOAD).close();
+            clock.add(1);
+            Tempo.Phase p = t.phase(DECODE); // no row left: dropped
+            p.set(BYTES, 1).fail().label("Decode");
+            assertEquals(0, p.elapsedNanos());
+            clock.add(2);
+            t.done(DECODE);                  // still the open phase: no mismatch
+            assertEquals(1, t.dropped());
+            assertEquals(0, t.misuses());
+            assertEquals(0, t.total(DECODE).count()); // like a span past the cap
+            assertEquals("0.000s", t.toRuntime(3));
+        }
+    }
+
+    @Test
+    void phasesOfFoldedAndUndrawnSpansCountTowardsTheTotals() {
+        for (int mode = 0; mode < 2; mode++) {
+            List<Long> heard = new ArrayList<>();
+            Trace t = Tempo.trace(SEARCH, opts().budget(0)).records(mode == 0 ? SPAN : STEP); // undrawn, folded
+            t.on(DECODE, heard::add);
+            try (Span step = t.step(MATCH)) {
+                Tempo.Phase p = step.phase(DECODE);
+                assertNotSame(Tempo.Phase.NOOP, p);
+                p.set(BYTES, 1).label("ignored");   // no row to keep it
+                clock.add(3);
+                step.phase(RERANK);
+                clock.add(2);
+                step.done(RERANK);
+                step.done(LOAD);                   // a named stretch of no time
+            }
+            t.close();
+            assertEquals(List.of(3L), heard);
+            assertEquals("count=1 sum=3 mean=3 min=3 max=3 waitSum=0 waitMax=0", t.total(DECODE).toString());
+            assertEquals(2, t.total(RERANK).sum());
+            assertEquals(1, t.total(LOAD).count());
+            assertFalse(tree(t).contains("phase"), tree(t));
             assertEquals(0, t.misuses());
         }
     }
 
     @Test
-    void phasesAndLapsAllocateNothingOnceWarm() {
-        int rounds = 2_000; // four rows per round
+    void strictStaysSilentOnCorrectPhases() throws Exception {
+        try (Trace t = Tempo.trace(SEARCH, strict())) {
+            Span s = t;
+            s.done(DECODE);
+            s.phase(RERANK).set(BYTES, 1).label("Rerank");
+            s.span(LOAD).close();
+            s.done(RERANK).phase(MATCH).fail();
+            s.lap(clock.t);
+            s.done(JOIN);
+            assertEquals(0, t.misuses());
+        }
+    }
+
+    @Test
+    void phasesAllocateNothingOnceWarm() {
+        int rounds = 2_000; // three rows per round
         for (int i = 0; i < 3; i++) { // as large as the trace measured: the thread pools as many handles
             Trace warm = Tempo.trace(SEARCH, opts());
-            laps(warm, rounds + 1);
+            phases(warm, rounds + 1);
             warm.close();
             warm.release();
         }
         Trace t = Tempo.trace(SEARCH, opts());
-        laps(t, 1); // creates the phase state, the handles and the event table
-        assertEquals(0, allocatedBy(() -> laps(t, rounds)), "bytes allocated by " + rounds + " rounds");
+        phases(t, 1); // creates the phase state, the handles and the event table
+        assertEquals(0, allocatedBy(() -> phases(t, rounds)), "bytes allocated by " + rounds + " rounds");
         t.close();
         assertEquals(0, t.misuses());
         t.release();
     }
 
-    static final Tempo.ThrowingSupplier<Object, RuntimeException> NOTHING = () -> null;
-
-    private void laps(Span root, int rounds) {
+    private void phases(Span root, int rounds) {
         for (int i = 0; i < rounds; i++) {
-            root.phase(DECODE).phaseSet(BYTES, i);
+            root.phase(DECODE).set(BYTES, i).fail();
             root.span(LOAD).close();
             clock.add(1);
-            root.done(DECODE).done(RERANK).legacy();
-            root.lap(MATCH, NOTHING);
+            root.done(DECODE).done(RERANK);
+            root.lap(clock.t);
         }
+    }
+
+    // ---- timing by hand --------------------------------------------------------------------------------
+
+    @Test
+    void aSpanTimedByHand() {
+        List<Long> heard = new ArrayList<>();
+        Trace t = Tempo.trace(SEARCH, strict()).on(LOAD, heard::add);
+        long zero = clock.t;
+        clock.add(100);
+        t.span(LOAD).phase(DECODE).start(zero + 20).lap(zero + 50).phase(RERANK).stop(zero + 90).close();
+        clock.add(10);
+        t.close();
+        assertEquals(lines(
+                "search 0+110",
+                "  load 20+70",
+                "    decode 20+30 phase",
+                "    rerank 50+40 phase"), tree(t));
+        assertEquals(List.of(70L), heard);
+        assertEquals(30, t.total(DECODE).sum());
+        assertEquals(40, t.total(RERANK).sum());
+        assertEquals(0, t.misuses());
+    }
+
+    @Test
+    void aSpanStartedByHandBeforeItsSiblingsComesFirst() {
+        Trace t = Tempo.trace(SEARCH, strict());
+        long zero = clock.t;
+        clock.add(10);
+        t.span(MATCH).close();
+        clock.add(10);
+        Span l = t.span(LOAD).start(zero + 5); // within the root's window, before match
+        l.lap(zero + 8);                       // a boundary without a phase
+        l.phase(DECODE);                       // timed by hand: starts at that boundary
+        l.done();
+        l.close();
+        t.close();
+        assertEquals(lines(
+                "search 0+20",
+                "  load 5+15",
+                "    decode 8+12 phase",
+                "  match 10+0"), tree(t));
+        assertEquals(0, t.misuses());
+    }
+
+    @Test
+    void timesOutsideTheWindowAreClampedFlaggedAndCounted() {
+        Trace t = Tempo.trace(SEARCH, opts());
+        long zero = clock.t;
+        clock.add(100);
+        Span p = t.span(LOAD);
+        clock.add(50);
+        Span x = p.span(MATCH);
+        x.start(zero + 10);              // before its parent: at the parent's start
+        x.lap(zero + 90);                // before the last boundary: there
+        x.phase(DECODE);                 // timed by hand: starts at that boundary
+        x.stop(zero + 500);              // after now: now
+        assertEquals(3, t.misuses());
+        assertSame(Tempo.Phase.NOOP, x.phase(RERANK)); // after stop
+        x.lap(zero + 150);
+        x.stop(zero + 150);
+        x.start(zero + 100);
+        assertEquals(7, t.misuses());
+        clock.add(5);
+        x.close();                       // keeps the stopped end
+        p.close();
+        t.start(zero + 1);               // the root starts at the trace's zero point
+        assertEquals(8, t.misuses());
+        clock.add(5);
+        t.close();
+        assertEquals(lines(
+                "search 0+160 misuse",
+                "  load 100+55",
+                "    match 100+50 misuse",
+                "      decode 100+50 phase misuse"), tree(t));
+        assertEquals(50, t.total(MATCH).sum());
+    }
+
+    @Test
+    void aStartByHandStaysBeforeTheChildrenAndTheFirstBoundary() {
+        Trace t = Tempo.trace(SEARCH, opts());
+        long zero = clock.t;
+        Span x = t.span(LOAD);
+        clock.add(10);
+        x.span(MATCH).close();
+        clock.add(10);
+        x.start(zero + 15);              // after its child: at the child's start
+        assertEquals(1, t.misuses());
+        Span y = x.span(JOIN);
+        clock.add(5);
+        y.phase(DECODE);                 // its first boundary, at 25
+        clock.add(5);
+        y.done();
+        y.start(zero + 28);              // after the first boundary: there
+        assertEquals(2, t.misuses());
+        y.close();
+        x.close();
+        t.close();
+        assertEquals(lines(
+                "search 0+30",
+                "  load 10+20 misuse",
+                "    match 10+0",
+                "    join 25+5 misuse",
+                "      decode 25+5 phase"), tree(t));
+    }
+
+    @Test
+    void strictThrowsOnATimeOutsideTheWindow() {
+        Trace t = Tempo.trace(SEARCH, strict());
+        long zero = clock.t;
+        clock.add(10);
+        Span x = t.span(LOAD);
+        AssertionError e = assertThrows(AssertionError.class, () -> x.start(zero - 1));
+        assertEquals("Tempo misuse: start(nanos) outside the parent's time window", e.getMessage());
+        assertThrows(AssertionError.class, () -> x.lap(zero + 50));
+        assertThrows(AssertionError.class, () -> x.stop(zero + 5));
+        assertThrows(AssertionError.class, () -> x.stop(zero + 10));
+        x.close();
+        t.close();
+        assertEquals(4, t.misuses());
     }
 
     // ---- run / call -----------------------------------------------------------------------------------
@@ -1551,10 +1720,11 @@ class TempoTest {
             inner = Tempo.trace(RERANK, strict()); // its options are ignored: it is part of the outer trace
             assertSame(inner, Tempo.current());
             inner.on(MATCH, heard::add);
+            inner.phase(LOAD).label("Load");
             clock.add(3_000);
             Tempo.span(LOAD).close();
             Tempo.step(MATCH).close();
-            inner.done(LOAD, "Load");
+            inner.done();
             clock.add(2_000);
             inner.close();
             inner.close(); // idempotent
@@ -1566,12 +1736,12 @@ class TempoTest {
                 "search 0+21000",
                 "  decode 10000+10000",
                 "    rerank 15000+5000",
-                "      load 15000+3000 lap legacy 'Load'",
-                "        load 18000+0"), tree(outer));
+                "      load 15000+3000 phase 'Load'",
+                "      load 18000+0"), tree(outer));
         assertEquals(lines(
                 "rerank 0+5000",
-                "  load 0+3000 lap legacy 'Load'",
-                "    load 3000+0"), tree(inner));
+                "  load 0+3000 phase 'Load'",
+                "  load 3000+0"), tree(inner));
         String main = Tempo.Header.text(Thread.currentThread().getName());
         assertEquals(Map.of("name", "rerank", "start", 0L, "dur", 5L, "thread", 0L, "id", 0L, "parent", -1L),
                 ((List<?>) WireDecoder.decode(inner.toHeader()).get("spans")).get(0));
@@ -2540,8 +2710,7 @@ class TempoTest {
         assertTrue(p.recording());
         p.step(MATCH).close();             // undrawn too, timed
         p.set(BYTES, 1).set(SCORE, 0.5).fail().cancel().waiting().cpu()
-                .phase(DECODE).done(DECODE).done(DECODE, "x").legacy().phaseSet(BYTES, 2);
-        assertEquals(1, (int) p.lap(DECODE, () -> 1));
+                .phase(DECODE).set(BYTES, 2).label("x").done().done(DECODE); // phases: timed, not drawn
         Span inner = p.span(LOAD);         // recorded, under the nearest recorded span
         Span deeper = inner.step(parse);   // undrawn above a recorded span
         assertSame(deeper, Tempo.current());
@@ -2556,7 +2725,7 @@ class TempoTest {
                 "  load 10+4"), tree(t));
         assertEquals("count=5 sum=19 mean=3 min=2 max=5 waitSum=0 waitMax=0", t.total(parse).toString());
         assertEquals(1, t.total(MATCH).count());
-        assertEquals(0, t.total(DECODE).count());
+        assertEquals(2, t.total(DECODE).count());
         assertEquals(0, t.misuses());
     }
 

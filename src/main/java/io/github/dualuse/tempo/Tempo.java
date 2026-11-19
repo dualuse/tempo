@@ -70,10 +70,11 @@ public final class Tempo {
      */
     public static final int SPAN = 0, STEP = 1, TICK = 2;
 
-    // Row flag bits (16-bit column).
+    // Row flag bits (16-bit column). RETRO: a phase named after the fact (done(name) with none open), which
+    // the render puts before the spans that started with it. LABELED: a phase with a label, for Runtime.
     static final int PHASE = 1, RETRO = 1 << 1, HANDOFF = 1 << 2, WAIT = 1 << 3, FAILED = 1 << 4,
             CANCELLED = 1 << 5, HEALED = 1 << 6, MISUSE = 1 << 7, STEP_ROW = 1 << 8, TICK_ROW = 1 << 9,
-            LEGACY = 1 << 10, TASK = 1 << 11, UNRUN = 1 << 12; // UNRUN: a task cancelled before it began
+            LABELED = 1 << 10, TASK = 1 << 11, UNRUN = 1 << 12; // UNRUN: a task cancelled before it began
     static final int NEVER = 1 << 13; // in an aggregate's flags only: no handoff of it started
 
     // Event kinds, in the low KIND_BITS of an event's key; the rest is a Name id for attributes.
@@ -249,16 +250,14 @@ public final class Tempo {
 
     /**
      * The innermost open span of the calling thread, or {@link #NOOP}: the explicit way to annotate it,
-     * as in {@code Tempo.current().set("hits", n)}. An open phase is not a span of its own here: inside
-     * {@code s.phase(n)} this returns {@code s}. Costs one {@code ThreadLocal} read.
+     * as in {@code Tempo.current().set("hits", n)}. A phase is a section of its span, never a span of its
+     * own: inside {@code s.phase(n)} this returns {@code s}. Costs one {@code ThreadLocal} read.
      */
     public static Span current() {
         ThreadSlot slot = SLOT.get();
         Lane l = slot.current;
         if (l == null && ((l = slot.free) == null || l.depth == 0)) return NOOP;
-        int d = l.depth - 1;
-        while (d > 0 && l.isPhase(d)) d--;
-        return d < 0 ? NOOP : l.handles[d];
+        return l.handles[l.depth - 1];
     }
 
     /**
@@ -739,8 +738,7 @@ public final class Tempo {
                     for (int r = 0; r < rows; r++) {
                         Rows c = l.rows[r >>> Lane.CHUNK_BITS];
                         int i = r & Lane.MASK, f = c.flags[i];
-                        if (c.name[i] != id || (f & HANDOFF) != 0 || (f & (RETRO | MISUSE)) == (RETRO | MISUSE)
-                                || (f & (TASK | CANCELLED)) == (TASK | CANCELLED)) continue;
+                        if (c.name[i] != id || (f & HANDOFF) != 0 || (f & (TASK | CANCELLED)) == (TASK | CANCELLED)) continue;
                         long d = (long) Lane.DUR.getOpaque(c.dur, i);
                         if (d == Lane.OPEN) continue;
                         count++;
@@ -760,7 +758,7 @@ public final class Tempo {
                     Aggs a = (Aggs) Lane.AGGS.getAcquire(l);
                     for (int e = 0, n = a == null ? 0 : a.size(); e < n; e++) {
                         int k = e * Aggs.KEY, b = e * Aggs.CELLS, kind = a.keys[k + Aggs.KIND];
-                        // as in Shape: not ended yet, or moved under a lap row past the rows read
+                        // as in Shape: not ended yet, or anchored at a row past the rows read
                         if (a.keys[k + Aggs.NAME] != id || a.cells[b + Aggs.COUNT] == 0 || kind == Aggs.TASKS
                                 || kind == Aggs.SPANS && a.keys[k] >= rows) continue;
                         if (kind != Aggs.UNRUN) { // a folded task that ran, a folded or undrawn span
@@ -971,16 +969,19 @@ public final class Tempo {
      * reaches its trace's registry, so a strong one would keep an unreleased trace with all its lanes
      * alive for as long as the thread idles. The registry keeps the lanes of a live trace.
      *
-     * <p>The slot also pools the handles of the thread's recorded spans. A lane takes one per span and
-     * gives them all back when it retires, that is when its trace is released, so a thread holds as many
-     * handles as its largest traces needed at once. Pooled handles reach no lane and no trace.
+     * <p>The slot also pools the handles of the thread's recorded spans and phases. A lane takes one per
+     * span or phase and gives them all back when it retires, that is when its trace is released, so a
+     * thread holds as many handles as its largest traces needed at once. Pooled handles reach no lane and
+     * no trace.
      */
     static final class ThreadSlot {
-        private static final VarHandle RETURNED;
+        private static final VarHandle RETURNED, RETURNED_PHASES;
 
         static {
             try {
-                RETURNED = MethodHandles.lookup().findVarHandle(ThreadSlot.class, "returned", Span.class);
+                MethodHandles.Lookup l = MethodHandles.lookup();
+                RETURNED = l.findVarHandle(ThreadSlot.class, "returned", Span.class);
+                RETURNED_PHASES = l.findVarHandle(ThreadSlot.class, "returnedPhases", Phase.class);
             } catch (ReflectiveOperationException e) {
                 throw new ExceptionInInitializerError(e);
             }
@@ -996,6 +997,9 @@ public final class Tempo {
         // retiring lane pushes its handles onto from any thread, and that the owner takes whole.
         private Span spare;
         @SuppressWarnings("unused") private volatile Span returned;
+        // The same for the phase handles, linked by Phase.link.
+        private Phase sparePhase;
+        @SuppressWarnings("unused") private volatile Phase returnedPhases;
 
         /** Owner only: a pooled handle, or null if there is none. */
         Span take() {
@@ -1017,11 +1021,33 @@ public final class Tempo {
             } while (!RETURNED.compareAndSet(this, top, head));
         }
 
-        /** Handles pooled; for tests, while no thread uses the slot. */
+        /** Owner only: a pooled phase handle, or null if there is none. */
+        Phase takePhase() {
+            Phase p = sparePhase;
+            if (p == null) {
+                if (RETURNED_PHASES.getAcquire(this) == null) return null;
+                p = (Phase) RETURNED_PHASES.getAndSet(this, null);
+            }
+            sparePhase = p.link;
+            return p;
+        }
+
+        /** Any thread: pools the phase handles from {@code head} to {@code tail}, linked by {@link Phase#link}. */
+        void givePhases(Phase head, Phase tail) {
+            Phase top;
+            do {
+                top = (Phase) RETURNED_PHASES.getVolatile(this);
+                tail.link = top;
+            } while (!RETURNED_PHASES.compareAndSet(this, top, head));
+        }
+
+        /** Handles pooled, span and phase handles; for tests, while no thread uses the slot. */
         int pooled() {
             int n = 0;
             for (Span h = spare; h != null; h = h.link) n++;
             for (Span h = returned; h != null; h = h.link) n++;
+            for (Phase p = sparePhase; p != null; p = p.link) n++;
+            for (Phase p = returnedPhases; p != null; p = p.link) n++;
             return n;
         }
 
@@ -1225,15 +1251,22 @@ public final class Tempo {
 
         private Throwable thrown; // strict mode: a listener's throwable, rethrown once the operation is done
 
-        // Phase state of the span at depth d, created with the lane's first phase or lap: the time of its
-        // last phase boundary (valid unless lastPhase[d] == NO_PHASE), its last phase or lap row (or
-        // NO_PHASE, DROPPED_PHASE) and the number of boundaries so far.
-        static final int NO_PHASE = -1, DROPPED_PHASE = -2;
-        long[] mark;
-        int[] lastPhase, lapOrdinal;
-        int[] lapFrom; // aggregates created before the current lap of depth d; the lap's own come after
+        // Phases and hand timing of the open span at depth d, valid while bit d of timed is set: opening a
+        // span at d clears the bit, and its first phase, lap, start or stop sets the state up (the arrays
+        // come with the lane's first). times, at d * 4: MARK the last boundary, the span's start before the
+        // first one; FIRST the first boundary, while BOUNDS > 0; START the open phase's start; STOP the end
+        // that stop() gave. phaseAt, at d * 4: ROW the open phase's row (NO_PHASE: none open; ROWLESS: one
+        // without a row, of a folded or undrawn span or past the row cap), NAME its name, BOUNDS the
+        // boundaries so far, MODE: MANUAL timed by hand (a phase starts at the last boundary), STOPPED.
+        static final int NO_PHASE = -1, ROWLESS = -2, MARK = 0, FIRST = 1, START = 2, STOP = 3,
+                ROW = 0, NAME = 1, BOUNDS = 2, MODE = 3, MANUAL = 1, STOPPED = 2;
+        long timed;
+        private long[] times;
+        private int[] phaseAt;
+        private Phase[] rowless;                       // the handle the rowless phases at depth d share
+        private Phase issuedPhases, issuedPhasesTail; // phase handles taken from the slot, as issued above
 
-        // Legacy labels, referenced by LABEL events. Grown by copy and stored via LABELS.setRelease, so a
+        // Phase labels, referenced by LABEL events. Grown by copy and stored via LABELS.setRelease, so a
         // reader that acquires the commit and then the array sees every label that commit exposes, even
         // in a copy stored after that commit. The owner reads the field plainly.
         private String[] labels;
@@ -1588,9 +1621,9 @@ public final class Tempo {
         }
 
         /**
-         * Opens a folded span above the open one: no row, its start kept in the handle; it ends
-         * into the aggregate keyed by its anchor (the nearest recorded span), the anchor's lap, its parent
-         * (-1 when that is the anchor, else the name of the enclosing folded span) and its name.
+         * Opens a folded span above the open one: no row, its start kept in the handle; it ends into the
+         * aggregate keyed by its anchor (the nearest recorded span), its parent (-1 when that is the anchor,
+         * else the name of the enclosing folded span) and its name.
          */
         Span frame(Name n) {
             if (depth == MAX_DEPTH) {
@@ -1610,6 +1643,7 @@ public final class Tempo {
             int d = depth;
             rowAt[d] = d == 0 ? -1 : rowAt[d - 1]; // -1: a folded task's root, no row below
             depth = d + 1;
+            timed &= ~(1L << d);
             Span h = t != null ? t : frameHandle(d);
             handles[d] = h;
             h.row = FRAME;
@@ -1624,40 +1658,34 @@ public final class Tempo {
 
         /**
          * The aggregate entry for {@code n} folded on top of the stack: anchored at the nearest recorded span
-         * (-1 in a folded task without one) and its lap, parented by the enclosing folded span, if any (an
-         * undrawn step is passed over, as it is not drawn).
+         * (-1 in a folded task without one), parented by the enclosing folded span, if any (an undrawn step
+         * is passed over, as it is not drawn). Phases do not split it: they are sections, not parents.
          */
         private int entry(Name n, int kind) {
             int d = depth, a = d - 1;
             while (a >= 0 && handles[a].row == FRAME) a--;
             int p = d - 1;
             while (p > a && handles[p].hidden) p--;
-            return aggregate(rowAt[d - 1], a < 0 ? 0 : lapOrdinal(a), p == a ? -1 : handles[p].frame.id, n.id, kind);
+            return aggregate(rowAt[d - 1], 0, p == a ? -1 : handles[p].frame.id, n.id, kind);
         }
 
         /** The entry of an aggregate key, created if new; -1 past {@link Aggs#MAX} entries (counted as a drop). */
-        private int aggregate(int anchor, int lap, int parent, int name, int kind) {
+        private int aggregate(int anchor, int lane, int parent, int name, int kind) {
             Aggs a = aggs;
             if (a == null) AGGS.setRelease(this, a = new Aggs(8));
-            int e = a.find(anchor, lap, parent, name, kind);
+            int e = a.find(anchor, lane, parent, name, kind);
             if (e >= 0) return e;
             if (a.size() == Aggs.MAX) {
                 dropped++;
                 return -1;
             }
             if (a.full()) AGGS.setRelease(this, a = a.grow());
-            return a.create(anchor, lap, parent, name, kind);
+            return a.create(anchor, lane, parent, name, kind);
         }
 
         int aggregates() {
             Aggs a = aggs;
             return a == null ? 0 : a.size();
-        }
-
-        /** The aggregates of the lap of depth {@code d} that just ended as RETRO row {@code row} move under it. */
-        private void reanchor(int d, int lap, int row) {
-            Aggs a = aggs;
-            if (a != null) a.reanchor(lapFrom[d], rowAt[d], lap, row);
         }
 
         /** Elapsed time of frame handle {@code h}, which holds its start while open, then its duration; best effort off the owner. */
@@ -1704,11 +1732,7 @@ public final class Tempo {
             DUR.setOpaque(rows[r >>> CHUNK_BITS].dur, r & MASK, OPEN);
             rowAt[d] = r;
             depth = d + 1;
-            if (lastPhase != null) {
-                lastPhase[d] = NO_PHASE;
-                lapOrdinal[d] = 0;
-                lapFrom[d] = aggregates();
-            }
+            timed &= ~(1L << d);
             Span h = t != null ? t : issue(d);
             handles[d] = h;
             h.row = r;
@@ -1782,7 +1806,7 @@ public final class Tempo {
             if (healed) ctx.misuse("span closed while a child span was open");
         }
 
-        /** Ends every row above depth {@code d}; returns whether one of them was a span healed (phases end normally). */
+        /** Ends every row above depth {@code d}; returns whether one of them was healed. */
         private boolean unwind(int d, long now) {
             boolean healed = false;
             for (int k = depth - 1; k > d; k--) healed |= end(k, now, true);
@@ -1790,9 +1814,16 @@ public final class Tempo {
             return healed;
         }
 
-        /** Ends the row at depth {@code k}: flags and events first, duration last (the commit protocol). */
+        /**
+         * Ends the row at depth {@code k} at {@code now}, or where {@link #stop} put its end: its open phase
+         * first, then flags and events, duration last (the commit protocol).
+         */
         private boolean end(int k, long now, boolean heal) {
             Span h = handles[k];
+            if ((timed >>> k & 1) != 0) {
+                if ((phaseAt[k << 2 | MODE] & STOPPED) != 0) now = times[k << 2 | STOP];
+                if (phaseAt[k << 2 | ROW] != NO_PHASE) endPhase(k, now, 0);
+            }
             if (h.row == FRAME) {
                 long start = h.time, dur = Math.max(0, now - start), cpu = cpuSince(k);
                 h.time = dur;
@@ -1802,17 +1833,12 @@ public final class Tempo {
             int r = h.row;
             Rows c = rows[r >>> CHUNK_BITS];
             int i = r & MASK;
-            boolean phase = (c.flags[i] & PHASE) != 0, healed = heal && !phase;
-            if (healed) c.flags[i] |= HEALED;
-            if (phase) { // however the phase ends, its end is the owner's last boundary
-                mark[k - 1] = now;
-                lapFrom[k - 1] = aggregates();
-            }
+            if (heal) c.flags[i] |= HEALED;
             long cpu = cpuSince(k);
             if (cpu >= 0) append(r, CPU, cpu);
             long dur = now - c.start[i];
             DUR.setOpaque(c.dur, i, dur < 0 ? 0L : dur);
-            return healed;
+            return heal;
         }
 
         /**
@@ -1849,107 +1875,275 @@ public final class Tempo {
             throw Context.listenerThrew(t);
         }
 
-        boolean isPhase(int d) {
-            int r = handles[d].row;
-            return r != FRAME && (rows[r >>> CHUNK_BITS].flags[r & MASK] & PHASE) != 0;
+        // ---- phases and hand timing (owner thread, the span at depth d is open) ----
+        //
+        // A phase is a section of its span's timeline, a row under the span that is never on the stack: the
+        // span's children stay its children and may cross phase boundaries. The boundaries of a span only
+        // move forward: its start, then each phase start and end, lap and named stretch, up to its stop.
+
+        /** Sets up the phase state of the span at depth {@code d}, unless it has one already. */
+        private void timing(int d) {
+            if ((timed >>> d & 1) != 0) return;
+            if (times == null) {
+                times = new long[4 * MAX_DEPTH];
+                phaseAt = new int[4 * MAX_DEPTH];
+            }
+            times[d << 2 | MARK] = startAt(d);
+            phaseAt[d << 2 | BOUNDS] = 0;
+            phaseAt[d << 2 | ROW] = NO_PHASE;
+            phaseAt[d << 2 | MODE] = 0;
+            timed |= 1L << d;
         }
 
-        // ---- phases and laps (owner thread, the span at depth d is open) ----
-
-        private void laps() {
-            mark = new long[MAX_DEPTH];
-            lapOrdinal = new int[MAX_DEPTH];
-            lapFrom = new int[MAX_DEPTH];
-            int[] p = new int[MAX_DEPTH];
-            Arrays.fill(p, NO_PHASE);
-            lastPhase = p;
+        /** The start of the open span at depth {@code d}: its row's, or a frame's, kept in its handle while open. */
+        private long startAt(int d) {
+            Span h = handles[d];
+            return h.row == FRAME ? h.time : rows[h.row >>> CHUNK_BITS].start[h.row & MASK];
         }
 
-        /** Label first: ends whatever is open above depth {@code d} and opens a phase row at one {@code now}. */
-        void phase(int d, Name n, int flags) {
-            if (lastPhase == null) laps();
-            long now = ctx.now();
-            int top = depth;
-            boolean healed = unwind(d, now);
-            if (ctx.listening) fire(d + 1, top); // before the new phase takes the depth of the old one
-            mark[d] = now;
-            lapOrdinal[d]++;
-            lapFrom[d] = aggregates();
-            Span h = stack(n, flags | PHASE);
-            if (h != NOOP) rows[h.row >>> CHUNK_BITS].start[h.row & MASK] = now;
-            lastPhase[d] = h == NOOP ? DROPPED_PHASE : h.row;
-            publish();
-            if (thrown != null) rethrow();
-            if (healed) ctx.misuse("phase started while a child span was open");
+        /** Whether the span at depth {@code d} was stopped; misuse if so, for a call that must come before. */
+        private boolean stoppedAlready(int d, String call) {
+            if ((phaseAt[d << 2 | MODE] & STOPPED) == 0) return false;
+            ctx.misuse(call + " after stop");
+            return true;
+        }
+
+        /** A boundary of the span at depth {@code d} at {@code at}. */
+        private void boundary(int d, long at) {
+            if (phaseAt[d << 2 | BOUNDS]++ == 0) times[d << 2 | FIRST] = at;
+            times[d << 2 | MARK] = at;
         }
 
         /**
-         * Label after. An open label-first phase ends under its own name; a different {@code n} is kept as
-         * a zero-length misuse row. Otherwise a closed RETRO row covers {@code [mark, now)}; the render
-         * moves the spans opened since {@code mark} under it. {@code n} is null when the caller passed none.
+         * Starts phase {@code n} of the span at depth {@code d}, ending the open one at the same instant: now,
+         * or for a span timed by hand with none open, its last boundary.
          */
-        void done(int d, Name n, int flags, String label) {
-            if (lastPhase == null) laps();
-            long now = ctx.now(), lap = -1; // the new lap's duration, for its listeners
-            int p = lastPhase[d], top = depth;
-            boolean healed, mismatch = false;
-            if (p >= 0 && depth > d + 1 && rowAt[d + 1] == p) {
-                annotate(p, flags, label);
-                healed = unwind(d, now); // ends p and sets mark[d]
-                if (n != null && nameOf(p) != n.id) {
-                    mismatch = true;
-                    int m = row(n, RETRO | PHASE | MISUSE, rowAt[d]);
-                    if (m >= 0) closed(m, now, 0);
-                }
-            } else {
-                healed = unwind(d, now);
-                long from = p == NO_PHASE ? rows[rowAt[d] >>> CHUNK_BITS].start[rowAt[d] & MASK] : mark[d];
-                int r = n == null ? row(Name.UNKNOWN, RETRO | PHASE | MISUSE | flags, rowAt[d])
-                        : row(n, RETRO | PHASE | flags, rowAt[d]);
-                if (r >= 0) {
-                    closed(r, from, now - from);
-                    annotate(r, 0, label);
-                    reanchor(d, lapOrdinal[d], r);
-                }
-                lastPhase[d] = r >= 0 ? r : DROPPED_PHASE;
-                mark[d] = now;
-                lapOrdinal[d]++;
-                lapFrom[d] = aggregates();
-                if (n != null) lap = Math.max(0, now - from);
-            }
+        Phase phase(int d, Name n, int flags) {
+            timing(d);
+            if (stoppedAlready(d, "phase()")) return Phase.NOOP;
+            boolean open = phaseAt[d << 2 | ROW] != NO_PHASE;
+            long at = open || (phaseAt[d << 2 | MODE] & MANUAL) == 0 ? ctx.now() : times[d << 2 | MARK];
+            if (open) endPhase(d, at, 0);
+            Phase p = startPhase(d, n, flags, at);
             publish();
-            if (ctx.listening) {
-                fire(d + 1, top);
-                if (lap >= 0) notify(n, lap);
-            }
             if (thrown != null) rethrow();
-            if (healed) ctx.misuse("lap ended while a child span was open");
-            if (mismatch) ctx.misuse("done(" + n + ") while phase " + Name.byId(nameOf(p)) + " is open");
-        }
-
-        void legacy(int d) {
-            int p = lastPhase(d, "legacy()");
-            if (p < 0) return;
-            rows[p >>> CHUNK_BITS].flags[p & MASK] |= LEGACY;
-            publish();
-        }
-
-        void phaseSet(int d, int key, long value) {
-            int p = lastPhase(d, "phaseSet()");
-            if (p < 0) return;
-            append(p, key, value);
-            publish();
-        }
-
-        /** The open phase or last lap of the span at depth {@code d}; none is misuse, a dropped one is not. */
-        private int lastPhase(int d, String call) {
-            int p = lastPhase == null ? NO_PHASE : lastPhase[d];
-            if (p == NO_PHASE) ctx.misuse(call + " without a phase or lap");
             return p;
         }
 
-        int lapOrdinal(int d) {
-            return lapOrdinal == null ? 0 : lapOrdinal[d];
+        private Phase startPhase(int d, Name n, int flags, long at) {
+            boundary(d, at);
+            phaseAt[d << 2 | NAME] = n.id;
+            times[d << 2 | START] = at;
+            Span h = handles[d];
+            int r = h.row == FRAME ? -1 : row(n, flags | PHASE, h.row);
+            if (r < 0) {
+                phaseAt[d << 2 | ROW] = ROWLESS;
+                return rowless(d);
+            }
+            Rows c = rows[r >>> CHUNK_BITS];
+            c.start[r & MASK] = at;
+            DUR.setOpaque(c.dur, r & MASK, OPEN);
+            phaseAt[d << 2 | ROW] = r;
+            return issuePhase(d, r);
+        }
+
+        /**
+         * Ends the open phase of the span at depth {@code d} at {@code at}, {@code flags} added to its row.
+         * Its duration goes to the totals and listeners of its name: on its row, or for a phase of a folded
+         * or undrawn span into the lane's undrawn entry of the name. A phase past the row cap counts nowhere,
+         * like a span there.
+         */
+        private void endPhase(int d, long at, int flags) {
+            int r = phaseAt[d << 2 | ROW];
+            long dur = Math.max(0, at - times[d << 2 | START]);
+            phaseAt[d << 2 | ROW] = NO_PHASE;
+            boundary(d, at);
+            if (r >= 0) {
+                Rows c = rows[r >>> CHUNK_BITS];
+                c.flags[r & MASK] |= flags;
+                DUR.setOpaque(c.dur, r & MASK, dur);
+            } else if (handles[d].row == FRAME) {
+                hidden(phaseAt[d << 2 | NAME], times[d << 2 | START], dur);
+            } else {
+                return;
+            }
+            if (ctx.listening) notify(Name.byId(phaseAt[d << 2 | NAME]), dur);
+        }
+
+        /** An occurrence of name {@code id} that no render shows, for the totals: a phase of a folded or undrawn span. */
+        private void hidden(int id, long start, long dur) {
+            if (free) return;
+            int e = aggregate(-1, 0, -1, id, Aggs.HIDDEN);
+            if (e >= 0) aggs.add(e, start, dur, 0, -1, 0, false);
+        }
+
+        /**
+         * Ends the open phase of the span at depth {@code d}; {@code n} null for none named. A name must be the
+         * open phase's, else that phase ends anyway under its own name, flagged and counted as misuse. With
+         * no phase open, a name goes to the time since the last boundary, a phase named after the fact.
+         */
+        void done(int d, Name n, int flags) {
+            if (n == null && (timed >>> d & 1) == 0) return; // nothing open, nothing to name
+            timing(d);
+            if (stoppedAlready(d, "done()")) return;
+            long now = ctx.now();
+            if (phaseAt[d << 2 | ROW] != NO_PHASE) {
+                boolean mismatch = n != null && (flags & MISUSE) == 0 && n.id != phaseAt[d << 2 | NAME];
+                if (mismatch) ctx.misuse("done(" + n + ") while phase " + Name.byId(phaseAt[d << 2 | NAME]) + " is open");
+                endPhase(d, now, mismatch ? MISUSE : 0);
+            } else if (n != null) {
+                long from = times[d << 2 | MARK], dur = Math.max(0, now - from);
+                if (phaseAt[d << 2 | BOUNDS]++ == 0) times[d << 2 | FIRST] = from;
+                boundary(d, now);
+                Span h = handles[d];
+                int r = h.row == FRAME ? -1 : row(n, flags | PHASE | RETRO, h.row);
+                if (r >= 0) closed(r, from, dur);
+                else if (h.row == FRAME) hidden(n.id, from, dur);
+                if ((r >= 0 || h.row == FRAME) && ctx.listening) notify(n, dur);
+            }
+            publish();
+            if (thrown != null) rethrow();
+        }
+
+        /** Ends the open phase of the span at depth {@code d} at clock reading {@code t}: a boundary there. */
+        void lap(int d, long t) {
+            timing(d);
+            if (stoppedAlready(d, "lap(nanos)")) return;
+            long now = ctx.now(), want = relative(t), at = clamp(want, times[d << 2 | MARK], now);
+            phaseAt[d << 2 | MODE] |= MANUAL;
+            boolean clamped = at != want;
+            if (phaseAt[d << 2 | ROW] != NO_PHASE) endPhase(d, at, clamped ? MISUSE : 0);
+            else boundary(d, at);
+            if (clamped) flagRow(d);
+            publish();
+            if (thrown != null) rethrow();
+            if (clamped) ctx.misuse("lap(nanos) before the last boundary or after now");
+        }
+
+        /**
+         * Moves the start of the span at depth {@code d} to clock reading {@code t}, within its parent's window
+         * (from the parent's start to now), before its first boundary and its children; while that boundary
+         * is the start of its open first phase, the phase moves with it. The trace's root (its zero point)
+         * and a task (where its queue wait ends) keep their start.
+         */
+        void start(int d, long t) {
+            timing(d);
+            if (stoppedAlready(d, "start(nanos)")) return;
+            Span h = handles[d];
+            long now = ctx.now(), want = relative(t), lo, hi = now;
+            boolean task = h.row != FRAME ? (rows[h.row >>> CHUNK_BITS].flags[h.row & MASK] & TASK) != 0
+                    : h.agg >= 0 && aggs.keys[h.agg * Aggs.KEY + Aggs.KIND] == Aggs.RAN;
+            if (task || d == 0 && !free) lo = hi = startAt(d);
+            else lo = d > 0 ? startAt(d - 1) : Long.MIN_VALUE;
+            int b = phaseAt[d << 2 | BOUNDS];
+            boolean fresh = b == 0 || b == 1 && phaseAt[d << 2 | ROW] != NO_PHASE;
+            if (!fresh) hi = Math.min(hi, times[d << 2 | FIRST]);
+            if (h.row != FRAME) hi = Math.min(hi, firstChild(d, h.row));
+            long at = lo <= hi ? clamp(want, lo, hi) : startAt(d); // no room (a folded parent moved by hand): it stays
+            if (h.row == FRAME) h.time = at;
+            else rows[h.row >>> CHUNK_BITS].start[h.row & MASK] = at;
+            if (b == 0) {
+                times[d << 2 | MARK] = at;
+            } else if (fresh) {
+                times[d << 2 | START] = times[d << 2 | FIRST] = times[d << 2 | MARK] = at;
+                int r = phaseAt[d << 2 | ROW];
+                if (r >= 0) rows[r >>> CHUNK_BITS].start[r & MASK] = at;
+            }
+            phaseAt[d << 2 | MODE] |= MANUAL;
+            boolean clamped = at != want;
+            if (clamped) flagRow(d);
+            publish();
+            if (clamped) ctx.misuse("start(nanos) outside the parent's time window");
+        }
+
+        /**
+         * Ends the span at depth {@code d} at clock reading {@code t}, its open phase with it; it stays on the
+         * stack until it closes. Within its last boundary and now.
+         */
+        void stop(int d, long t) {
+            timing(d);
+            if (stoppedAlready(d, "stop(nanos)")) return;
+            long now = ctx.now(), want = relative(t), at = clamp(want, times[d << 2 | MARK], now);
+            boolean clamped = at != want;
+            if (phaseAt[d << 2 | ROW] != NO_PHASE) endPhase(d, at, clamped ? MISUSE : 0);
+            else boundary(d, at);
+            times[d << 2 | STOP] = at;
+            phaseAt[d << 2 | MODE] |= STOPPED;
+            phaseAt[d << 2 | MODE] |= MANUAL;
+            if (clamped) flagRow(d);
+            publish();
+            if (thrown != null) rethrow();
+            if (clamped) ctx.misuse("stop(nanos) before the last boundary or after now");
+        }
+
+        /**
+         * The earliest start of what is drawn under row {@code r}, open at depth {@code d}, its phases aside:
+         * child rows, which come after it, folded spans open above it, and the aggregates anchored at it
+         * (a folded handoff by its submit).
+         */
+        private long firstChild(int d, int r) {
+            long min = Long.MAX_VALUE;
+            for (int x = r + 1; x < rowCount; x++) {
+                Rows c = rows[x >>> CHUNK_BITS];
+                int i = x & MASK;
+                if (c.parent[i] == r && (c.flags[i] & PHASE) == 0) min = Math.min(min, c.start[i]);
+            }
+            for (int k = d + 1; k < depth; k++) if (handles[k].row == FRAME) min = Math.min(min, handles[k].time);
+            Aggs a = aggs;
+            for (int e = 0, n = a == null ? 0 : a.size(); e < n; e++) {
+                int k = e * Aggs.KEY, b = e * Aggs.CELLS;
+                if (a.keys[k] != r || a.keys[k + Aggs.KIND] > Aggs.TASKS) continue;
+                min = Math.min(min, Math.min(a.cells[b + Aggs.FIRST], a.cells[b + Aggs.SUBMIT_FIRST]));
+            }
+            return min;
+        }
+
+        /** A clock reading as a time of this lane's trace; past the range of a long, the nearest end of it. */
+        private long relative(long t) {
+            long e = ctx.epoch, r = t - e;
+            return ((t ^ e) & (t ^ r)) < 0 ? t < e ? Long.MIN_VALUE : Long.MAX_VALUE : r;
+        }
+
+        private static long clamp(long t, long lo, long hi) {
+            return t < lo ? lo : t > hi ? Math.max(lo, hi) : t;
+        }
+
+        /** Flags the row of the span at depth {@code d} as misused, if it has one. */
+        private void flagRow(int d) {
+            int r = handles[d].row;
+            if (r != FRAME) rows[r >>> CHUNK_BITS].flags[r & MASK] |= MISUSE;
+        }
+
+        /** A handle of its own for phase row {@code r} of the span at depth {@code d}: pooled, or new in strict mode. */
+        private Phase issuePhase(int d, int r) {
+            Phase p = ctx.strict ? null : slot.takePhase();
+            if (p == null) p = new Phase();
+            p.bind(this, handles[d], d, r);
+            if (!ctx.strict) {
+                if (issuedPhases == null) issuedPhasesTail = p;
+                p.link = issuedPhases;
+                issuedPhases = p;
+            }
+            return p;
+        }
+
+        /** The handle the rowless phases at depth {@code d} share, bound to the span open there. */
+        private Phase rowless(int d) {
+            Phase[] f = rowless;
+            if (f == null) rowless = f = new Phase[MAX_DEPTH];
+            Phase p = f[d];
+            if (p == null) {
+                if (free || ctx.strict) p = new Phase();
+                else if ((p = slot.takePhase()) == null) p = new Phase();
+                if (!free && !ctx.strict) {
+                    if (issuedPhases == null) issuedPhasesTail = p;
+                    p.link = issuedPhases;
+                    issuedPhases = p;
+                }
+                f[d] = p;
+            }
+            p.bind(this, handles[d], d, FRAME);
+            return p;
         }
 
         int nameOf(int r) {
@@ -1962,14 +2156,22 @@ public final class Tempo {
             return c == null ? -1 : c.name[r & MASK];
         }
 
-        private void annotate(int r, int flags, String label) {
-            rows[r >>> CHUNK_BITS].flags[r & MASK] |= flags;
-            if (label == null || eventCount == MAX_EVENTS) return;
-            String[] t = labels;
-            if (t == null) LABELS.setRelease(this, t = new String[8]);
-            else if (labelCount == t.length) LABELS.setRelease(this, t = Arrays.copyOf(t, 2 * labelCount));
-            t[labelCount] = label;
-            append(r, LABEL, labelCount++);
+        /** Labels phase row {@code r}, also after the lane went idle; false once the lane is retired. */
+        boolean label(int r, String text) {
+            if (!enter()) return false;
+            rows[r >>> CHUNK_BITS].flags[r & MASK] |= LABELED;
+            if (eventCount < MAX_EVENTS) {
+                String[] t = labels;
+                if (t == null) LABELS.setRelease(this, t = new String[8]);
+                else if (labelCount == t.length) LABELS.setRelease(this, t = Arrays.copyOf(t, 2 * labelCount));
+                t[labelCount] = text;
+                append(r, LABEL, labelCount++);
+            } else {
+                dropped++;
+            }
+            publish();
+            leave();
+            return true;
         }
 
         /**
@@ -2058,19 +2260,26 @@ public final class Tempo {
          * IDLE -> RETIRED, once, by whichever of the owner and release() gets there; then the chunks go back
          * to the pool. A table entry is cleared before its chunk is given away, and a reader that still
          * picked one up discards what it read, because it finds the trace released (see Snapshot). The
-         * handles go back to the owner's slot, each detached first (see Span#detach), so a use of one
-         * is stale from now until the owner issues it again.
+         * span and phase handles go back to the owner's slot, each detached first (see Span#detach), so a
+         * use of one is stale from now until the owner issues it again.
          */
         private void retire() {
             int s = state;
             if ((s & KIND) != IDLE || !STATE.compareAndSet(this, s, s | RETIRED)) return;
             Arrays.fill(handles, null);
             frames = null;
+            rowless = null;
             Span h = issued;
             if (h != null) {
                 for (Span x = h; x != null; x = x.link) x.detach();
                 slot.give(h, issuedTail);
                 issued = issuedTail = null;
+            }
+            Phase p = issuedPhases;
+            if (p != null) {
+                for (Phase x = p; x != null; x = x.link) x.detach();
+                slot.givePhases(p, issuedPhasesTail);
+                issuedPhases = issuedPhasesTail = null;
             }
             for (int i = 0; i < CHUNKS && rows[i] != null; i++) {
                 Rows c = rows[i];
@@ -2111,9 +2320,9 @@ public final class Tempo {
         }
 
         /**
-         * The legacy phases under row {@code root} and its wall time, read in place with one {@code now}
-         * for whatever is open, their starts from the root's; empty once released. Safe from any thread. Legacy rows are phases, which
-         * a RETRO lap never adopts, so row order is their order in the stitched tree.
+         * The labelled phases of row {@code root} and its wall time, read in place with one {@code now} for
+         * whatever is open, their starts from the root's; empty once released. Safe from any thread. The
+         * boundaries of a span only move forward, so its phase rows are in start order.
          */
         Tops tops(int root) {
             if (ctx.released || retired()) return Tops.EMPTY;
@@ -2125,7 +2334,7 @@ public final class Tempo {
                 for (int r = root; r < n; r++) {
                     Rows k = rows[r >>> CHUNK_BITS];
                     int i = r & MASK;
-                    if (r != root && (k.parent[i] != root || (k.flags[i] & LEGACY) == 0)) continue;
+                    if (r != root && (k.parent[i] != root || (k.flags[i] & LABELED) == 0)) continue;
                     long d = (long) DUR.getOpaque(k.dur, i), s = k.start[i];
                     d = d != OPEN ? d : Math.max(0, now - s);
                     if (r == root) {
@@ -2152,18 +2361,19 @@ public final class Tempo {
     }
 
     /**
-     * The aggregates of one lane, keyed by (anchor row, lap ordinal, parent, name, kind) where the parent is
-     * -1 for the anchor itself or the name of an enclosing folded span. {@code SPANS} hold folded spans,
-     * {@code HIDDEN} the undrawn steps of a name, which only the totals read (anchor -1, lap 0, parent -1).
+     * The aggregates of one lane, keyed by (anchor row, lane, parent, name, kind) where the parent is -1 for
+     * the anchor itself or the name of an enclosing folded span, and the lane 0 but for RAN and UNRUN.
+     * {@code SPANS} hold folded spans, {@code HIDDEN} the undrawn steps and the phases of folded or undrawn
+     * spans of a name, which only the totals read (anchor -1, parent -1).
      * A handoff past the budget is a {@code TASKS} entry where it was submitted,
      * which counts the submits; its tasks are occurrences in the lane that runs ({@code RAN}) or cancels
-     * ({@code UNRUN}) them, in an entry keyed by the {@code TASKS} entry instead: ANCHOR is its index, LAP
+     * ({@code UNRUN}) them, in an entry keyed by the {@code TASKS} entry instead: ANCHOR is its index, LANE
      * its lane. So every entry has one writer, the owner, and a render merges the occurrences into their
      * {@code TASKS} entry. The owner appends entries and updates them in place; a reader takes the size
      * with acquire and reads the entries below it, exact once the lane is idle and best effort while it records.
      */
     static final class Aggs {
-        static final int MAX = 4096, KEY = 5, ANCHOR = 0, LAP = 1, PARENT = 2, NAME = 3, KIND = 4;
+        static final int MAX = 4096, KEY = 5, ANCHOR = 0, LANE = 1, PARENT = 2, NAME = 3, KIND = 4;
         static final int SPANS = 0, TASKS = 1, RAN = 2, UNRUN = 3, HIDDEN = 4;
         // Over the ended occurrences; a handoff's starts at its submit and ends at submit + wait + duration.
         static final int CELLS = 15, COUNT = 0, SUM = 1, MIN = 2, MAX_DUR = 3, FIRST = 4, LAST = 5, MAX_AT = 6, CPU = 7,
@@ -2201,20 +2411,20 @@ public final class Tempo {
             return size == keys.length / KEY;
         }
 
-        int find(int anchor, int lap, int parent, int name, int kind) {
+        int find(int anchor, int lane, int parent, int name, int kind) {
             int mask = index.length - 1;
-            for (int i = hash(anchor, lap, parent, name, kind) & mask; ; i = (i + 1) & mask) {
+            for (int i = hash(anchor, lane, parent, name, kind) & mask; ; i = (i + 1) & mask) {
                 int e = index[i] - 1, k = e * KEY;
                 if (e < 0) return -1;
-                if (keys[k] == anchor && keys[k + LAP] == lap && keys[k + PARENT] == parent && keys[k + NAME] == name
+                if (keys[k] == anchor && keys[k + LANE] == lane && keys[k + PARENT] == parent && keys[k + NAME] == name
                         && keys[k + KIND] == kind) return e;
             }
         }
 
-        int create(int anchor, int lap, int parent, int name, int kind) {
+        int create(int anchor, int lane, int parent, int name, int kind) {
             int e = size, k = e * KEY;
             keys[k] = anchor;
-            keys[k + LAP] = lap;
+            keys[k + LANE] = lane;
             keys[k + PARENT] = parent;
             keys[k + NAME] = name;
             keys[k + KIND] = kind;
@@ -2230,7 +2440,7 @@ public final class Tempo {
 
         private void index(int e) {
             int k = e * KEY, mask = index.length - 1;
-            int i = hash(keys[k], keys[k + LAP], keys[k + PARENT], keys[k + NAME], keys[k + KIND]) & mask;
+            int i = hash(keys[k], keys[k + LANE], keys[k + PARENT], keys[k + NAME], keys[k + KIND]) & mask;
             while (index[i] != 0) i = (i + 1) & mask;
             index[i] = e + 1;
         }
@@ -2293,18 +2503,8 @@ public final class Tempo {
             c[b + WAIT_MAX] = Math.max(c[b + WAIT_MAX], q[a + WAIT_MAX]);
         }
 
-        /**
-         * Entries from {@code from} on of a lap that ended as a label-after row move under that row. The
-         * index keeps their old keys, which no later lookup asks for: the lap's ordinal has moved on.
-         */
-        void reanchor(int from, int anchor, int lap, int row) {
-            for (int e = from, k = from * KEY; e < size; e++, k += KEY) {
-                if (keys[k] == anchor && keys[k + LAP] == lap && keys[k + KIND] <= TASKS) keys[k] = row;
-            }
-        }
-
-        private static int hash(int anchor, int lap, int parent, int name, int kind) {
-            int h = (((anchor * 31 + lap) * 31 + parent) * 31 + name) * 31 + kind;
+        private static int hash(int anchor, int lane, int parent, int name, int kind) {
+            int h = (((anchor * 31 + lane) * 31 + parent) * 31 + name) * 31 + kind;
             h *= 0x9E3779B9;
             return h ^ (h >>> 16);
         }
@@ -2326,7 +2526,7 @@ public final class Tempo {
         final short[] flags;
         final int[] from, attrKey;  // attributes of row r: [from[r], from[r + 1]), in append order
         final long[] attrValue;
-        String[] label;             // by row; null in a lane without labels
+        String[] label;             // phase labels by row; null in a lane without
         long[] link, wait;          // XPARENT and QWAIT by row; null in a lane without tasks
         long[] cpu;                 // CPU by row, -1 where not measured; null in a lane without
         static final int NONE = -1, MIXED = -2;
@@ -2425,7 +2625,7 @@ public final class Tempo {
 
         /**
          * Whether aggregate {@code e} is a node of the tree: a SPANS or TASKS entry with an occurrence, not
-         * (in a live copy) moved under a lap row this copy does not have. RAN and UNRUN entries are merged.
+         * (in a live copy) anchored at a row this copy does not have. RAN and UNRUN entries are merged.
          */
         boolean shown(int e) {
             int k = e * Aggs.KEY;
@@ -2519,13 +2719,14 @@ public final class Tempo {
         }
 
         /**
-         * Child lists in row order. A RETRO lap adopts the run of preceding siblings that started at or
-         * after it, back to the previous phase row, and takes the place of the first of them. Aggregates
-         * join their parent's list in start order.
+         * Child lists in start order. Rows are mostly added in that order; one that starts before siblings
+         * added earlier (a phase named after the fact, a span started by hand) goes before them, a phase
+         * named after the fact also before those that started with it. Aggregates join their parent's list
+         * in start order.
          */
         void tree() {
             int top = rows, nodes = rows + 1 + aggs;
-            int[] last = new int[rows + 1], prev = new int[rows + 1];
+            int[] last = new int[rows + 1], prev = new int[rows];
             first = new int[nodes];
             next = new int[nodes];
             Arrays.fill(first, -1);
@@ -2533,42 +2734,31 @@ public final class Tempo {
             Arrays.fill(last, -1);
             for (int r = 0; r < rows; r++) {
                 if (hidden != null && hidden[r]) continue;
-                int p = parent[r] < 0 ? top : parent[r];
-                if ((flags[r] & RETRO) != 0) {
-                    int a = last[p], b = -1;
-                    while (a >= 0 && (flags[a] & PHASE) == 0 && start[a] >= start[r]) {
-                        b = a;
-                        a = prev[a];
-                    }
-                    if (b >= 0) {
-                        first[r] = b;
-                        last[r] = last[p];
-                        prev[b] = -1;
-                        last[p] = a;
-                        if (a >= 0) next[a] = -1;
-                        else first[p] = -1;
-                    }
-                }
-                next[r] = -1;
-                prev[r] = last[p];
-                if (last[p] >= 0) next[last[p]] = r;
-                else first[p] = r;
-                last[p] = r;
+                int p = parent[r] < 0 ? top : parent[r], a = last[p];
+                long s = startOf(r);
+                boolean retro = (flags[r] & RETRO) != 0;
+                while (a >= 0 && (startOf(a) > s || retro && startOf(a) == s)) a = prev[a];
+                int b = a < 0 ? first[p] : next[a]; // r goes between a and b
+                prev[r] = a;
+                next[r] = b;
+                if (a < 0) first[p] = r;
+                else next[a] = r;
+                if (b < 0) last[p] = r;
+                else prev[b] = r;
             }
             for (int e = 0; e < aggs; e++) if (shown(e)) attach(rows + 1 + e, aggregateParent(e));
         }
 
         /**
-         * The anchor row, or for an aggregate nested in another folded span the earlier aggregate
-         * of that name under the same anchor and lap (created when that span opened, so before this one).
-         * Without an anchor (folded in a folded task) it is a top-level node of the lane.
+         * The anchor row, or for an aggregate nested in another folded span the earlier aggregate of that
+         * name under the same anchor (created when that span opened, so before this one). Without an
+         * anchor (folded in a folded task) it is a top-level node of the lane.
          */
         private int aggregateParent(int e) {
             int k = e * Aggs.KEY, outer = aggKey[k + Aggs.PARENT];
             for (int f = 0; outer >= 0 && f < e; f++) {
                 int j = f * Aggs.KEY;
-                if (aggKey[j + Aggs.NAME] == outer && aggKey[j] == aggKey[k] && aggKey[j + Aggs.LAP] == aggKey[k + Aggs.LAP]
-                        && shown(f)) {
+                if (aggKey[j + Aggs.NAME] == outer && aggKey[j] == aggKey[k] && shown(f)) {
                     return rows + 1 + f;
                 }
             }
@@ -2697,7 +2887,7 @@ public final class Tempo {
                     int k = e * Aggs.KEY, target = s.aggKey[k];
                     int kind = s.aggKey[k + Aggs.KIND];
                     if (kind != Aggs.RAN && kind != Aggs.UNRUN) continue;
-                    Shape t = shape((long) s.aggKey[k + Aggs.LAP] << 32);
+                    Shape t = shape((long) s.aggKey[k + Aggs.LANE] << 32);
                     if (t != null && target < t.aggs && t.aggKey[target * Aggs.KEY + Aggs.KIND] == Aggs.TASKS) t.merge(target, s, e);
                 }
             }
@@ -2848,7 +3038,7 @@ public final class Tempo {
                 if (s == null) continue;
                 for (int r = 0; r < s.rows; r++) {
                     int f = s.flags[r];
-                    if (s.name[r] != id || (f & HANDOFF) != 0 || (f & (RETRO | MISUSE)) == (RETRO | MISUSE)) continue;
+                    if (s.name[r] != id || (f & HANDOFF) != 0) continue;
                     boolean task = s.link != null && s.link[r] >= 0;
                     if (task) {
                         long w = s.wait == null ? 0 : s.wait[r];
@@ -2971,8 +3161,8 @@ public final class Tempo {
             if (s == null) return Tops.EMPTY;
             Tops t = new Tops();
             t.total = elapsedNanos();
-            for (int r = rootRow + 1; r < s.rows; r++) { // row order is tree order for phases, see Lane.tops
-                if (s.parent[r] != rootRow || (s.flags[r] & LEGACY) == 0) continue;
+            for (int r = rootRow + 1; r < s.rows; r++) { // a span's phase rows are in start order, see Lane.tops
+                if (s.parent[r] != rootRow || (s.flags[r] & LABELED) == 0) continue;
                 long d = s.dur[r];
                 t.add(r, s.name[r], s.label == null ? null : s.label[r], s.start[r] - base, d != Lane.OPEN ? d : Math.max(0, now - s.start[r]));
             }
@@ -2996,8 +3186,8 @@ public final class Tempo {
     // ---------------------------------------------------------------------------------------------
 
     /**
-     * The root's legacy phases (name, label, start, duration) and the root's wall time, read once for
-     * the legacy renderers.
+     * The root's labelled phases (name, label, start, duration) and the root's wall time, read once for
+     * the {@code Runtime} and {@code Server-Timing} renderers.
      */
     static final class Tops {
         static final Tops EMPTY = new Tops();
@@ -3503,30 +3693,31 @@ public final class Tempo {
             return v.aggregate ? v.handoff : v.handoff && !v.inline;
         }
 
-        /** The record's flags, by bit in {@link #FLAG_TEXT}'s order {@code fconwm}. */
+        /** The record's flags, by bit in {@link #FLAG_TEXT}'s order {@code fconwmp}. */
         private static int flags(SpanView v) {
             int f = v.flags;
             return ((f & FAILED) != 0 ? 1 : 0) | ((f & CANCELLED) != 0 ? 2 : 0) | (v.open ? 4 : 0)
-                    | (v.neverStarted() ? 8 : 0) | ((f & WAIT) != 0 ? 16 : 0) | ((f & (HEALED | MISUSE)) != 0 ? 32 : 0);
+                    | (v.neverStarted() ? 8 : 0) | ((f & WAIT) != 0 ? 16 : 0) | ((f & (HEALED | MISUSE)) != 0 ? 32 : 0)
+                    | ((f & PHASE) != 0 ? 64 : 0);
         }
 
-        /** The flag strings by {@link #flags} bits: {@code fconwm}, in that order. */
-        private static final String[] FLAG_TEXT = new String[64];
+        /** The flag strings by {@link #flags} bits: {@code fconwmp}, in that order. */
+        private static final String[] FLAG_TEXT = new String[128];
 
         static {
-            for (int m = 0; m < 64; m++) {
-                StringBuilder b = new StringBuilder(6);
-                for (int i = 0; i < 6; i++) if ((m & 1 << i) != 0) b.append("fconwm".charAt(i));
+            for (int m = 0; m < 128; m++) {
+                StringBuilder b = new StringBuilder(7);
+                for (int i = 0; i < 7; i++) if ((m & 1 << i) != 0) b.append("fconwmp".charAt(i));
                 FLAG_TEXT[m] = b.toString();
             }
         }
 
         /**
-         * A name as a decoder reads it back from {@link #name}: {@code ?} for a null or empty one and for
-         * each unpaired surrogate; the string itself when it has none.
+         * A name as a decoder reads it back from {@link #name}: {@code ?} for a null one and for each
+         * unpaired surrogate; the string itself when it has none, the empty name included.
          */
         static String text(String s) {
-            if (s == null || s.isEmpty()) return "?";
+            if (s == null) return "?";
             char[] c = null;
             for (int i = 0, n = s.length(); i < n; i++) {
                 char x = s.charAt(i);
@@ -3585,10 +3776,11 @@ public final class Tempo {
 
         /**
          * Appends a name: {@code A-Z a-z 0-9 . -} as themselves, a space as {@code _}, every other UTF-8 byte
-         * as {@code %XX}; an unpaired surrogate as {@code ?}, and a null or empty name as {@code %3F}.
+         * as {@code %XX}; an unpaired surrogate as {@code ?}, a null name as {@code %3F}, and the empty name
+         * (of an unnamed span) as nothing.
          */
         static void name(StringBuilder b, String s) {
-            if (s == null || s.isEmpty()) {
+            if (s == null) {
                 escape(b, '?');
                 return;
             }
@@ -3818,8 +4010,8 @@ public final class Tempo {
      * It reads only values its own encoder wrote, so it checks nothing.
      */
     static final class Ladder {
-        private static final String FLAGS = "fconwm"; // bit i is FLAGS.charAt(i)
-        private static final int F = 1; // failed
+        private static final String FLAGS = "fconwmp"; // bit i is FLAGS.charAt(i)
+        private static final int F = 1, P = 64; // failed, phase
 
         private final String value;
         private String wall; // the w= digits, or null
@@ -3855,8 +4047,8 @@ public final class Tempo {
                     default: nTable = f;
                 }
             }
-            threads = tTable.split(":");
-            names = nTable.split(":");
+            threads = tTable.split(":", -1); // an empty name is one too
+            names = nTable.split(":", -1);
             live = new boolean[threads.length];
             if (l != null) for (String x : l.split("\\.")) live[Integer.parseInt(x, 36)] = true;
             int records = 1;
@@ -3967,13 +4159,15 @@ public final class Tempo {
 
         /**
          * Step 1's groups: the children of one parent with one name, handoffs (records with a queue wait)
-         * apart from the rest. Each lists its first record, then those it folds: all but the failed single
-         * records and the slowest single one (the first of equals). Only groups that fold two or more,
-         * the most first, then by their first record.
+         * apart from the rest, phases never. Each lists its first record, then those it folds: all but the
+         * failed single records and the slowest single one (the first of equals). Only groups that fold two
+         * or more, the most first, then by their first record.
          */
         private int[][] groups() {
-            Integer[] by = new Integer[n - 1];
-            for (int i = 1; i < n; i++) by[i - 1] = i;
+            int phases = 0;
+            for (int i = 1; i < n; i++) if ((flags[i] & P) != 0) phases++;
+            Integer[] by = new Integer[n - 1 - phases];
+            for (int i = 1, k = 0; i < n; i++) if ((flags[i] & P) == 0) by[k++] = i;
             Comparator<Integer> key = Comparator.<Integer>comparingInt(i -> parent[i]).thenComparingInt(i -> name[i])
                     .thenComparing(this::waits);
             Arrays.sort(by, key.thenComparingInt(i -> i));
@@ -4309,7 +4503,8 @@ public final class Tempo {
          * (largest group first, failed ones and the slowest kept), then the deepest levels go down to
          * depth 2, then the attributes, then depth 2. What is left out is counted in {@code x=}. Below 256
          * bytes, or if no step fits, the value is the fallback {@code v1;x=0.<n>;T=%3F;N=%3F;S=00.0.<dur>;e=1},
-         * which a limit below 256 may not hold. The legacy headers and this one share a limit like this:
+         * which a limit below 256 may not hold. The {@code Runtime} and {@code Server-Timing} headers and this
+         * one share a limit like this:
          *
          * <pre>{@code
          * String runtime = t.toRuntime(3), timing = t.toServerTiming();
@@ -4383,18 +4578,18 @@ public final class Tempo {
         }
 
         /**
-         * Visits the legacy phases in start order: the trace's children marked by {@link Span#done(Name,
-         * String)} or {@link Span#legacy()}, with their label ({@code null} if none), start from the trace's
-         * start and duration; an open phase lasts until now. Reads the trace's lane in place.
+         * Visits the labelled phases of the trace's root ({@link Phase#label}) in start order, with their
+         * name, label, start from the trace's start and duration; an open phase lasts until now. Reads the
+         * trace's lane in place.
          */
         public void forEachTop(TopVisitor visitor) {
             tops().forEach(visitor);
         }
 
         /**
-         * The legacy {@code Runtime} text {@code <total>s = <d1>s (<label1>) + ... + <dn>s (<labeln>)}, or
-         * {@code <total>s} without legacy phases (see {@link #forEachTop}). The total is the trace's wall time,
-         * up to now while it is open. Each phase prints its label, or its name without one. Durations are
+         * The {@code Runtime} text {@code <total>s = <d1>s (<label1>) + ... + <dn>s (<labeln>)}, or {@code
+         * <total>s} without labelled phases (see {@link #forEachTop}). The total is the trace's wall time,
+         * up to now while it is open. Each phase prints its label. Durations are
          * seconds with {@code digits} fixed decimals, rounded half up, or with {@code digits = -1} as
          * {@code Double.toString(nanos / 1e9)} prints them. After release: just the total, {@code 0}.
          */
@@ -4408,7 +4603,7 @@ public final class Tempo {
         }
 
         /**
-         * A W3C {@code Server-Timing} value: one {@code <token>;dur=<ms>} per legacy phase (see
+         * A W3C {@code Server-Timing} value: one {@code <token>;dur=<ms>} per labelled phase (see
          * {@link #forEachTop}), then {@code total;dur=<ms>}, joined by {@code ", "}. The token is the
          * phase's name lower-cased with each run of characters outside {@code [a-z0-9]} replaced by
          * {@code -}; durations are milliseconds with three decimals, rounded half up.
@@ -4461,6 +4656,35 @@ public final class Tempo {
     // ---------------------------------------------------------------------------------------------
 
     /**
+     * Anything timed: a {@link Span} or a {@link Phase}. Numbers and the failed flag attach to it; its
+     * duration is {@link #elapsedNanos()}.
+     */
+    public abstract static class Timing {
+        Timing() {}
+
+        /** Attaches a number. */
+        public abstract Timing set(Name key, long value);
+
+        /** Like {@link #set(Name, long)}, the key looked up as for {@link Tempo#span(String)}. */
+        public abstract Timing set(String key, long value);
+
+        /** Attaches a number. */
+        public abstract Timing set(Name key, double value);
+
+        /** Like {@link #set(Name, double)}, the key looked up as for {@link Tempo#span(String)}. */
+        public abstract Timing set(String key, double value);
+
+        /** Marks it failed. */
+        public abstract Timing fail();
+
+        /** Marks it failed; only the flag is recorded, not the throwable. */
+        public abstract Timing fail(Throwable cause);
+
+        /** Running time while open, the duration once ended. */
+        public abstract long elapsedNanos();
+    }
+
+    /**
      * Same-thread handle to a span. A recorded span has a handle of its own for the whole trace: {@link
      * #set}, {@link #fail}, {@link #cancel} and {@link #waiting} work after close too, as in the catch block
      * right after, until the trace is released. A span folded past the budget or an undrawn {@link #step}
@@ -4474,11 +4698,12 @@ public final class Tempo {
      * handle inside the block that opened it. {@link Options#strict} never pools a handle, so there every
      * stale call throws.
      *
-     * <p>A span opens children only as the innermost open span of its thread (an open phase of it aside):
-     * opening one under a span with others open above it closes those first, flagged healed, and counts
-     * as misuse (strict mode throws).
+     * <p>A span opens children only as the innermost open span of its thread: opening one under a span with
+     * others open above it closes those first, flagged healed, and counts as misuse (strict mode throws).
+     * Its {@link #phase phases} section its own timeline and open nothing, so they work at any time while
+     * it is open.
      */
-    public static class Span implements AutoCloseable {
+    public static class Span extends Timing implements AutoCloseable {
         private static final VarHandle STAMP;
 
         static {
@@ -4583,9 +4808,9 @@ public final class Tempo {
          * A child step: always timed into the trace's totals and listeners; drawn when the trace records
          * steps ({@link Trace#records(int)}) while its budget lasts ({@link Options#budget}), past it folded.
          * A folded or undrawn step writes no row: it costs two clock reads and an aggregate update. Spans
-         * opened inside it are recorded under its nearest recorded ancestor; attributes and phases on it are
-         * ignored, flags set while it is open show on a folded aggregate if every occurrence has them, and
-         * {@link #cpu()} adds to the aggregate's CPU time.
+         * opened inside it are recorded under its nearest recorded ancestor; its phases count towards the
+         * totals but are not drawn, attributes on it are ignored, flags set while it is open show on a folded
+         * aggregate if every occurrence has them, and {@link #cpu()} adds to the aggregate's CPU time.
          */
         public Span step(Name name) {
             Lane l = top();
@@ -4623,13 +4848,12 @@ public final class Tempo {
 
         /**
          * The lane, for a child to open on top: null unless {@link #live()}; with spans open above this one,
-         * those are closed first, healed (misuse). An open phase of this span stays: children nest under it.
+         * those are closed first, healed (misuse).
          */
         private Lane top() {
             if (!live()) return null;
             Lane l = lane;
-            int top = l.depth - 1;
-            if (top != depth && !(top == depth + 1 && l.isPhase(top))) l.healAbove(depth);
+            if (l.depth - 1 != depth) l.healAbove(depth);
             return l;
         }
 
@@ -4686,74 +4910,107 @@ public final class Tempo {
         }
 
         /**
-         * Starts a phase of this span, label first: ends the open phase or any span still open below this
-         * one (a span left open is healed and counted as misuse), then opens the phase at the same instant.
-         * Spans opened until the next boundary nest under the phase. Returns this span.
+         * Starts a phase of this span: a labelled section of its timeline, not a parent of anything. It ends
+         * the open phase at the same instant, so two phases in a row share one clock read; otherwise it
+         * starts now, and the time since the last boundary stays unphased. On a span timed by hand ({@link
+         * #start}, {@link #lap(long)}, {@link #stop}) with no phase open, it starts at the last boundary.
+         * The span's children stay its children and may cross phase boundaries. A phase counts towards the
+         * totals and listeners of its name, also on a folded or undrawn span, which draws none.
          */
-        public Span phase(Name name) {
-            if (recorded()) {
-                if (name != null) lane.phase(depth, name, 0);
-                else lane.phase(depth, nullName(), MISUSE);
-            }
-            return this;
+        public Phase phase(Name name) {
+            return phase(name, 0);
         }
 
         /** Like {@link #phase(Name)}, the name looked up as for {@link Tempo#span(String)}. */
-        public Span phase(String name) {
-            return lane == null ? this : phase(ctx.name(name));
+        public Phase phase(String name) {
+            if (lane == null) return Phase.NOOP;
+            Name n = ctx.name(name);
+            return phase(n, n != null && Name.overflowed(n, name) ? MISUSE : 0);
+        }
+
+        private Phase phase(Name name, int flags) {
+            if (!live()) return Phase.NOOP;
+            return name != null ? lane.phase(depth, name, flags) : lane.phase(depth, nullName(), MISUSE);
+        }
+
+        /** Ends the open phase now; no phase opens in its place. Without one open it does nothing. Returns this span. */
+        public Span done() {
+            if (live()) lane.done(depth, null, 0);
+            return this;
+        }
+
+        /** Like {@link #done()}. */
+        public Span lap() {
+            return done();
         }
 
         /**
-         * Ends a lap of this span, label after. If a {@link #phase} is open, ends that phase under its own
-         * name (a different {@code name} is kept as a zero-length misuse entry). Otherwise records a lap
-         * from the last phase boundary, or this span's start, to now; the spans opened in that time are
-         * shown under the lap. Returns this span.
+         * Ends the open phase, which must be {@code name}: with another one open it ends under its own name,
+         * flagged and counted as misuse (strict mode throws). With none open, it names the time since the
+         * last boundary (a phase start or end, a lap, or the span's start) as a phase {@code name}. Returns
+         * this span.
          */
         public Span done(Name name) {
-            return done(name, 0, null);
+            if (live()) {
+                if (name != null) lane.done(depth, name, 0);
+                else lane.done(depth, nullName(), MISUSE);
+            }
+            return this;
         }
 
         /** Like {@link #done(Name)}, the name looked up as for {@link Tempo#span(String)}. */
         public Span done(String name) {
-            return lane == null ? this : done(ctx.name(name), 0, null);
+            if (lane == null) return this;
+            Name n = ctx.name(name);
+            if (n == null) return done((Name) null);
+            if (live()) lane.done(depth, n, Name.overflowed(n, name) ? MISUSE : 0);
+            return this;
+        }
+
+        /** Like {@link #done(Name)}. */
+        public Span lap(Name name) {
+            return done(name);
+        }
+
+        /** Like {@link #done(String)}. */
+        public Span lap(String name) {
+            return done(name);
         }
 
         /**
-         * Like {@link #done(Name)}, and selects the lap for the legacy headers, shown there as
-         * {@code legacyLabel} or, if that is {@code null}, as the name.
+         * Ends the open phase at {@code nanos}, a reading of the trace's clock ({@code System.nanoTime()}
+         * or {@link Options#clock}): a boundary there, also with no phase open. It must lie between the last
+         * boundary and now; outside it is clamped, the span flagged and the misuse counted (strict mode
+         * throws). Returns this span.
          */
-        public Span done(Name name, String legacyLabel) {
-            return done(name, LEGACY, legacyLabel);
-        }
-
-        /** Like {@link #done(Name, String)}, the name looked up as for {@link Tempo#span(String)}. */
-        public Span done(String name, String legacyLabel) {
-            return lane == null ? this : done(ctx.name(name), LEGACY, legacyLabel);
-        }
-
-        private Span done(Name name, int flags, String label) {
-            if (recorded()) {
-                if (name == null) nullName();
-                lane.done(depth, name, flags, label);
-            }
+        public Span lap(long nanos) {
+            if (live()) lane.lap(depth, nanos);
             return this;
         }
 
-        /** Selects the open phase or the last lap of this span for the legacy headers. */
-        public Span legacy() {
-            if (recorded()) lane.legacy(depth);
+        /**
+         * Starts this span at {@code nanos}, a reading of the trace's clock, instead of when it opened: for
+         * work timed elsewhere, as in {@code parent.span("x").phase("a").start(t0).lap(t1).phase("b")
+         * .stop(t2).close()}. While the span's only boundary is the start of its open first phase, that phase
+         * starts there too. The time must lie within the parent's window (from the parent's start to now)
+         * and before the span's first boundary; outside it is clamped, the span flagged and the misuse
+         * counted (strict mode throws). A trace's root, which starts at the trace's zero point, and a task,
+         * which starts where its queue wait ends, do not move. Returns this span.
+         */
+        public Span start(long nanos) {
+            if (live()) lane.start(depth, nanos);
             return this;
         }
 
-        /** Attaches a number to the open phase or the last lap of this span. */
-        public Span phaseSet(Name key, long value) {
-            if (recorded()) lane.phaseSet(depth, key(key) << KIND_BITS | ATTR_LONG, value);
+        /**
+         * Ends this span at {@code nanos}, a reading of the trace's clock, and its open phase with it. The
+         * span stays the thread's innermost until {@link #close()}, which then keeps this end. The time must
+         * lie between the last boundary and now; outside it is clamped, the span flagged and the misuse
+         * counted (strict mode throws). Phases, laps and a second stop after it are misuse. Returns this span.
+         */
+        public Span stop(long nanos) {
+            if (live()) lane.stop(depth, nanos);
             return this;
-        }
-
-        /** Like {@link #phaseSet(Name, long)}, the key looked up as for {@link Tempo#span(String)}. */
-        public Span phaseSet(String key, long value) {
-            return lane == null ? this : phaseSet(ctx.name(key), value);
         }
 
         /**
@@ -4764,36 +5021,6 @@ public final class Tempo {
         public Span cpu() {
             if (live() && ctx.cpu()) lane.sampleCpu(depth);
             return this;
-        }
-
-        /**
-         * Runs {@code body}, then {@link #done(Name) done(name)}. If the body throws, the lap is recorded
-         * as failed, never for the legacy headers, and the throwable is rethrown unwrapped.
-         */
-        public <T, E extends Exception> T lap(Name name, ThrowingSupplier<T, E> body) throws E {
-            T result;
-            try {
-                result = body.get();
-            } catch (Throwable t) {
-                try {
-                    done(name, FAILED, null);
-                } catch (AssertionError misuse) { // strict mode must not hide the body's throwable
-                    if (misuse != t) t.addSuppressed(misuse);
-                }
-                throw t;
-            }
-            done(name);
-            return result;
-        }
-
-        /** Like {@link #lap(Name, ThrowingSupplier)}, the name looked up as for {@link Tempo#span(String)}. */
-        public <T, E extends Exception> T lap(String name, ThrowingSupplier<T, E> body) throws E {
-            return lap(lane == null ? null : ctx.name(name), body);
-        }
-
-        /** Phase boundaries of this span so far; separates the laps for aggregation. */
-        int lapOrdinal() {
-            return lane == null ? 0 : lane.lapOrdinal(depth);
         }
 
         private Name nullName() {
@@ -4946,10 +5173,6 @@ public final class Tempo {
             else if (!(this instanceof Trace) || Thread.currentThread() != owner) live(); // counts the misuse
         }
 
-        /** {@link #live()} and has a row: phases, laps and CPU time do nothing on a folded or undrawn span. */
-        private boolean recorded() {
-            return live() && row != Lane.FRAME;
-        }
 
         /** Owner thread and still open. */
         private boolean live() {
@@ -4972,6 +5195,216 @@ public final class Tempo {
         }
     }
 
+    /**
+     * A labelled section of a span's timeline, from {@link Span#phase}: it ends at the span's next phase,
+     * at {@link #done()} or {@link #lap()}, or when the span ends. It opens nothing; {@link #phase}, {@link
+     * #done()}, {@link #lap()} and the hand-timing calls on it continue its span's sequence, and {@link
+     * #done()} returns the span. {@link #set}, {@link #fail()} and {@link #label} apply to the phase itself,
+     * also after it ended, until the trace is released.
+     *
+     * <p>Like a span's, a recorded phase's handle is its own for the whole trace and pooled by the thread
+     * once the trace is released; a call through it then is ignored and counted as misuse ({@link
+     * Options#strict} throws, and never pools one). The phases of a folded or undrawn span, which draws
+     * none, share one handle per depth: they count towards the totals but keep no attributes.
+     */
+    public static final class Phase extends Timing {
+        private static final VarHandle STAMP;
+
+        static {
+            try {
+                STAMP = MethodHandles.lookup().findVarHandle(Phase.class, "stamp", long.class);
+            } catch (ReflectiveOperationException e) {
+                throw new ExceptionInInitializerError(e);
+            }
+        }
+
+        /** The phase of {@link Tempo#NOOP}: records nothing; its {@link #done()} returns {@link Tempo#NOOP}. */
+        public static final Phase NOOP = new Phase();
+
+        // The binding, as for Span: written by the owner when it issues the handle and by a retiring lane when
+        // the handle goes back to the pool; the stamp is the trace's id while issued, 0 while pooled.
+        Lane lane;
+        Context ctx = Context.NONE;
+        Thread owner;
+        AtomicInteger misuses = Context.NONE.misuses;
+        Span span; // the span this phase sections
+        int row = Lane.FRAME; // FRAME: no row, a phase of a folded or undrawn span or past the row cap
+        @SuppressWarnings("unused") private long stamp; // via STAMP
+        Phase link; // the next handle in its lane's issued list, or in its slot's pool
+
+        Phase() {}
+
+        /** Owner thread: issues this handle to phase row {@code r} (or FRAME) of {@code s}, open at depth {@code d} of {@code l}. */
+        void bind(Lane l, Span s, int d, int r) {
+            Context c = l.ctx;
+            lane = l;
+            ctx = c;
+            owner = l.owner;
+            misuses = c.misuses;
+            span = s;
+            row = r;
+            STAMP.setRelease(this, c.id);
+        }
+
+        /** The lane retiring: takes the handle off its trace before it is pooled, as {@link Span#detach()}. */
+        void detach() {
+            STAMP.setOpaque(this, 0L);
+            VarHandle.storeStoreFence();
+            lane = Lane.POOLED;
+            ctx = Context.NONE;
+            span = null;
+        }
+
+        private boolean stale() {
+            return lane.retired() || (long) STAMP.getAcquire(this) != ctx.id;
+        }
+
+        private void misuse(String what) {
+            misuses.incrementAndGet();
+            if (ctx.strict) throw new AssertionError("Tempo misuse: " + what);
+        }
+
+        /** Owner thread and not stale; else counts the misuse. False for {@link #NOOP}. */
+        private boolean owned() {
+            if (lane == null) return false;
+            if (Thread.currentThread() != owner) {
+                misuse("phase used on a foreign thread");
+                return false;
+            }
+            if (!stale()) return true;
+            misuse(Span.STALE);
+            return false;
+        }
+
+        /** The span this phase sections; {@link Tempo#NOOP} for {@link #NOOP} or a stale handle (misuse). */
+        private Span span() {
+            if (lane == null) return Tempo.NOOP;
+            if (!stale()) return span;
+            misuse(Span.STALE);
+            return Tempo.NOOP;
+        }
+
+        /** Attaches a number to this phase, also after it ended; ignored on a phase without a row. */
+        @Override
+        public Phase set(Name key, long value) {
+            if (owned() && row != Lane.FRAME && !lane.event(row, ctx.key(key) << KIND_BITS | ATTR_LONG, value)) misuse(Span.STALE);
+            return this;
+        }
+
+        /** Like {@link #set(Name, long)}, the key looked up as for {@link Tempo#span(String)}. */
+        @Override
+        public Phase set(String key, long value) {
+            return lane == null || lane.free ? this : set(ctx.name(key), value);
+        }
+
+        @Override
+        public Phase set(Name key, double value) {
+            if (owned() && row != Lane.FRAME
+                    && !lane.event(row, ctx.key(key) << KIND_BITS | ATTR_DOUBLE, Double.doubleToRawLongBits(value))) misuse(Span.STALE);
+            return this;
+        }
+
+        /** Like {@link #set(Name, double)}, the key looked up as for {@link Tempo#span(String)}. */
+        @Override
+        public Phase set(String key, double value) {
+            return lane == null || lane.free ? this : set(ctx.name(key), value);
+        }
+
+        /** Marks the phase failed, also after it ended. */
+        @Override
+        public Phase fail() {
+            if (owned() && row != Lane.FRAME && !lane.flag(row, FAILED)) misuse(Span.STALE);
+            return this;
+        }
+
+        /** Like {@link #fail()}; only the flag is recorded, not the throwable. */
+        @Override
+        public Phase fail(Throwable cause) {
+            return fail();
+        }
+
+        /**
+         * The text of this phase in the {@code Runtime} and {@code Server-Timing} headers ({@link
+         * Trace#toRuntime(int)}, {@link Trace#toServerTiming()}), which list the trace's labelled phases.
+         * Also after the phase ended; a second label replaces the first. Null is misuse.
+         */
+        public Phase label(String text) {
+            if (!owned() || row == Lane.FRAME) return this;
+            if (text == null) misuse("null label");
+            else if (!lane.label(row, text)) misuse(Span.STALE);
+            return this;
+        }
+
+        /** The span's next phase: {@link Span#phase(Name)}. */
+        public Phase phase(Name name) {
+            return span().phase(name);
+        }
+
+        /** The span's next phase: {@link Span#phase(String)}. */
+        public Phase phase(String name) {
+            return span().phase(name);
+        }
+
+        /** Ends the span's open phase: {@link Span#done()}. Returns the span. */
+        public Span done() {
+            return span().done();
+        }
+
+        /** Like {@link #done()}. */
+        public Span lap() {
+            return span().done();
+        }
+
+        /** {@link Span#done(Name)}. Returns the span. */
+        public Span done(Name name) {
+            return span().done(name);
+        }
+
+        /** {@link Span#done(String)}. Returns the span. */
+        public Span done(String name) {
+            return span().done(name);
+        }
+
+        /** Like {@link #done(Name)}. */
+        public Span lap(Name name) {
+            return span().done(name);
+        }
+
+        /** Like {@link #done(String)}. */
+        public Span lap(String name) {
+            return span().done(name);
+        }
+
+        /** Ends the span's open phase at {@code nanos}: {@link Span#lap(long)}. Returns the span. */
+        public Span lap(long nanos) {
+            return span().lap(nanos);
+        }
+
+        /** Starts the span at {@code nanos}, this phase with it while it is the first: {@link Span#start(long)}. Returns this phase. */
+        public Phase start(long nanos) {
+            span().start(nanos);
+            return this;
+        }
+
+        /** Ends the span, and this phase if open, at {@code nanos}: {@link Span#stop(long)}. Returns the span. */
+        public Span stop(long nanos) {
+            return span().stop(nanos);
+        }
+
+        /**
+         * Running time while open, the duration once ended; 0 for a phase without a row and after release.
+         * Any thread, best effort off the owner.
+         */
+        @Override
+        public long elapsedNanos() {
+            long s = (long) STAMP.getAcquire(this);
+            Lane l = lane;
+            int r = row;
+            if (l == null || r == Lane.FRAME || s != l.ctx.id) return 0;
+            return l.elapsed(r);
+        }
+    }
+
     // ---------------------------------------------------------------------------------------------
 
     @FunctionalInterface
@@ -4979,7 +5412,7 @@ public final class Tempo {
         void visit(SpanView span);
     }
 
-    /** Receives the legacy phases of a trace, see {@link Trace#forEachTop}. */
+    /** Receives the labelled phases of a trace, see {@link Trace#forEachTop}. */
     @FunctionalInterface
     public interface TopVisitor {
         void visit(Name name, String label, long startNanos, long durationNanos);
@@ -5082,19 +5515,19 @@ public final class Tempo {
         /** Closed implicitly by an ancestor's close. */
         public boolean healed() { return (flags & HEALED) != 0; }
 
-        /** Recorded through a misused call, e.g. with a null name or a {@code done} that names another phase. */
+        /**
+         * Recorded through a misused call, e.g. with a null name, a {@code done} that names another phase,
+         * or a time given by hand outside its window.
+         */
         public boolean misuse() { return (flags & MISUSE) != 0; }
 
-        /** A phase ({@link Span#phase}) or a lap ({@link Span#done}, {@link Span#lap}) of its parent. */
+        /**
+         * A phase of its parent ({@link Span#phase}, or {@link Span#done(Name)} naming the time since the
+         * last boundary): a section of the parent's timeline, never the parent of anything.
+         */
         public boolean phase() { return (flags & PHASE) != 0; }
 
-        /** A lap recorded label after; its children are the spans opened during it. */
-        boolean retro() { return (flags & RETRO) != 0; }
-
-        /** Selected for the legacy headers. */
-        public boolean legacy() { return (flags & LEGACY) != 0; }
-
-        /** The legacy label given to {@link Span#done(Name, String)}, or {@code null}. */
+        /** The label of a phase ({@link Phase#label}), or {@code null}. */
         public String label() { return label; }
 
         /** {@link #SPAN}, {@link #STEP} or {@link #TICK}: the word that opened it. */

@@ -42,7 +42,7 @@ metrics, headers), and the complex ones combine them into a service.
 | Demo | What it teaches | Tempo API it introduces |
 |---|---|---|
 | `FirstTrace` | One request recorded as a trace: spans, a nested span, the four response headers. | `Tempo.name`, `Tempo.start`, `Options.strict`, `Span.span` / `call` / `run`, `Span.set`, `Trace.forEachSpan`, `release` |
-| `StopwatchSteps` | A job that used to time itself with a stopwatch: steps marked before or after they run, and the legacy `Runtime` and `Server-Timing` headers. | `phase`, `done`, `lap`, `legacy`, `phaseSet`, `printOnClose`, `forEachTop`, `toRuntime`, `toServerTiming` |
+| `StopwatchSteps` | A job that used to time itself with a stopwatch: steps as phases named before or after they run, and the `Runtime` and `Server-Timing` headers from their labels. | `phase`, `done`, `label`, `printOnClose`, `forEachTop`, `toRuntime`, `toServerTiming` |
 | `AttributesAndFailures` | Numbers on spans, failed and cancelled work, a helper that finds its parent span, and what happens to a span left open. | long and double attributes, `fail`, `cancel`, `Tempo.current`, `Tempo.NOOP`, healed misuse (`m`) versus `strict` |
 
 ### Medium: one concept each

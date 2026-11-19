@@ -29,6 +29,7 @@ fragment wins over one in the query.
 | `handoff-not-run` | Cancelled before start (`^c`, `dur` 0, wait until cancel), cancelled while running, never started (`^n`, wait until render). |
 | `failed-open` | Flags `f`, `o`, `w`, `m` and combinations; a trace rendered while open (root `^o`), live lanes. |
 | `aggregates` | Aggregate on an explicit thread, on mixed threads (`@_`), without wait on the parent's thread, with flags, with attributes, with count 1. |
+| `phases` | Phases (`^p`, FORMAT.md §6.7): label-first phases of the root, one with an attribute, and a child that crosses their boundary; phases of a task on another thread; an unnamed span (the empty name, `::` in `N=`) labelled by its phases, one failed (`^fp`); a phase named after the fact; a span timed by hand; a phase ended by a `done` that named another (`^mp`). |
 | `attributes` | Integers (0, negative, 2^53−1), fractions (0.5, −0.25, 0.000001, 123456.789, −3.141593), a key that is also a span name. |
 | `names` | Percent-encoding: space as `_`, literal `_` as `%5F`, `/ : ; = %`, UTF-8 of 2, 3 and 4 bytes, `?` (`%3F`), raw `.` and `-`, encoded thread names. |
 | `live-and-folded` | `x=` with folded and dropped counts, `l=` with three live lanes holding open spans. |
@@ -56,7 +57,7 @@ each one is: `tools/tempo_ref.py fit <limit>` makes it from `ladder`, and the Ja
 Six canonical vectors are **wire-only**: they were written for the format and describe
 traces the Java recorder cannot produce by design. Decoders and the reference encoder
 must match them like any other vector; the Java encoder's test (`GoldenTest`) records the
-closest trace it can and checks that byte for byte instead. The other eleven canonical
+closest trace it can and checks that byte for byte instead. The other twelve canonical
 vectors, the worked example and the ladder vectors among them, are recorded through the
 public API and rendered byte for byte.
 

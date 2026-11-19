@@ -103,7 +103,7 @@ public final class Demo {
     /**
      * Prints the response a service would send for this trace, the way {@code curl -i} shows it, so
      * that {@code ./gradlew -q demo -Pdemo=Name | tools/tempo} draws it. The four timing headers:
-     * {@code Runtime} and {@code Server-Timing} (the legacy steps), {@code Tempo-Timing} (the whole
+     * {@code Runtime} and {@code Server-Timing} (the labelled phases), {@code Tempo-Timing} (the whole
      * tree, FORMAT.md) and {@code Tempo-Link} (the same tree as a link to Tempo Timeline).
      */
     public static void respond(Tempo.Trace t) {

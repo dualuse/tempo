@@ -148,7 +148,7 @@ class LinkTest {
         try (Stream<Path> files = Files.list(GoldenTest.DATA.resolve("golden"))) {
             links = files.filter(p -> p.toString().endsWith(".link")).sorted().collect(Collectors.toList());
         }
-        assertEquals(17, links.size(), "canonical vectors");
+        assertEquals(18, links.size(), "canonical vectors");
         for (Path p : links) {
             String name = p.getFileName().toString().replace(".link", "");
             String link = new String(Files.readAllBytes(p), StandardCharsets.US_ASCII).trim();

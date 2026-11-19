@@ -1,0 +1,27 @@
+{
+  "v": 1,
+  "unit": "us",
+  "wall": 1794567890200,
+  "folded": 0,
+  "dropped": 0,
+  "threads": ["http-3", "pool-1"],
+  "live": [],
+  "truncated": false,
+  "spans": [
+    {"id":0,"parent":-1,"name":"PUT /batch","start":0,"dur":3000,"thread":0},
+    {"id":1,"parent":0,"name":"parse","start":100,"dur":500,"thread":0,"flags":"p","attrs":{"rows":1200}},
+    {"id":2,"parent":0,"name":"read","start":150,"dur":750,"thread":0},
+    {"id":3,"parent":0,"name":"store","start":600,"dur":1200,"thread":0,"flags":"p"},
+    {"id":4,"parent":0,"name":"flush","start":950,"dur":1600,"thread":1,"wait":50},
+    {"id":5,"parent":4,"name":"compress","start":1000,"dur":500,"thread":1,"flags":"p"},
+    {"id":6,"parent":4,"name":"write","start":1500,"dur":1100,"thread":1,"flags":"p"},
+    {"id":7,"parent":0,"name":"verify","start":1800,"dur":900,"thread":0,"flags":"p"},
+    {"id":8,"parent":0,"name":"","start":1900,"dur":500,"thread":0},
+    {"id":9,"parent":8,"name":"open","start":1900,"dur":100,"thread":0,"flags":"p"},
+    {"id":10,"parent":8,"name":"copy","start":2000,"dur":400,"thread":0,"flags":"fp"},
+    {"id":11,"parent":0,"name":"replay","start":2750,"dur":40,"thread":0},
+    {"id":12,"parent":11,"name":"fetch","start":2750,"dur":30,"thread":0,"flags":"p"},
+    {"id":13,"parent":11,"name":"apply","start":2780,"dur":10,"thread":0,"flags":"p"},
+    {"id":14,"parent":0,"name":"check","start":2850,"dur":50,"thread":0,"flags":"mp"}
+  ]
+}

@@ -55,7 +55,7 @@ class SetupTimeTest {
         }
     }
 
-    /** {@code start+duration} of every span, and the legacy steps of {@code forEachTop}, of the trace and its snapshot. */
+    /** {@code start+duration} of every span, and the labelled phases of {@code forEachTop}, of the trace and its snapshot. */
     static String starts(Trace t) {
         StringBuilder b = new StringBuilder();
         t.forEachSpan(v -> b.append(v.name()).append(' ').append(v.startNanos()).append('+').append(v.durationNanos()).append('\n'));
@@ -69,23 +69,24 @@ class SetupTimeTest {
     }
 
     @Test
-    void theRootStartsAtZeroAndTheLegacyStepsCountFromIt() {
+    void theRootStartsAtZeroAndThePhasesCountFromIt() {
         for (int level : new int[] {SPAN, STEP}) {
             Stepping clock = new Stepping(10);
             Trace t = Tempo.trace(SEARCH, new Options().clock(clock).cpu(false)).records(level);
             Span s = t;
-            s.span(LOAD).close();          // the zero point is the first read; this one runs from 10 to 20
-            s.done(DECODE, "Decode");      // a lap from the root's start, 0, to 30
+            s.phase(DECODE).label("Decode"); // the zero point is the first read; the phase starts at 10
+            s.span(LOAD).close();            // from 20 to 30
+            s.done();                        // at 40
             clock.add(100);
-            t.close();                     // at 140
+            t.close();                       // at 150
             assertEquals(lines(
-                    "search 0+140",
-                    "decode 0+30",
-                    "load 10+10",
-                    "top decode 0+30"), starts(t), "level " + level);
-            assertEquals(140, t.elapsedNanos());
-            assertEquals(140, t.snapshot().elapsedNanos());
-            assertEquals("0.000000140s = 0.000000030s (Decode)", t.toRuntime(9));
+                    "search 0+150",
+                    "decode 10+30",
+                    "load 20+10",
+                    "top decode 10+30"), starts(t), "level " + level);
+            assertEquals(150, t.elapsedNanos());
+            assertEquals(150, t.snapshot().elapsedNanos());
+            assertEquals("0.000000150s = 0.000000030s (Decode)", t.toRuntime(9));
             assertTrue(t.toHeader().contains(";S=00.0.0/"), t.toHeader()); // the root's wire start is 0 too
         }
     }
@@ -118,14 +119,14 @@ class SetupTimeTest {
     void theRootStartsAtZeroWithTheSystemClock() {
         for (int level : new int[] {SPAN, STEP}) {
             Trace t = Tempo.trace(SEARCH, new Options()).records(level);
-            t.done(DECODE, "Decode");
+            t.done(DECODE); // a phase named after the fact, from the root's start
             t.close();
             List<Long> starts = new ArrayList<>();
             t.forEachSpan(v -> starts.add(v.startNanos()));
             t.forEachTop((name, label, start, dur) -> starts.add(start));
             t.snapshot().forEachSpan(v -> starts.add(v.startNanos()));
             t.snapshot().forEachTop((name, label, start, dur) -> starts.add(start));
-            assertEquals(List.of(0L, 0L, 0L, 0L, 0L, 0L), starts, "level " + level);
+            assertEquals(List.of(0L, 0L, 0L, 0L), starts, "level " + level);
         }
     }
 

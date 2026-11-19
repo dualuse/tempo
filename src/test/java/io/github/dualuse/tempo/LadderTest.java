@@ -173,17 +173,32 @@ class LadderTest {
     /**
      * A sample of values and links from random recordings, checked outside the JVM: the reference ladder
      * of {@code tools/tempo_ref.py} fits each value to the same bytes, its link decoder and the viewer's
-     * parser read every value and link, and {@code tools/tempo --check} accepts them all. Skipped where
+     * parser read every value and link, and {@code tools/tempo --check} accepts them all. The viewer's
+     * parser gets recordings without phases and unnamed spans, which it does not read yet. Skipped where
      * python3 or node is not installed.
      */
     @Test
     void theReferenceAndTheViewersAgree() throws Exception {
+        Path file = Files.createTempFile("tempo-java-outputs", ".tsv"), plain = Files.createTempFile("tempo-java-outputs", ".tsv");
+        try {
+            Files.write(file, corpus(true).getBytes(StandardCharsets.UTF_8));
+            Files.write(plain, corpus(false).getBytes(StandardCharsets.UTF_8));
+            run("python3", "tests/check_java_outputs.py", file.toString());
+            run("node", "tests/check_java_outputs.mjs", plain.toString());
+        } finally {
+            Files.delete(file);
+            Files.delete(plain);
+        }
+    }
+
+    /** The values and links of {@link #theReferenceAndTheViewersAgree}, with or without phases and unnamed spans. */
+    private static String corpus(boolean phases) {
         SplittableRandom rnd = new SplittableRandom(20261116);
         StringBuilder corpus = new StringBuilder();
         Snapshot ladder = ladderTrace();
         for (int limit : new int[] {100, 256, 300, 400, 500}) line(corpus, "header", limit, ladder, ladder.toHeader(limit));
         for (int round = 0; round < 80; round++) {
-            Snapshot snap = HeaderTest.randomSnapshot(rnd, round, new HashSet<>());
+            Snapshot snap = HeaderTest.randomSnapshot(rnd, round, new HashSet<>(), phases);
             int length = snap.toHeader(Integer.MAX_VALUE).length();
             for (int i = 0; i < 3; i++) {
                 int limit = 256 + rnd.nextInt(Math.max(1, length - 255));
@@ -192,14 +207,7 @@ class LadderTest {
             int limit = BASE.length() + 256 + rnd.nextInt(Math.max(1, length - 200));
             line(corpus, "link", limit, snap, snap.toLink(BASE, limit));
         }
-        Path file = Files.createTempFile("tempo-java-outputs", ".tsv");
-        try {
-            Files.write(file, corpus.toString().getBytes(StandardCharsets.UTF_8));
-            run("python3", "tests/check_java_outputs.py", file.toString());
-            run("node", "tests/check_java_outputs.mjs", file.toString());
-        } finally {
-            Files.delete(file);
-        }
+        return corpus.toString();
     }
 
     private static void line(StringBuilder corpus, String kind, int limit, Snapshot snap, String output) {

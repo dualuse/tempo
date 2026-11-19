@@ -183,7 +183,7 @@ public final class MetricsAndListeners {
     }
 
     /**
-     * toServerTiming() prints the legacy steps and the total. The cache calls are this service's own
+     * toServerTiming() prints the labelled phases and the total. The cache calls are this service's own
      * entry, rendered from their total. Its dur is a sum over calls that ran at the same time on two
      * threads, so it can come close to the total or exceed it.
      */
