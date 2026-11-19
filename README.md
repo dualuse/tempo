@@ -8,8 +8,8 @@ headers, as JSON, or as a link that opens the trace in a web viewer.
 - **One source file**, `Tempo.java`, Java 11 or newer, no runtime dependencies. An optional
   second file, `TempoJackson.java`, serializes traces with Jackson.
 - **No allocation while recording.** Spans go into per-thread primitive buffers, and their
-  handles are pooled per thread. A span costs about 30 ns (two clock reads), a tick the trace
-  does not record about a branch, and a task allocates one object: itself. See
+  handles are pooled per thread. A recorded span costs about 37 ns (two clock reads), a tick
+  the trace does not record about a branch, and a task allocates one object: itself. See
   [BENCHMARKS.md](BENCHMARKS.md).
 - **A compact wire format**, `Tempo-Timing`, specified in [FORMAT.md](FORMAT.md): a whole
   request tree with threads, queue waits, CPU time, phases, attributes and flags in one header
@@ -562,7 +562,7 @@ cpu
 | `├─ name ─┤` | A span's run time, its name centred (`\|- name -\|` with `--ascii`). |
 | `┼` | A phase boundary inside a span's bar; each phase's name is centred in its section. |
 | `·` | Unphased time of a span that has phases. |
-| `*1` | A phase too narrow for its name, named in a footnote line under the lanes. One too narrow even for that has its `*1` after its span's name. |
+| `*1` | A phase too narrow for its name, named in a footnote line under the lanes. One too narrow even for that has its `*1` after its span's name; where many such follow one another, a range such as `*4–*13` stands for them. |
 | `░` | Queue wait of a task, drawn dim in front of its run. |
 | `├╌╌┤` | Blocking wait (join, future get), flag `w`. |
 | `▚` with `×N` and `┃` | Aggregate of N folded spans over its extent; `┃` marks where the slowest one started. |
@@ -683,8 +683,10 @@ in [BENCHMARKS.md](BENCHMARKS.md).
 | `Tempo-Timing` value, 300 spans | 15 µs | 5.3 KB, mostly the output string |
 
 CI holds every recording operation to its allocation, and the four cost promises to their
-gates, on JDK 11, 17 and 21 (`./gradlew jmhGate`): 0 B per recorded span, one object per task,
-an unrecorded tick under half a clock read, and a recorded static span at most 6.4 clock reads.
+gates, on JDK 11, 17 and 21 (`./gradlew jmhGate`): 0 B per recorded span, one object per task
+plus a one-time lane setup of at most 256 B for each trace and worker thread (248 B measured,
+gated like `traceLifecycle`), an unrecorded tick under half a clock read, and a recorded static
+span at most 6.4 clock reads.
 
 ## Building and testing
 

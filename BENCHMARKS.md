@@ -23,7 +23,7 @@ were taken on.
 | Promise | Benchmarks | Measured | Gate |
 |---|---|---|---|
 | 1. 0 B per recorded span, steady state | `span`, `spanStatic`, `spanNotInlined`, `run`, `stepDrawn`, `phase`, `done`, `setLong` | 0.0000 to 0.0003 B/op | 0.01 B/op |
-| 2. One object per task | `task`, `supplierInline` | 48.0001, 48.0004 B/op | 48.01 B/op: a `Task` or `SupplierTask` |
+| 2. One object per task, plus a one-time lane setup of at most 256 B for each trace and worker thread (248 B measured), gated like `traceLifecycle` | `task`, `supplierInline` | 48.0001, 48.0004 B/op | 48.01 B/op: a `Task` or `SupplierTask` |
 | | `taskInline`, `callableInline`, `taskFolded`, `taskUndrawn` | 56.0004 to 56.0007 B/op | 56.01 B/op: a `RunnableTask` or `CallableTask`, also its future |
 | | `executorSubmit`, `executorCall`, `executorCallableTask` (through `Tempo.executor`) | 56.0005 B/op | 56.01 B/op: the task, which is the future returned |
 | | `across` (a `Task` begun on another thread), per op of either side | 24.0014 B/op, setup 630 B per trace | 24.01 B/op, setup 1,024 B |
