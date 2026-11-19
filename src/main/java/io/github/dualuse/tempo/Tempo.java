@@ -630,7 +630,7 @@ public final class Tempo {
             }
         }
 
-        static final Context NONE = new Context(-1, false); // below SPAN, so NOOP.tick() returns at the level check
+        static final Context NONE = new Context(-1, false); // below SPAN and never seen: a tick through NOOP or a pooled handle takes Span.unrecorded
         /** Of the spans timed outside a trace for global listeners: records nothing, never released. */
         static final Context FREE = new Context(SPAN, true);
 
@@ -1131,6 +1131,8 @@ public final class Tempo {
         Lane current;
         Lane free; // the spans timed outside a trace for global listeners; created on first use
         StringBuilder text; // the header encoder's, reused while it stays small (Header.KEEP)
+        // TaskExecutor: the task its newTaskFor just made, until the execute that follows takes it
+        TaskFuture<?> made;
         @SuppressWarnings("unchecked")
         final WeakReference<Lane>[] lanes = new WeakReference[4];
         private int victim;
@@ -5331,24 +5333,38 @@ public final class Tempo {
 
         /**
          * A child tick: timed and drawn only when the trace records ticks, then like a drawn {@link #step};
-         * otherwise {@link #NOOP} at the cost of a branch.
+         * otherwise {@link #NOOP} at the cost of a branch. Strict mode checks the handle on every call, so a
+         * call after close, from a foreign thread or after release throws. Outside strict mode an
+         * unrecorded tick checks the handle only where that is free: through a pooled handle, and on the
+         * trace's first step or tick, which fixes its level; such a misuse is counted, and a closed or
+         * foreign handle never fixes the level.
          */
         public Span tick(Name name) {
-            if (ctx.mode < Context.TICK_MODE) {
-                if (lane == null || lane.free) return NOOP;
-                if (ctx.strict && stale()) misuse(STALE);
-                if (ctx.sawStep() < Context.TICK_MODE) return NOOP;
-            }
+            Context c = ctx;
+            int m = c.mode;
+            if (m < Context.TICK_MODE && ((m & Context.SEEN) != 0 && !c.strict || unrecorded())) return NOOP;
             Lane l = top();
             return l == null ? NOOP : l.openTick(name, 0);
         }
 
         /** Like {@link #tick(Name)}, the name looked up as for {@link Tempo#span(String)}. */
         public Span tick(String name) {
-            if (ctx.mode < Context.TICK_MODE && (lane == null || lane.free || ctx.sawStep() < Context.TICK_MODE))
-                return tick((Name) null);
+            Context c = ctx;
+            int m = c.mode;
+            if (m < Context.TICK_MODE && ((m & Context.SEEN) != 0 && !c.strict || unrecorded())) return NOOP;
             Lane l = top();
             return l == null ? NOOP : l.openTick(name);
+        }
+
+        /**
+         * A tick's slow way, below the level of ticks, in strict mode or with the level not yet fixed:
+         * whether it is not recorded. {@link #NOOP} and a span outside a trace have no trace to record in; a
+         * closed, foreign or stale handle is misuse (strict throws), and only a live one fixes the level.
+         * A pooled handle's context is {@link Context#NONE}, whose level never fixes.
+         */
+        private boolean unrecorded() {
+            Lane l = lane;
+            return l == null || l.free || !live() || ctx.sawStep() < Context.TICK_MODE;
         }
 
         /**
@@ -6770,40 +6786,58 @@ public final class Tempo {
      * {@code execute} as its own {@link Future}, so a submit allocates that one object. A task made by
      * {@link Tempo#runnable} or {@link Tempo#callable} goes in as it is, under its own name. A submit the
      * pool refuses is recorded as rejected before the {@link RejectedExecutionException} reaches the
-     * caller. {@code invokeAll} goes through {@link #newTaskFor}; {@code invokeAny} through a view whose
-     * {@code execute} hands the JDK's completion wrapper of each task straight to the pool, so every
-     * element is recorded once, under its task's name.
+     * caller. {@code invokeAll} goes through {@link #newTaskFor}. So does an {@code
+     * ExecutorCompletionService} over this executor, its own in {@code invokeAny} too: it wraps the task in
+     * a future of its own and hands that to {@link #execute} right away, on the same thread, which passes
+     * it to the pool as it is, so every element is recorded once, under its task's name.
      */
     static final class TaskExecutor extends AbstractExecutorService {
         private final ExecutorService pool;
         private final Name name;
-        private final Direct direct = new Direct();
 
         TaskExecutor(ExecutorService pool, Name name) {
             this.pool = pool;
             this.name = name;
         }
 
-        /** Runs {@code r} as a task; a throwable from it is thrown on the pool thread, as from a plain runnable. */
+        /**
+         * Runs {@code r} as a task; a throwable from it is thrown on the pool thread, as from a plain
+         * runnable. The completion wrapper of the task {@link #newTaskFor} just made on this thread goes to
+         * the pool as it is: that task is the one recorded, and rejected if the pool refuses the wrapper.
+         */
         @Override
         public void execute(Runnable r) {
-            start(ours(r) ? (RunnableFuture<?>) r : new RunnableTask(name, null, r, 0));
+            ThreadSlot slot = SLOT.get();
+            TaskFuture<?> made = slot.made;
+            if (made != null) slot.made = null;
+            if (ours(r)) {
+                start((RunnableFuture<?>) r);
+            } else if (made != null && r instanceof Future) {
+                try {
+                    pool.execute(r);
+                } catch (RejectedExecutionException e) {
+                    made.reject();
+                    throw e;
+                }
+            } else {
+                start(new RunnableTask(name, null, r, 0));
+            }
         }
 
         /** Submits {@code r} as a task, which is the future returned; a throwable from it stays in the future. */
         @Override
         public Future<?> submit(Runnable r) {
-            return start(newTaskFor(r, null));
+            return start(task(r, null));
         }
 
         @Override
         public <T> Future<T> submit(Runnable r, T result) {
-            return start(newTaskFor(r, result));
+            return start(task(r, result));
         }
 
         @Override
         public <T> Future<T> submit(Callable<T> c) {
-            return start(newTaskFor(c));
+            return start(task(c));
         }
 
         /** A task that is its own future and runnable: one made by {@link Tempo#runnable}, {@link Tempo#callable}, or this executor. */
@@ -6812,9 +6846,8 @@ public final class Tempo {
         }
 
         /** {@code r} itself if it is a task (its throwable kept in the future, {@code result} its result), else a new task. */
-        @Override
         @SuppressWarnings("unchecked")
-        protected <T> RunnableFuture<T> newTaskFor(Runnable r, T result) {
+        private <T> RunnableFuture<T> task(Runnable r, T result) {
             if (!ours(r)) return result == null ? (RunnableFuture<T>) new RunnableTask(name, null, r, Task.QUIET)
                     : new ResultTask<>(name, r, result);
             TaskFuture<?> t = (TaskFuture<?>) r;
@@ -6824,24 +6857,28 @@ public final class Tempo {
         }
 
         /** {@code c} itself if it is a task (its throwable kept in the future), else a new task. */
-        @Override
         @SuppressWarnings("unchecked")
-        protected <T> RunnableFuture<T> newTaskFor(Callable<T> c) {
+        private <T> RunnableFuture<T> task(Callable<T> c) {
             if (!ours(c)) return new CallTask<>(name, null, c, Task.QUIET);
             ((TaskFuture<?>) c).quiet();
             return (RunnableFuture<T>) c;
         }
 
+        /** Like {@link #task(Runnable, Object)}; remembered for the {@link #execute} that follows. */
         @Override
-        public <T> T invokeAny(java.util.Collection<? extends Callable<T>> tasks)
-                throws InterruptedException, ExecutionException {
-            return direct.invokeAny(tasks);
+        protected <T> RunnableFuture<T> newTaskFor(Runnable r, T result) {
+            return made(task(r, result));
         }
 
+        /** Like {@link #task(Callable)}; remembered for the {@link #execute} that follows. */
         @Override
-        public <T> T invokeAny(java.util.Collection<? extends Callable<T>> tasks, long timeout, TimeUnit unit)
-                throws InterruptedException, ExecutionException, TimeoutException {
-            return direct.invokeAny(tasks, timeout, unit);
+        protected <T> RunnableFuture<T> newTaskFor(Callable<T> c) {
+            return made(task(c));
+        }
+
+        private static <T> RunnableFuture<T> made(RunnableFuture<T> t) {
+            SLOT.get().made = (TaskFuture<?>) t;
+            return t;
         }
 
         private <F extends Runnable> F start(F t) {
@@ -6882,54 +6919,6 @@ public final class Tempo {
         @Override
         public String toString() {
             return "Tempo.executor(" + pool + ", " + (name == null ? null : name.text) + ")";
-        }
-
-        /**
-         * The executor's view for {@code invokeAny}, whose {@code ExecutorCompletionService} wraps each task
-         * from {@link #newTaskFor} in a future of its own and passes that to {@code execute}: here it goes to
-         * the pool as it is, not into a second task. A wrapper the pool refuses leaves its task to {@code
-         * invokeAny}, which cancels it on the way out.
-         */
-        private final class Direct extends AbstractExecutorService {
-            @Override
-            public void execute(Runnable r) {
-                pool.execute(r);
-            }
-
-            @Override
-            protected <T> RunnableFuture<T> newTaskFor(Runnable r, T result) {
-                return TaskExecutor.this.newTaskFor(r, result);
-            }
-
-            @Override
-            protected <T> RunnableFuture<T> newTaskFor(Callable<T> c) {
-                return TaskExecutor.this.newTaskFor(c);
-            }
-
-            @Override
-            public void shutdown() {
-                pool.shutdown();
-            }
-
-            @Override
-            public List<Runnable> shutdownNow() {
-                return pool.shutdownNow();
-            }
-
-            @Override
-            public boolean isShutdown() {
-                return pool.isShutdown();
-            }
-
-            @Override
-            public boolean isTerminated() {
-                return pool.isTerminated();
-            }
-
-            @Override
-            public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
-                return pool.awaitTermination(timeout, unit);
-            }
         }
 
         /** The pool of an executor made over a null one: runs every task at once, on the submitting thread. */

@@ -13,12 +13,15 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionService;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -478,6 +481,112 @@ class TaskTest {
                 "  match 2+0 cancelled handoff~0",
                 "  match 2+0 cancelled handoff~0",
                 "  load 2+0 cancelled handoff~0"), tree(t));
+    }
+
+    /**
+     * A JDK {@code ExecutorCompletionService} over the executor makes each element through its {@code
+     * newTaskFor} and hands the executor a wrapper of it: still one task per submit, its run time and
+     * queue wait counted once, a task of its own kept as it is.
+     */
+    @Test
+    void aCompletionServiceOverTheExecutorRecordsEachSubmitOnce() throws Exception {
+        ExecutorService pool = worker("worker-1");
+        ExecutorService match = Tempo.executor(pool, MATCH);
+        CountDownLatch busy = new CountDownLatch(1), finish = new CountDownLatch(1);
+        try {
+            pool.execute(() -> {
+                busy.countDown();
+                try {
+                    finish.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            assertTrue(busy.await(10, TimeUnit.SECONDS));
+            Trace t = Tempo.trace(SEARCH, opts().cpu(false)).records(STEP);
+            CompletionService<Integer> cs = new ExecutorCompletionService<>(match);
+            Future<Integer> a = cs.submit(() -> {
+                clock.add(3);
+                return 1;
+            });
+            assertTrue(a instanceof Task);
+            clock.add(2);
+            CallableTask<Integer> own = Tempo.callable(LOAD, () -> 2);
+            assertSame(own, cs.submit(own));
+            clock.add(5);
+            finish.countDown();
+            assertEquals(3, cs.take().get() + cs.take().get());
+            t.close();
+            assertEquals(lines(
+                    "search 0+10",
+                    "  match 0+3 handoff~7 @worker-1",
+                    "  load 2+0 handoff~8 @worker-1"), tree(t));
+            assertEquals("count=1 sum=3 mean=3 min=3 max=3 waitSum=7 waitMax=7", t.total(MATCH).toString());
+            assertEquals("count=1 sum=0 mean=0 min=0 max=0 waitSum=8 waitMax=8", t.total(LOAD).toString());
+            assertEquals(0, t.misuses());
+        } finally {
+            finish.countDown();
+            match.shutdownNow();
+        }
+    }
+
+    /**
+     * A refused submit is recorded as rejected, with its queue wait in the totals, whether it came through
+     * {@code submit}, {@code invokeAny} or a completion service over the executor: never left as a task
+     * that has not started.
+     */
+    @Test
+    void aRefusedInvokeAnyOrCompletionServiceSubmitIsRecordedRejected() {
+        ExecutorService refusing = new AbstractExecutorService() { // refuses each task 4 ns after the submit
+            @Override
+            public void execute(Runnable r) {
+                clock.add(4);
+                throw new RejectedExecutionException("full");
+            }
+
+            @Override
+            public void shutdown() { }
+
+            @Override
+            public List<Runnable> shutdownNow() {
+                return List.of();
+            }
+
+            @Override
+            public boolean isShutdown() {
+                return false;
+            }
+
+            @Override
+            public boolean isTerminated() {
+                return false;
+            }
+
+            @Override
+            public boolean awaitTermination(long timeout, TimeUnit unit) {
+                return false;
+            }
+        };
+        ExecutorService match = Tempo.executor(refusing, MATCH);
+        Trace t = Tempo.trace(SEARCH, opts()).records(STEP);
+        AtomicInteger ran = new AtomicInteger();
+        assertThrows(RejectedExecutionException.class, () -> match.submit(ran::incrementAndGet));
+        assertThrows(RejectedExecutionException.class, () -> match.invokeAny(List.of(ran::incrementAndGet)));
+        CallableTask<Integer> own = Tempo.callable(LOAD, ran::incrementAndGet);
+        assertThrows(RejectedExecutionException.class, () -> match.invokeAny(List.of(own)));
+        assertTrue(own.isCancelled());
+        CompletionService<Integer> cs = new ExecutorCompletionService<>(match);
+        assertThrows(RejectedExecutionException.class, () -> cs.submit(ran::incrementAndGet));
+        t.close();
+        assertEquals(0, ran.get());
+        assertEquals(lines(
+                "search 0+16",
+                "  match 0+0 cancelled handoff~4",
+                "  match 4+0 cancelled handoff~4",
+                "  load 8+0 cancelled handoff~4",
+                "  match 12+0 cancelled handoff~4"), tree(t));
+        assertEquals("count=0 sum=0 mean=0 min=0 max=0 waitSum=12 waitMax=4", t.total(MATCH).toString());
+        assertEquals("count=0 sum=0 mean=0 min=0 max=0 waitSum=4 waitMax=4", t.total(LOAD).toString());
     }
 
     /** {@code Future.cancel} cancels the task first: a queued task's body never runs, traced or not. */

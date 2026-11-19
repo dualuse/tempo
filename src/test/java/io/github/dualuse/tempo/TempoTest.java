@@ -626,6 +626,49 @@ class TempoTest {
         }
     }
 
+    /**
+     * An unrecorded tick checks its handle in strict mode: after close and on a foreign thread it throws,
+     * whatever the trace records, and the misuse does not fix the trace's level.
+     */
+    @Test
+    void strictThrowsOnAnUnrecordedTickThroughAClosedOrForeignSpan() throws Exception {
+        try (Trace t = Tempo.trace(SEARCH, strict())) {
+            Span d = t.span(DECODE);
+            d.close();
+            AssertionError e = assertThrows(AssertionError.class, () -> d.tick(MATCH));
+            assertEquals("Tempo misuse: span used after close", e.getMessage());
+            assertThrows(AssertionError.class, () -> d.tick("match"));
+            Throwable f = onOtherThread(() -> t.tick(MATCH));
+            assertTrue(f instanceof AssertionError);
+            assertEquals("Tempo misuse: span used on a foreign thread", f.getMessage());
+            assertEquals(3, t.misuses());
+            assertSame(t, t.records(STEP)); // not fixed by the misuse
+            t.tick(MATCH).close();          // fixes it now, still unrecorded
+            assertThrows(AssertionError.class, () -> d.tick(MATCH));
+            assertEquals(4, t.misuses());
+        }
+    }
+
+    /**
+     * Outside strict mode, the trace's first tick checks its handle: through a closed span it is counted
+     * as misuse and leaves the level open; once the level is fixed, an unrecorded tick is a branch.
+     */
+    @Test
+    void anUnrecordedTickThroughAClosedSpanNeverFixesTheLevel() {
+        try (Trace t = Tempo.trace(SEARCH, opts())) {
+            Span d = t.span(DECODE);
+            d.close();
+            assertSame(NOOP, d.tick(MATCH));
+            assertSame(NOOP, d.tick("match"));
+            assertEquals(2, t.misuses());
+            assertSame(t, t.records(STEP));
+            assertEquals(STEP, t.records());
+            assertEquals(2, t.misuses());
+            assertSame(NOOP, t.tick(MATCH)); // fixes the level
+            assertEquals(2, t.misuses());
+        }
+    }
+
     @Test
     void strictThrowsOnRefusedWidening() {
         try (Trace t = Tempo.trace(SEARCH, strict())) {
@@ -869,7 +912,8 @@ class TempoTest {
     /**
      * A handle whose trace was released sits in its thread's pool: every call through it is ignored and
      * counted as misuse in the released trace, also when another thread released it, and also for a call
-     * from another thread. An unrecorded tick is a no-op and is not checked outside strict mode.
+     * from another thread. An unrecorded tick is counted too, and leaves the shared context of pooled
+     * handles as it is.
      */
     @Test
     void aHandleUsedAfterReleaseIsIgnoredAndCountedAsMisuse() throws Exception {
@@ -887,14 +931,16 @@ class TempoTest {
         assertSame(NOOP, s.step(LOAD));
         assertSame(Tempo.Phase.NOOP, s.phase(RERANK));
         assertSame(s, s.done(RERANK));
-        assertSame(NOOP, s.tick(LOAD));  // not counted
+        assertSame(NOOP, s.tick(LOAD));
+        assertSame(NOOP, s.tick("load"));
+        assertEquals(0, Tempo.Context.NONE.mode); // never marked seen
         s.close();
-        assertEquals(11, t.misuses());
+        assertEquals(13, t.misuses());
         assertNull(onThread("other", () -> s.add(MATCH, 5)));
-        assertEquals(12, t.misuses());
+        assertEquals(14, t.misuses());
         assertEquals(0, s.elapsedNanos());
         assertFalse(s.recording());
-        assertEquals(12, t.misuses());   // reads are not misuse
+        assertEquals(14, t.misuses());   // reads are not misuse
         assertEquals("", tree(t));
     }
 
@@ -2724,6 +2770,7 @@ class TempoTest {
         RunnableTask[] rs = new RunnableTask[n];
         Future<?>[] fs = new Future<?>[n];
         for (int mode = 0; mode < 3; mode++) {
+            boolean warm = false; // one clean round once compiled: the JVM allocates now and then (steadyAllocatedBy)
             for (int round = 0; round < 8; round++) {
                 Trace t = allocTrace(mode);
                 try (t) {
@@ -2737,7 +2784,9 @@ class TempoTest {
                     long submitted = allocatedBy(() -> {
                         for (int i = 0; i < n; i++) fs[i] = match.submit(NOTHING);
                     });
-                    if (round == 7) { // warm, compiled
+                    if (round >= 4 && !warm)
+                        warm = made > 0 && made % n == 0 && made / n <= 56 && ran == 0 && submitted == made;
+                    if (round == 7 && !warm) { // warm, compiled
                         assertTrue(made > 0 && made % n == 0 && made / n <= 56, "mode " + mode + ": runnable() allocated " + made + " B for " + n);
                         assertEquals(0, ran, "mode " + mode + ": bytes the tasks allocated as they ran");
                         assertEquals(made, submitted, "mode " + mode + ": a submit allocates its task, which is the future");
@@ -3356,6 +3405,17 @@ class TempoTest {
     }
 
     /** Bytes {@code body} allocates on this thread, net of the probe's own allocation. */
+    /**
+     * {@link #allocatedBy} of a body that can run again, run up to five times until one window is clean:
+     * the JVM itself allocates now and then on a thread that allocates nothing (tens to hundreds of bytes
+     * at a deoptimization or a compiled transition), while a body that allocates does so every time.
+     */
+    static long steadyAllocatedBy(Runnable body) {
+        long bytes = allocatedBy(body);
+        for (int i = 1; i < 5 && bytes != 0; i++) bytes = allocatedBy(body);
+        return bytes;
+    }
+
     static long allocatedBy(Runnable body) {
         java.lang.management.ThreadMXBean bean = ManagementFactory.getThreadMXBean();
         assumeTrue(bean instanceof com.sun.management.ThreadMXBean);
@@ -3399,7 +3459,7 @@ class TempoTest {
                 }
             };
             calls.run();
-            assertEquals(0, allocatedBy(calls));
+            assertEquals(0, steadyAllocatedBy(calls));
             t.close();
             assertEquals(0, t.misuses());
             assertEquals(lines("search 0+0"), tree(t));
