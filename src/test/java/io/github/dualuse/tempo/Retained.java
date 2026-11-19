@@ -12,8 +12,9 @@ import java.util.TreeMap;
 
 /**
  * Estimated bytes strongly reachable from a root through Tempo's own objects and arrays, with compressed
- * oops (12-byte headers, 4-byte references, 8-byte alignment). Threads, names and classes are shared and
- * not counted; a {@link Reference} counts as one small object whose referent is not followed; any other
+ * oops (12-byte headers, 4-byte references, 8-byte alignment). Threads, names, classes, the shared
+ * sentinels and, unless it is the root, a thread's slot (with its pool of handles) are shared and not
+ * counted; a {@link Reference} counts as one small object whose referent is not followed; any other
  * JDK object counts 16 bytes and is not followed.
  */
 final class Retained {
@@ -27,7 +28,8 @@ final class Retained {
         todo.push(root);
         while (!todo.isEmpty()) {
             Object o = todo.pop();
-            if (seen.put(o, Boolean.TRUE) != null || o instanceof Thread || o instanceof Tempo.Name || o instanceof Class) continue;
+            if (seen.put(o, Boolean.TRUE) != null || o instanceof Thread || o instanceof Tempo.Name || o instanceof Class
+                    || o == Tempo.Lane.POOLED || o == Tempo.Context.NONE || o instanceof Tempo.ThreadSlot && o != root) continue;
             Class<?> c = o.getClass();
             r.instances.merge(c.getSimpleName(), 1, Integer::sum);
             if (c.isArray()) {

@@ -57,8 +57,8 @@ public final class AttributesAndFailures {
         // strict(true) is for tests: misuse (opening a child on a span that already closed, a call on a
         // foreign thread, closing a span while a child is still open) throws AssertionError where Tempo
         // detects it, instead of being healed and counted. set, fail and cancel after close are allowed
-        // until the next span opens at the same depth (see thumbnails below), and are not misuse. In
-        // production leave it off.
+        // until the trace is released (see thumbnails below), and are not misuse. In production leave
+        // it off.
         Tempo.Trace t = Tempo.trace(UPLOAD, new Tempo.Options().strict(true));
         try (t) {
             upload(t);
@@ -137,7 +137,7 @@ public final class AttributesAndFailures {
 
         // Optional work under a time budget. try-with-resources closes the span before the catch block
         // runs; set, fail and cancel still apply to it there (the handle stays this span's until the
-        // next span opens at the same depth). cancel(), not fail(): nothing broke, the work was given up.
+        // trace is released). cancel(), not fail(): nothing broke, the work was given up.
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(4);
         int made = 0;
         Tempo.Span thumbs = root.span(THUMBNAILS);

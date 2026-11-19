@@ -52,11 +52,12 @@ import java.util.zip.Deflater;
  * ticks, and costs about a branch otherwise. Outside a trace a span or step is timed only when its name
  * has a global listener ({@link #on}); otherwise it is a no-op.
  *
- * <p>A {@link Span} is a handle that only its lane's owner thread may use. The handle object is reused
- * for the next span opened at the same depth on that thread, so a handle is its span only until then:
- * keep it inside its block ({@code set}, {@code fail} and {@code cancel} after close, as in a catch
- * block right after, are fine).
- * Work for another thread goes through a {@link Handoff}: {@code s.handoff(n)} where the task is
+ * <p>A {@link Span} is a handle that only its lane's owner thread may use. Each recorded span has a
+ * handle of its own for the whole trace, so {@code set}, {@code fail} and {@code cancel} after close, as
+ * in a catch block right after, reach that span. Once the trace is released, the thread reuses the
+ * handle for a span of a later trace; a use of it before then is ignored and counted as misuse ({@link
+ * Options#strict} throws, and never reuses a handle). Spans folded past the budget share one handle per
+ * depth. Work for another thread goes through a {@link Handoff}: {@code s.handoff(n)} where the task is
  * submitted, {@code h.begin()} (or {@code h.runnable(r)}) where it runs, which records its queue wait.
  * Build with {@code -Xlint} and a span opened by try-with-resources but not used in its block warns;
  * {@code @SuppressWarnings("try")} silences it, or {@link #run} and {@link #call} are the compact form.
@@ -969,14 +970,60 @@ public final class Tempo {
      * most one idle lane per thread however many traces interleave. The references are weak: a lane
      * reaches its trace's registry, so a strong one would keep an unreleased trace with all its lanes
      * alive for as long as the thread idles. The registry keeps the lanes of a live trace.
+     *
+     * <p>The slot also pools the handles of the thread's recorded spans. A lane takes one per span and
+     * gives them all back when it retires, that is when its trace is released, so a thread holds as many
+     * handles as its largest traces needed at once. Pooled handles reach no lane and no trace.
      */
     static final class ThreadSlot {
+        private static final VarHandle RETURNED;
+
+        static {
+            try {
+                RETURNED = MethodHandles.lookup().findVarHandle(ThreadSlot.class, "returned", Span.class);
+            } catch (ReflectiveOperationException e) {
+                throw new ExceptionInInitializerError(e);
+            }
+        }
+
         Lane current;
         Lane free; // the spans timed outside a trace for global listeners; created on first use
         StringBuilder text; // the header encoder's, reused while it stays small (Header.KEEP)
         @SuppressWarnings("unchecked")
         final WeakReference<Lane>[] lanes = new WeakReference[4];
         private int victim;
+        // Pooled handles, linked by Span.link: spare is the owner's own list; returned is a stack that a
+        // retiring lane pushes its handles onto from any thread, and that the owner takes whole.
+        private Span spare;
+        @SuppressWarnings("unused") private volatile Span returned;
+
+        /** Owner only: a pooled handle, or null if there is none. */
+        Span take() {
+            Span h = spare;
+            if (h == null) {
+                if (RETURNED.getAcquire(this) == null) return null;
+                h = (Span) RETURNED.getAndSet(this, null);
+            }
+            spare = h.link;
+            return h;
+        }
+
+        /** Any thread: pools the handles from {@code head} to {@code tail}, linked by {@link Span#link}. */
+        void give(Span head, Span tail) {
+            Span top;
+            do {
+                top = (Span) RETURNED.getVolatile(this);
+                tail.link = top;
+            } while (!RETURNED.compareAndSet(this, top, head));
+        }
+
+        /** Handles pooled; for tests, while no thread uses the slot. */
+        int pooled() {
+            int n = 0;
+            for (Span h = spare; h != null; h = h.link) n++;
+            for (Span h = returned; h != null; h = h.link) n++;
+            return n;
+        }
 
         /**
          * A span or step of {@code n} opened outside a trace: timed for the name's global listeners if it has
@@ -1131,6 +1178,13 @@ public final class Tempo {
             }
         }
 
+        /** The lane of a pooled handle: retired from the start, so every use of such a handle is stale. */
+        static final Lane POOLED = new Lane(Context.NONE, null);
+
+        static {
+            POOLED.state = RETIRED;
+        }
+
         final Context ctx;
         final Thread owner;
         final ThreadSlot slot;
@@ -1143,12 +1197,15 @@ public final class Tempo {
         final Rows[] rows = new Rows[CHUNKS];
         Events[] events;
 
-        // Open stack: rowAt[d] is the open row at depth d < depth; handles[d] is the reusable handle for depth d,
-        // or while a nested trace is open there (and until the next span opens there) that Trace.
-        // A folded or undrawn span is a frame without a row: its handle's row is FRAME and rowAt holds the
-        // row of the nearest recorded span below it, which is the parent of anything opened above it.
+        // Open stack: rowAt[d] is the open row at depth d < depth, handles[d] its handle. A recorded span has
+        // a handle of its own, taken from the slot's pool (issued, linked by Span.link, newest first, until
+        // the lane retires); a trace's root and a nested trace have their Trace. A folded or undrawn span is
+        // a frame without a row: its handle is the one of its depth in frames, its row is FRAME, and rowAt
+        // holds the row of the nearest recorded span below it, which is the parent of anything opened above.
         final int[] rowAt = new int[MAX_DEPTH];
         final Span[] handles = new Span[MAX_DEPTH];
+        private Span[] frames; // created with the first frame
+        private Span issued, issuedTail;
         int depth, rowCount, eventCount, dropped;
         int credit, folded; // step and tick budget held by this lane; those folded for want of it
 
@@ -1547,13 +1604,14 @@ public final class Tempo {
 
         /**
          * Pushes frame {@code n} into aggregate {@code agg} (-1: none) with handle {@code t}, or the depth's
-         * own if null; it started at {@code now}, after a queue wait of {@code wait}.
+         * frame handle if null; it started at {@code now}, after a queue wait of {@code wait}.
          */
         private Span openFrame(Name n, int agg, long wait, long now, Trace t) {
             int d = depth;
             rowAt[d] = d == 0 ? -1 : rowAt[d - 1]; // -1: a folded task's root, no row below
             depth = d + 1;
-            Span h = handle(d, t);
+            Span h = t != null ? t : frameHandle(d);
+            handles[d] = h;
             h.row = FRAME;
             h.frame = n;
             h.agg = agg;
@@ -1651,24 +1709,33 @@ public final class Tempo {
                 lapOrdinal[d] = 0;
                 lapFrom[d] = aggregates();
             }
-            Span h = handle(d, t);
+            Span h = t != null ? t : issue(d);
+            handles[d] = h;
             h.row = r;
             return h;
         }
 
         /**
-         * The handle for a span opening at depth {@code d}: {@code t}, a nested trace, which takes the depth's
-         * place until the next span opens there; else the depth's own, given back by a nested trace.
+         * A handle of its own for a recorded span opening at depth {@code d}: a pooled one of this thread, or
+         * new. Strict mode never reuses a handle, so a stale one always stays stale.
          */
-        private Span handle(int d, Trace t) {
-            Span h = handles[d];
-            if (t != null) {
-                t.displaced = h instanceof Trace ? ((Trace) h).displaced : h;
-                handles[d] = t;
-                return t;
-            }
-            if (h instanceof Trace) h = handles[d] = ((Trace) h).displaced;
-            if (h == null) handles[d] = h = new Span(this, ctx, d);
+        private Span issue(int d) {
+            if (ctx.strict) return new Span(this, ctx, d);
+            Span h = slot.take();
+            if (h == null) h = new Span(this, ctx, d);
+            else h.bind(this, d);
+            if (issued == null) issuedTail = h;
+            h.link = issued;
+            issued = h;
+            return h;
+        }
+
+        /** The handle the folded and undrawn spans at depth {@code d} share; the free lane's are its own. */
+        private Span frameHandle(int d) {
+            Span[] f = frames;
+            if (f == null) frames = f = new Span[MAX_DEPTH];
+            Span h = f[d];
+            if (h == null) f[d] = h = free ? new Span(this, ctx, d) : issue(d);
             return h;
         }
 
@@ -1925,18 +1992,22 @@ public final class Tempo {
             idle();
         }
 
-        void flag(int r, int bits) {
-            if (!enter()) return;
+        /** Flags row {@code r}, also after the lane went idle; false once the lane is retired. */
+        boolean flag(int r, int bits) {
+            if (!enter()) return false;
             rows[r >>> CHUNK_BITS].flags[r & MASK] |= bits;
             publish();
             leave();
+            return true;
         }
 
-        void event(int r, int key, long value) {
-            if (!enter()) return;
+        /** Attaches an event to row {@code r}, also after the lane went idle; false once the lane is retired. */
+        boolean event(int r, int key, long value) {
+            if (!enter()) return false;
             append(r, key, value);
             publish();
             leave();
+            return true;
         }
 
         /** Writes an event without publishing it; at the event cap counts a drop. */
@@ -1986,11 +2057,21 @@ public final class Tempo {
         /**
          * IDLE -> RETIRED, once, by whichever of the owner and release() gets there; then the chunks go back
          * to the pool. A table entry is cleared before its chunk is given away, and a reader that still
-         * picked one up discards what it read, because it finds the trace released (see Snapshot).
+         * picked one up discards what it read, because it finds the trace released (see Snapshot). The
+         * handles go back to the owner's slot, each detached first (see Span#detach), so a use of one
+         * is stale from now until the owner issues it again.
          */
         private void retire() {
             int s = state;
             if ((s & KIND) != IDLE || !STATE.compareAndSet(this, s, s | RETIRED)) return;
+            Arrays.fill(handles, null);
+            frames = null;
+            Span h = issued;
+            if (h != null) {
+                for (Span x = h; x != null; x = x.link) x.detach();
+                slot.give(h, issuedTail);
+                issued = issuedTail = null;
+            }
             for (int i = 0; i < CHUNKS && rows[i] != null; i++) {
                 Rows c = rows[i];
                 rows[i] = null;
@@ -4069,7 +4150,6 @@ public final class Tempo {
         static final Trace NOOP_TRACE = new Trace(null, Context.NONE, 0, false);
 
         private final boolean nested; // joined an outer trace: renders its subtree, releases nothing
-        Span displaced;               // nested: the handle of its depth, given back to the next span there
         Consumer<String> printer;     // printOnClose; written and read by the owner thread
 
         Trace(Lane lane, Context ctx, int depth, boolean nested) {
@@ -4381,24 +4461,47 @@ public final class Tempo {
     // ---------------------------------------------------------------------------------------------
 
     /**
-     * Same-thread handle to a span. A thread reuses one handle object per depth, so a handle is its span
-     * only until the next span opens at the same depth on that thread; from then on it is that span, and
-     * every call through it acts on the new one, undetected, even under {@link Options#strict}. Keep a
-     * handle inside the block that opened it. Until the next span opens there, {@link #set}, {@link #fail},
-     * {@link #cancel} and {@link #waiting} work after close too, as in the catch block right after, on a
-     * span with a row: a folded or undrawn one ({@link #step}) keeps no attributes, and flags only while it
-     * is open. The other calls after close, and every call on a foreign thread, are ignored and counted as
-     * misuse, and methods that open spans then return {@link #NOOP}.
+     * Same-thread handle to a span. A recorded span has a handle of its own for the whole trace: {@link
+     * #set}, {@link #fail}, {@link #cancel} and {@link #waiting} work after close too, as in the catch block
+     * right after, until the trace is released. A span folded past the budget or an undrawn {@link #step}
+     * shares one handle with the others at its depth on that thread: it keeps no attributes, and flags only
+     * while it is open. The other calls after close, and every call on a foreign thread, are ignored and
+     * counted as misuse, and methods that open spans then return {@link #NOOP}.
+     *
+     * <p>Once its trace is released, the thread pools the handle and later issues it to a span of another
+     * trace. A call through it while it sits in the pool is stale: ignored and counted as misuse in the
+     * released trace. A call after the handle was issued again acts on the new span, undetected; so keep a
+     * handle inside the block that opened it. {@link Options#strict} never pools a handle, so there every
+     * stale call throws.
      *
      * <p>A span opens children only as the innermost open span of its thread (an open phase of it aside):
      * opening one under a span with others open above it closes those first, flagged healed, and counts
      * as misuse (strict mode throws).
      */
     public static class Span implements AutoCloseable {
-        final Lane lane;
-        final Context ctx;
-        final Thread owner;
-        final int depth;
+        private static final VarHandle STAMP;
+
+        static {
+            try {
+                STAMP = MethodHandles.lookup().findVarHandle(Span.class, "stamp", long.class);
+            } catch (ReflectiveOperationException e) {
+                throw new ExceptionInInitializerError(e);
+            }
+        }
+
+        static final String STALE = "span used after its trace was released";
+
+        // The binding, written by the owner when it issues the handle (bind) and by a retiring lane when the
+        // handle goes back to the pool (detach). The stamp is the id of the trace the handle is issued in, 0
+        // while it is pooled; it is written last on bind and first on detach, so a reader on another thread
+        // that reads the same stamp before and after the binding read it whole.
+        Lane lane;
+        Context ctx;
+        Thread owner;
+        AtomicInteger misuses; // of the trace it was last issued in; kept while pooled, for stale uses
+        int depth;
+        @SuppressWarnings("unused") private long stamp; // via STAMP
+        Span link; // the next handle in its lane's issued list, or in its slot's pool
         int row;    // Lane.FRAME for a span without a row (folded, undrawn, or outside a trace), which has the next seven
         Name frame;
         int agg;    // its entry in the lane's aggregates, or -1
@@ -4412,7 +4515,48 @@ public final class Tempo {
             this.lane = lane;
             this.ctx = ctx;
             this.owner = lane == null ? null : lane.owner;
+            this.misuses = ctx.misuses;
             this.depth = depth;
+            this.stamp = ctx.id;
+        }
+
+        /** Owner thread: issues this pooled handle to a span at depth {@code d} of {@code l}. */
+        void bind(Lane l, int d) {
+            Context c = l.ctx;
+            lane = l;
+            ctx = c;
+            owner = l.owner;
+            misuses = c.misuses;
+            depth = d;
+            folded = hidden = false;
+            STAMP.setRelease(this, c.id);
+        }
+
+        /**
+         * The lane retiring: takes the handle off its trace before it is pooled, so the pool keeps no lane
+         * or trace alive and every use from now until the next {@link #bind} is stale. Any thread.
+         */
+        void detach() {
+            STAMP.setOpaque(this, 0L);
+            VarHandle.storeStoreFence();
+            lane = Lane.POOLED;
+            ctx = Context.NONE;
+        }
+
+        /** Whether the trace of this handle is released and its lane retired, or the handle is pooled. Not {@link #NOOP}. */
+        boolean stale() {
+            return lane.retired() || stamp() != ctx.id;
+        }
+
+        /** The id of the trace the handle is issued in; 0 while it is pooled. */
+        long stamp() {
+            return (long) STAMP.getAcquire(this);
+        }
+
+        /** Counts a misuse of this handle in its trace, or in the trace it was last issued in; strict mode throws. */
+        void misuse(String what) {
+            misuses.incrementAndGet();
+            if (ctx.strict) throw new AssertionError("Tempo misuse: " + what);
         }
 
         /**
@@ -4460,7 +4604,10 @@ public final class Tempo {
          */
         public Span tick(Name name) {
             if (ctx.level < TICK) {
-                if (lane != null && !lane.free) ctx.sawStep();
+                if (lane != null && !lane.free) {
+                    ctx.sawStep();
+                    if (ctx.strict && stale()) misuse(STALE);
+                }
                 return NOOP;
             }
             Lane l = top();
@@ -4656,11 +4803,11 @@ public final class Tempo {
 
         /**
          * Attaches a number to this span. Also after it closed (e.g. in the catch block right after), until
-         * the next span opens at the same depth on this thread: from then on the handle is that span.
-         * Ignored on a folded or undrawn span, which has no row to keep it ({@link #step}).
+         * its trace is released. Ignored on a folded or undrawn span, which has no row to keep it ({@link
+         * #step}).
          */
         public Span set(Name key, long value) {
-            if (owned() && row != Lane.FRAME) lane.event(row, key(key) << KIND_BITS | ATTR_LONG, value);
+            if (owned() && row != Lane.FRAME && !lane.event(row, key(key) << KIND_BITS | ATTR_LONG, value)) misuse(STALE);
             return this;
         }
 
@@ -4670,7 +4817,8 @@ public final class Tempo {
         }
 
         public Span set(Name key, double value) {
-            if (owned() && row != Lane.FRAME) lane.event(row, key(key) << KIND_BITS | ATTR_DOUBLE, Double.doubleToRawLongBits(value));
+            if (owned() && row != Lane.FRAME
+                    && !lane.event(row, key(key) << KIND_BITS | ATTR_DOUBLE, Double.doubleToRawLongBits(value))) misuse(STALE);
             return this;
         }
 
@@ -4687,14 +4835,27 @@ public final class Tempo {
          * Adds one occurrence of {@code name} lasting {@code nanos}, measured elsewhere, to the trace's
          * totals ({@link Trace#total}) and calls the name's listeners on the calling thread. No span is
          * drawn. Any thread, also after close; allocation-free once the trace has seen the name. Outside a
-         * trace it only calls the global listeners. Ignored after release.
+         * trace it only calls the global listeners. Ignored after release, and counted as misuse once the
+         * handle's lane has retired too.
          */
         public Span add(Name name, long nanos) {
-            if (lane == null || ctx.released) return this;
+            // Any thread, so it reads the binding between two reads of the stamp (see bind and detach).
+            long s = (long) STAMP.getAcquire(this);
+            Lane l = lane;
+            Context c = ctx;
+            AtomicInteger m = misuses;
+            VarHandle.loadLoadFence();
+            if (l == null) return this;
+            if (s != (long) STAMP.getOpaque(this) || s != c.id || l.retired()) {
+                m.incrementAndGet(); // pooled handles are never strict
+                if (c.strict) throw new AssertionError("Tempo misuse: " + STALE);
+                return this;
+            }
+            if (c.released) return this; // a task still running after release
             long v = Math.max(0, nanos);
-            if (!lane.free) ctx.totals().add(ctx.key(name), false, v);
-            Throwable t = name != null && ctx.listening ? ctx.notify(name, v) : null;
-            if (t != null && ctx.strict) throw Context.listenerThrew(t);
+            if (!l.free) c.totals().add(c.key(name), false, v);
+            Throwable t = name != null && c.listening ? c.notify(name, v) : null;
+            if (t != null && c.strict) throw Context.listenerThrew(t);
             return this;
         }
 
@@ -4723,8 +4884,8 @@ public final class Tempo {
         }
 
         /**
-         * Marks the span failed. Also after close, until the next span opens at this depth, like {@link
-         * #set(Name, long)}; on a folded or undrawn span ({@link #step}) only while it is open.
+         * Marks the span failed. Also after close, until the trace is released, like {@link #set(Name,
+         * long)}; on a folded or undrawn span ({@link #step}) only while it is open.
          */
         public Span fail() {
             return flag(FAILED);
@@ -4747,19 +4908,31 @@ public final class Tempo {
 
         private Span flag(int bits) {
             if (!owned()) return this;
-            if (row != Lane.FRAME) lane.flag(row, bits);
-            else if (depth < lane.depth) flags |= bits; // an open frame: its aggregate shows what all occurrences had
+            Lane l = lane;
+            if (row != Lane.FRAME) {
+                if (!l.flag(row, bits)) misuse(STALE);
+            } else if (depth < l.depth && l.handles[depth] == this) {
+                flags |= bits; // an open frame: its aggregate shows what all occurrences had
+            }
             return this;
         }
 
-        /** Running time while open, the duration once closed; 0 on {@link #NOOP} and after release. */
+        /**
+         * Running time while open, the duration once closed; 0 on {@link #NOOP} and after release. Any
+         * thread, best effort off the owner.
+         */
         public long elapsedNanos() {
-            return lane == null ? 0 : row == Lane.FRAME ? lane.frameElapsed(this) : lane.elapsed(row);
+            long s = (long) STAMP.getAcquire(this);
+            Lane l = lane;
+            int r = row;
+            if (l == null || s != l.ctx.id) return 0; // pooled, or issued again while this read
+            return r == Lane.FRAME ? l.frameElapsed(this) : l.elapsed(r);
         }
 
-        /** Whether this span records into a trace: not {@link #NOOP}, and not a span timed outside a trace. */
+        /** Whether this span records into a trace: not {@link #NOOP}, not a span timed outside a trace, not pooled. */
         public boolean recording() {
-            return lane != null && !lane.free;
+            Lane l = lane;
+            return l != null && !l.free && l != Lane.POOLED;
         }
 
         /**
@@ -4782,14 +4955,19 @@ public final class Tempo {
         private boolean live() {
             Lane l = lane;
             if (Thread.currentThread() == owner && depth < l.depth && l.handles[depth] == this) return true;
-            if (l != null) ctx.misuse(Thread.currentThread() == owner ? "span used after close" : "span used on a foreign thread");
+            if (l != null) misuse(Thread.currentThread() != owner ? "span used on a foreign thread" : stale() ? STALE : "span used after close");
             return false;
         }
 
-        /** Owner thread; the span may be closed. */
+        /** Owner thread, and open or closed in a trace not released; else counts the misuse. */
         private boolean owned() {
-            if (Thread.currentThread() == owner) return true;
-            if (lane != null) ctx.misuse("span used on a foreign thread");
+            Lane l = lane;
+            if (Thread.currentThread() != owner) {
+                if (l != null) misuse("span used on a foreign thread");
+                return false;
+            }
+            if (depth < l.depth && l.handles[depth] == this || !stale()) return true;
+            misuse(STALE);
             return false;
         }
     }

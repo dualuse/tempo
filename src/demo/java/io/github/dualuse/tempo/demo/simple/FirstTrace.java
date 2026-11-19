@@ -71,8 +71,8 @@ public final class FirstTrace {
             return query.substring(query.indexOf('=') + 1);
         });
 
-        // try-with-resources for a block. The handle belongs to this thread and is reused for the next span
-        // at this depth, so use it inside the block (set and fail also work right after it closes).
+        // try-with-resources for a block. The handle belongs to this thread and is reused once the trace is
+        // released, so use it inside the block (set and fail also work right after it closes).
         String greeting;
         try (Tempo.Span s = root.span(LOOKUP)) {
             Demo.cpu(100);

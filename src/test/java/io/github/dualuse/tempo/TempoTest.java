@@ -801,28 +801,182 @@ class TempoTest {
         assertEquals(0, t.misuses());
         assertEquals(lines("search 0+0 failed score=1.5", "  decode 0+0 failed bytes=7"), tree(t));
         t.release();
-        t.fail(); // after release: ignored
+        t.fail(); // after release: ignored, and counted as misuse
+        assertEquals(1, t.misuses());
         assertEquals("", tree(t));
     }
 
-    /**
-     * Pins current behaviour, documented in the Span Javadoc, not a guarantee: a thread reuses one handle
-     * per depth, so once the next span opens at that depth the old variable is the new span, and a late
-     * call through it lands there, undetected even under strict. A redesign of the handles changes this.
-     */
+    // ---- handles ------------------------------------------------------------------------------------
+
+    /** Every recorded span has a handle of its own, so a late call through it reaches that span. */
     @Test
-    void pinsCurrentBehaviourAHandleIsTheNextSpanOpenedAtItsDepth() {
+    void eachRecordedSpanKeepsItsHandleForTheWholeTrace() {
         Trace t = Tempo.trace(SEARCH, strict());
         Span d = t.span(DECODE);
         d.close();
-        d.set(BYTES, 7);                 // still decode: right after close is fine
-        Span l = t.span(LOAD);    // the next span at the same depth on this thread
-        assertSame(d, l);                // ...is the same handle
-        d.fail().set(SCORE, 0.5);        // so these land on load
+        Span l = t.span(LOAD);           // the next span at the same depth
+        assertNotSame(d, l);
+        Span m = l.span(MATCH);
+        m.close();
         l.close();
+        d.fail().set(BYTES, 7);          // all after close, all on the span they name
+        m.set(SCORE, 0.5);
+        l.cancel();
         t.close();
-        assertEquals(lines("search 0+0", "  decode 0+0 bytes=7", "  load 0+0 failed score=0.5"), tree(t));
+        assertEquals(lines("search 0+0", "  decode 0+0 failed bytes=7", "  load 0+0 cancelled", "    match 0+0 score=0.5"), tree(t));
         assertEquals(0, t.misuses());
+    }
+
+    /**
+     * A handle whose trace was released sits in its thread's pool: every call through it is ignored and
+     * counted as misuse in the released trace, also when another thread released it, and also for a call
+     * from another thread. An unrecorded tick is a no-op and is not checked outside strict mode.
+     */
+    @Test
+    void aHandleUsedAfterReleaseIsIgnoredAndCountedAsMisuse() throws Exception {
+        Trace t = Tempo.trace(SEARCH, opts());
+        Span s = t.span(DECODE);
+        clock.add(3);
+        s.close();
+        t.close();
+        assertNull(onThread("releaser", t::release));
+        assertSame(Tempo.Lane.POOLED, s.lane);
+        assertEquals(0, t.misuses());
+
+        s.set(BYTES, 1).set(SCORE, 0.5).fail().cancel().waiting().add(MATCH, 5);
+        assertSame(NOOP, s.span(LOAD));
+        assertSame(NOOP, s.step(LOAD));
+        assertSame(s, s.phase(RERANK).done(RERANK));
+        assertSame(NOOP, s.tick(LOAD));  // not counted
+        s.close();
+        assertEquals(11, t.misuses());
+        assertNull(onThread("other", () -> s.add(MATCH, 5)));
+        assertEquals(12, t.misuses());
+        assertEquals(0, s.elapsedNanos());
+        assertFalse(s.recording());
+        assertEquals(12, t.misuses());   // reads are not misuse
+        assertEquals("", tree(t));
+    }
+
+    /** Strict mode never pools a handle: a stale call throws, even after the thread has started more traces. */
+    @Test
+    void strictModeNeverReusesAHandleAndThrowsOnEveryStaleCall() throws Exception {
+        assertNull(onThread("strict", () -> {
+            Trace t = Tempo.trace(SEARCH, strict());
+            Span a = t.span(DECODE), b = a.span(LOAD);
+            b.close();
+            a.close();
+            t.close();
+            t.release();
+            assertEquals(0, Tempo.SLOT.get().pooled());
+            Trace u = Tempo.trace(RERANK, strict());
+            Span x = u.span(DECODE), y = x.span(LOAD);
+            assertNotSame(a, x);
+            assertNotSame(b, y);
+            assertNotSame(a, y);
+            assertNotSame(b, x);
+            y.close();
+            x.close();
+            u.close();
+            for (Runnable stale : new Runnable[] {
+                    () -> a.set(BYTES, 1), () -> a.set(SCORE, 0.5), b::fail, b::cancel, b::waiting,
+                    () -> a.add(MATCH, 1), () -> a.span(LOAD), () -> a.step(LOAD), () -> a.tick(LOAD),
+                    () -> a.phase(RERANK), () -> a.done(RERANK), a::close}) {
+                AssertionError e = assertThrows(AssertionError.class, stale::run);
+                assertTrue(e.getMessage().contains("released"), e.getMessage());
+            }
+            assertEquals(12, t.misuses());
+            assertEquals(0, u.misuses());
+            assertEquals(lines("rerank 0+0", "  decode 0+0", "    load 0+0"), tree(u));
+            u.release();
+        }));
+    }
+
+    /**
+     * Released, a trace gives its handles back to the thread, which issues them to the spans of its next
+     * trace: no new handle once warm. From then on the old variable is the new span, undetected; this is
+     * why strict mode never pools.
+     */
+    @Test
+    void aReleasedTraceHandsItsHandlesToTheThreadsNextTrace() throws Exception {
+        assertNull(onThread("pool", () -> {
+            Trace t = Tempo.trace(SEARCH, opts());
+            Span a = t.span(DECODE), b = a.span(LOAD);
+            b.close();
+            a.close();
+            t.close();
+            assertEquals(0, Tempo.SLOT.get().pooled());
+            t.release();
+            assertEquals(2, Tempo.SLOT.get().pooled());
+            a.set(BYTES, 1);             // stale while pooled: ignored, counted
+            assertEquals(1, t.misuses());
+
+            Trace u = Tempo.trace(RERANK, opts());
+            Span x = u.span(MATCH), y = x.span(JOIN);
+            assertEquals(0, Tempo.SLOT.get().pooled());
+            assertTrue(x == a && y == b || x == b && y == a, "the released trace's handles, issued again");
+            Span z = y.span(DECODE);     // the pool is empty: a new handle
+            assertTrue(z != a && z != b);
+            b.set(BYTES, 2);             // b is a span of u now: the call lands there, undetected
+            z.close();
+            y.close();
+            x.close();
+            u.close();
+            String bName = b == x ? "match" : "join";
+            String tree = tree(u);
+            assertTrue(tree.contains(bName + " 0+0 bytes=2"), tree);
+            assertEquals(0, u.misuses());
+            assertEquals(1, t.misuses());
+            u.release();
+            assertEquals(3, Tempo.SLOT.get().pooled());
+        }));
+    }
+
+    /**
+     * Folded and undrawn spans write no row and share one handle per depth: the next one at that depth
+     * has the same handle, while a recorded span has its own. Released, the shared ones are pooled too.
+     */
+    @Test
+    void foldedAndUndrawnSpansShareOneHandlePerDepth() throws Exception {
+        assertNull(onThread("frames", () -> {
+            Trace t = Tempo.trace(SEARCH, opts().budget(0)).records(STEP);
+            Span f = t.step(LOAD);
+            Span g = f.step(MATCH);      // depth 2: a handle of its own depth
+            assertNotSame(f, g);
+            g.close();
+            f.close();
+            Span h = t.step(DECODE);     // depth 1 again: the same handle
+            assertSame(f, h);
+            assertSame(g, h.step(JOIN));
+            Tempo.current().close();
+            h.close();
+            Span r = t.span(RERANK);     // recorded: its own handle
+            assertNotSame(f, r);
+            r.close();
+            t.close();
+            assertEquals(lines(
+                    "search 0+0",
+                    "  rerank 0+0",
+                    "  load 0+0 agg*1 min=0 max=0 maxAt=0 extent=0",
+                    "    match 0+0 agg*1 min=0 max=0 maxAt=0 extent=0",
+                    "  decode 0+0 agg*1 min=0 max=0 maxAt=0 extent=0",
+                    "    join 0+0 agg*1 min=0 max=0 maxAt=0 extent=0"), tree(t));
+
+            Trace u = Tempo.trace(SEARCH, opts());   // records spans only: steps are undrawn frames
+            Span v = u.step(LOAD);
+            v.close();
+            assertSame(v, u.step(DECODE));
+            Tempo.current().close();
+            u.close();
+            assertEquals(1, u.total(LOAD).count());
+            assertEquals(1, u.total(DECODE).count());
+
+            t.release();
+            assertEquals(3, Tempo.SLOT.get().pooled()); // f, g and r
+            f.fail();                    // stale: counted
+            assertEquals(1, t.misuses());
+            u.release();
+        }));
     }
 
     /**
@@ -1266,9 +1420,9 @@ class TempoTest {
     @Test
     void phasesAndLapsAllocateNothingOnceWarm() {
         int rounds = 2_000; // four rows per round
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 3; i++) { // as large as the trace measured: the thread pools as many handles
             Trace warm = Tempo.trace(SEARCH, opts());
-            laps(warm, rounds);
+            laps(warm, rounds + 1);
             warm.close();
             warm.release();
         }
@@ -2824,15 +2978,15 @@ class TempoTest {
     @Test
     void recordedSpansAllocateNothingOnceWarm() {
         int spans = 8_000;
-        for (int round = 0; round < 3; round++) { // fills the chunk pool and loads every class on the path
+        for (int round = 0; round < 3; round++) { // fills the chunk and handle pools, loads every class on the path
             Trace warm = Tempo.trace(SEARCH, opts().budget(Integer.MAX_VALUE)).records(STEP);
-            record(warm, spans);
+            record(warm, spans + 1);
             warm.close();
             warm.release();
         }
 
         Trace t = Tempo.trace(SEARCH, opts().budget(Integer.MAX_VALUE)).records(STEP);
-        record(t, 1); // creates the depth-1 handle and the event table
+        record(t, 1); // creates the event table
         assertEquals(0, allocatedBy(() -> record(t, spans)), "bytes allocated by " + spans + " spans");
         t.close();
         t.release();

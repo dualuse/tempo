@@ -22,6 +22,11 @@ import java.util.TreeMap;
  * the setup is reported, and {@code traceLifecycle} is held to a ceiling of its own. A handoff allocates
  * exactly one small object, so the handoff benchmarks are gated at its size instead of zero.
  *
+ * <p>A recorded span takes a handle from its thread's pool, which a released trace refills. So 0 B per
+ * recorded span in steady state is the gate of {@code span}, {@code spanStatic}, {@code spanNotInlined},
+ * {@code phase} and {@code handoffInline}: a handle allocated per span, in one trace or in every trace,
+ * grows with the cycle and shows in {@code perOp}.
+ *
  * <p>Rendering the 300-span trace of {@code Rendered} is held to ceilings: the encoder alone
  * ({@code snapshotToHeader}) to its one output String (3,440 characters, 3.5 KB) plus about 2 KB of
  * per-render tables and walk state, measured 5.2 KB; {@code toHeader} adds the copy of the trace that
