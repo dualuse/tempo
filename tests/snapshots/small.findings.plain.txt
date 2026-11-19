@@ -1,4 +1,4 @@
-Findings  ·  GET /search  ·  48.675 ms  ·  2026-11-13 09:00:55.433 UTC  ·  26 spans on 9 threads
-  queue-wait  rerank/load on io-1: waited 2.013 ms before a 1.329 ms run (1.5× the run)
-  queue-wait  rerank/load on io-4: waited 0.988 ms before a 6.727 ms run (0.1× the run)
+Findings  ·  GET /search  ·  48.675 ms  ·  2026-11-13 09:00:55.433 UTC  ·  20 spans and 6 phases on 9 threads
+  queue-wait  load on io-1: waited 2.013 ms before a 1.329 ms run (1.5× the run)
+  queue-wait  load on io-4: waited 0.988 ms before a 6.727 ms run (0.1× the run)
   queue-wait  by pool: io 3.001 ms over 8 (max 2.013)

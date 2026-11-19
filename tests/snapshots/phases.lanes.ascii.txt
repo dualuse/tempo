@@ -1,0 +1,15 @@
+PUT /batch  -  3.000 ms  -  2026-11-13 11:04:50.200 UTC  -  5 spans and 10 phases on 2 threads
+                        ms 0           0.5         1           1.5         2           2.5
+                           +-----------+-----------+-----------+-----------+-----------+------------
+http
+  http-3        PUT /batch |.|-- parse ---|---------- store -----------|------ verify -------|..|-||
+                               |----- read -----|                        |*1| copy -|  replay |
+pool
+  pool-1                                    flush _|- compress -|-------- write ---------|
+  queued <=1                                      @=
+
+*1 open
+
+|-| span  | phase boundary  .. unphased time  *1 phase named below  _ queue wait  |~| blocking wait
+% aggregate xcount, # slowest  X failed  / cancelled  > open  0 never started  * live lane
+= this request's queued handoffs

@@ -1,0 +1,6 @@
+Findings  ·  PUT /batch  ·  3.000 ms  ·  2026-11-13 11:04:50.200 UTC
+5 spans and 10 phases on 2 threads
+  failed      (open|copy):copy on http-3: failed after 0.400 ms
+  misuse      :check on http-3: misuse detected and healed by the recorder
+  queue-wait  flush on pool-1: waited 0.050 ms before a 1.600 ms run (0.0× the run)
+  queue-wait  by pool: pool 0.050 ms over 1 (max 0.050)

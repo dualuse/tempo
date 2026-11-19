@@ -1,0 +1,17 @@
+PUT /batch  ·  3.000 ms  ·  2026-11-13 11:04:50.200 UTC  ·  5 spans and 10 phases on 2 threads
+span                  start   wait    dur   self  cpu  off-cpu  thread  flags  attributes
+PUT /batch            0.000         3.000  1.710                http-3
+├─ :parse             0.100         0.500                               p      rows=1200
+├─ read               0.150         0.750  0.750                http-3
+├─ :store             0.600         1.200                               p
+├─ flush              0.950  0.050  1.600  1.600                pool-1
+│  ├─ :compress       1.000         0.500                               p
+│  └─ :write          1.500         1.100                               p
+├─ :verify            1.800         0.900                               p
+├─ (open|copy)        1.900         0.500  0.500                http-3
+│  ├─ :open           1.900         0.100                               p
+│  └─ :copy           2.000         0.400                               fp
+├─ replay             2.750         0.040  0.040                http-3
+│  ├─ :fetch          2.750         0.030                               p
+│  └─ :apply          2.780         0.010                               p
+└─ :check             2.850         0.050                               mp

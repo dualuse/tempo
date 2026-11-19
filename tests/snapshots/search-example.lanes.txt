@@ -2,18 +2,19 @@ GET /search  ·  184.200 ms  ·  2026-11-13 11:04:50.123 UTC  ·  13 spans on 4 
             ms 0          25          50         75          100        125         150        175
                ┬──────────┬───────────┬──────────┬───────────┬──────────┬───────────┬──────────┬────
 http
-  http-7       GET /search██████████████████████████████████████████████████████████████████████████
-               de…█describe▓▓▓▓▓▓▓▓▓▓▓index█████████rerank▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓█
+  http-7       ├─────────────────────────────────── GET /search ───────────────────────────────────┤
+               ├──┤                   ├── index ───┤                                               │
+                   ├─── describe ────┤              ├────────────────── rerank ───────────────────┤
 cpu
-  cpu-1            fingerpri…█                         ma…█
-  cpu-2                                                   ma…█
+  cpu-1            ├fingerpr…┤                         ├──┤
+  cpu-2                                                   ├──┤
   (mixed)                                                    match ×36▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚┃▚▚▚▚▚▚▚▚▚▚▚
   queued ≤1       █▄                                  ▁   ▁  ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
 io
-  io-1                                              ███    ▚▚▚▚▚▚▚▚▚▚▚▚▚┃load ×36▚▚▚▚▚▚
-                                                    ░░░██✗
+  io-1                                              ├─┤    ▚▚▚▚▚▚▚▚▚▚▚▚▚┃load ×36▚▚▚▚▚▚
+                                                    ░░░├─✗
   queued ≤2                                         ███   ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
 
-█ run  ░ queue wait  ─ blocking wait  ▚ aggregate ×count, ┃ slowest  ✗ failed  ⊘ cancelled  ▶ open
-∅ never started  ● live lane  ▄ this request's queued handoffs
+├─┤ span  ░ queue wait  ├╌┤ blocking wait  ▚ aggregate ×count, ┃ slowest  ✗ failed  ⊘ cancelled
+▶ open  ∅ never started  ● live lane  ▄ this request's queued handoffs
 x=: 72 spans folded into aggregates, 0 dropped (not on the wire)

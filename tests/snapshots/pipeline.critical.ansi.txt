@@ -1,24 +1,17 @@
-[1mCritical path[0m  ·  PUT /video  ·  790.221 ms  ·  2026-11-13 09:00:39.595 UTC  ·  34 spans on 9 threads
+[1mCritical path[0m  ·  PUT /video  ·  790.221 ms  ·  2026-11-13 09:00:39.595 UTC
+30 spans and 4 phases on 9 threads
 [2mthe chain of spans that determined the end time, walking back from the root's end through handoffs[0m
 [1m   from       to   wait      run  blocked  thread   span[0m
-  0.000    0.200  [33m     [0m    0.200  [34m       [0m  http-10  PUT /video
-  0.200   44.355  [33m     [0m   44.155  [34m       [0m  http-10  upload
- 44.355   44.375  [33m     [0m    0.020  [34m       [0m  http-10  PUT /video
- 44.375   48.308  [33m     [0m    3.933  [34m       [0m  http-10  probe
- 48.308   48.328  [33m     [0m    0.020  [34m       [0m  http-10  PUT /video
- 48.328   48.339  [33m     [0m    0.011  [34m       [0m  http-10  pipeline
- 48.339   51.395  [33m     [0m    3.056  [34m       [0m  io-3     pipeline/read
- 51.395   51.400  [33m     [0m           [34m  0.005[0m  http-10  pipeline
- 51.400   58.653  [33m     [0m    7.253  [34m       [0m  cpu-4    pipeline/decode
- 58.653   58.658  [33m     [0m           [34m  0.005[0m  http-10  pipeline
- 58.658   71.461  [33m5.938[0m    6.865  [34m       [0m  cpu-4    pipeline/describe
- 71.461   71.466  [33m     [0m           [34m  0.005[0m  http-10  pipeline
- 71.466  783.034  [33m     [0m  711.568  [34m       [0m  ?-*      pipeline/store ×120 (aggregate: extent; per-occurrence
-                  [33m     [0m           [34m       [0m           wait not on the wire)
-783.034  783.074  [33m     [0m    0.035  [34m  0.005[0m  http-10  pipeline
-783.074  783.094  [33m     [0m    0.020  [34m       [0m  http-10  PUT /video
-783.094  790.191  [33m     [0m    7.097  [34m       [0m  http-10  commit
-790.191  790.221  [33m     [0m    0.030  [34m       [0m  http-10  PUT /video
+  0.000   48.339  [33m     [0m   48.339  [34m       [0m  http-10  PUT /video
+ 48.339   51.395  [33m     [0m    3.056  [34m       [0m  io-3     read
+ 51.395   51.400  [33m     [0m           [34m  0.005[0m  http-10  PUT /video
+ 51.400   58.653  [33m     [0m    7.253  [34m       [0m  cpu-4    decode
+ 58.653   58.658  [33m     [0m           [34m  0.005[0m  http-10  PUT /video
+ 58.658   71.461  [33m5.938[0m    6.865  [34m       [0m  cpu-4    describe
+ 71.461   71.466  [33m     [0m           [34m  0.005[0m  http-10  PUT /video
+ 71.466  783.034  [33m     [0m  711.568  [34m       [0m  ?-*      store ×120 (aggregate: extent; per-occurrence wait not on
+                  [33m     [0m           [34m       [0m           the wire)
+783.034  790.221  [33m     [0m    7.182  [34m  0.005[0m  http-10  PUT /video
 
 790.221 ms on the path: run 72.695 ms (9.2%), queue wait 5.938 ms (0.8%), blocked 0.020 ms (0.0%), aggregates
     711.568 ms (90.0%)

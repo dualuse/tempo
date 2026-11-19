@@ -1,4 +1,4 @@
-Pools  ·  PUT /video  ·  790.221 ms  ·  2026-11-13 09:00:39.595 UTC  ·  34 spans on 9 threads
+Pools  ·  PUT /video  ·  790.221 ms  ·  2026-11-13 09:00:39.595 UTC  ·  30 spans and 4 phases on 9 threads
 this request's share of each pool; gauges are the pool's queue depth and active count at submit (all requests)
                    ms 0          100        200        300        400        500        600        700
                       ┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────

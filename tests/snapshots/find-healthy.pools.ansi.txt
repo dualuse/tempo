@@ -1,4 +1,4 @@
-[1mPools[0m  ·  GET /search  ·  87.728 ms  ·  2026-11-13 09:01:27.109 UTC  ·  63 spans on 17 threads
+[1mPools[0m  ·  GET /search  ·  87.728 ms  ·  2026-11-13 09:01:27.109 UTC  ·  57 spans and 6 phases on 17 threads
 [2mthis request's share of each pool; gauges are the pool's queue depth and active count at submit (all requests)[0m
 [2m                   ms [0m[2m0                   20                  40                  60                  80[0m
                       [2m┬───────────────────┬───────────────────┬───────────────────┬───────────────────┬───────[0m

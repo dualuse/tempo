@@ -560,8 +560,10 @@ def normalize_doc(obj):
             raise TempoFormatError("E_JSON", "span %d has parent %d" % (i, parent))
         if parent >= 0 and "agg" in spans[parent]:
             raise TempoFormatError("E_JSON", "span %d is a child of an aggregate" % i)
+        if parent >= 0 and "p" in spans[parent].get("flags", ""):
+            raise TempoFormatError("E_JSON", "span %d is a child of a phase" % i)
         name = s.get("name")
-        if name is None or name == "":
+        if name is None:
             name = "?"
         if not isinstance(name, str):
             raise TempoFormatError("E_JSON", "span %d name is not a string" % i)
@@ -582,6 +584,9 @@ def normalize_doc(obj):
             raise TempoFormatError("E_JSON", "span %d has bad flags %r" % (i, flags))
         if flags:
             out["flags"] = "".join(f for f in FLAG_ORDER if f in flags)
+        if "p" in flags and (i == 0 or "wait" in out or "agg" in s or "n" in flags):
+            raise TempoFormatError("E_JSON", "span %d: a phase that is the root, a handoff or an "
+                                   "aggregate" % i)
         attrs = s.get("attrs")
         if attrs:
             if not isinstance(attrs, dict):
@@ -855,10 +860,10 @@ def pool_of(thread_name):
 class Span(object):
     __slots__ = ("id", "parent", "name", "start", "dur", "thread", "wait", "cpu", "flags",
                  "attrs", "agg", "children", "depth", "path", "key", "handoff", "not_run",
-                 "run_start", "end", "self_time", "pool", "lane")
+                 "run_start", "end", "self_time", "pool", "lane", "phase", "phases", "title")
 
     def label(self):
-        return "%s ×%d" % (self.name, self.agg["count"]) if self.agg else self.name
+        return "%s ×%d" % (self.title, self.agg["count"]) if self.agg else self.title
 
     @property
     def wait_max(self):
@@ -873,7 +878,21 @@ class Span(object):
         return max(0, self.dur - self.cpu)
 
 
+def title_of(s):
+    """What a span is called: its name; an unnamed span is called by its phases
+    (FORMAT.md 6.7), as (open|copy)."""
+    if s.name:
+        return s.name
+    if s.phases:
+        return "(%s)" % "|".join(ph.name or "?" for ph in s.phases)
+    return "(unnamed)"
+
+
 class Trace(object):
+    """The records of a trace. `spans` holds every record, indexed by id; a phase
+    (flag p) is listed in its parent's `phases`, never in its `children`, so the
+    tree, self times, the critical path and the pools see spans only."""
+
     def __init__(self, doc, label="-"):
         self.doc = doc
         self.label = label
@@ -897,12 +916,14 @@ class Trace(object):
             s.attrs = d.get("attrs") or {}
             s.agg = d.get("agg")
             s.children = []
+            s.phases = []
+            s.phase = "p" in s.flags and s.parent is not None
             if s.agg:
                 s.handoff = "waitSum" in s.agg
                 s.wait = s.agg.get("waitSum", 0)
             else:
-                s.handoff = "wait" in d
-                s.wait = d.get("wait", 0)
+                s.handoff = "wait" in d and not s.phase
+                s.wait = d.get("wait", 0) if s.handoff else 0
             s.not_run = s.handoff and ("n" in s.flags or ("c" in s.flags and s.dur == 0))
             s.run_start = s.start + s.wait if (s.handoff and not s.agg) else s.start
             s.end = s.start + s.agg["extent"] if s.agg else s.run_start + s.dur
@@ -910,20 +931,36 @@ class Trace(object):
                 s.end = s.start + s.wait
             if s.parent is None:
                 s.depth = 0
-                s.path = s.name
-                s.key = ""
             else:
-                s.parent.children.append(s)
+                (s.parent.phases if s.phase else s.parent.children).append(s)
                 s.depth = s.parent.depth + 1
-                s.key = s.name if s.parent.parent is None else s.parent.key + "/" + s.name
-                s.path = s.key
             self.spans.append(s)
+        # names and paths once the phases are known: an unnamed span takes its title from them.
+        # A phase's path is its span's path, ':' and its name (':decode' is a phase of the root)
+        for s in self.spans:
+            s.title = s.name if s.phase else title_of(s)
+            if s.parent is None:
+                s.key = ""
+                s.path = s.title
+            elif s.phase:
+                s.key = s.parent.key + ":" + s.title
+                s.path = s.key
+            else:
+                s.key = s.title if s.parent.parent is None else s.parent.key + "/" + s.title
+                s.path = s.key
         self.root = self.spans[0] if self.spans else None
         for s in self.spans:
-            s.self_time = s.dur if s.agg else max(0, s.dur - sum(
-                c.dur for c in s.children if self._nested(c, s)))
+            if s.phase:
+                s.self_time = None
+            else:
+                s.self_time = s.dur if s.agg else max(0, s.dur - sum(
+                    c.dur for c in s.children if self._nested(c, s)))
         self._assign_pools()
         self.end = max([s.end for s in self.spans] or [0])
+
+    @property
+    def phase_count(self):
+        return sum(1 for s in self.spans if s.phase)
 
     @staticmethod
     def _nested(c, s):
@@ -934,7 +971,7 @@ class Trace(object):
         by_key = {}
         by_name = {}
         for s in self.spans:
-            if s.thread >= 0 and not s.not_run:
+            if s.thread >= 0 and not s.not_run and not s.phase:
                 p = pool_of(self.threads[s.thread])
                 by_key.setdefault(s.key, {}).setdefault(p, 0)
                 by_key[s.key][p] += 1
@@ -951,7 +988,10 @@ class Trace(object):
             return "?"
 
         for s in self.spans:
-            if s.not_run:
+            if s.phase:
+                s.pool = s.parent.pool
+                s.lane = s.parent.lane
+            elif s.not_run:
                 s.pool = guess(s)
                 s.lane = ("queued", s.pool)
             elif s.thread < 0:
@@ -970,7 +1010,7 @@ class Trace(object):
 
     def is_task(self, s):
         """A unit of work this request handed to a pool (or ran on another thread)."""
-        if s.parent is None:
+        if s.parent is None or s.phase:
             return False
         if s.handoff:
             return True
@@ -1012,7 +1052,7 @@ class Filter(object):
         roots = []
         if self.focus:
             for s in trace.spans:
-                if self.matches_focus(s) and not any(a in roots for a in ancestors(s)):
+                if not s.phase and self.matches_focus(s) and not any(a in roots for a in ancestors(s)):
                     roots.append(s)
         else:
             roots = [trace.root] if trace.root else []
@@ -1030,6 +1070,11 @@ class Filter(object):
                     vis.add(s.id)
                 stack.extend(s.children)
         return vis, roots
+
+    def phases(self, trace, vis):
+        """Ids of the phases shown with the visible spans `vis` (--min-ms applies to them too)."""
+        return set(ph.id for s in trace.spans if s.id in vis for ph in s.phases
+                   if not self.min_us or ph.dur >= self.min_us)
 
 
 def thread_filter_label(trace, s):
@@ -1051,26 +1096,29 @@ def ancestors(s):
 # Terminal output
 # ======================================================================
 
-UNI = {"run": "█", "run2": "▓", "wait": "░", "block": "─", "agg": "▚",
+UNI = {"bar": "─", "bar_l": "├", "bar_r": "┤", "bar_x": "┼", "bar_1": "│", "wbar": "╌",
+       "unphased": "·", "wait": "░", "agg": "▚",
        "tick": "┃", "f": "✗", "c": "⊘", "o": "▶", "n": "∅", "m": "!",
        "live": "●", "axis": "─", "axis_tick": "┬", "end": "┊",
        "ell": "…", "times": "×", "delta": "Δ", "arrow": "→", "le": "≤",
        "dot": "·", "tm": "├─ ", "tl": "└─ ", "tp": "│  ", "tb": "   ",
        "spark": " ▁▂▃▄▅▆▇█", "gauge": "•"}
-ASCII = {"run": "#", "run2": "=", "wait": ".", "block": "-", "agg": "%", "tick": "|",
+ASCII = {"bar": "-", "bar_l": "|", "bar_r": "|", "bar_x": "|", "bar_1": "|", "wbar": "~",
+         "unphased": ".", "wait": "_", "agg": "%", "tick": "#",
          "f": "X", "c": "/", "o": ">", "n": "0", "m": "!", "live": "*", "axis": "-",
          "axis_tick": "+", "end": ":", "ell": "~", "times": "x", "delta": "d", "arrow": "->",
          "le": "<=", "dot": "-", "tm": "|- ", "tl": "`- ", "tp": "|  ", "tb": "   ",
          "spark": " .:-=+*#@", "gauge": "o"}
 
 STYLES = {
-    "run": "36", "lbl": "30;46", "blk": "34", "blk_lbl": "34",
-    "wait": "2;33", "wait_lbl": "33", "fail": "31", "fail_lbl": "97;41",
+    "run": "36", "lbl": "1", "phase": "36", "phase_lbl": "1;36", "unphased": "2;36",
+    "blk": "34", "blk_lbl": "34", "ref": "1;36",
+    "wait": "2;33", "wait_lbl": "33", "fail": "31", "fail_lbl": "1;31",
     "agg": "36", "agg_lbl": "30;46", "tick": "1;97",
     "mark_f": "1;31", "mark_c": "33", "mark_o": "1;35", "mark_n": "1;33", "mark_m": "35",
     "axis": "2", "dim": "2", "bold": "1", "head": "1;4", "red": "31", "green": "32",
     "yellow": "33", "magenta": "35", "live": "35", "spark_run": "36", "spark_wait": "33",
-    "spark_gauge": "35", "end": "1;35", "blue": "34",
+    "spark_gauge": "35", "end": "1;35", "blue": "34", "cyan": "36",
 }
 MARK_ORDER = "fcom"
 
@@ -1141,7 +1189,7 @@ def wall_str(wall):
 
 
 def span_label(s, g):
-    return "%s %s%d" % (s.name, g["times"], s.agg["count"]) if s.agg else s.name
+    return "%s %s%d" % (s.title, g["times"], s.agg["count"]) if s.agg else s.title
 
 
 def header_line(trace, p, title=None, width=None):
@@ -1151,11 +1199,16 @@ def header_line(trace, p, title=None, width=None):
     parts = []
     if title:
         parts.append((title, "bold"))
-    parts.append((r.name, None if title else "bold"))
+    parts.append((r.title, None if title else "bold"))
     parts.append(("%s ms" % ms(r.dur), None))
     if trace.wall is not None:
         parts.append((wall_str(trace.wall), None))
-    parts.append(("%d spans on %d threads" % (len(trace.spans), len(trace.threads)), None))
+    phases = trace.phase_count
+    if phases:
+        parts.append(("%d spans and %d phase%s on %d threads" % (
+            len(trace.spans) - phases, phases, "" if phases == 1 else "s", len(trace.threads)), None))
+    else:
+        parts.append(("%d spans on %d threads" % (len(trace.spans), len(trace.threads)), None))
     sep = "  %s  " % g["dot"]
     lines = []
     cur = []
@@ -1330,16 +1383,55 @@ def pool_title(pool):
     return "(pool unknown)" if pool == "?" else pool
 
 
-def draw_lane(spans, scale, p, rowof=None):
+class Notes(object):
+    """References to phases too narrow for their names: *1, *2, ... by name, in the
+    order they are first drawn; resolved in a footnote line under the lanes."""
+
+    def __init__(self):
+        self.refs = {}
+        self.order = []
+
+    def ref(self, name):
+        if name not in self.refs:
+            self.order.append(name)
+            self.refs[name] = "*%d" % len(self.order)
+        return self.refs[name]
+
+    def lines(self, p, width):
+        out = []
+        line = []
+        n = 0
+        for name in self.order:
+            ref = self.refs[name]
+            piece = len(ref) + 1 + len(name)
+            if line and n + 2 + piece > width:
+                out.append("  ".join(line))
+                line = []
+                n = 0
+            line.append(p.c(ref, "ref") + " " + fit(name, width - len(ref) - 1, p.g))
+            n += piece + (2 if n else 0)
+        if line:
+            out.append("  ".join(line))
+        return out
+
+
+def draw_lane(spans, scale, p, rowof=None, names=None, notes=None):
     """Pack the spans of one lane into rows; returns a list of cell rows.
 
+    A span is a box-plot bar, |---- name ----|. A span with phases has its phases
+    drawn inside its bar, each name centred in its section, the same | at the
+    boundaries, unphased time as dots; its own name stands in front of the bar.
+    Where the front has no room (the bar starts at the left edge) the name goes to
+    the chart's name column: `names`, when given, receives row -> name for it.
+    `notes` collects the references of phases too narrow for their names.
     `rowof`, when given, receives the row of each span id."""
     g = p.g
     w = scale.w
     rows = []
     occ = []
-    last = []
     rowof = {} if rowof is None else rowof
+    names = {} if names is None else names
+    notes = Notes() if notes is None else notes
     for s in spans:
         # rows separate nesting and true concurrency; spans that merely share a
         # cell at this resolution stay in one row (the later one draws over)
@@ -1352,6 +1444,12 @@ def draw_lane(spans, scale, p, rowof=None):
         wa, wc0 = ta, c0
         if s.handoff and not s.agg and not s.not_run and s.wait > 0 and scale.rd(s.start) < c0:
             wa, wc0 = s.start, scale.rd(s.start)
+        # the name of a span with phases stands in front of the bar (and its wait),
+        # one space apart, or in the name column when the front has no room
+        front = s.name if (s.phases and not s.agg and not s.not_run) else ""
+        l0 = wc0 - len(front) - 1 if front else wc0
+        in_column = l0 < 0
+        lab0 = 0 if in_column else max(0, l0 - 1)
         floor = 0
         if not s.handoff and not s.not_run:
             a = s.parent
@@ -1361,18 +1459,24 @@ def draw_lane(spans, scale, p, rowof=None):
                     break
                 a = a.parent
         r = floor
+        me = (wa, tb, wc0, c1, lab0)
         while True:
             while r >= len(rows):
                 rows.append([(" ", None)] * w)
                 occ.append([])
-                last.append((-1, 0))
-            if not any(_clash(wa, tb, wc0, c1, o) for o in occ[r]):
+            if not any(_clash(me, o) for o in occ[r]) and not (in_column and r in names):
                 break
             r += 1
-        occ[r].append((wa, tb, wc0, c1))
+        occ[r].append(me)
         rowof[s.id] = r
         cells = rows[r]
         failed = "f" in s.flags
+        if front:
+            if in_column:
+                names[r] = (front, "fail_lbl" if failed else "lbl")
+            else:
+                for i, ch in enumerate(front):
+                    cells[l0 + i] = (ch, "fail_lbl" if failed else "lbl")
         if s.not_run:
             for c in range(c0, c1):
                 cells[c] = (g["wait"], "wait")
@@ -1394,17 +1498,7 @@ def draw_lane(spans, scale, p, rowof=None):
                     _marker(cells, c1 - 1, f, g)
                     break
         else:
-            if "w" in s.flags and not failed:
-                ch, st, lst = g["block"], "blk", "blk_lbl"
-            else:
-                lc1, lshade = last[r]
-                shade = 1 - lshade if lc1 >= c0 else 0
-                ch = g["run2"] if shade else g["run"]
-                st, lst = ("fail", "fail_lbl") if failed else ("run", "lbl")
-                last[r] = (c1, shade)
-            for c in range(c0, c1):
-                cells[c] = (ch, st)
-            _label(cells, c0, c1, s.name, lst, g)
+            _bar(cells, s, c0, c1, scale, p, notes)
             for f in MARK_ORDER:
                 if f in s.flags:
                     _marker(cells, c1 - 1, f, g)
@@ -1418,11 +1512,75 @@ def draw_lane(spans, scale, p, rowof=None):
     return rows
 
 
-def _clash(ta, tb, c0, c1, other):
-    a, b, d0, d1 = other
+def _bar(cells, s, c0, c1, scale, p, notes):
+    """The box-plot bar of a span over cells [c0, c1), with its phases or its name."""
+    g = p.g
+    failed = "f" in s.flags
+    blocking = "w" in s.flags and not failed
+    st = "fail" if failed else ("blk" if blocking else "run")
+    lst = "fail_lbl" if failed else ("blk_lbl" if blocking else "lbl")
+    if c1 - c0 == 1:
+        cells[c0] = (g["bar_1"], st)
+        return
+    fill = g["wbar"] if blocking else g["bar"]
+    cells[c0] = (g["bar_l"], st)
+    cells[c1 - 1] = (g["bar_r"], st)
+    phases = sorted(s.phases, key=lambda ph: (ph.start, ph.id))
+    for c in range(c0 + 1, c1 - 1):
+        cells[c] = (g["unphased"], "unphased") if phases else (fill, st)
+    if not phases:
+        if s.name:
+            _centre(cells, c0 + 1, c1 - 1, s.name, lst, g)
+        return
+    for ph in phases:
+        a = min(c1 - 1, max(c0, scale.rd(ph.start)))
+        b = min(c1 - 1, max(c0, scale.rd(ph.start + ph.dur)))
+        pst = "fail" if "f" in ph.flags else "phase"
+        for c in (a, b):
+            if c0 < c < c1 - 1:
+                cells[c] = (g["bar_x"], st)
+        for c in range(a + 1, b):
+            cells[c] = (g["bar"], pst)
+        if ph.name and not _centre(cells, a + 1, b, ph.name, "fail_lbl" if pst == "fail" else "phase_lbl", g,
+                                   cut=False):
+            # a phase too narrow even for a reference stays unnamed at this width
+            ref = notes.refs.get(ph.name) or "*%d" % (len(notes.order) + 1)
+            if len(ref) <= b - a - 1:
+                _centre(cells, a + 1, b, notes.ref(ph.name), "fail_lbl" if pst == "fail" else "ref", g)
+
+
+def _centre(cells, a, b, text, style, g, cut=True):
+    """`text` centred in cells [a, b), with a space on each side when there is room;
+    shortened with an ellipsis when `cut` (and at least 3 cells), else not drawn.
+    Returns whether the whole text was drawn."""
+    n = b - a
+    whole = True
+    if len(text) + 2 <= n:
+        text = " %s " % text
+    elif len(text) > n:
+        if not cut or n < 3:
+            return False
+        text = text[:n - 1] + g["ell"]
+        whole = False
+    at = a + (n - len(text)) // 2
+    for i, ch in enumerate(text):
+        cells[at + i] = (ch, None if ch == " " else style)
+    return whole
+
+
+def _clash(new, other):
+    """Two lane occupants (t0, t1, c0, c1, label start) that cannot share a row: their
+    times overlap (instants: their cells), or one's name in front lies on the other."""
+    ta, tb, c0, c1, l0 = new
+    a, b, d0, d1, m0 = other
     if ta == tb or a == b:          # instants: keep their cell free
-        return d0 < c1 and c0 < d1
-    return a < tb and ta < b
+        if d0 < c1 and c0 < d1:
+            return True
+    elif a < tb and ta < b:
+        return True
+    if l0 < c0 and l0 < d1 and m0 < c0:
+        return True
+    return m0 < d0 and m0 < c1 and l0 < d0
 
 
 def _label(cells, a, b, text, style, g):
@@ -1460,8 +1618,23 @@ def view_lanes(trace, flt, p, width):
         labels.extend(lane_label(trace, k, grouped, g) for k in keys)
     labels.append("  queued %s999" % g["le"])
     lw = min(max([len(x) for x in labels] + [8]) + 2, max(10, width // 4))
-    cw = max(10, width - lw)
-    scale = Scale(t0, t1, cw)
+    # the name column, between the lane labels and the time axis, holds the names of
+    # spans with phases that start too near the left edge to have their name in front
+    nw = 0
+    for _ in range(3):
+        scale = Scale(t0, t1, max(10, width - lw - nw))
+        notes = Notes()
+        drawn = {}
+        for pool, grouped, keys in groups:
+            for k in keys:
+                names = {}
+                drawn[k] = (draw_lane(by_lane.get(k, []), scale, p, names=names, notes=notes), names)
+        need = max([len(t) for _, names in drawn.values() for t, _ in names.values()] or [0])
+        want = min(need + 1, max(6, width // 6)) if need else 0
+        if want <= nw:
+            break
+        nw = want
+    cw = scale.w
     marks = {}
     root = trace.root
     if not flt.focus and root.end < scale.t1:
@@ -1470,29 +1643,43 @@ def view_lanes(trace, flt, p, width):
     if flt.focus:
         out.extend(wrap("focus %s: %s %s %s ms" % (flt.focus, ms(t0), g["arrow"], ms(t1)),
                         width, None, p))
-    out.extend(axis_lines(scale, lw, p, marks))
+    out.extend(axis_lines(scale, lw + nw, p, marks))
     any_wait = False
     for pool, grouped, keys in groups:
         if grouped:
             out.append(p.c(fit(pool_title(pool), lw - 1, g), "bold"))
         for k in keys:
-            rows = draw_lane(by_lane.get(k, []), scale, p) or [[(" ", None)] * cw]
+            rows, names = drawn[k]
+            rows = rows or [[(" ", None)] * cw]
             lab = fit(lane_label(trace, k, grouped, g), lw - 1, g)
             live = k[0] == "t" and k[1] in trace.live
             for i, cells in enumerate(rows):
                 head = (lab if i == 0 else "").ljust(lw)
-                out.append(pad(p, head, lw, "live" if (live and i == 0) else None) + p.cells(cells))
+                line = pad(p, head, lw, "live" if (live and i == 0) else None)
+                if nw:
+                    text, st = names.get(i, ("", None))
+                    line += pad(p, fit(text, nw - 1, g), nw, st)
+                out.append(line + p.cells(cells))
         if grouped:
             act = pool_activity(trace, [s for s in spans if s.pool == pool], scale)
             if act["peak_queued"] > 0:
                 any_wait = True
                 vmax = max(act["queued"])
                 head = fit("  queued %s%s" % (g["le"], _short(act["peak_queued"])), lw - 1, g)
-                out.append(pad(p, head, lw, "dim") + p.cells(
+                out.append(pad(p, head, lw + nw, "dim") + p.cells(
                     [(spark(v, vmax, g), "spark_wait" if v > 0 else None) for v in act["queued"]]))
+    if notes.order:
+        out.append("")
+        out.extend(notes.lines(p, width))
     out.append("")
-    items = [(g["run"], "run", "run"), (g["wait"], "wait", "queue wait"),
-             (g["block"], "blk", "blocking wait"),
+    items = [(g["bar_l"] + g["bar"] + g["bar_r"], "run", "span")]
+    if any(s.phases for s in spans):
+        items.append((g["bar_x"], "run", "phase boundary"))
+        items.append((g["unphased"] * 2, "unphased", "unphased time"))
+    if notes.order:
+        items.append(("*1", "ref", "phase named below"))
+    items += [(g["wait"], "wait", "queue wait"),
+             (g["bar_l"] + g["wbar"] + g["bar_r"], "blk", "blocking wait"),
              (g["agg"], "agg", "aggregate %scount, %s slowest" % (g["times"], g["tick"])),
              (g["f"], "mark_f", "failed"), (g["c"], "mark_c", "cancelled"),
              (g["o"], "mark_o", "open"), (g["n"], "mark_n", "never started"),
@@ -1777,6 +1964,10 @@ def view_tree(trace, flt, p, width):
     if flt.focus and not roots:
         raise UsageError("no span matches --focus %r" % flt.focus)
     shown = set(vis)
+    # a phase is listed under its span, by start among the children; it reports only its
+    # own start and duration (and its flags and attributes)
+    phases = flt.phases(trace, vis)
+    shown.update(phases)
     root_ids = set(r.id for r in roots)
     for s in trace.spans:
         if s.id in vis:
@@ -1793,7 +1984,7 @@ def view_tree(trace, flt, p, width):
         else:
             name_prefix = prefix + (g["tl"] if last else g["tm"])
             child_prefix = prefix + (g["tb"] if last else g["tp"])
-        kids = [c for c in s.children if c.id in shown]
+        kids = sorted([c for c in s.children + s.phases if c.id in shown], key=lambda c: c.id)
         # continuation lines of a row (wrapped attributes) carry the tree's guides
         lines.append((name_prefix, child_prefix + (g["tp"] if kids else ""), s))
         for i, c in enumerate(kids):
@@ -1803,12 +1994,13 @@ def view_tree(trace, flt, p, width):
         if r.id in shown:
             walk(r, "", True, True)
     heads = ("start", "wait", "dur", "self", "cpu", "off-cpu")
-    table = [[ms(s.start), ms(s.wait) if s.handoff else "", ms(s.dur), ms(s.self_time),
+    table = [[ms(s.start), "", ms(s.dur), "", "", ""] if s.phase else
+             [ms(s.start), ms(s.wait) if s.handoff else "", ms(s.dur), ms(s.self_time),
               ms(s.cpu), ms(s.offcpu)] for _, _, s in lines]
     nat = [max([len(h)] + [len(v[k]) for v in table]) for k, h in enumerate(heads)]
-    tw = max([len(trace.thread_label(s)) for _, _, s in lines] + [6])
+    tw = max([len(tree_thread(trace, s)) for _, _, s in lines] + [6])
     fw = max([len(s.flags) for _, _, s in lines] + [5])
-    names = max(len(pre) + len(span_label(s, g)) for pre, _, s in lines)
+    names = max(len(pre) + len(tree_label(s, g)) for pre, _, s in lines)
     attr_max = max(len(attr_text(s)) for _, _, s in lines)
     # numbers keep their full text. When the line is too wide, the number
     # columns close up and the attributes wrap in their column (the name
@@ -1845,7 +2037,7 @@ def view_tree(trace, flt, p, width):
         head += gap + "attributes"
     out.append(p.c(head, "bold"))
     for (pre, cont, s), vals in zip(lines, table):
-        label = span_label(s, g)
+        label = tree_label(s, g)
         # a deep prefix loses its outer levels first, so the name stays readable
         room = nw - min(len(label), 10)
         if pre and len(pre) > room:
@@ -1853,14 +2045,14 @@ def view_tree(trace, flt, p, width):
             pre = g["ell"] + pre[cut:]
             cont = " " + cont[cut:]
         name = fit(pre + label, nw, g)
-        ctx = s.id not in vis
-        name_st = "dim" if ctx else ("red" if "f" in s.flags else None)
+        ctx = s.id not in vis and not s.phase
+        name_st = "dim" if ctx else ("red" if "f" in s.flags else ("cyan" if s.phase else None))
         k = min(len(pre), len(name))
         cols = [p.c(name[:k], "dim") + p.c(name[k:], name_st) + " " * (nw - len(name))]
         for k, v in enumerate(vals):
             st = "dim" if ctx else ("yellow" if (k == 1 and s.wait > 0) else None)
             cols.append(gap + p.c(v.rjust(nws[k]), st))
-        cols.append(gap + trace.thread_label(s).ljust(tw))
+        cols.append(gap + tree_thread(trace, s).ljust(tw))
         cols.append(gap + p.c(s.flags, "red" if "f" in s.flags else ("magenta" if s.flags else None))
                     + " " * (fw - len(s.flags)))
         attrs = attr_text(s)
@@ -1878,6 +2070,15 @@ def view_tree(trace, flt, p, width):
                        for q in _wrap_text(attrs, width - ind - 2))
     out.extend(notices(trace, p, width))
     return out
+
+
+def tree_label(s, g):
+    """A row of the tree: a phase as :name (a section of the span above), else the span."""
+    return ":" + s.name if s.phase else span_label(s, g)
+
+
+def tree_thread(trace, s):
+    return "" if s.phase else trace.thread_label(s)
 
 
 def _wrap_text(text, n):
@@ -1901,33 +2102,39 @@ def attr_text(s):
 
 # ---------------------------------------------------------------- per-path tables
 
-def path_table(trace, vis):
-    """Per-path totals in first-appearance (pre-)order."""
+def path_table(trace, vis, flt=None):
+    """Per-path totals in first-appearance (pre-)order. The phases of the visible spans
+    (as `flt` shows them) are rows of their own, path span:name, with count and
+    durations only ("phase": True; no self time, wait or cpu)."""
     table = {}
     order = []
+    phases = (flt or Filter()).phases(trace, vis)
     for s in trace.spans:
-        if s.id not in vis:
+        if s.id not in vis and s.id not in phases:
             continue
         e = table.get(s.key)
         if e is None:
             e = table[s.key] = {"key": s.key, "label": s.path, "count": 0, "sum": 0, "self": 0,
                                 "min": None, "max": 0, "wait": 0, "wmax": 0, "cpu": 0,
-                                "cpu_known": False, "flags": set(), "depth": s.depth}
+                                "cpu_known": False, "flags": set(), "depth": s.depth,
+                                "phase": s.phase}
             order.append(s.key)
         n = s.agg["count"] if s.agg else 1
         lo = s.agg["min"] if s.agg else s.dur
         hi = s.agg["max"] if s.agg else s.dur
         e["count"] += n
         e["sum"] += s.dur
-        e["self"] += s.self_time
         e["min"] = lo if e["min"] is None else min(e["min"], lo)
         e["max"] = max(e["max"], hi)
+        e["flags"].update(s.flags)
+        if s.phase:
+            continue
+        e["self"] += s.self_time
         e["wait"] += s.wait
         e["wmax"] = max(e["wmax"], s.wait_max or 0)
         if s.cpu is not None:
             e["cpu"] += s.cpu
             e["cpu_known"] = True
-        e["flags"].update(s.flags)
     return [table[k] for k in order]
 
 
@@ -1943,9 +2150,11 @@ def view_agg(trace, flt, p, width):
         raise UsageError("no span matches --focus %r" % flt.focus)
     rows = []
     styles = []
-    for e in path_table(trace, vis):
-        rows.append([e["label"], str(e["count"]), ms(e["sum"]), ms(e["self"]), ms(e["min"]),
-                     ms(e["max"]), ms(e["wait"]), ms(e["wmax"]),
+    for e in path_table(trace, vis, flt):
+        ph = e["phase"]
+        rows.append([e["label"], str(e["count"]), ms(e["sum"]), "" if ph else ms(e["self"]),
+                     ms(e["min"]), ms(e["max"]), "" if ph else ms(e["wait"]),
+                     "" if ph else ms(e["wmax"]),
                      ms(e["cpu"]) if e["cpu_known"] else "", flags_str(e["flags"])])
         st = [None] * 10
         if "f" in e["flags"]:
@@ -1957,7 +2166,8 @@ def view_agg(trace, flt, p, width):
     out.extend(render_table(["path", "count", "sum", "self", "min", "max", "wait sum",
                              "wait max", "cpu", "flags"], rows, p, width, "l" + "r" * 9,
                             styles=styles, groups=[[1, 2, 3, 4, 5], [6, 7], [8, 9]]))
-    out.extend(wrap("times in ms; aggregates contribute their count, sum, min and max",
+    out.extend(wrap("times in ms; aggregates contribute their count, sum, min and max; "
+                    "span:name is a phase of the span (:name of the root), timed only",
                     width, "dim", p, ""))
     out.extend(notices(trace, p, width))
     return out
@@ -1983,10 +2193,14 @@ def findings(trace, vis):
     """List of (kind, span or None, text, numbers) tuples."""
     out = []
     spans = [s for s in trace.spans if s.id in vis]
+    # phases of the visible spans count where they carry a flag (failed, open, misuse);
+    # nothing else about them is a finding
+    phases = Filter().phases(trace, vis)
+    flagged = [s for s in trace.spans if s.id in vis or s.id in phases]
     g = UNI
 
     def where(s):
-        return "%s on %s" % (s.path if s.parent else s.name, trace.thread_label(s)) \
+        return "%s on %s" % (s.path if s.parent else s.title, trace.thread_label(s)) \
             if not s.not_run else "%s (%s pool)" % (s.path, s.pool)
 
     def lab(s):
@@ -2002,7 +2216,7 @@ def findings(trace, vis):
     strag.sort(key=lambda x: (-x[0], x[1].id))
     for over, s in strag[:10]:
         out.append(("straggler", s, "%s ends %s ms after %s (at %s ms)"
-                    % (lab(s), ms(over), s.parent.path if s.parent.parent else s.parent.name,
+                    % (lab(s), ms(over), s.parent.path if s.parent.parent else s.parent.title,
                        ms(s.end)), over))
     if len(strag) > 10:
         out.append(("straggler", None, "%d more stragglers" % (len(strag) - 10), 0))
@@ -2011,19 +2225,19 @@ def findings(trace, vis):
             n = s.agg["count"] if s.agg else 1
             out.append(("never-started", s, "%s: %d handoff%s queued %s ms until render and never ran"
                         % (lab(s), n, "" if n == 1 else "s", ms(s.wait_max)), n))
-    for s in spans:
+    for s in flagged:
         if "o" in s.flags:
             out.append(("open", s, "%s: still running at render after %s ms%s"
                         % (lab(s), ms(s.dur), (" (queued %s ms first)" % ms(s.wait))
                            if s.handoff and s.wait and not s.agg else ""), s.dur))
-    for s in spans:
+    for s in flagged:
         if "f" in s.flags:
             out.append(("failed", s, "%s: failed after %s ms" % (lab(s), ms(s.dur)), s.dur))
     for s in spans:
         if "c" in s.flags:
             what = "cancelled before it started" if s.not_run else "cancelled after %s ms" % ms(s.dur)
             out.append(("cancelled", s, "%s: %s" % (lab(s), what), s.dur))
-    for s in spans:
+    for s in flagged:
         if "m" in s.flags:
             out.append(("misuse", s, "%s: misuse detected and healed by the recorder" % lab(s), 0))
     waits = [s for s in spans if s.handoff and not s.not_run and (s.wait_max or 0) > 0]
@@ -2221,7 +2435,7 @@ def view_critical(trace, flt, p, width):
     styles = []
     for h in hops:
         s = h["span"]
-        name = s.path if s.parent else s.name
+        name = s.path if s.parent else s.title
         if s.agg:
             name = "%s %s%d (aggregate: extent; per-occurrence wait not on the wire)" % (
                 name, g["times"], s.agg["count"])
@@ -2276,20 +2490,20 @@ def view_diff(a, b, flt, p, width):
     g = p.g
     if not a.spans or not b.spans:
         raise UsageError("cannot diff a trace without spans")
-    ta = {e["key"]: e for e in path_table(a, flt.apply(a)[0])}
-    tb = {e["key"]: e for e in path_table(b, flt.apply(b)[0])}
+    ta = {e["key"]: e for e in path_table(a, flt.apply(a)[0], flt)}
+    tb = {e["key"]: e for e in path_table(b, flt.apply(b)[0], flt)}
     keys = list(ta)
     keys.extend(k for k in tb if k not in ta)
-    zero = {"count": 0, "sum": 0, "self": 0, "wait": 0, "cpu": 0, "label": None}
+    zero = {"count": 0, "sum": 0, "self": 0, "wait": 0, "cpu": 0, "label": None, "phase": False}
     rows = []
     for k in keys:
         x = ta.get(k, zero)
         y = tb.get(k, zero)
         d = {f: y[f] - x[f] for f in ("count", "sum", "self", "wait", "cpu")}
         mag = max(abs(d["sum"]), abs(d["self"]), abs(d["wait"]), abs(d["cpu"]))
-        label = (x["label"] or y["label"]) if k else a.root.name
+        label = (x["label"] or y["label"]) if k else a.root.title
         state = "" if (k in ta and k in tb) else ("only B" if k in tb else "only A")
-        rows.append((mag, keys.index(k), label, x, y, d, state))
+        rows.append((mag, keys.index(k), label, x, y, d, state, x["phase"] or y["phase"]))
     rows.sort(key=lambda r: (-r[0], r[1]))
     da = a.root.end
     db = b.root.end
@@ -2301,10 +2515,11 @@ def view_diff(a, b, flt, p, width):
              D + "cpu", "sum A", "sum B", ""]
     body = []
     styles = []
-    for mag, _, label, x, y, d, state in rows:
+    for mag, _, label, x, y, d, state, ph in rows:
         body.append([label, "%d%s%d" % (x["count"], g["arrow"], y["count"]),
-                     "%+d" % d["count"], ms_signed(d["sum"]), ms_signed(d["self"]),
-                     ms_signed(d["wait"]), ms_signed(d["cpu"]), ms(x["sum"]), ms(y["sum"]), state])
+                     "%+d" % d["count"], ms_signed(d["sum"]), "" if ph else ms_signed(d["self"]),
+                     "" if ph else ms_signed(d["wait"]), "" if ph else ms_signed(d["cpu"]),
+                     ms(x["sum"]), ms(y["sum"]), state])
         st = [None] * 10
         for i, f in ((3, "sum"), (4, "self"), (5, "wait"), (6, "cpu")):
             if d[f] > 0:
@@ -2315,7 +2530,8 @@ def view_diff(a, b, flt, p, width):
     out.extend(render_table(heads, body, p, width, "l" + "r" * 9, styles=styles,
                             groups=[[1, 2], [3, 4, 5, 6], [7, 8, 9]]))
     out.extend(wrap("%s = B %s A in ms, sorted by the largest absolute change; red is slower, "
-                    "green faster" % (D, "-" if g is ASCII else "−"), width, "dim", p, ""))
+                    "green faster; span:name is a phase of the span, timed only"
+                    % (D, "-" if g is ASCII else "−"), width, "dim", p, ""))
     return out
 
 
@@ -2350,12 +2566,12 @@ def view_stats(traces, flt, p, width):
     for t in traces:
         if not t.spans:
             continue
-        roots[t.root.name] = roots.get(t.root.name, 0) + 1
-        for e in path_table(t, flt.apply(t)[0]):
+        roots[t.root.title] = roots.get(t.root.title, 0) + 1
+        for e in path_table(t, flt.apply(t)[0], flt):
             k = e["key"]
             if k not in per:
                 per[k] = {"label": e["label"], "n": 0, "count": [],
-                          "sum": [], "self": [], "wait": []}
+                          "sum": [], "self": [], "wait": [], "phase": e["phase"]}
                 order.append(k)
             r = per[k]
             r["n"] += 1
@@ -2378,13 +2594,17 @@ def view_stats(traces, flt, p, width):
         r = per[k]
         row = [r["label"], "%d/%d" % (r["n"], n), _short(percentile(r["count"], 50))]
         for f in ("sum", "self", "wait"):
+            if r["phase"] and f != "sum":
+                row.extend(["", "", ""])
+                continue
             row.extend([ms(percentile(r[f], 50)), ms(percentile(r[f], 95)), ms(max(r[f]))])
         rows.append(row)
-        styles.append([None] * 9 + ["yellow" if max(r["wait"]) else None] * 3)
+        styles.append([None] * 9 + ["yellow" if (not r["phase"] and max(r["wait"])) else None] * 3)
     out.extend(render_table(heads, rows, p, width, "l" + "r" * 11, styles=styles,
                             groups=[[1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]]))
     out.extend(wrap("ms per trace; percentiles by nearest rank over the traces that contain "
-                    "the path", width, "dim", p, ""))
+                    "the path; span:name is a phase of the span (:name of the root), timed only",
+                    width, "dim", p, ""))
     return out
 
 
@@ -2396,7 +2616,7 @@ def to_chrome(trace):
     """Chrome Trace Event JSON (opens in Perfetto and chrome://tracing)."""
     ev = []
     pid = 1
-    root_name = trace.root.name if trace.root else "trace"
+    root_name = trace.root.title if trace.root else "trace"
     ev.append({"ph": "M", "pid": pid, "tid": 0, "name": "process_name", "args": {"name": root_name}})
     tids = {}
     for i, t in enumerate(trace.threads):
@@ -2410,7 +2630,7 @@ def to_chrome(trace):
             key = ("agg", s.id)
             tids[key] = nxt
             ev.append({"ph": "M", "pid": pid, "tid": nxt, "name": "thread_name",
-                       "args": {"name": "%s-* %s ×%d" % (s.pool, s.name, s.agg["count"])}})
+                       "args": {"name": "%s-* %s ×%d" % (s.pool, s.title, s.agg["count"])}})
             ev.append({"ph": "M", "pid": pid, "tid": nxt, "name": "thread_sort_index",
                        "args": {"sort_index": nxt}})
             nxt += 1
@@ -2424,6 +2644,20 @@ def to_chrome(trace):
 
     for s in trace.spans:
         args = {"path": s.path, "id": s.id}
+        if s.phase:
+            # a section of its span's timeline, not a nested slice: an async slice of
+            # its own on the span's thread
+            if s.flags:
+                args["flags"] = s.flags
+            if s.attrs:
+                args["attrs"] = s.attrs
+            src = tid_of(s.parent)
+            pid_ = "p%d" % s.id
+            ev.append({"ph": "b", "pid": pid, "tid": src, "ts": s.start, "id": pid_, "cat": "phase",
+                       "name": s.title, "args": args})
+            ev.append({"ph": "e", "pid": pid, "tid": src, "ts": s.start + s.dur, "id": pid_,
+                       "cat": "phase", "name": s.title})
+            continue
         if s.handoff:
             args["wait_us"] = s.wait
         if s.cpu is not None:
@@ -2439,10 +2673,10 @@ def to_chrome(trace):
             e = None
         elif s.agg:
             e = {"ph": "X", "pid": pid, "tid": tid_of(s), "ts": s.start, "dur": s.agg["extent"],
-                 "name": "%s ×%d" % (s.name, s.agg["count"]), "cat": cat, "args": args}
+                 "name": "%s ×%d" % (s.title, s.agg["count"]), "cat": cat, "args": args}
         else:
             e = {"ph": "X", "pid": pid, "tid": tid_of(s), "ts": s.run_start, "dur": s.dur,
-                 "name": s.name, "cat": cat, "args": args}
+                 "name": s.title, "cat": cat, "args": args}
         if e is not None:
             if "f" in s.flags:
                 e["cname"] = "terrible"
@@ -2469,12 +2703,15 @@ def to_chrome(trace):
 
 
 def to_folded(trace):
-    """Collapsed stacks: `root;child;leaf <self µs>` (thread time, queue waits excluded)."""
+    """Collapsed stacks: `root;child;leaf <self µs>` (thread time, queue waits excluded;
+    phases are no frames)."""
     totals = {}
     order = []
     stacks = {}
     for s in trace.spans:
-        frame = s.name.replace(";", ":").replace("\n", " ")
+        if s.phase:
+            continue
+        frame = s.title.replace(";", ":").replace("\n", " ")
         stacks[s.id] = frame if s.parent is None else stacks[s.parent.id] + ";" + frame
         v = s.self_time
         if v <= 0:
@@ -2519,6 +2756,17 @@ web viewer (Tempo Timeline):
 
 views (default: lanes per thread, grouped into pools):
   --tree, --agg, --pools, --findings, --critical, --diff [OTHER], --stats FILES...
+
+lanes:
+  A span is a bar, |---- name ----|. Its phases are sections of the bar,
+  |-init-|--- loading ---|, with the span's name in front of the bar, or in a
+  name column left of the time axis when the bar starts at the left edge;
+  unphased time is dots. A phase too narrow for its name shows *1, named
+  below the chart. An unnamed span is labelled by its phases only, as
+  (open|copy) in the other views. --tree lists a phase as :name under its
+  span, the per-path tables as span:name (:name for the root), with its
+  start and duration only: it has no self time and no children. The critical
+  path, the pools and the collapsed stacks leave phases out.
 
 layout:
   Lanes and charts fit --width down to 40 columns (a smaller width is

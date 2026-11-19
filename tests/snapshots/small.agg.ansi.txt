@@ -1,18 +1,18 @@
-[1mAggregates[0m  ·  GET /search  ·  48.675 ms  ·  2026-11-13 09:00:55.433 UTC  ·  26 spans on 9 threads
-[1mpath                  count     sum    self     min     max  wait sum  wait max     cpu  flags[0m
-GET /search               1  48.675   0.389  48.675  48.675     0.000     0.000  12.007
-decode                    1   6.889   6.889   6.889   6.889     0.000     0.000   6.406
-scale                     1   1.648   1.648   1.648   1.648     0.000     0.000
-describe                  1  17.099   0.030  17.099  17.099     0.000     0.000
-describe/infer            1  16.435  16.435  16.435  16.435     0.000     0.000  15.803
-describe/await            1  16.430  16.430  16.430  16.430     0.000     0.000              w
-describe/fingerprint      1   0.639   0.639   0.639   0.639     0.000     0.000
-index                     1   3.945   0.279   3.945   3.945     0.000     0.000
-index/query               2   7.221   7.221   3.551   3.670     0.000     0.000   0.530
-index/await               1   3.666   3.666   3.666   3.666     0.000     0.000              w
-rerank                    1  16.826   1.978  16.826  16.826     0.000     0.000
-rerank/load               6  22.015  22.015   0.990   8.233  [33m   3.001[0m  [33m   2.013[0m   1.581
-rerank/await              1  14.848  14.848  14.848  14.848     0.000     0.000              w
-rerank/match              6  25.966  25.966   3.380   6.587     0.000     0.000  25.452
-encode                    1   1.879   1.879   1.879   1.879     0.000     0.000
-[2mtimes in ms; aggregates contribute their count, sum, min and max[0m
+[1mAggregates[0m  ·  GET /search  ·  48.675 ms  ·  2026-11-13 09:00:55.433 UTC
+20 spans and 6 phases on 9 threads
+[1mpath         count     sum    self     min     max  wait sum  wait max     cpu  flags[0m
+GET /search      1  48.675  13.092  48.675  48.675     0.000     0.000  12.007
+:decode          1   6.889           6.889   6.889                                  p
+:scale           1   1.648           1.648   1.648                                  p
+:describe        1  17.099          17.099  17.099                                  p
+infer            1  16.435  16.435  16.435  16.435     0.000     0.000  15.803
+await            3  34.944  34.944   3.666  16.430     0.000     0.000              w
+fingerprint      1   0.639   0.639   0.639   0.639     0.000     0.000
+:index           1   3.945           3.945   3.945                                  p
+query            2   7.221   7.221   3.551   3.670     0.000     0.000   0.530
+:rerank          1  16.826          16.826  16.826                                  p
+load             6  22.015  22.015   0.990   8.233  [33m   3.001[0m  [33m   2.013[0m   1.581
+match            6  25.966  25.966   3.380   6.587     0.000     0.000  25.452
+:encode          1   1.879           1.879   1.879                                  p
+[2mtimes in ms; aggregates contribute their count, sum, min and max; span:name is a phase of the span (:name of[0m
+[2mthe root), timed only[0m

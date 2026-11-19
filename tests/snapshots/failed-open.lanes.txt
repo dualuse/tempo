@@ -2,15 +2,16 @@ search  ·  61.000 ms  ·  2026-11-13 11:04:50.129 UTC  ·  9 spans on 2 threads
             ms 0            10            20            30            40            50            60
                ┬────────────┬─────────────┬─────────────┬─────────────┬─────────────┬─────────────┬─
 http
-  http-9 ●     search██████████████████████████████████████████████████████████████████████████████▶
-               ██✗index▓▓▓▓▓▓▓▓▓▓▓▓rerank██████████████████████████████████████████████████████████▶
-                  await─────────── join────────────────────────────────────────────────────────────▶
+  http-9 ●     ├───────────────────────────────────── search ──────────────────────────────────────▶
+               ├─✗                 ├─────────────────────────── rerank ────────────────────────────▶
+                  ├──── index ────┤
+                  ├╌╌╌ await ╌╌╌╌┤ ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ join ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌▶
                                    !
                                    ✗
 io
-  io-4 ●                           load████████████████████████████████████████████████████████████▶
+  io-4 ●                           ├──────────────────────────── load ─────────────────────────────▶
   queued ≤1                       █▂
 
-█ run  ░ queue wait  ─ blocking wait  ▚ aggregate ×count, ┃ slowest  ✗ failed  ⊘ cancelled  ▶ open
-∅ never started  ● live lane  ▄ this request's queued handoffs
+├─┤ span  ░ queue wait  ├╌┤ blocking wait  ▚ aggregate ×count, ┃ slowest  ✗ failed  ⊘ cancelled
+▶ open  ∅ never started  ● live lane  ▄ this request's queued handoffs
 l=: lanes live at render: http-9, io-4 (their records are best effort)

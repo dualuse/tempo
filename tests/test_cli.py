@@ -609,10 +609,39 @@ class Model(unittest.TestCase):
 
     def test_blocking_wait_is_subtracted_from_parent(self):
         t = trace_of(os.path.join(SAMPLES, "small.header"))
-        describe = [s for s in t.spans if s.name == "describe"][0]
-        awaits = [c for c in describe.children if "w" in c.flags]
+        root = t.root
+        awaits = [c for c in root.children if "w" in c.flags]
         self.assertTrue(awaits)
-        self.assertLess(describe.self_time, describe.dur - sum(a.dur for a in awaits) + 1000)
+        self.assertLess(root.self_time, root.dur - sum(a.dur for a in awaits) + 1000)
+
+    def test_phases_are_sections_not_children(self):
+        # FORMAT.md 6.7: a phase is listed with its span, never as a child; its span's
+        # self time keeps the phase's time; it has no self time of its own
+        t = trace_of(os.path.join(GOLDEN, "phases.header"))
+        root = t.root
+        self.assertEqual([ph.name for ph in root.phases], ["parse", "store", "verify", "check"])
+        self.assertEqual([c.name for c in root.children], ["read", "flush", "", "replay"])
+        self.assertEqual(root.self_time, 3000 - 750 - 500 - 40)
+        flush = t.spans[4]
+        self.assertEqual(([ph.name for ph in flush.phases], flush.children, flush.self_time),
+                         (["compress", "write"], [], 1600))
+        for ph in root.phases:
+            self.assertTrue(ph.phase)
+            self.assertIsNone(ph.self_time)
+            self.assertFalse(t.is_task(ph))
+            self.assertEqual(ph.key, ":" + ph.name)
+        self.assertEqual(t.spans[6].key, "flush:write")
+        self.assertEqual(t.phase_count, 10)
+
+    def test_unnamed_span_takes_its_title_from_its_phases(self):
+        t = trace_of(os.path.join(GOLDEN, "phases.header"))
+        unnamed = t.spans[8]
+        self.assertEqual((unnamed.name, unnamed.title, unnamed.key), ("", "(open|copy)", "(open|copy)"))
+        self.assertEqual(t.spans[10].key, "(open|copy):copy")
+        doc = json.loads(read(os.path.join(GOLDEN, "phases.json")))
+        doc["spans"] = doc["spans"][:8] + [doc["spans"][8]]
+        [(label, bare)] = tempo.load_text(json.dumps(doc), "bare")
+        self.assertEqual(bare.spans[8].title, "(unnamed)")
 
     def test_handoff_timing(self):
         t = trace_of(os.path.join(GOLDEN, "search-example.header"))
@@ -632,10 +661,11 @@ class Model(unittest.TestCase):
 
     def test_filters(self):
         t = trace_of(os.path.join(SAMPLES, "find-healthy.header"))
-        vis, roots = tempo.Filter(focus="rerank").apply(t)
-        self.assertEqual([r.path for r in roots], ["rerank"])
-        self.assertTrue(all(t.spans[i].key.startswith("rerank") for i in vis))
-        vis, _ = tempo.Filter(focus="load").apply(t)
+        with self.assertRaises(Exception):
+            tempo.view_lanes(t, tempo.Filter(focus="rerank"), tempo.Painter(), 100)   # a phase, not a span
+        self.assertEqual(tempo.Filter(focus="rerank").apply(t)[1], [])
+        vis, roots = tempo.Filter(focus="load").apply(t)
+        self.assertEqual(set(r.path for r in roots), {"load"})
         self.assertTrue(vis and all(t.spans[i].name == "load" for i in vis))
         vis, _ = tempo.Filter(depth=1).apply(t)
         self.assertTrue(all(t.spans[i].depth <= 1 for i in vis))
@@ -648,6 +678,132 @@ class Model(unittest.TestCase):
 
 
 # ======================================================================
+# Drawing: box-plot bars, phases, names in front, the name column
+# ======================================================================
+
+# startup has phases init, loading and warm-up and starts at the left edge (its name
+# goes to the name column); scan is a plain span; sync's name cannot stand in front of
+# it next to scan, so it moves down a row; fetch is a handoff with phases open and
+# read (unphased time after read), its name in front of its queue wait; the unnamed
+# span is labelled by its phases parse and check, check too narrow for its name
+DRAWING = {"v": 1, "unit": "us", "folded": 0, "dropped": 0, "threads": ["main", "pool-1"],
+           "live": [], "truncated": False, "spans": [
+               {"id": 0, "parent": -1, "name": "startup", "start": 0, "dur": 4000, "thread": 0},
+               {"id": 1, "parent": 0, "name": "init", "start": 0, "dur": 400, "thread": 0, "flags": "p"},
+               {"id": 2, "parent": 0, "name": "loading", "start": 400, "dur": 2000, "thread": 0, "flags": "p"},
+               {"id": 3, "parent": 0, "name": "scan", "start": 600, "dur": 1000, "thread": 0},
+               {"id": 4, "parent": 0, "name": "fetch", "start": 1000, "dur": 2600, "thread": 1, "wait": 200},
+               {"id": 5, "parent": 4, "name": "open", "start": 1200, "dur": 100, "thread": 1, "flags": "p"},
+               {"id": 6, "parent": 4, "name": "read", "start": 1300, "dur": 1500, "thread": 1, "flags": "p"},
+               {"id": 7, "parent": 0, "name": "sync", "start": 1700, "dur": 600, "thread": 0},
+               {"id": 8, "parent": 7, "name": "push", "start": 1700, "dur": 600, "thread": 0, "flags": "p"},
+               {"id": 9, "parent": 0, "name": "warm-up", "start": 2400, "dur": 1200, "thread": 0, "flags": "p"},
+               {"id": 10, "parent": 0, "name": "", "start": 2600, "dur": 1000, "thread": 0},
+               {"id": 11, "parent": 10, "name": "parse", "start": 2600, "dur": 600, "thread": 0, "flags": "p"},
+               {"id": 12, "parent": 10, "name": "check", "start": 3200, "dur": 400, "thread": 0, "flags": "fp"}]}
+
+
+class Drawing(unittest.TestCase):
+    maxDiff = None
+
+    def lanes(self, *args):
+        code, out, err = cli(["--no-color"] + list(args), stdin=json.dumps(DRAWING))
+        self.assertEqual(code, 0, err)
+        return out
+
+    def test_ascii(self):
+        self.assertEqual(self.lanes("--ascii", "--width", "72"), "\n".join([
+            "startup  -  4.000 ms  -  5 spans and 8 phases on 2 threads",
+            "                     ms 0           1           2           3",
+            "                        +-----------+-----------+-----------+-----------",
+            "main            startup |init|------- loading -------|-- warm-up --|...|",
+            "                               |-- scan --|            |parse-|*1-|",
+            "                                       sync | push |",
+            "pool",
+            "  pool-1                      fetch __|-|----- read ------|..........|",
+            "  queued <=1                        @@=",
+            "",
+            "*1 check",
+            "",
+            "|-| span  | phase boundary  .. unphased time  *1 phase named below",
+            "_ queue wait  |~| blocking wait  % aggregate xcount, # slowest  X failed",
+            "/ cancelled  > open  0 never started  * live lane",
+            "= this request's queued handoffs",
+            ""]))
+
+    def test_unicode(self):
+        self.assertEqual(self.lanes("--width", "72").splitlines()[2:8], [
+            "                       ┬───────────┬───────────┬───────────┬────────────",
+            "main           startup ├init┼─────── loading ───────┼── warm-up ───┼···┤",
+            "                              ├── scan ───┤            ├parse─┼*1─┤",
+            "                                       sync ├push─┤",
+            "pool",
+            "  pool-1                     fetch ░░░├┼───── read ──────┼···········┤"])
+
+    def test_narrow(self):
+        # the name column keeps at most a sixth of the width; more phases need
+        # references, numbered as they are drawn; a phase too narrow even for a
+        # reference (check, open) stays unnamed
+        self.assertEqual(self.lanes("--width", "40").splitlines()[4:12], [
+            "main      star… ├─┼─ loading ─┼warm-up┼┤",
+            "                    ├scan┤      ├*2┼─┤",
+            "                     sync ├*1┤",
+            "pool",
+            "  pool-1        fetch ░├┼─ read ─┼····┤",
+            "  queued…             █▂",
+            "",
+            "*1 push  *2 parse"])
+
+    def test_no_name_column_without_need(self):
+        # a root without phases has its name in its bar; stage, with phases, has room
+        # for its name in front: no name column
+        doc = {"v": 1, "spans": [
+            {"id": 0, "parent": -1, "name": "job", "start": 0, "dur": 3000, "thread": 0},
+            {"id": 1, "parent": 0, "name": "stage", "start": 1000, "dur": 1500, "thread": 0},
+            {"id": 2, "parent": 1, "name": "a", "start": 1000, "dur": 500, "thread": 0, "flags": "p"},
+            {"id": 3, "parent": 1, "name": "b", "start": 1500, "dur": 500, "thread": 0, "flags": "p"}],
+            "threads": ["main"]}
+        code, out, err = cli(["--no-color", "--ascii", "--width", "60"], stdin=json.dumps(doc))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines()[1:5], [
+            "            ms 0              1              2",
+            "               +--------------+--------------+--------------",
+            "main           |------------------- job -------------------|",
+            "                        stage |-- a --|- b --|......|"])
+
+    def test_the_other_views_report_phases_by_start_and_duration(self):
+        code, out, err = cli(["--no-color", "--tree", "--width", "100"], stdin=json.dumps(DRAWING))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines()[1:], [
+            "span                     start      wait       dur      self       cpu   off-cpu  thread  flags",
+            "startup                  0.000               4.000     1.400                      main",
+            "├─ :init                 0.000               0.400                                        p",
+            "├─ :loading              0.400               2.000                                        p",
+            "├─ scan                  0.600               1.000     1.000                      main",
+            "├─ fetch                 1.000     0.200     2.600     2.600                      pool-1",
+            "│  ├─ :open              1.200               0.100                                        p",
+            "│  └─ :read              1.300               1.500                                        p",
+            "├─ sync                  1.700               0.600     0.600                      main",
+            "│  └─ :push              1.700               0.600                                        p",
+            "├─ :warm-up              2.400               1.200                                        p",
+            "└─ (parse|check)         2.600               1.000     1.000                      main",
+            "   ├─ :parse             2.600               0.600                                        p",
+            "   └─ :check             3.200               0.400                                        fp"])
+        code, out, err = cli(["--no-color", "--agg", "--width", "100"], stdin=json.dumps(DRAWING))
+        self.assertEqual(code, 0, err)
+        rows = dict((line.split()[0], line.split()[1:]) for line in out.splitlines()[2:-1])
+        self.assertEqual(rows[":loading"], ["1", "2.000", "2.000", "2.000", "p"])
+        self.assertEqual(rows["fetch:read"], ["1", "1.500", "1.500", "1.500", "p"])
+        self.assertEqual(rows["(parse|check):check"], ["1", "0.400", "0.400", "0.400", "fp"])
+        self.assertEqual(rows["fetch"], ["1", "2.600", "2.600", "2.600", "2.600", "0.200", "0.200"])
+        code, out, err = cli(["--no-color", "--critical", "--width", "100"], stdin=json.dumps(DRAWING))
+        self.assertNotIn(":", "".join(line.split()[-1] for line in out.splitlines()[3:-3]))
+        code, out, err = cli(["--to", "folded"], stdin=json.dumps(DRAWING))
+        self.assertEqual(out, "startup 1400\nstartup;scan 1000\nstartup;fetch 2600\n"
+                              "startup;sync 600\nstartup;(parse|check) 1000\n")
+
+
+# ======================================================================
 # Snapshots
 # ======================================================================
 
@@ -657,12 +813,12 @@ VIEWS = {"lanes": [], "tree": ["--tree"], "agg": ["--agg"], "pools": ["--pools"]
 EXTRA = {
     "find-saturated.lanes.ascii": (["--ascii"], "find-saturated"),
     "find-healthy.lanes.threads-io": (["--threads", "^io-"], "find-healthy"),
-    "find-healthy.lanes.focus-rerank": (["--focus", "rerank"], "find-healthy"),
+    "find-healthy.lanes.focus-load": (["--focus", "load"], "find-healthy"),
     "find-healthy.tree.depth-1": (["--tree", "--depth", "1"], "find-healthy"),
     "find-healthy.tree.min-ms-5": (["--tree", "--min-ms", "5"], "find-healthy"),
-    "find-healthy.agg.focus-match": (["--agg", "--focus", "rerank/match"], "find-healthy"),
+    "find-healthy.agg.focus-match": (["--agg", "--focus", "match"], "find-healthy"),
     "pipeline.lanes.width-60": (["--width", "60"], "pipeline"),
-    "small.lanes.focus-rerank-200": (["--focus", "rerank", "--width", "200"], "small"),
+    "small.lanes.focus-load-200": (["--focus", "load", "--width", "200"], "small"),
     "find-saturated.tree.width-80": (["--tree", "--width", "80"], "find-saturated"),
     "find-saturated.agg.width-80": (["--agg", "--width", "80"], "find-saturated"),
     "pipeline.pools.width-80": (["--pools", "--width", "80"], "pipeline"),
@@ -670,6 +826,11 @@ EXTRA = {
     "search-example.lanes": ([], "../testdata/golden/search-example"),
     "search-example.tree": (["--tree"], "../testdata/golden/search-example"),
     "failed-open.lanes": ([], "../testdata/golden/failed-open"),
+    "phases.lanes": ([], "../testdata/golden/phases"),
+    "phases.lanes.ascii": (["--ascii"], "../testdata/golden/phases"),
+    "phases.tree": (["--tree"], "../testdata/golden/phases"),
+    "phases.agg": (["--agg"], "../testdata/golden/phases"),
+    "phases.findings": (["--findings"], "../testdata/golden/phases"),
     "handoff-not-run.lanes": ([], "../testdata/golden/handoff-not-run"),
     "truncated-cut.lanes": ([], "../testdata/golden/truncated-cut"),
     "truncated-empty.lanes": ([], "../testdata/golden/truncated-empty"),
@@ -832,8 +993,8 @@ class Layout(unittest.TestCase):
                             self.assertEqual(cells[c0 - 1][0], p.g["wait"])
                         moved += rowof[s.id] > 0
         self.assertGreater(moved, 0)
-        # the case from the review: rerank/load on io-1 and io-4 of small
-        code, out, err = cli(["--no-color", "--width", "200", "--focus", "rerank",
+        # the case from the review: the loads on io-1 and io-4 of small
+        code, out, err = cli(["--no-color", "--width", "200", "--focus", "load",
                               os.path.join(SAMPLES, "small.header")])
         lanes = {}
         name = None
@@ -929,7 +1090,9 @@ class Converters(unittest.TestCase):
                 self.assertEqual(opened, {})
                 for fid, kinds in flows.items():
                     self.assertEqual(sorted(kinds), ["f", "s"])
-                self.assertEqual(xs, sum(1 for s in t.spans if not s.not_run))
+                self.assertEqual(xs, sum(1 for s in t.spans if not s.not_run and not s.phase))
+                sections = [e for e in ev if e.get("cat") == "phase"]
+                self.assertEqual(len(sections), 2 * t.phase_count)
 
     def test_chrome_times_match_spans(self):
         t = trace_of(os.path.join(GOLDEN, "search-example.header"))
@@ -955,7 +1118,9 @@ class Converters(unittest.TestCase):
                     stacks.add(m.group(1))
                     total += int(m.group(2))
                 t = trace_of(path)
-                self.assertEqual(total, sum(s.self_time for s in t.spans))
+                self.assertEqual(total, sum(s.self_time for s in t.spans if not s.phase))
+                for ph in (s for s in t.spans if s.phase):     # phases are no frames
+                    self.assertNotIn(";" + ph.name + " ", out)
 
     def test_json_round_trips_through_the_reference_encoder(self):
         sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -980,7 +1145,7 @@ class Analysis(unittest.TestCase):
         ta = {e["key"]: e for e in tempo.path_table(a, tempo.Filter().apply(a)[0])}
         tb = {e["key"]: e for e in tempo.path_table(b, tempo.Filter().apply(b)[0])}
         # splitting the shared pool removes most of the queue wait of the loads
-        self.assertLess(tb["rerank/load"]["wait"], ta["rerank/load"]["wait"] / 2)
+        self.assertLess(tb["load"]["wait"], ta["load"]["wait"] / 2)
         self.assertLess(b.root.dur, a.root.dur)
         code, out, err = cli(["--no-color", "--width", "400",
                               os.path.join(SAMPLES, "diff", "before.header"),
@@ -990,12 +1155,19 @@ class Analysis(unittest.TestCase):
         mags = []
         for line in rows:
             cols = line.split()
+            if cols[0].startswith(":"):
+                mags.append(abs(float(cols[3])))       # a phase: its change of duration only
+                continue
             path_end = cols.index(next(c for c in cols if "→" in c))
             deltas = [abs(float(x)) for x in cols[path_end + 2:path_end + 6]]
             mags.append(max(deltas))
         self.assertEqual(mags, sorted(mags, reverse=True))
-        load = [l for l in rows if l.startswith("rerank/load ")][0]
-        self.assertIn("%+.3f" % ((tb["rerank/load"]["wait"] - ta["rerank/load"]["wait"]) / 1000.0), load)
+        load = [l for l in rows if l.startswith("load ")][0]
+        self.assertIn("%+.3f" % ((tb["load"]["wait"] - ta["load"]["wait"]) / 1000.0), load)
+        # a phase row carries its change of duration only
+        rerank = [l for l in rows if l.startswith(":rerank ")][0].split()
+        self.assertEqual((rerank[1], len(rerank)), ("1→1", 6))
+        self.assertEqual(rerank[3], "%+.3f" % ((tb[":rerank"]["sum"] - ta[":rerank"]["sum"]) / 1000.0))
 
     def test_diff_against_itself_is_zero(self):
         p = os.path.join(SAMPLES, "find-healthy.header")
@@ -1010,7 +1182,7 @@ class Analysis(unittest.TestCase):
         files = sorted(glob.glob(os.path.join(SAMPLES, "batch", "*.header")))
         self.assertEqual(len(files), 30)
         traces = [trace_of(f) for f in files]
-        sums = sorted(sum(s.dur for s in t.spans if s.key == "rerank/match") for t in traces)
+        sums = sorted(sum(s.dur for s in t.spans if s.key == "match") for t in traces)
         p50, p95 = sums[14], sums[28]          # nearest rank: ceil(0.5*30)=15, ceil(0.95*30)=29
         self.assertEqual(tempo.percentile(sums, 50), p50)
         self.assertEqual(tempo.percentile(sums, 95), p95)
@@ -1018,10 +1190,17 @@ class Analysis(unittest.TestCase):
         code, out, err = cli(["--no-color", "--width", "200", "--stats"] + files)
         self.assertEqual(code, 0, err)
         self.assertIn("over 30 traces", out)
-        row = [l for l in out.splitlines() if l.startswith("rerank/match ")][0].split()
+        row = [l for l in out.splitlines() if l.startswith("match ")][0].split()
         self.assertEqual(row[1], "30/30")
         self.assertEqual(row[3:6], [tempo.ms(p50), tempo.ms(p95), tempo.ms(sums[-1])])
+        # a phase row: its durations only, no self time or wait
+        rerank = sorted(sum(s.dur for s in t.spans if s.key == ":rerank") for t in traces)
+        row = [l for l in out.splitlines() if l.startswith(":rerank ")][0].split()
+        self.assertEqual(row[1:], ["30/30", "1", tempo.ms(tempo.percentile(rerank, 50)),
+                                   tempo.ms(tempo.percentile(rerank, 95)), tempo.ms(rerank[-1])])
         for line in out.splitlines()[2:-1]:
+            if line.startswith(":"):
+                continue
             nums = [float(x) for x in line.split()[-9:]]
             for k in range(0, 9, 3):
                 self.assertLessEqual(nums[k], nums[k + 1])
@@ -1069,22 +1248,21 @@ class Analysis(unittest.TestCase):
         self.assertEqual((infer[0]["wait"], infer[0]["run"]), (last.wait, last.dur))
         code, out, err = cli(["--no-color", "--critical", os.path.join(SAMPLES, "find-saturated.header")])
         self.assertIn("queue wait", out)
-        self.assertIn("describe/infer", out)
+        self.assertIn("cpu-2   infer", out)
+        # phases section the root's own time on the path; they are never hops
+        self.assertFalse([h for h in hops if h["span"].phase])
 
-    def test_critical_path_follows_early_exit_into_the_running_work(self):
-        # early exit: the await of rerank ends while the match aggregate (or a
-        # straggler) still runs; that work, not 'blocked', belongs on the path
-        for name, agg in (("diff/after", 26), ("batch/find-05", 18), ("batch/find-08", 8)):
+    def test_critical_path_ends_in_the_work_that_ran_last(self):
+        # the request's span waits on the matches and ends with the last of them: that
+        # match, not 'blocked', is the end of the path, reached through its queue wait
+        for name in ("diff/after", "batch/find-05", "batch/find-08"):
             with self.subTest(trace=name):
                 t = trace_of(os.path.join(SAMPLES, name + ".header"))
                 hops = tempo.critical_hops(t)
-                match = [h for h in hops if h["span"].path == "rerank/match"]
-                self.assertTrue(match, "rerank/match missing from the critical path")
-                self.assertIn(agg, [h["span"].agg["count"] for h in match if h["span"].agg])
-                blocked = sum(h["blocked"] for h in hops)
-                self.assertLess(blocked, 0.01 * (t.root.end - t.root.start))
-                rerank = [h for h in hops if h["span"].path == "rerank"]
-                self.assertLess(sum(h["blocked"] for h in rerank), 100)   # µs: wake-up gaps only
+                last = max((s for s in t.spans if s.name == "match" and not s.agg), key=lambda s: s.end)
+                self.assertIs(hops[-1]["span"], last)
+                self.assertEqual((hops[-1]["wait"], hops[-1]["run"]), (last.wait, last.end - last.run_start))
+                self.assertLess(sum(h["blocked"] for h in hops), 0.03 * (t.root.end - t.root.start))
 
     @staticmethod
     def early_exit_trace(first_dur):
@@ -1133,11 +1311,21 @@ class Analysis(unittest.TestCase):
             return [k for k, _, _, _ in tempo.findings(t, set(s.id for s in t.spans))]
 
         sat = kinds("find-saturated")
-        for k in ("never-started", "open", "straggler", "queue-wait"):
+        for k in ("never-started", "open", "queue-wait"):
             self.assertIn(k, sat)
+        # the handoffs are children of the request's span, which ends with them: a
+        # straggler outlives its parent, as match 4 outlives rerank here
+        t = self.early_exit_trace(5000)
+        strag = [(k, s.id) for k, s, _, _ in tempo.findings(t, set(s.id for s in t.spans)) if k == "straggler"]
+        self.assertEqual(strag, [("straggler", 4)])
         healthy = kinds("find-healthy")
         self.assertNotIn("never-started", healthy)
         self.assertIn("failed", healthy)
+        # a phase is a finding only by its flags: copy failed, check was misused
+        t = trace_of(os.path.join(GOLDEN, "phases.header"))
+        found = [(k, s.path) for k, s, _, _ in tempo.findings(t, tempo.Filter().apply(t)[0])
+                 if s is not None and s.phase]
+        self.assertEqual(found, [("failed", "(open|copy):copy"), ("misuse", ":check")])
         # loads on the shared pool: I/O on a compute pool shows as off-CPU
         self.assertIn("off-cpu", kinds("diff/before"))
         self.assertNotIn("off-cpu", kinds("diff/after"))

@@ -1,0 +1,28 @@
+GET /search  ·  87.728 ms  ·  2026-11-13 09:01:27.109 UTC  ·  57 spans and 6 phases on 17 threads
+focus load: 42.779 → 62.630 ms
+            ms          45         47.5      50         52.5       55         57.5      60
+               ─────────┬──────────┬─────────┬──────────┬──────────┬──────────┬─────────┬──────────┬
+io
+  io-1         ├load─┤      ░░░░░├───────────────────── load ─────────────────────┤
+                     ░├─ load ──┤
+  io-2         ├load┤            ░░├───────── load ──────────┤
+               ░░░░░░├─── load ───┤
+  io-3         ├── load ──┤          ░░░░├ load ┤               ░░░░░░├──── load ─────✗
+                      ░░░░░├─── load ───┤
+  io-4         ├── load ──┤        ░░├ load ┤
+                     ░░░░░░├─ load ─✗      ░░├──────────────── load ─────────────────┤
+  io-5         ├── load ───┤          ░░░░░├─── load ───┤
+                      ░░░░░░├─── load ────┤
+  io-6         ├load┤      ░░├ load ─┤
+                                   ░░░├─── load ────┤
+  io-7         ├─┤          ░░░░░░░├─ load ─┤
+               ░░░├──┤                     ░░├── load ──┤
+                  ░░░░├── load ───┤
+  io-8         ├────────── load ──────────┤  ░░├┤
+                                         ░░├──┤
+  (mixed)                                    ▚▚▚▚▚▚▚▚▚▚▚┃load ×20▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚▚
+  queued ≤3    ▅▆▆▆▆▆████████▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▇▇▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▇█████▆▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅
+
+├─┤ span  ░ queue wait  ├╌┤ blocking wait  ▚ aggregate ×count, ┃ slowest  ✗ failed  ⊘ cancelled
+▶ open  ∅ never started  ● live lane  ▄ this request's queued handoffs
+x=: 50 spans folded into aggregates, 0 dropped (not on the wire)

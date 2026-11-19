@@ -1,34 +1,23 @@
-Critical path  ·  GET /search  ·  87.728 ms  ·  2026-11-13 09:01:27.109 UTC  ·  63 spans on 17 threads
+Critical path  ·  GET /search  ·  87.728 ms  ·  2026-11-13 09:01:27.109 UTC
+57 spans and 6 phases on 17 threads
 the chain of spans that determined the end time, walking back from the root's end through handoffs
   from      to   wait     run  blocked  thread  span
- 0.000   0.273          0.273           http-8  GET /search
- 0.273   3.856          3.583           http-8  decode
- 3.856   3.871          0.015           http-8  GET /search
- 3.871   5.610          1.739           http-8  scale
- 5.610   5.625          0.015           http-8  GET /search
- 5.625   5.630          0.005           http-8  describe
- 5.630  25.649         20.019           cpu-3   describe/infer
-25.649  25.659          0.010           http-8  describe
-25.659  26.116          0.457           http-8  describe/fingerprint
-26.116  26.126          0.010           http-8  describe
-26.126  26.141          0.015           http-8  GET /search
-26.141  26.145          0.004           http-8  index
-26.145  42.365         16.220           io-1    index/query
-42.365  42.759          0.394           http-8  index
-42.759  42.774          0.015           http-8  GET /search
-42.774  42.791          0.017           http-8  rerank
-42.791  43.425          0.634           io-7    rerank/load
-43.425  43.431                   0.006  http-8  rerank
-43.431  47.376  0.979   2.966           io-7    rerank/load
-47.376  47.382                   0.006  http-8  rerank
-47.382  49.890  0.466   2.042           io-4    rerank/load
-49.890  49.898                   0.008  http-8  rerank
-49.898  83.045         33.147           cpu-*   rerank/match ×30 (aggregate: extent; per-occurrence wait not
-                                                on the wire)
-83.045  86.165          3.090    0.030  http-8  rerank
-86.165  86.180          0.015           http-8  GET /search
-86.180  87.698          1.518           http-8  encode
-87.698  87.728          0.030           http-8  GET /search
+ 0.000   5.630          5.630           http-8  GET /search
+ 5.630  25.649         20.019           cpu-3   infer
+25.649  25.659          0.010           http-8  GET /search
+25.659  26.116          0.457           http-8  fingerprint
+26.116  26.145          0.029           http-8  GET /search
+26.145  42.365         16.220           io-1    query
+42.365  42.791          0.426           http-8  GET /search
+42.791  43.425          0.634           io-7    load
+43.425  43.431                   0.006  http-8  GET /search
+43.431  47.376  0.979   2.966           io-7    load
+47.376  47.382                   0.006  http-8  GET /search
+47.382  49.890  0.466   2.042           io-4    load
+49.890  49.898                   0.008  http-8  GET /search
+49.898  83.045         33.147           cpu-*   match ×30 (aggregate: extent; per-occurrence wait not on the
+                                                wire)
+83.045  87.728          4.653    0.030  http-8  GET /search
 
 87.728 ms on the path: run 53.086 ms (60.5%), queue wait 1.445 ms (1.6%), blocked 0.050 ms (0.1%), aggregates
     33.147 ms (37.8%)

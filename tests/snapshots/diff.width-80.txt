@@ -1,38 +1,34 @@
 Diff  A samples/diff/before.header 147.430 ms
       B samples/diff/after.header 100.496 ms
       Δ -46.934 ms (-31.8%)
-path                  count A→B  Δcount     Δsum    Δself     Δwait     Δcpu
-rerank/load               48→48      +0  +16.597  +16.597  -694.142   +0.799
-rerank/match              48→45      -3  -31.241  -31.241  -211.893  -30.453
-GET /search                 1→1      +0  -46.934   +0.217    +0.000   -4.710
-rerank/await                1→1      +0  -44.903  -44.903    +0.000   +0.000
-rerank                      1→1      +0  -43.551   +1.352    +0.000   +0.000
-describe/infer              1→2      +1  +14.005  +14.005   +10.164  +13.419
-index/query                 3→2      -1  -10.809  -10.809   -12.304   -0.097
-decode                      1→1      +0   -6.660   -6.660    +0.000   -6.194
-describe/await              1→1      +0   +6.158   +6.158    +0.000   +0.000
-describe                    1→1      +0   +6.031   +0.003    +0.000   +0.000
-index                       1→1      +0   -3.323   -0.150    +0.000   +0.000
-index/await                 1→1      +0   -3.173   -3.173    +0.000   +0.000
-encode                      1→1      +0   +0.381   +0.381    +0.000   +0.000
-describe/fingerprint        1→1      +0   -0.130   -0.130    +0.000   +0.000
-scale                       1→1      +0   -0.029   -0.029    +0.000   +0.000
+path         count A→B  Δcount     Δsum    Δself     Δwait     Δcpu
+load             48→48      +0  +16.597  +16.597  -694.142   +0.799
+match            48→45      -3  -31.241  -31.241  -211.893  -30.453
+GET /search        1→1      +0  -46.934   -4.886    +0.000   -4.710
+:rerank            1→1      +0  -43.551
+await              3→3      +0  -41.918  -41.918    +0.000   +0.000
+infer              1→2      +1  +14.005  +14.005   +10.164  +13.419
+query              3→2      -1  -10.809  -10.809   -12.304   -0.097
+:decode            1→1      +0   -6.660
+:describe          1→1      +0   +6.031
+:index             1→1      +0   -3.323
+:encode            1→1      +0   +0.381
+fingerprint        1→1      +0   -0.130   -0.130    +0.000   +0.000
+:scale             1→1      +0   -0.029
 
-path                    sum A    sum B
-rerank/load           115.471  132.068
-rerank/match          233.910  202.669
-GET /search           147.430  100.496
-rerank/await          103.388   58.485
-rerank                105.317   61.766
-describe/infer         14.619   28.624
-index/query            23.161   12.352
-decode                 10.920    4.260
-describe/await         14.614   20.772
-describe               15.554   21.585
-index                  12.832    9.509
-index/await            12.164    8.991
-encode                  1.169    1.550
-describe/fingerprint    0.910    0.780
-scale                   1.459    1.430
+path           sum A    sum B
+load         115.471  132.068
+match        233.910  202.669
+GET /search  147.430  100.496
+:rerank      105.317   61.766
+await        130.166   88.248
+infer         14.619   28.624
+query         23.161   12.352
+:decode       10.920    4.260
+:describe     15.554   21.585
+:index        12.832    9.509
+:encode        1.169    1.550
+fingerprint    0.910    0.780
+:scale         1.459    1.430
 Δ = B − A in ms, sorted by the largest absolute change; red is slower, green
-faster
+faster; span:name is a phase of the span, timed only

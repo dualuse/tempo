@@ -1,57 +1,57 @@
-PUT /video  ·  790.221 ms  ·  2026-11-13 09:00:39.595 UTC  ·  34 spans on 9 threads
+PUT /video  ·  790.221 ms  ·  2026-11-13 09:00:39.595 UTC  ·  30 spans and 4 phases on 9 threads
 span                   start     wait      dur     self     cpu off-cpu thread  flags attributes
-PUT /video             0.000           790.221    0.290                 http-10
-├─ upload              0.200            44.155   44.155                 http-10       bytes=26289111
-├─ probe              44.375             3.933    3.933                 http-10       frames=120
-├─ pipeline           48.328           734.746    0.064                 http-10       frames=120
-│  ├─ read            48.333    0.000    2.995    2.995   0.239   2.756 io-1          frame=0 queued=0
-│  │                                                                                  active=0
-│  ├─ read            48.336    0.000    3.072    3.072   0.245   2.827 io-2          frame=1 queued=0
-│  │                                                                                  active=1
-│  ├─ read            48.339    0.000    3.056    3.056   0.244   2.812 io-3          frame=2 queued=0
-│  │                                                                                  active=2
-│  ├─ read            48.342    0.000    2.736    2.736   0.218   2.518 io-4          frame=3 queued=0
-│  │                                                                                  active=3
-│  ├─ read            48.345    2.733    2.276    2.276   0.182   2.094 io-4          frame=4 queued=0
-│  │                                                                                  active=4
-│  ├─ read            48.348    2.980    2.065    2.065   0.165   1.900 io-1          frame=5 queued=1
-│  │                                                                                  active=4
-│  ├─ read            48.351    3.044    2.971    2.971   0.237   2.734 io-3          frame=6 queued=2
-│  │                                                                                  active=4
-│  ├─ read            48.354    3.054    2.241    2.241   0.179   2.062 io-2          frame=7 queued=3
-│  │                                                                                  active=4
-│  ├─ await           48.357           734.682  734.682                 http-10 w
-│  ├─ decode          51.083    0.000    7.811    7.811   7.576   0.235 cpu-2         queued=0 active=1
-│  ├─ decode          51.333    0.000    6.059    6.059   5.877   0.182 cpu-3         queued=0 active=2
-│  ├─ decode          51.400    0.000    7.253    7.253   7.035   0.218 cpu-4         queued=0 active=3
-│  ├─ decode          51.413    5.979    4.371    4.371   4.239   0.132 cpu-3         queued=0 active=4
-│  ├─ decode          53.359    5.294    5.943    5.943   5.764   0.179 cpu-4         queued=1 active=4
-│  ├─ decode          53.398    5.496    4.869    4.869   4.722   0.147 cpu-2         queued=2 active=4
-│  ├─ decode          53.654    6.010    5.312    5.312   5.152   0.160 cpu-1         queued=3 active=4
-│  ├─ decode          54.371    7.392    4.491    4.491   4.356   0.135 cpu-3         queued=4 active=4
-│  ├─ describe        57.397    6.366   10.622   10.622  10.303   0.319 cpu-2         queued=4 active=4
-│  ├─ describe        58.658    5.938    6.865    6.865   6.659   0.206 cpu-4         queued=4 active=4
-│  ├─ describe        58.899    6.077   12.985   12.985  12.595   0.390 cpu-1         queued=4 active=4
-│  ├─ describe        61.768    4.486   12.041   12.041  11.679   0.362 cpu-3         queued=3 active=4
-│  ├─ describe        63.768   10.617   11.583   11.583  11.235   0.348 cpu-2         queued=4 active=4
-│  ├─ describe        64.601   12.866    9.703    9.703   9.411   0.292 cpu-4         queued=4 active=4
-│  ├─ describe        64.981   12.980    7.191    7.191   6.975   0.216 cpu-1         queued=4 active=4
-│  ├─ describe        66.259   12.036   10.872   10.872  10.545   0.327 cpu-3         queued=4 active=4
-│  ├─ store ×120      71.466    0.000  232.592  232.592  23.207 209.385 ?-*           [min=0.880 max=5.261
-│  │                                                                                  extent=711.568
-│  │                                                                                  maxAt=+475.755
-│  │                                                                                  waitMax=0.000 par=0.33]
-│  ├─ read ×112       73.278    0.000  299.748  299.748  23.925 275.823 io-*          [min=1.123 max=6.168
-│  │                                                                                  extent=663.971
-│  │                                                                                  maxAt=+656.518
-│  │                                                                                  waitMax=0.000 par=0.45]
-│  ├─ decode ×112     75.226 1655.931  640.749  640.749 621.469  19.280 cpu-*         [min=2.462 max=12.541
-│  │                                                                                  extent=685.559
-│  │                                                                                  maxAt=+660.743
-│  │                                                                                  waitMax=26.642 par=0.93]
-│  └─ describe ×112   90.883 1637.183 1009.082 1009.082 978.758  30.324 cpu-*         [min=4.222 max=17.081
+PUT /video             0.000           790.221   55.539                 http-10
+├─ :upload             0.200            44.155                                  p     bytes=26289111
+├─ :probe             44.375             3.933                                  p     frames=120
+├─ :pipeline          48.328           734.746                                  p     frames=120
+├─ read               48.333    0.000    2.995    2.995   0.239   2.756 io-1          frame=0 queued=0
+│                                                                                     active=0
+├─ read               48.336    0.000    3.072    3.072   0.245   2.827 io-2          frame=1 queued=0
+│                                                                                     active=1
+├─ read               48.339    0.000    3.056    3.056   0.244   2.812 io-3          frame=2 queued=0
+│                                                                                     active=2
+├─ read               48.342    0.000    2.736    2.736   0.218   2.518 io-4          frame=3 queued=0
+│                                                                                     active=3
+├─ read               48.345    2.733    2.276    2.276   0.182   2.094 io-4          frame=4 queued=0
+│                                                                                     active=4
+├─ read               48.348    2.980    2.065    2.065   0.165   1.900 io-1          frame=5 queued=1
+│                                                                                     active=4
+├─ read               48.351    3.044    2.971    2.971   0.237   2.734 io-3          frame=6 queued=2
+│                                                                                     active=4
+├─ read               48.354    3.054    2.241    2.241   0.179   2.062 io-2          frame=7 queued=3
+│                                                                                     active=4
+├─ await              48.357           734.682  734.682                 http-10 w
+├─ decode             51.083    0.000    7.811    7.811   7.576   0.235 cpu-2         queued=0 active=1
+├─ decode             51.333    0.000    6.059    6.059   5.877   0.182 cpu-3         queued=0 active=2
+├─ decode             51.400    0.000    7.253    7.253   7.035   0.218 cpu-4         queued=0 active=3
+├─ decode             51.413    5.979    4.371    4.371   4.239   0.132 cpu-3         queued=0 active=4
+├─ decode             53.359    5.294    5.943    5.943   5.764   0.179 cpu-4         queued=1 active=4
+├─ decode             53.398    5.496    4.869    4.869   4.722   0.147 cpu-2         queued=2 active=4
+├─ decode             53.654    6.010    5.312    5.312   5.152   0.160 cpu-1         queued=3 active=4
+├─ decode             54.371    7.392    4.491    4.491   4.356   0.135 cpu-3         queued=4 active=4
+├─ describe           57.397    6.366   10.622   10.622  10.303   0.319 cpu-2         queued=4 active=4
+├─ describe           58.658    5.938    6.865    6.865   6.659   0.206 cpu-4         queued=4 active=4
+├─ describe           58.899    6.077   12.985   12.985  12.595   0.390 cpu-1         queued=4 active=4
+├─ describe           61.768    4.486   12.041   12.041  11.679   0.362 cpu-3         queued=3 active=4
+├─ describe           63.768   10.617   11.583   11.583  11.235   0.348 cpu-2         queued=4 active=4
+├─ describe           64.601   12.866    9.703    9.703   9.411   0.292 cpu-4         queued=4 active=4
+├─ describe           64.981   12.980    7.191    7.191   6.975   0.216 cpu-1         queued=4 active=4
+├─ describe           66.259   12.036   10.872   10.872  10.545   0.327 cpu-3         queued=4 active=4
+├─ store ×120         71.466    0.000  232.592  232.592  23.207 209.385 ?-*           [min=0.880 max=5.261
+│                                                                                     extent=711.568
+│                                                                                     maxAt=+475.755
+│                                                                                     waitMax=0.000 par=0.33]
+├─ read ×112          73.278    0.000  299.748  299.748  23.925 275.823 io-*          [min=1.123 max=6.168
+│                                                                                     extent=663.971
+│                                                                                     maxAt=+656.518
+│                                                                                     waitMax=0.000 par=0.45]
+├─ decode ×112        75.226 1655.931  640.749  640.749 621.469  19.280 cpu-*         [min=2.462 max=12.541
+│                                                                                     extent=685.559
+│                                                                                     maxAt=+660.743
+│                                                                                     waitMax=26.642 par=0.93]
+├─ describe ×112      90.883 1637.183 1009.082 1009.082 978.758  30.324 cpu-*         [min=4.222 max=17.081
 │                                                                                     extent=690.331
 │                                                                                     maxAt=+568.093
 │                                                                                     waitMax=27.451 par=1.46]
-└─ commit            783.094             7.097    7.097                 http-10
+└─ :commit           783.094             7.097                                  p
 x=: 456 spans folded into aggregates, 0 dropped (not on the wire)
