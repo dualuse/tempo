@@ -247,6 +247,8 @@ button.tile:hover { background: hsl(var(--foreground) / .025); }
 .sw.fail { background: hsl(var(--destructive)); }
 .sw.agg { background: repeating-linear-gradient(90deg, hsl(var(--foreground) / .5) 0 3px, hsl(var(--foreground) / .16) 3px 6px); }
 .sw.open { background: linear-gradient(90deg, hsl(var(--foreground) / .5) 60%, transparent 60%); box-shadow: inset -2px 0 0 hsl(var(--foreground)); }
+.sw.phase { width: 24px; background: linear-gradient(90deg, hsl(var(--foreground) / .5) 0 11px, hsl(var(--card)) 11px 12px, hsl(var(--foreground) / .5) 12px); }
+.sw.unphased { background: hsl(var(--foreground) / .19); }
 .zoom-ctl { display: flex; gap: 6px; align-items: center; }
 .zoom-ctl .btn-ghost { padding: .25rem .7rem; min-width: 2.1rem; }
 
@@ -286,6 +288,9 @@ table.tbl { border-collapse: collapse; width: 100%; font-size: 12.5px; }
 .tbl .wait { color: hsl(var(--wait)); }
 .tbl .off { color: hsl(var(--off)); }
 .tbl .fail { color: hsl(var(--destructive)); }
+.tbl tr.phase-row td.name { color: hsl(var(--muted-foreground)); }
+.tag { display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 4px; font-family: var(--font-sans); font-size: 10px; letter-spacing: .02em; color: hsl(var(--muted-foreground)); border: 1px solid hsl(var(--border)); vertical-align: 1px; }
+.unnamed { font-style: italic; }
 .flags { font-family: var(--font-mono); }
 .bar-cell { width: 90px; min-width: 70px; }
 .dbar { position: relative; height: 8px; background: hsl(var(--foreground) / .06); border-radius: 2px; }
@@ -479,6 +484,8 @@ body.prompting footer { display: none; }
             <span><i class="sw fail"></i>failed</span>
             <span><i class="sw agg"></i>aggregate</span>
             <span><i class="sw open"></i>open</span>
+            <span><i class="sw phase"></i>phases</span>
+            <span><i class="sw unphased"></i>unphased time</span>
           </div>
           <div class="zoom-ctl">
             <button class="btn-ghost" id="cpToggle" type="button" aria-pressed="true" title="Show the critical path track">Path</button>
@@ -491,7 +498,7 @@ body.prompting footer { display: none; }
           <canvas id="lanes" tabindex="0" aria-label="Timeline lanes per thread, grouped by pool"></canvas>
           <div class="tooltip" id="tip" role="tooltip"></div>
         </div>
-        <p class="micro hint">wheel: zoom · shift+wheel: pan · alt+wheel: scroll · drag: pan · click: select · click again or double-click: zoom to span · pool header: collapse · keys: ← → + − 0 enter esc</p>
+        <p class="micro hint">wheel: zoom · shift+wheel: pan · alt+wheel: scroll · drag: pan · click: select · click again or double-click: zoom to span · hover: a phase too narrow for its name · pool header: collapse · keys: ← → + − 0 enter esc</p>
       </div>
       <div class="pane" id="pane-findings" role="tabpanel" hidden></div>
       <div class="pane" id="pane-tree" role="tabpanel" hidden></div>
@@ -1837,7 +1844,7 @@ const TempoAnalysis = (function (P) {
   // r: what P.load / P.loadAsync return ({doc, header, source, compare?, tab?, note?})
   function makeTrace(r, name) {
     const m = A.model(r.doc);
-    const tr = { name: name || (m.root ? m.root.name : "trace"), header: r.header, source: r.source, doc: r.doc, m: m, compare: r.compare, tab: r.tab };
+    const tr = { name: name || (m.root ? m.root.title : "trace"), header: r.header, source: r.source, doc: r.doc, m: m, compare: r.compare, tab: r.tab };
     tr.findings = A.findings(m);
     tr.cp = A.criticalPath(m);
     tr.pools = A.pools(m);
@@ -2212,7 +2219,7 @@ const TempoAnalysis = (function (P) {
     $("mainMenu").open = false;
     const tr = state.A;
     if (!tr || state.ghost) return;
-    const base = "tempo-" + slug(tr.m.root ? tr.m.root.name : "trace") + (tr.doc.wall ? "-" + tr.doc.wall : "");
+    const base = "tempo-" + slug(tr.m.root ? tr.m.root.title : "trace") + (tr.doc.wall ? "-" + tr.doc.wall : "");
     const kind = b.dataset.export;
     if (kind === "json") download(base + ".json", P.dumpJson(tr.doc), "application/json");
     else if (kind === "chrome") download(base + ".chrome.json", JSON.stringify(A.toChrome(tr.m)), "application/json");
@@ -2274,8 +2281,8 @@ const TempoAnalysis = (function (P) {
     updateChrome();
     if (!has) return;
     const tr = state.A, m = tr.m, d = tr.doc, cp = tr.cp, root = m.root;
-    $("traceName").textContent = root ? root.name : "(no spans)";
-    $("traceName").title = root ? root.name : "";
+    $("traceName").textContent = root ? root.title : "(no spans)";
+    $("traceName").title = root ? root.title : "";
     $("traceDur").textContent = root ? fmtT(root.dur) : "";
     const ofPath = (v) => (cp.total ? pct(v / cp.total) + " of the critical path" : "");
     const pools = new Set(d.threads.map(A.poolOf)).size;
@@ -2361,9 +2368,10 @@ const TempoAnalysis = (function (P) {
       return;
     }
     const row = (k, v, cls) => "<dt>" + esc(k) + "</dt><dd" + (cls ? " class=\"" + cls + "\"" : "") + ">" + v + "</dd>";
+    if (s.isPhase) { renderPhaseDetail(el, tr, s, row); return; }
     let h = "<p class=\"eyebrow\">Span #" + s.id + " · " + esc(s.notRun ? "never ran" : threadLabel(tr, s.thread)) + "</p>";
-    h += "<h3>" + esc(s.name) + (s.isAgg ? " ×" + fmtN(s.agg.count) : "") + "</h3>";
-    h += "<div class=\"path\">" + esc(s.parent ? (m.root.name + " / " + s.key.split("/").join(" / ")) : "root") + "</div>";
+    h += "<h3" + (s.unnamed ? " class=\"unnamed\" title=\"An unnamed span, labelled by its phases\"" : "") + ">" + esc(s.title) + (s.isAgg ? " ×" + fmtN(s.agg.count) : "") + "</h3>";
+    h += "<div class=\"path\">" + esc(s.parent ? (m.root.title + " / " + s.key.split("/").join(" / ")) : "root") + "</div>";
     if (s.flags) h += "<div style=\"margin-top:6px\">" + flagWords(s.flags).map((w, i) => { const f = s.flags[i]; return "<span class=\"chip" + (f === "f" ? " fail" : f === "w" ? " off" : f === "n" ? " wait" : "") + "\">" + esc(w) + "</span>"; }).join("") + "</div>";
     h += "<dl>";
     h += row(s.isHandoff || (s.isAgg && s.wait !== undefined) ? "Submitted" : "Start", fmtT(s.start));
@@ -2394,16 +2402,44 @@ const TempoAnalysis = (function (P) {
       h += "<div class=\"sect eyebrow\">Attributes</div>";
       for (const k of Object.keys(s.attrs)) h += row(k, esc(fmtN(s.attrs[k])));
     }
+    if (s.phases.length) {
+      h += "<div class=\"sect eyebrow\">Phases · " + s.phases.length + "</div>";
+      const shown = s.phases.slice(0, 12);
+      for (const q of shown) h += "<dt><button class=\"linkish\" type=\"button\" data-select=\"" + q.id + "\">" + esc(q.title) + "</button></dt><dd" + (A.has(q, "f") ? " class=\"fail\"" : "") + ">" + fmtT(q.dur) + "</dd>";
+      if (s.phases.length > shown.length) h += "<dt class=\"micro\">+" + (s.phases.length - shown.length) + " more</dt><dd></dd>";
+      const inPhases = s.phases.reduce((a, q) => a + q.dur, 0);
+      if (!s.isAgg && s.dur > inPhases) h += row("Unphased", fmtT(s.dur - inPhases));
+    }
     if (s.children.length) {
       h += "<div class=\"sect eyebrow\">Children · " + s.children.length + "</div>";
       const shown = s.children.slice(0, 12);
-      for (const c of shown) h += "<dt><button class=\"linkish\" type=\"button\" data-select=\"" + c.id + "\">" + esc(c.name) + (c.isAgg ? " ×" + c.agg.count : "") + "</button></dt><dd>" + fmtT(c.dur) + "</dd>";
+      for (const c of shown) h += "<dt><button class=\"linkish\" type=\"button\" data-select=\"" + c.id + "\">" + esc(c.title) + (c.isAgg ? " ×" + c.agg.count : "") + "</button></dt><dd>" + fmtT(c.dur) + "</dd>";
       if (s.children.length > shown.length) h += "<dt class=\"micro\">+" + (s.children.length - shown.length) + " more</dt><dd></dd>";
     }
     h += "</dl><div class=\"row\">";
     h += "<button class=\"btn-ghost\" type=\"button\" id=\"dZoom\">Zoom to span</button>";
     if (s.parent) h += "<button class=\"btn-ghost\" type=\"button\" data-select=\"" + s.parent.id + "\">Parent</button>";
     h += "</div>";
+    el.innerHTML = h;
+    $("dZoom").addEventListener("click", () => jumpTo(s.id));
+  }
+
+  // A phase: its own start and duration, flags and attributes; no self time, CPU or children.
+  function renderPhaseDetail(el, tr, s, row) {
+    const par = s.parent;
+    let h = "<p class=\"eyebrow\">Phase #" + s.id + " · of span #" + par.id + "</p>";
+    h += "<h3>" + esc(s.title) + "</h3>";
+    h += "<div class=\"path\">" + esc(tr.m.root.title + " / " + s.key.split("/").join(" / ")) + "</div>";
+    const fl = s.flags.replace("p", "");
+    if (fl) h += "<div style=\"margin-top:6px\">" + flagWords(fl).map((w, i) => "<span class=\"chip" + (fl[i] === "f" ? " fail" : "") + "\">" + esc(w) + "</span>").join("") + "</div>";
+    h += "<dl>" + row("Start", fmtT(s.start)) + row("Duration", fmtT(s.dur));
+    if (s.attrs) {
+      h += "<div class=\"sect eyebrow\">Attributes</div>";
+      for (const k of Object.keys(s.attrs)) h += row(k, esc(fmtN(s.attrs[k])));
+    }
+    h += "</dl><p class=\"note\">A section of the timeline of <button class=\"linkish\" type=\"button\" data-select=\"" + par.id + "\">" + esc(par.title) + "</button>, not a child of it.</p><div class=\"row\">";
+    h += "<button class=\"btn-ghost\" type=\"button\" id=\"dZoom\">Zoom to phase</button>";
+    h += "<button class=\"btn-ghost\" type=\"button\" data-select=\"" + par.id + "\">Span</button></div>";
     el.innerHTML = h;
     $("dZoom").addEventListener("click", () => jumpTo(s.id));
   }
@@ -2422,6 +2458,7 @@ const TempoAnalysis = (function (P) {
       lanes.set(ln.key, ln);
     });
     for (const s of m.spans) {
+      if (s.isPhase) continue;   // drawn on its span's bar
       const k = laneKeyOf(s);
       let ln = lanes.get(k);
       if (!ln) {
@@ -2433,10 +2470,10 @@ const TempoAnalysis = (function (P) {
       }
       ln.spans.push(s);
     }
-    const rowOf = new Map(), groupOf = new Map(), laneOf = new Map();
+    const rowOf = new Map(), groupOf = new Map(), laneOf = new Map(), prevOf = new Map();
     for (const g of groups.values()) {
       for (const ln of g.lanes) {
-        const rows = [];
+        const rows = [], rowSpans = [];
         for (const s of ln.spans) {
           let r = s.parent && laneKeyOf(s.parent) === ln.key ? rowOf.get(s.parent.id) + 1 : 0;
           const lo = s.notRun ? s.start : s.runStart, hi = Math.max(s.end, lo + 1);
@@ -2445,16 +2482,31 @@ const TempoAnalysis = (function (P) {
             if (!rows[r].some((iv) => iv[0] < hi && lo < iv[1])) break;
           }
           rows[r].push([lo, hi]);
+          (rowSpans[r] = rowSpans[r] || []).push([lo, s]);
           rowOf.set(s.id, r);
           groupOf.set(s.id, g.pool);
           laneOf.set(s.id, ln);
+          for (const p of s.phases) { rowOf.set(p.id, r); groupOf.set(p.id, g.pool); laneOf.set(p.id, ln); }
+        }
+        // the bar before each one in its row: a phased span's name goes in front of its bar when it fits there
+        for (const list of rowSpans) {
+          if (!list) continue;
+          list.sort((a, b) => a[0] - b[0]);
+          for (let i = 1; i < list.length; i++) prevOf.set(list[i][1].id, list[i - 1][1]);
         }
         ln.rows = Math.max(1, rows.length);
         g.tasks += ln.spans.length;
       }
     }
-    return { groups: Array.from(groups.values()), rowOf: rowOf, groupOf: groupOf, laneOf: laneOf };
+    // A phased span shows its name in front of its bar. Where there is no room in front (the bar starts
+    // at the left edge or right after another), it goes in a name column left of the time axis, which
+    // the chart has whenever it has a named phased span.
+    ctx.font = NAME_FONT();
+    let nameW = 0;
+    for (const s of m.spans) if (s.phases.length && !s.unnamed && !s.isAgg && !s.notRun) nameW = Math.max(nameW, ctx.measureText(s.title).width);
+    return { groups: Array.from(groups.values()), rowOf: rowOf, groupOf: groupOf, laneOf: laneOf, prevOf: prevOf, nameW: nameW };
   }
+  const NAME_FONT = () => "500 11px " + pal().font;
 
   const laneH = (ln) => L.LABEL + L.WAIT + ln.rows * L.ROW + L.GAP;
   const topH = () => L.AXIS + (state.showCp ? L.CPL + L.CPB + L.CPG : 0);
@@ -2484,7 +2536,8 @@ const TempoAnalysis = (function (P) {
   // ---------------------------------------------------------------- lanes: view state
   const canvas = $("lanes");
   const ctx = canvas.getContext("2d");
-  const view = { W: 600, H: 300, dpr: 1, t0: 0, t1: 1, scrollY: 0, hits: [], hover: null, drag: null, fitted: false, raf: 0 };
+  // X0: left edge of the time axis (the width of the name column, 0 without one); TW: its width.
+  const view = { W: 600, H: 300, X0: 0, TW: 600, dpr: 1, t0: 0, t1: 1, scrollY: 0, hits: [], hover: null, drag: null, fitted: false, raf: 0 };
 
   function sizeCanvas() {
     if (!state.A) return;
@@ -2494,6 +2547,9 @@ const TempoAnalysis = (function (P) {
     const maxH = Math.max(260, Math.round(window.innerHeight * 0.68));
     const H = Math.min(want, maxH);
     const dpr = Math.min(3, window.devicePixelRatio || 1);
+    const nameW = state.A.layout.nameW;
+    view.X0 = nameW ? Math.round(Math.min(nameW + 18, 220, Math.max(64, W * 0.3))) : 0;
+    view.TW = W - view.X0;
     if (W !== view.W || H !== view.H || dpr !== view.dpr || canvas.width !== Math.round(W * dpr)) {
       view.W = W; view.H = H; view.dpr = dpr;
       canvas.width = Math.round(W * dpr);
@@ -2526,7 +2582,7 @@ const TempoAnalysis = (function (P) {
     if (view.t0 > end * 1.5) { view.t1 -= view.t0 - end * 1.5; view.t0 = end * 1.5; }
   }
   function zoomAt(x, factor) {
-    const t = view.t0 + (x / view.W) * (view.t1 - view.t0);
+    const t = view.t0 + ((x - view.X0) / view.TW) * (view.t1 - view.t0);
     view.t0 = t - (t - view.t0) * factor;
     view.t1 = t + (view.t1 - t) * factor;
     clampView();
@@ -2575,33 +2631,40 @@ const TempoAnalysis = (function (P) {
     ctx.stroke();
     ctx.restore();
   }
-  function text(str, x, y, maxW, color, font) {
+  // The longest prefix of str (with "…") that fits maxW in the current font; "" if not even one character does.
+  function fitText(str, maxW) {
+    if (ctx.measureText(str).width <= maxW) return str;
+    let lo = 0, hi = str.length;
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (ctx.measureText(str.slice(0, mid) + "…").width <= maxW) lo = mid; else hi = mid - 1; }
+    return lo < 1 ? "" : str.slice(0, lo) + "…";
+  }
+  function text(str, x, y, maxW, color, font, align) {
     if (maxW < 14) return;
     ctx.font = font || ("11px " + pal().font);
+    const s = fitText(str, maxW);
+    if (!s) return;
     ctx.fillStyle = color;
-    let s = str;
-    if (ctx.measureText(s).width > maxW) {
-      let lo = 0, hi = s.length;
-      while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (ctx.measureText(s.slice(0, mid) + "…").width <= maxW) lo = mid; else hi = mid - 1; }
-      if (lo < 1) return;
-      s = s.slice(0, lo) + "…";
-    }
-    ctx.fillText(s, x, y);
+    if (align === "center") ctx.fillText(s, x + (maxW - ctx.measureText(s).width) / 2, y);
+    else if (align === "right") ctx.fillText(s, x + maxW - ctx.measureText(s).width, y);
+    else ctx.fillText(s, x, y);
   }
   const setSpacing = (v) => { if ("letterSpacing" in ctx) ctx.letterSpacing = v; };
+  // Clips to the time axis: right of the name column, from y down to the bottom.
+  function clipTime(y) { ctx.save(); ctx.beginPath(); ctx.rect(view.X0, y, view.W - view.X0, view.H - y); ctx.clip(); }
 
   function draw() {
     const tr = state.A;
     if (!tr || state.tab !== "lanes" || $("viewer").hidden) return;
-    const c = pal(), W = view.W, H = view.H, m = tr.m;
+    const c = pal(), W = view.W, H = view.H, m = tr.m, X0 = view.X0;
     ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
     ctx.textBaseline = "middle";
     ctx.fillStyle = c.card;
     ctx.fillRect(0, 0, W, H);
     view.hits = [];
-    const X = (t) => (t - view.t0) / (view.t1 - view.t0) * W;
+    view.phases = 0;
+    const X = (t) => X0 + (t - view.t0) / (view.t1 - view.t0) * view.TW;
     const top = topH();
-    const step = niceStep(view.t1 - view.t0, W / 110);
+    const step = niceStep(view.t1 - view.t0, view.TW / 110);
     const ticks = [];
     for (let t = Math.ceil(view.t0 / step) * step; t <= view.t1; t += step) ticks.push(t);
 
@@ -2610,10 +2673,10 @@ const TempoAnalysis = (function (P) {
     ctx.beginPath(); ctx.rect(0, top, W, H - top); ctx.clip();
     ctx.strokeStyle = c.grid; ctx.lineWidth = 1;
     ctx.beginPath();
-    for (const t of ticks) { const x = Math.round(X(t)) + 0.5; ctx.moveTo(x, top); ctx.lineTo(x, H); }
+    for (const t of ticks) { const x = Math.round(X(t)) + 0.5; if (x < X0) continue; ctx.moveTo(x, top); ctx.lineTo(x, H); }
     ctx.stroke();
     // render time: the root's end
-    if (m.root) { ctx.strokeStyle = c.muted; ctx.setLineDash([2, 3]); ctx.beginPath(); const x = Math.round(X(m.root.end)) + 0.5; ctx.moveTo(x, top); ctx.lineTo(x, H); ctx.stroke(); ctx.setLineDash([]); }
+    if (m.root && X(m.root.end) >= X0) { ctx.strokeStyle = c.muted; ctx.setLineDash([2, 3]); ctx.beginPath(); const x = Math.round(X(m.root.end)) + 0.5; ctx.moveTo(x, top); ctx.lineTo(x, H); ctx.stroke(); ctx.setLineDash([]); }
     let y = top - view.scrollY;
     for (const g of tr.layout.groups) {
       const collapsed = state.collapsed.has(g.pool);
@@ -2641,9 +2704,9 @@ const TempoAnalysis = (function (P) {
     ctx.beginPath(); ctx.moveTo(0, L.AXIS - 0.5); ctx.lineTo(W, L.AXIS - 0.5); ctx.moveTo(0, top - 0.5); ctx.lineTo(W, top - 0.5); ctx.stroke();
     ctx.strokeStyle = c.muted;
     ctx.beginPath();
-    for (const t of ticks) { const x = Math.round(X(t)) + 0.5; ctx.moveTo(x, L.AXIS - 5); ctx.lineTo(x, L.AXIS); }
+    for (const t of ticks) { const x = Math.round(X(t)) + 0.5; if (x < X0) continue; ctx.moveTo(x, L.AXIS - 5); ctx.lineTo(x, L.AXIS); }
     ctx.stroke();
-    for (const t of ticks) text(fmtTick(t, step), X(t) + 4, L.AXIS / 2, W - X(t) - 4, c.muted);
+    for (const t of ticks) if (X(t) >= X0) text(fmtTick(t, step), X(t) + 4, L.AXIS / 2, W - X(t) - 4, c.muted);
     // scroll indicator
     const ch = contentH(tr.layout), vis = H - top;
     if (ch > vis) {
@@ -2651,6 +2714,8 @@ const TempoAnalysis = (function (P) {
       ctx.fillStyle = c.faint; ctx.fillRect(W - 5, top, 4, vis);
       ctx.fillStyle = c.muted; ctx.fillRect(W - 5, ty, 4, th);
     }
+    canvas.dataset.phases = String(view.phases);
+    canvas.dataset.nameColumn = String(X0);
   }
 
   function drawGroup(g, y, collapsed) {
@@ -2667,18 +2732,20 @@ const TempoAnalysis = (function (P) {
 
   function drawDensity(g, y, X) {
     const c = pal();
+    clipTime(y);
     for (const ln of g.lanes) for (const s of ln.spans) {
       const x0 = X(s.notRun ? s.start : s.runStart), x1 = X(s.end);
-      if (x1 < 0 || x0 > view.W) continue;
+      if (x1 < view.X0 || x0 > view.W) continue;
       ctx.fillStyle = s.notRun ? c.orangeSoft : A.has(s, "f") ? c.red : c.ramp[3];
       ctx.globalAlpha = 0.55;
       ctx.fillRect(x0, y + 2, Math.max(1, x1 - x0), L.DENS - 4);
     }
     ctx.globalAlpha = 1;
+    ctx.restore();
   }
 
   function drawLane(tr, ln, y, X) {
-    const c = pal(), W = view.W;
+    const c = pal(), W = view.W, X0 = view.X0;
     ctx.font = "500 11px " + c.font;
     ctx.fillStyle = ln.special ? c.muted : c.fg;
     ctx.fillText(ln.title, 8, y + L.LABEL / 2 + 1);
@@ -2686,35 +2753,54 @@ const TempoAnalysis = (function (P) {
     const sub = [ln.sub, ln.live ? "live" : ""].filter(Boolean).join(" · ");
     if (sub) text(sub, 8 + tw, y + L.LABEL / 2 + 1, W - 16 - tw, c.muted, "11px " + c.font);
     const wy = y + L.LABEL, ry = wy + L.WAIT + 1;
+    if (X0) {   // the name column, beside the lane's rows
+      const bottom = y + laneH(ln) - L.GAP / 2;
+      ctx.fillStyle = c.faint; ctx.fillRect(0, wy, X0, bottom - wy);
+      ctx.strokeStyle = c.border; ctx.beginPath(); ctx.moveTo(X0 - 0.5, wy); ctx.lineTo(X0 - 0.5, bottom); ctx.stroke();
+    }
     ctx.strokeStyle = c.grid;
     ctx.beginPath(); ctx.moveTo(0, y + laneH(ln) - L.GAP / 2 + 0.5); ctx.lineTo(W, y + laneH(ln) - L.GAP / 2 + 0.5); ctx.stroke();
     const rowOf = tr.layout.rowOf;
-    for (const s of ln.spans) drawSpan(tr, s, ry + rowOf.get(s.id) * L.ROW, wy, X, rowOf.get(s.id));
+    const column = new Map();   // row -> phased spans whose name goes in the name column
+    const phaseHits = [];
+    clipTime(wy);
+    for (const s of ln.spans) drawSpan(tr, s, ry + rowOf.get(s.id) * L.ROW, wy, X, rowOf.get(s.id), column, phaseHits);
+    ctx.restore();
+    // phases above their spans, so that hovering a phase finds the phase
+    for (const h of phaseHits) view.hits.push(h);
+    const h = L.ROW - 3;
+    for (const [row, list] of column) {
+      const yy = ry + row * L.ROW;
+      ctx.font = NAME_FONT();
+      text(list.map((s) => s.title).join(" · "), 6, yy + h / 2 + 0.5, X0 - 12, c.fg, NAME_FONT(), "right");
+      view.hits.push({ kind: "span", id: list[0].id, x: 0, y: yy - 1, w: X0, h: h + 2 });
+    }
   }
 
-  function drawSpan(tr, s, ry, wy, X, row) {
-    const c = pal(), W = view.W, h = L.ROW - 3;
+  function drawSpan(tr, s, ry, wy, X, row, column, phaseHits) {
+    const c = pal(), W = view.W, X0 = view.X0, h = L.ROW - 3;
     const sel = state.sel === s.id, hov = view.hover === s.id;
-    const label = s.name + (s.isAgg ? " ×" + s.agg.count : "");
+    const label = s.title + (s.isAgg ? " ×" + s.agg.count : "");
     let x0, x1;
     if (s.notRun) {
       x0 = X(s.start); x1 = X(s.end);
-      if (x1 < -2 || x0 > W + 2) return;
+      if (x1 < X0 - 2 || x0 > W + 2) return;
       const w = Math.max(2, x1 - x0);
       ctx.fillStyle = c.orangeSoft; ctx.fillRect(x0, ry, w, h);
       hatch(x0, ry, w, h, c.orange, 5);
       ctx.fillStyle = c.orange; ctx.fillRect(x0, ry, 2, h);
-      text(label + (A.has(s, "n") ? " · never started" : " · cancelled in queue"), Math.max(x0, 0) + 5, ry + h / 2 + 0.5, Math.min(x1, W) - Math.max(x0, 0) - 8, c.fg);
+      text(label + (A.has(s, "n") ? " · never started" : " · cancelled in queue"), Math.max(x0, X0) + 5, ry + h / 2 + 0.5, Math.min(x1, W) - Math.max(x0, X0) - 8, c.fg);
     } else {
       if (s.isHandoff && s.runStart > s.start) {
         const a = X(s.start), b = X(s.runStart);
-        if (b > -2 && a < W + 2) { ctx.fillStyle = c.orange; ctx.fillRect(a, wy, Math.max(1, b - a), L.WAIT - 1); }
+        if (b > X0 - 2 && a < W + 2) { ctx.fillStyle = c.orange; ctx.fillRect(a, wy, Math.max(1, b - a), L.WAIT - 1); }
       }
       x0 = s.isAgg ? X(s.start) : X(s.runStart);
       x1 = X(s.end);
-      if (x1 < -2 || x0 > W + 2) return;
+      if (x1 < X0 - 2 || x0 > W + 2) return;
       const w = Math.max(1, x1 - x0);
       const ramp = c.ramp[Math.min(row, c.ramp.length - 1)], rampText = c.rampText[Math.min(row, c.rampText.length - 1)];
+      const phased = s.phases.length > 0 && !s.isAgg;
       let textColor = rampText;
       if (s.isAgg) {
         if (s.wait) { ctx.fillStyle = c.orangeSoft; ctx.fillRect(x0, wy, w, L.WAIT - 1); }
@@ -2731,7 +2817,7 @@ const TempoAnalysis = (function (P) {
         if (w > 30) {
           ctx.font = "11px " + c.font;
           const tw = Math.min(ctx.measureText(label).width + 8, w - 2);
-          ctx.fillStyle = c.card; ctx.globalAlpha = 0.85; ctx.fillRect(Math.max(x0, 0) + 1, ry + 2, tw, h - 4); ctx.globalAlpha = 1;
+          ctx.fillStyle = c.card; ctx.globalAlpha = 0.85; ctx.fillRect(Math.max(x0, X0) + 1, ry + 2, tw, h - 4); ctx.globalAlpha = 1;
         }
       } else if (A.has(s, "w")) {
         ctx.fillStyle = c.blueSoft; ctx.fillRect(x0, ry, w, h);
@@ -2739,13 +2825,17 @@ const TempoAnalysis = (function (P) {
         ctx.strokeStyle = c.blue; ctx.lineWidth = 1; ctx.strokeRect(x0 + 0.5, ry + 0.5, Math.max(0, w - 1), h - 1);
         textColor = c.fg;
       } else {
+        // a phased span: its unphased time in a lighter fill, its phases drawn on top below
         ctx.fillStyle = A.has(s, "f") ? c.red : ramp;
+        if (phased) ctx.globalAlpha = 0.38;
         ctx.fillRect(x0, ry, w, h);
+        ctx.globalAlpha = 1;
         if (A.has(s, "f")) textColor = c.redFg;
-        if (s.offCpu > 0 && s.dur > 0) {
-          const ow = w * s.offCpu / s.dur;
-          ctx.fillStyle = c.blue; ctx.fillRect(x1 - ow, ry + h - 3, ow, 3);
-        }
+      }
+      if (phased) drawPhases(s, ry, h, X, x0, x1, ramp, rampText, phaseHits);
+      if (!s.isAgg && !A.has(s, "w") && s.offCpu > 0 && s.dur > 0) {
+        const ow = w * s.offCpu / s.dur;
+        ctx.fillStyle = c.blue; ctx.fillRect(x1 - ow, ry + h - 3, ow, 3);
       }
       if (A.has(s, "o")) {
         ctx.fillStyle = c.card; ctx.fillRect(x1 - 3, ry, 3, h);
@@ -2753,17 +2843,62 @@ const TempoAnalysis = (function (P) {
       }
       if (A.has(s, "c")) { ctx.strokeStyle = c.fg; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(x0, ry + h / 2); ctx.lineTo(x1, ry + h / 2); ctx.stroke(); }
       if (A.has(s, "m")) { ctx.fillStyle = c.fg; ctx.fillRect(x0, ry - 2, 2, 2); }
-      text(label, Math.max(x0, 0) + 4, ry + h / 2 + 0.5, Math.min(x1, W) - Math.max(x0, 0) - 7, textColor);
+      if (!phased) text(label, Math.max(x0, X0) + 4, ry + h / 2 + 0.5, Math.min(x1, W) - Math.max(x0, X0) - 7, textColor, s.unnamed ? "italic 11px " + c.font : undefined);
+      else if (!s.unnamed) {
+        // the name in front of the bar, never above or behind it; else in the name column
+        ctx.font = NAME_FONT();
+        const nw = ctx.measureText(s.title).width;
+        const prev = tr.layout.prevOf.get(s.id);
+        const room = x0 - Math.max(X0, prev ? X(prev.end) : X0);
+        if (room >= nw + 10 && x0 <= W) {
+          ctx.fillStyle = c.fg;
+          ctx.fillText(s.title, x0 - 5 - nw, ry + h / 2 + 0.5);
+          view.hits.push({ kind: "span", id: s.id, x: x0 - 6 - nw, y: ry - 1, w: nw + 6, h: h + 2 });
+        } else if (X0) {
+          if (!column.has(row)) column.set(row, []);
+          column.get(row).push(s);
+        }
+      }
     }
     if (sel || hov) {
       ctx.strokeStyle = c.ring; ctx.lineWidth = sel ? 2 : 1;
-      ctx.strokeRect(Math.max(-2, x0) - (sel ? 1.5 : 0.5), ry - (sel ? 1.5 : 0.5), Math.min(W + 4, Math.max(2, x1 - x0)) + (sel ? 3 : 1), h + (sel ? 3 : 1));
+      ctx.strokeRect(Math.max(X0 - 2, x0) - (sel ? 1.5 : 0.5), ry - (sel ? 1.5 : 0.5), Math.min(W + 4, Math.max(2, x1 - Math.max(X0 - 2, x0))) + (sel ? 3 : 1), h + (sel ? 3 : 1));
     }
-    view.hits.push({ kind: "span", id: s.id, x: Math.min(x0, x1) - 1, y: ry - 1, w: Math.max(4, Math.abs(x1 - x0)) + 2, h: h + 2 });
+    const hx = Math.max(X0, Math.min(x0, x1) - 1);
+    view.hits.push({ kind: "span", id: s.id, x: hx, y: ry - 1, w: Math.max(4, Math.max(x0, x1) + 1 - hx), h: h + 2 });
+  }
+
+  // The phases of a span on its bar: each section in the full fill, a 1px gap at every boundary (the
+  // CLI's |), its name centred when it fits (else only on hover). Hits go to phaseHits.
+  function drawPhases(s, ry, h, X, x0, x1, ramp, rampText, phaseHits) {
+    const c = pal(), X0 = view.X0, W = view.W;
+    const edges = new Set();
+    for (const p of s.phases) {
+      const a = Math.max(x0, X(p.start)), b = Math.min(x1, X(p.start + p.dur));
+      if (b < X0 - 2 || a > W + 2) continue;
+      const w = Math.max(1, b - a), failed = A.has(p, "f");
+      ctx.fillStyle = failed ? c.red : A.has(s, "f") ? c.red : ramp;
+      ctx.fillRect(a, ry, w, h);
+      edges.add(Math.round(a)); edges.add(Math.round(a + w));
+      if (A.has(p, "m")) { ctx.fillStyle = c.fg; ctx.fillRect(a, ry - 2, 2, 2); }
+      const lo = Math.max(a, X0), hi = Math.min(a + w, W);
+      text(p.name, lo + 3, ry + h / 2 + 0.5, hi - lo - 6, failed || A.has(s, "f") ? c.redFg : rampText, undefined, "center");
+      if (state.sel === p.id || view.hover === p.id) {
+        const on = state.sel === p.id;
+        ctx.strokeStyle = c.ring; ctx.lineWidth = on ? 2 : 1;
+        ctx.strokeRect(a - (on ? 1 : 0.5), ry - (on ? 1 : 0.5), w + (on ? 2 : 1), h + (on ? 2 : 1));
+      }
+      // a narrow phase still gets a hit 5px wide, so that hovering shows its name
+      const hw = Math.max(5, hi - lo);
+      phaseHits.push({ kind: "span", id: p.id, x: Math.max(X0, (lo + hi) / 2 - hw / 2), y: ry, w: hw, h: h });
+      view.phases++;
+    }
+    ctx.fillStyle = c.card;
+    for (const e of edges) if (e > x0 + 0.5 && e < x1 - 0.5) ctx.fillRect(e, ry, 1, h);
   }
 
   function drawCp(tr, y, X) {
-    const c = pal(), W = view.W, cp = tr.cp;
+    const c = pal(), W = view.W, cp = tr.cp, X0 = view.X0;
     ctx.fillStyle = c.card; ctx.fillRect(0, y, W, L.CPL + L.CPB + L.CPG);
     setSpacing("0.5px");
     ctx.font = "600 10px " + c.font; ctx.fillStyle = c.muted;
@@ -2773,17 +2908,20 @@ const TempoAnalysis = (function (P) {
     const b = cp.byKind;
     text("run " + fmtT(b.run) + " · queue " + fmtT(b.wait) + " · blocked " + fmtT(b.block) + " · aggregates " + fmtT(b.agg), 8 + tw, y + L.CPL / 2 + 1, W - 16 - tw, c.fg);
     const by = y + L.CPL;
+    ctx.save(); ctx.beginPath(); ctx.rect(X0, by - 2, W - X0, L.CPB + 6); ctx.clip();
     for (const g of cp.segments) {
       const x0 = X(g.from), x1 = X(g.to);
-      if (x1 < 0 || x0 > W) continue;
+      if (x1 < X0 || x0 > W) continue;
       const w = Math.max(1, x1 - x0);
       if (g.kind === "wait") { ctx.fillStyle = c.orange; ctx.fillRect(x0, by, w, L.CPB); }
       else if (g.kind === "block") { ctx.fillStyle = c.blueSoft; ctx.fillRect(x0, by, w, L.CPB); hatch(x0, by, w, L.CPB, c.blue, 4); }
       else if (g.kind === "agg") { ctx.fillStyle = c.ramp[2]; ctx.globalAlpha = 0.45; ctx.fillRect(x0, by, w, L.CPB); ctx.globalAlpha = 1; ctx.save(); ctx.beginPath(); ctx.rect(x0, by, w, L.CPB); ctx.clip(); ctx.fillStyle = c.ramp[1]; for (let i = Math.floor(x0 / 6) * 6; i < x1; i += 6) ctx.fillRect(i, by, 3, L.CPB); ctx.restore(); }
       else { ctx.fillStyle = c.ramp[0]; ctx.fillRect(x0, by, w, L.CPB); }
       if (state.sel === g.id) { ctx.fillStyle = c.fg; ctx.fillRect(x0, by + L.CPB + 1, w, 2); }
-      view.hits.push({ kind: "span", id: g.id, seg: g, x: x0, y: by - 1, w: w, h: L.CPB + 2 });
+      const hx = Math.max(X0, x0);
+      view.hits.push({ kind: "span", id: g.id, seg: g, x: hx, y: by - 1, w: Math.max(1, x1 - hx), h: L.CPB + 2 });
     }
+    ctx.restore();
   }
 
   // ---------------------------------------------------------------- lanes: interaction
@@ -2805,6 +2943,17 @@ const TempoAnalysis = (function (P) {
     const tr = state.A, s = tr.m.spans[hit.id];
     const kv = [];
     const add = (k, v) => kv.push("<span>" + esc(k) + "</span><span>" + v + "</span>");
+    if (s.isPhase) {
+      // a phase reports its own start and duration only
+      add("start", fmtT(s.start));
+      add("dur", fmtT(s.dur));
+      const fl = s.flags.replace("p", "");
+      if (fl) add("flags", esc(flagWords(fl).join(", ")));
+      if (s.attrs) add("attrs", esc(Object.keys(s.attrs).slice(0, 4).map((k) => k + "=" + s.attrs[k]).join(" ")));
+      tip.innerHTML = "<b>" + esc(s.title) + "</b><span class=\"micro\">phase of " + esc(s.parent.label || s.parent.title) + "</span><div class=\"kv\">" + kv.join("") + "</div>";
+      placeTip(tip, p);
+      return;
+    }
     if (hit.seg) add("path", esc({ run: "own work", wait: "queue wait", block: "blocked", agg: "aggregate" }[hit.seg.kind]) + " · " + fmtT(hit.seg.to - hit.seg.from));
     add("start", fmtT(s.start) + (s.isHandoff ? " · began " + fmtT(s.runStart) : ""));
     add(s.isAgg ? "run Σ" : "dur", fmtT(s.dur) + (s.isAgg ? " · extent " + fmtT(s.agg.extent) : ""));
@@ -2815,7 +2964,11 @@ const TempoAnalysis = (function (P) {
     add("thread", esc(s.notRun ? "never ran" : s.thread >= 0 ? tr.doc.threads[s.thread] : "mixed"));
     if (s.flags) add("flags", esc(flagWords(s.flags).join(", ")));
     if (s.attrs) add("attrs", esc(Object.keys(s.attrs).slice(0, 4).map((k) => k + "=" + s.attrs[k]).join(" ")));
-    tip.innerHTML = "<b>" + esc(s.name + (s.isAgg ? " ×" + s.agg.count : "")) + "</b><span class=\"micro\">" + esc(s.parent ? s.key : "root") + "</span><div class=\"kv\">" + kv.join("") + "</div>";
+    if (s.phases.length) add("phases", esc(s.phases.map((q) => q.title).join(" · ")));
+    tip.innerHTML = "<b" + (s.unnamed ? " class=\"unnamed\"" : "") + ">" + esc(s.title + (s.isAgg ? " ×" + s.agg.count : "")) + "</b><span class=\"micro\">" + esc(s.parent ? s.key : "root") + "</span><div class=\"kv\">" + kv.join("") + "</div>";
+    placeTip(tip, p);
+  }
+  function placeTip(tip, p) {
     const bw = $("lanesBox").clientWidth, tw = tip.offsetWidth, th = tip.offsetHeight;
     let x = p.x + 14, y = p.y + 14;
     if (x + tw > bw - 4) x = Math.max(4, p.x - tw - 14);
@@ -2837,7 +2990,7 @@ const TempoAnalysis = (function (P) {
     if (d && d.id === e.pointerId) {
       if (!d.moved && Math.hypot(p.x - d.x, p.y - d.y) > 4) { d.moved = true; canvas.classList.add("grab"); $("tip").classList.remove("on"); }
       if (d.moved) {
-        const dt = (p.x - d.x) / view.W * (d.t1 - d.t0);
+        const dt = (p.x - d.x) / view.TW * (d.t1 - d.t0);
         view.t0 = d.t0 - dt; view.t1 = d.t1 - dt;
         view.scrollY = d.sy - (p.y - d.y);
         clampView(); clampScroll(); redraw();
@@ -2882,7 +3035,7 @@ const TempoAnalysis = (function (P) {
     const dx = e.deltaX * unit, dy = e.deltaY * unit;
     if (e.altKey) { view.scrollY += dy; clampScroll(); redraw(); return; }
     if (e.shiftKey || Math.abs(dx) > Math.abs(dy)) {
-      const d = (Math.abs(dx) > Math.abs(dy) ? dx : dy) / view.W * (view.t1 - view.t0);
+      const d = (Math.abs(dx) > Math.abs(dy) ? dx : dy) / view.TW * (view.t1 - view.t0);
       view.t0 += d; view.t1 += d; clampView(); redraw();
       return;
     }
@@ -2896,16 +3049,16 @@ const TempoAnalysis = (function (P) {
     else if (e.key === "ArrowRight") { view.t0 += span * 0.15; view.t1 += span * 0.15; clampView(); redraw(); }
     else if (e.key === "ArrowUp") { view.scrollY -= 40; clampScroll(); redraw(); }
     else if (e.key === "ArrowDown") { view.scrollY += 40; clampScroll(); redraw(); }
-    else if (e.key === "+" || e.key === "=") zoomAt(view.W / 2, 0.7);
-    else if (e.key === "-" || e.key === "_") zoomAt(view.W / 2, 1 / 0.7);
+    else if (e.key === "+" || e.key === "=") zoomAt(view.X0 + view.TW / 2, 0.7);
+    else if (e.key === "-" || e.key === "_") zoomAt(view.X0 + view.TW / 2, 1 / 0.7);
     else if (e.key === "0") fit();
     else if (e.key === "Enter" && state.sel !== null) zoomToSpan(state.sel);
     else if (e.key === "Escape") select(null);
     else done = false;
     if (done) e.preventDefault();
   });
-  $("zoomIn").addEventListener("click", () => zoomAt(view.W / 2, 0.6));
-  $("zoomOut").addEventListener("click", () => zoomAt(view.W / 2, 1 / 0.6));
+  $("zoomIn").addEventListener("click", () => zoomAt(view.X0 + view.TW / 2, 0.6));
+  $("zoomOut").addEventListener("click", () => zoomAt(view.X0 + view.TW / 2, 1 / 0.6));
   $("zoomFit").addEventListener("click", () => fit());
   $("cpToggle").addEventListener("click", () => {
     state.showCp = !state.showCp;
@@ -2947,10 +3100,18 @@ const TempoAnalysis = (function (P) {
     const tr = state.A, m = tr.m;
     const hidden = new Set();
     let rows = "";
+    // Phases are listed right below their span at its own indent, marked "phase": sections of the
+    // span, not children. Collapsing a span hides its children, not its phases.
+    const phaseRow = (q) => "<tr class=\"phase-row" + (state.sel === q.id ? " sel" : "") + "\" data-id=\"" + q.id + "\">" +
+      "<td class=\"l name\" style=\"padding-left:" + (8 + q.parent.depth * 14) + "px\"><span class=\"tog\">·</span>" + esc(q.title) + "<span class=\"tag\">phase</span></td>" +
+      tc("", "l dim") + tc(fmtT(q.start)) + tc(fmtT(q.dur), A.has(q, "f") ? "fail" : "") + tc(opt(undefined)) + tc(opt(undefined)) + tc(opt(undefined)) + tc(opt(undefined)) +
+      tc("<span class=\"flags\">" + esc(q.flags) + "</span>", "l" + (A.has(q, "f") ? " fail" : "")) +
+      tc(esc(q.attrs ? Object.keys(q.attrs).map((k) => k + "=" + q.attrs[k]).join(" ") : ""), "l dim") + "</tr>";
     for (const s of m.spans) {
+      if (s.isPhase) continue;
       if (s.parent && (hidden.has(s.parent.id) || state.treeCollapsed.has(s.parent.id))) { hidden.add(s.id); continue; }
       const tog = s.children.length ? "<button class=\"tog\" type=\"button\" data-tog=\"" + s.id + "\" aria-label=\"Toggle\">" + (state.treeCollapsed.has(s.id) ? "▸" : "▾") + "</button>" : "<span class=\"tog\"></span>";
-      const nm = esc(s.name) + (s.isAgg ? " <span class=\"dim\">×" + fmtN(s.agg.count) + "</span>" : "") + (s.children.length && state.treeCollapsed.has(s.id) ? " <span class=\"dim\">(" + s.children.length + ")</span>" : "");
+      const nm = (s.unnamed ? "<span class=\"unnamed\">" + esc(s.title) + "</span>" : esc(s.title)) + (s.isAgg ? " <span class=\"dim\">×" + fmtN(s.agg.count) + "</span>" : "") + (s.children.length && state.treeCollapsed.has(s.id) ? " <span class=\"dim\">(" + s.children.length + ")</span>" : "");
       rows += "<tr data-id=\"" + s.id + "\"" + (state.sel === s.id ? " class=\"sel\"" : "") + ">" +
         "<td class=\"l name\" style=\"padding-left:" + (8 + s.depth * 14) + "px\">" + tog + nm + "</td>" +
         tc(esc(s.notRun ? "—" : s.thread >= 0 ? tr.doc.threads[s.thread] : "mixed"), "l dim") +
@@ -2958,8 +3119,9 @@ const TempoAnalysis = (function (P) {
         tc(opt(s.wait, fmtT), s.wait ? "wait" : "") + tc(opt(s.cpu, fmtT)) + tc(opt(s.offCpu, fmtT), s.offCpu ? "off" : "") +
         tc("<span class=\"flags\">" + esc(s.flags) + "</span>", "l" + (A.has(s, "f") ? " fail" : "")) +
         tc(esc(s.attrs ? Object.keys(s.attrs).map((k) => k + "=" + s.attrs[k]).join(" ") : ""), "l dim") + "</tr>";
+      for (const q of s.phases) rows += phaseRow(q);
     }
-    $("pane-tree").innerHTML = "<div class=\"pane-tools\"><span class=\"eyebrow\">" + plural(m.spans.length, "record") + " in pre-order · self excludes same-thread children and blocking waits</span>" +
+    $("pane-tree").innerHTML = "<div class=\"pane-tools\"><span class=\"eyebrow\">" + plural(m.spans.length, "record") + " in pre-order · phases below their span · self excludes same-thread children and blocking waits</span>" +
       "<div class=\"row\"><button class=\"btn-ghost\" type=\"button\" id=\"treeAll\">Expand all</button><button class=\"btn-ghost\" type=\"button\" id=\"treeNone\">Collapse</button></div></div>" +
       "<div class=\"tbl-wrap\"><table class=\"tbl\"><thead><tr><th class=\"l\">Span</th><th class=\"l\">Thread</th><th>Start</th><th>Dur</th><th>Self</th><th>Wait</th><th>CPU</th><th>Off-CPU</th><th class=\"l\">Flags</th><th class=\"l\">Attrs</th></tr></thead><tbody>" + rows + "</tbody></table></div>";
     $("treeAll").addEventListener("click", () => { state.treeCollapsed.clear(); renderTree(); });
@@ -2985,8 +3147,8 @@ const TempoAnalysis = (function (P) {
     const get = (r, k) => (k === "mean" ? r.sum / Math.max(1, r.count - r.notStarted) : r[k]);
     const rows = sortRows(tr.paths, key, dir, get);
     const body = rows.map((r) => "<tr data-id=\"" + r.firstId + "\"" + (state.sel === r.firstId ? " class=\"sel\"" : "") + ">" +
-      tc(esc(r.label), "l name") + tc(fmtN(r.count) + (r.notStarted ? " <span class=\"wait\">(" + r.notStarted + " n)</span>" : "") + (r.failed ? " <span class=\"fail\">(" + r.failed + " f)</span>" : "")) +
-      tc(fmtT(r.sum)) + tc(fmtT(r.self)) + tc(fmtT(r.min)) + tc(fmtT(r.max)) + tc(fmtT(get(r, "mean"))) +
+      tc(esc(r.label) + (r.phase ? "<span class=\"tag\">phase</span>" : ""), "l name") + tc(fmtN(r.count) + (r.notStarted ? " <span class=\"wait\">(" + r.notStarted + " n)</span>" : "") + (r.failed ? " <span class=\"fail\">(" + r.failed + " f)</span>" : "")) +
+      tc(fmtT(r.sum)) + tc(r.phase ? "<span class=\"dim\">–</span>" : fmtT(r.self)) + tc(fmtT(r.min)) + tc(fmtT(r.max)) + tc(fmtT(get(r, "mean"))) +
       tc(r.handoffs ? fmtT(r.waitSum) : "<span class=\"dim\">–</span>", r.waitSum ? "wait" : "") + tc(r.handoffs ? fmtT(r.waitMax) : "<span class=\"dim\">–</span>", r.waitMax ? "wait" : "") +
       tc(r.cpuDur ? fmtT(r.cpuSum) : "<span class=\"dim\">–</span>") + tc(r.cpuDur ? fmtT(r.offCpu) : "<span class=\"dim\">–</span>", r.offCpu ? "off" : "") + "</tr>").join("");
     $("pane-aggregates").innerHTML = "<div class=\"pane-tools\"><span class=\"eyebrow\">per path · individual spans and folded aggregates together · click a column to sort</span></div>" +
@@ -3096,13 +3258,13 @@ const TempoAnalysis = (function (P) {
     const maxSum = Math.max(1, ...rows.map((r) => Math.abs(r.dSum))), maxWait = Math.max(1, ...rows.map((r) => Math.abs(r.dWait)));
     const bar = (v, max, cls) => "<div class=\"dbar" + (cls ? " " + cls : "") + "\"><i style=\"" + (v >= 0 ? "left:50%;width:" : "right:50%;width:") + (Math.abs(v) / max * 50) + "%\"></i></div>";
     const side = (r, f) => (r ? fmtT(r[f]) : "<span class=\"dim\">–</span>");
-    const body = rows.map((r) => "<tr" + (r.a ? " data-id=\"" + r.a.firstId + "\"" : "") + ">" + tc(esc(r.label) + (!r.a ? " <span class=\"dim\">(only B)</span>" : !r.b ? " <span class=\"dim\">(only A)</span>" : ""), "l name") +
+    const body = rows.map((r) => "<tr" + (r.a ? " data-id=\"" + r.a.firstId + "\"" : "") + ">" + tc(esc(r.label) + (r.phase ? "<span class=\"tag\">phase</span>" : "") + (!r.a ? " <span class=\"dim\">(only B)</span>" : !r.b ? " <span class=\"dim\">(only A)</span>" : ""), "l name") +
       tc((r.a ? fmtN(r.a.count) : "0") + " → " + (r.b ? fmtN(r.b.count) : "0")) + tc(side(r.a, "sum")) + tc(side(r.b, "sum")) + tc(fmtD(r.dSum)) + tc(bar(r.dSum, maxSum), "bar-cell") +
-      tc(fmtD(r.dSelf)) + tc(fmtD(r.dWait), r.dWait ? "wait" : "") + tc(bar(r.dWait, maxWait, "wait"), "bar-cell") + tc(fmtD(r.dCpu)) + "</tr>").join("");
+      tc(r.phase ? "<span class=\"dim\">–</span>" : fmtD(r.dSelf)) + tc(fmtD(r.dWait), r.dWait ? "wait" : "") + tc(bar(r.dWait, maxWait, "wait"), "bar-cell") + tc(fmtD(r.dCpu)) + "</tr>").join("");
     const total = (t) => t.m.root ? fmtT(t.m.root.dur) : "–";
     host.innerHTML = "<div class=\"panel card\"><div class=\"kv-grid\">" +
-      "<div><p class=\"eyebrow\">A · trace</p><span class=\"stat-value\">" + esc(a.m.root ? a.m.root.name : "") + " · " + total(a) + "</span></div>" +
-      "<div><p class=\"eyebrow\">B · compared with</p><span class=\"stat-value\">" + esc(b.m.root ? b.m.root.name : "") + " · " + total(b) + "</span></div>" +
+      "<div><p class=\"eyebrow\">A · trace</p><span class=\"stat-value\">" + esc(a.m.root ? a.m.root.title : "") + " · " + total(a) + "</span></div>" +
+      "<div><p class=\"eyebrow\">B · compared with</p><span class=\"stat-value\">" + esc(b.m.root ? b.m.root.title : "") + " · " + total(b) + "</span></div>" +
       "<div><p class=\"eyebrow\">Δ total (B − A)</p><span class=\"stat-value\">" + fmtD((b.m.root ? b.m.root.dur : 0) - (a.m.root ? a.m.root.dur : 0)) + "</span></div>" +
       "<div><p class=\"eyebrow\">Δ queue wait on path</p><span class=\"stat-value wait\">" + fmtD(b.cp.byKind.wait - a.cp.byKind.wait) + "</span></div></div>" +
       "<p class=\"note\" style=\"margin-bottom:0\">Δ = B − A per path. Count, sum, self, wait and CPU include folded aggregates. Sorted by the absolute change; click a column to sort by another.</p></div>" +
@@ -3129,10 +3291,10 @@ const TempoAnalysis = (function (P) {
       const rows = sortRows(rows0, key, dir, get);
       const scale = Math.max(1, ...rows0.map((r) => r.sum.max));
       const range = (s) => "<div class=\"rbar\"><i style=\"left:" + (s.p50 / scale * 100) + "%;width:" + ((s.p95 - s.p50) / scale * 100) + "%\"></i><b style=\"left:calc(" + (s.max / scale * 100) + "% - 1px)\"></b></div>";
-      const body = rows.map((r) => "<tr>" + tc(esc(r.label), "l name") + tc(r.n + (r.n < r.traces ? " <span class=\"dim\">/ " + r.traces + "</span>" : "")) +
+      const body = rows.map((r) => "<tr>" + tc(esc(r.label) + (r.phase ? "<span class=\"tag\">phase</span>" : ""), "l name") + tc(r.n + (r.n < r.traces ? " <span class=\"dim\">/ " + r.traces + "</span>" : "")) +
         tc(fmtT(r.sum.p50)) + tc(fmtT(r.sum.p95)) + tc(fmtT(r.sum.max)) + tc(range(r.sum), "bar-cell") +
         tc(r.wait.max ? fmtT(r.wait.p50) : "<span class=\"dim\">–</span>", r.wait.max ? "wait" : "") + tc(r.wait.max ? fmtT(r.wait.p95) : "<span class=\"dim\">–</span>", r.wait.max ? "wait" : "") + tc(r.wait.max ? fmtT(r.wait.max) : "<span class=\"dim\">–</span>", r.wait.max ? "wait" : "") +
-        tc(fmtT(r.self.p50)) + tc(fmtT(r.self.p95)) + tc(fmtN(r.count.p50)) + "</tr>").join("");
+        tc(r.phase ? "<span class=\"dim\">–</span>" : fmtT(r.self.p50)) + tc(r.phase ? "<span class=\"dim\">–</span>" : fmtT(r.self.p95)) + tc(fmtN(r.count.p50)) + "</tr>").join("");
       host.innerHTML = intro + "<div class=\"tbl-wrap\"><table class=\"tbl\"><thead><tr>" + th("Path", "label", "stats", "l") + th("n", "n", "stats") +
         th("Σ p50", "sum.p50", "stats") + th("Σ p95", "sum.p95", "stats") + th("Σ max", "sum.max", "stats") + "<th class=\"l\">p50–p95 · max</th>" +
         th("Wait Σ p50", "wait.p50", "stats") + th("Wait Σ p95", "wait.p95", "stats") + th("Wait Σ max", "wait.max", "stats") + th("Self p50", "self.p50", "stats") + th("Self p95", "self.p95", "stats") + th("Count p50", "count.p50", "stats") +

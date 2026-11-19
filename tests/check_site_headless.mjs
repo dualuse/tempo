@@ -3,7 +3,7 @@
 // phone (390x844, touch) and desktop (1440x900) size, through every tab. Fails on any console
 // message, uncaught exception or log entry (a CSP violation is one), any request besides the page
 // itself and data:/blob: URLs, a trace that does not open, an error in the notice, or a page wider
-// than the window.
+// than the window. Traces with phases are also checked for what the page draws of them (PHASES below).
 //
 //   node tests/check_site_headless.mjs [page.html]   CHROME=/path/to/chrome overrides the lookup
 //
@@ -15,11 +15,19 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { makeLink } from "../tools/tempo_parse.mjs";
+import { makeLink, decode } from "../tools/tempo_parse.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const PAGE = pathToFileURL(process.argv[2] || join(ROOT, "site", "index.html")).href;
 const sample = (name) => readFileSync(join(ROOT, "samples", name), "utf8").trim();
+
+// "phase < span" for every phase of a value, as the tooltip names them (an unnamed span by its phases).
+function phaseList(value) {
+  const spans = decode(value).spans;
+  const title = (s) => s.name || spans.filter((q) => q.parent === s.id && (q.flags || "").includes("p")).map((q) => q.name).join(" · ") || "(unnamed)";
+  const path = (s) => (s.parent <= 0 ? title(s) : path(spans[s.parent]) + "/" + title(s));
+  return spans.filter((s) => (s.flags || "").includes("p")).map((s) => s.name + " < " + (s.parent === 0 ? title(spans[0]) : path(spans[s.parent])));
+}
 
 function findChrome() {
   if (process.env.CHROME) return process.env.CHROME;
@@ -87,6 +95,42 @@ const PROBE = `(() => {
   });
 })()`;
 
+// Checks on a trace with phases (FORMAT.md §6.7), run in the page once it is open on the lanes tab.
+// Hovers the lanes canvas point by point and collects the tooltips: every phase must be reachable by
+// hover, narrow ones too, and say which span it sections. Then the tree lists each phase once below its
+// span, and a phase's detail shows its own start and duration only. Returns a list of problems.
+const PHASES = `(async () => {
+  const out = [];
+  const frames = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const cv = document.getElementById("lanes"), tip = document.getElementById("tip");
+  const want = JSON.parse(cv.dataset.expectPhases || "[]");
+  if (!(Number(cv.dataset.phases) > 0)) out.push("no phases drawn");
+  if (!(Number(cv.dataset.nameColumn) > 0)) out.push("no name column");
+  const box = cv.getBoundingClientRect(), seen = new Set();
+  for (let y = 2; y < box.height; y += 3) for (let x = 1; x < box.width; x += 2) {
+    cv.dispatchEvent(new PointerEvent("pointermove", { clientX: box.left + x, clientY: box.top + y, pointerType: "mouse", bubbles: true }));
+    if (tip.classList.contains("on") && tip.textContent.indexOf("phase of ") >= 0) seen.add(tip.querySelector("b").textContent + " < " + tip.querySelector(".micro").textContent.slice(9));
+  }
+  for (const w of want) if (!seen.has(w)) out.push("phase not reachable by hover: " + w);
+  cv.dispatchEvent(new PointerEvent("pointerleave", { bubbles: true }));
+  document.querySelector('.tab[data-tab="tree"]').click();
+  await frames();
+  const rows = [...document.querySelectorAll("#pane-tree tr.phase-row")];
+  if (rows.length !== want.length) out.push("tree lists " + rows.length + " phases, not " + want.length);
+  if (rows.some((r) => r.querySelector(".tog button"))) out.push("a phase in the tree can be expanded");
+  if (rows.length) {
+    rows[0].click();
+    await frames();
+    const d = document.getElementById("detail");
+    const dts = [...d.querySelectorAll("dt")].map((e) => e.textContent);
+    if (!/^Phase #/.test(d.querySelector(".eyebrow").textContent)) out.push("detail of a phase: " + d.querySelector(".eyebrow").textContent);
+    if (dts.indexOf("Start") < 0 || dts.indexOf("Duration") < 0 || dts.some((t) => /^(Self|CPU|End|Thread)$/.test(t))) out.push("detail of a phase lists " + dts.join(", "));
+  }
+  document.querySelector('.tab[data-tab="lanes"]').click();
+  await frames();
+  return JSON.stringify(out);
+})()`;
+
 async function run(cdp, c, view, scheme) {
   const problems = [];
   const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank" });
@@ -139,6 +183,12 @@ async function run(cdp, c, view, scheme) {
     if (s.dark !== (scheme === "dark")) problems.push("theme is " + (s.dark ? "dark" : "light") + " (background " + s.background + ")");
     if (c.tab && s.tab !== c.tab) problems.push("opened on tab " + s.tab + ", not " + c.tab);
     if (s.overflow > 0) problems.push("page " + s.overflow + "px wider than the window on tab " + s.tab);
+    if (c.phases) {
+      await send("Runtime.evaluate", { expression: "document.getElementById('lanes').dataset.expectPhases = " + JSON.stringify(JSON.stringify(c.phases)) });
+      const r = await send("Runtime.evaluate", { expression: PHASES, awaitPromise: true, returnByValue: true });
+      if (r.exceptionDetails) problems.push("phase checks threw: " + (r.exceptionDetails.exception?.description || r.exceptionDetails.text));
+      else problems.push(...JSON.parse(r.result.value));
+    }
     if (!c.landing) {
       for (const tab of s.tabs) {
         await send("Runtime.evaluate", { expression: `document.querySelector('.tab[data-tab="${tab}"]').click()` });
@@ -169,6 +219,9 @@ async function main() {
   }
   cases.push({ name: "diff", url: await makeLink(PAGE, sample("diff/before.header"), sample("diff/after.header"), "diff"), tab: "diff" });
   cases.push({ name: "batch", url: PAGE + "#demo=batch", tab: "stats" });
+  // phases on the root, on a handoff and on an unnamed span; narrow, failed and misused ones
+  const phases = readFileSync(join(ROOT, "testdata", "golden", "phases.header"), "utf8").trim();
+  cases.push({ name: "phases", url: await makeLink(PAGE, phases), phases: phaseList(phases) });
   const views = [
     { name: "phone", width: 390, height: 844, scale: 3, mobile: true },
     { name: "desktop", width: 1440, height: 900, scale: 1, mobile: false },
