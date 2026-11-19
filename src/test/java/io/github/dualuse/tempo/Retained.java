@@ -39,15 +39,17 @@ final class Retained {
                 r.bytes += 32;
             } else if (c.getName().startsWith(Tempo.class.getName() + "$")) {
                 long shallow = 12;
-                for (Field f : c.getDeclaredFields()) {
-                    if (Modifier.isStatic(f.getModifiers())) continue;
-                    shallow += size(f.getType());
-                    if (f.getType().isPrimitive()) continue;
-                    f.setAccessible(true);
-                    try {
-                        push(todo, f.get(o));
-                    } catch (IllegalAccessException x) {
-                        throw new AssertionError(x);
+                for (Class<?> k = c; k != Object.class; k = k.getSuperclass()) { // a Trace's fields are mostly its Span's
+                    for (Field f : k.getDeclaredFields()) {
+                        if (Modifier.isStatic(f.getModifiers())) continue;
+                        shallow += size(f.getType());
+                        if (f.getType().isPrimitive()) continue;
+                        f.setAccessible(true);
+                        try {
+                            push(todo, f.get(o));
+                        } catch (IllegalAccessException x) {
+                            throw new AssertionError(x);
+                        }
                     }
                 }
                 r.bytes += align(shallow);
