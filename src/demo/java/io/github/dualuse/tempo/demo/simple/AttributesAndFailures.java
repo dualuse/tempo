@@ -12,9 +12,11 @@ import java.util.concurrent.TimeoutException;
  * store (it times out, the replica takes the write) and renders thumbnails until its time is up.
  *
  * <p>It shows numbers on spans (long and double attributes), the three ways a span learns about a
- * failure ({@code run}/{@code call} on a throw, {@code fail(e)} in a catch, and {@code cancel()} for
- * work given up), a flag set after the span closed, a helper that finds its parent with
- * {@code Tempo.current()}, and what {@code Options.strict} does with a span left open.
+ * failure ({@code Tempo.run}/{@code Tempo.call} on a throw, {@code fail(e)} in a catch, and {@code
+ * cancel()} for work given up), a flag set after the span closed, shared code that opens its own span
+ * without being handed one, shared code that annotates its caller's span through {@code
+ * Tempo.current()}, the explicit escape hatch, and what {@code Options.strict} does with a span left
+ * open.
  *
  * <pre>
  * ./gradlew -q demo -Pdemo=AttributesAndFailures                      the story and the response
@@ -45,10 +47,11 @@ public final class AttributesAndFailures {
 
     public static void main(String[] args) throws Exception {
         // The parser is shared code: here it runs at startup, outside any trace. Tempo.current() is
-        // then Tempo.NOOP, a handle on which every call returns at once and records nothing.
+        // then Tempo.NOOP, a handle on which every call returns at once and records nothing, and a span
+        // opened there is NOOP too (unless a global listener hears its name, see MetricsAndListeners).
         Demo.check(Tempo.current() == Tempo.NOOP, "outside a trace Tempo.current() is Tempo.NOOP");
         Demo.check(Parser.parse("format=png;width=640;height=480") == 3, "the parser works without a trace");
-        Demo.check(!Tempo.current().recording() && Tempo.current().span(PARSE) == Tempo.NOOP,
+        Demo.check(!Tempo.current().recording() && Tempo.span(PARSE) == Tempo.NOOP,
                 "outside a trace a new span is NOOP too: nothing is recorded");
 
         // A mistake first, and what Tempo does with it with and without strict mode.
@@ -61,7 +64,7 @@ public final class AttributesAndFailures {
         // it off.
         Tempo.Trace t = Tempo.trace(UPLOAD, new Tempo.Options().strict(true));
         try (t) {
-            upload(t);
+            upload();
         }
 
         Demo.check(Tempo.current() == Tempo.NOOP, "once the trace closed, Tempo.current() is NOOP again");
@@ -71,7 +74,8 @@ public final class AttributesAndFailures {
                 "the helper's parse span nests under decode, the caller's span");
         Demo.check(Demo.attribute(t, READ, BYTES) == 48_213, "read carries bytes=48213, a long attribute");
         Demo.check(Demo.attribute(t, PARSE, FIELDS) == 3, "parse carries fields=3, set by the helper");
-        Demo.check(doubleAttribute(t, DEDUPE, HIT_RATIO) == 0.75, "dedupe carries hit-ratio=0.75, a double attribute");
+        Demo.check(Demo.attribute(t, DEDUPE, CHUNKS) == 4 && doubleAttribute(t, DEDUPE, HIT_RATIO) == 0.75,
+                "dedupe carries chunks=4 and hit-ratio=0.75, a double attribute, set through Tempo.current()");
         Demo.check(Demo.count(t, v -> v.name() == PREVIEW && v.failed()) == 1, "preview is flagged failed by run()");
         Demo.check(Demo.count(t, v -> v.name() == WRITE) == 2, "store made two write attempts");
         Demo.check(Demo.count(t, v -> v.name() == WRITE && v.failed() && Demo.attribute(v, REPLICA) == 0) == 1,
@@ -93,37 +97,35 @@ public final class AttributesAndFailures {
     }
 
     /** The request handler. Every step is a child of the root, so the tree reads like the method. */
-    static void upload(Tempo.Span root) {
+    static void upload() {
         byte[] body;
-        try (Tempo.Span s = root.span(READ)) {
+        try (Tempo.Span s = Tempo.span(READ)) {
             Demo.io(2);
             body = new byte[48_213];
             s.set(BYTES, body.length);                      // a long attribute: the size of what was read
         }
 
-        // call() returns the body's result; inside it, Tempo.current() is the decode span.
-        int fields = root.call(DECODE, () -> {
+        // Tempo.call returns the body's result; the parser's span opens inside decode.
+        int fields = Tempo.call(DECODE, () -> {
             Demo.cpu(500);
             return Parser.parse("format=tiff;width=" + body.length / 64 + ";height=48");
         });
 
-        try (Tempo.Span s = root.span(DEDUPE)) {
-            Demo.io(1);
-            int chunks = 4, stored = 3;
-            s.set(CHUNKS, chunks).set(HIT_RATIO, (double) stored / chunks);   // a double attribute
-        }
+        Tempo.run(DEDUPE, () -> Chunks.dedupe(4));
 
-        // run() flags the span failed when the body throws, and rethrows the exception as it was:
+        // Tempo.run flags the span failed when the body throws, and rethrows the exception as it was:
         // no wrapper to unpack, so the handler catches its own type and carries on without a preview.
         try {
-            root.run(PREVIEW, () -> renderPreview(fields));
+            Tempo.run(PREVIEW, () -> renderPreview(fields));
         } catch (UnsupportedFormat e) {
             Demo.say("preview: " + e.getMessage() + " (caught as UnsupportedFormat, not wrapped)");
         }
 
-        try (Tempo.Span store = root.span(STORE)) {
+        // A write that times out is caught inside the loop, so store itself does not fail. Each write
+        // opens under store, the innermost open span.
+        Tempo.run(STORE, () -> {
             for (int replica = 0; replica < 2; replica++) {
-                Tempo.Span w = store.span(WRITE).set(REPLICA, replica);
+                Tempo.Span w = Tempo.span(WRITE).set(REPLICA, replica);
                 try {
                     write(replica);
                     break;
@@ -133,14 +135,14 @@ public final class AttributesAndFailures {
                     w.close();
                 }
             }
-        }
+        });
 
         // Optional work under a time budget. try-with-resources closes the span before the catch block
         // runs; set, fail and cancel still apply to it there (the handle stays this span's until the
         // trace is released). cancel(), not fail(): nothing broke, the work was given up.
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(4);
         int made = 0;
-        Tempo.Span thumbs = root.span(THUMBNAILS);
+        Tempo.Span thumbs = Tempo.span(THUMBNAILS);
         try (thumbs) {
             for (int size : THUMBNAIL_SIZES) {
                 if (System.nanoTime() > deadline) throw new TimeoutException("no time left for size " + size);
@@ -153,17 +155,29 @@ public final class AttributesAndFailures {
     }
 
     /**
-     * Shared code that knows nothing about the request: it receives no span, but asks Tempo for the
-     * innermost open span of its thread and adds its own child there. Outside a trace that is NOOP.
+     * Shared code that knows nothing about the request: it receives no span, and the span it opens lands
+     * under the innermost open span of its thread. Outside a trace it is NOOP.
      */
     static final class Parser {
         static int parse(String header) {
-            try (Tempo.Span s = Tempo.current().span(PARSE)) {
+            try (Tempo.Span s = Tempo.span(PARSE)) {
                 Demo.cpu(100);
                 int fields = header.split(";").length;
                 s.set(FIELDS, fields);
                 return fields;
             }
+        }
+    }
+
+    /**
+     * Shared code that wants to annotate the span it runs in rather than open one: Tempo.current() is the
+     * explicit way to reach it (here dedupe, opened by the caller). Outside a trace it is NOOP.
+     */
+    static final class Chunks {
+        static void dedupe(int chunks) {
+            Demo.io(1);
+            int stored = 3;
+            Tempo.current().set(CHUNKS, chunks).set(HIT_RATIO, (double) stored / chunks);   // a double attribute
         }
     }
 
@@ -182,12 +196,13 @@ public final class AttributesAndFailures {
      * The same mistake in two traces: a cache lookup that returns early on a hit and forgets to close
      * its span. Closing the parent heals it; strict mode reports it instead. Neither is the response.
      */
+    @SuppressWarnings("try") // the strict trace's block never names it; see src/demo/README.md
     static void strictAndHealed() {
         // Without strict, as in production: the request is unharmed. The open span is ended at its
         // parent's close, flagged healed and counted as misuse: flag m in Tempo-Timing.
         Tempo.Trace t = Tempo.trace(STATUS);
         try (t) {
-            t.run(RENDER, () -> {
+            Tempo.run(RENDER, () -> {
                 leakyLookup("logo");
                 Demo.cpu(200);
             });
@@ -201,7 +216,7 @@ public final class AttributesAndFailures {
         // With strict, as in a test: the same close throws, naming the mistake.
         String error = null;
         try (Tempo.Trace s = Tempo.trace(STATUS, new Tempo.Options().strict(true))) {
-            s.run(RENDER, () -> leakyLookup("logo"));
+            Tempo.run(RENDER, () -> leakyLookup("logo"));
         } catch (AssertionError e) {
             error = e.getMessage();
         }
@@ -214,7 +229,7 @@ public final class AttributesAndFailures {
 
     /** The bug: on a cache hit it returns before closing its span. */
     static String leakyLookup(String key) {
-        Tempo.Span s = Tempo.current().span(LOOKUP);
+        Tempo.Span s = Tempo.span(LOOKUP);
         Demo.io(1);
         if (key.equals("logo")) return "cached";
         s.close();

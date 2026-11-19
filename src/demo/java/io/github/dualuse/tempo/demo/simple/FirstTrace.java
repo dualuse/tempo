@@ -6,10 +6,12 @@ import io.github.dualuse.tempo.demo.Demo;
 /**
  * The first contact: one request, {@code GET /hello?name=Ada}, recorded as a trace. The handler parses
  * the query, looks the greeting up (which loads it), renders the body and stores the visit count, each
- * step a span of the request's root span.
+ * a span under the request.
  *
- * <p>It shows the three ways to open a span (try-with-resources, {@code run} and {@code call}), a span
- * nested in another, and the four headers a service sends with the response.
+ * <p>It shows the three ways to open a span (try-with-resources, {@code Tempo.run} and {@code
+ * Tempo.call}), all static: a span opens under the innermost open span of its thread, so no method
+ * takes a span or a trace as a parameter. It also shows a span nested in another, a number on a span,
+ * and the four headers a service sends with the response.
  *
  * <pre>
  * ./gradlew -q demo -Pdemo=FirstTrace               the story and the response
@@ -24,16 +26,18 @@ public final class FirstTrace {
     private FirstTrace() {
     }
 
-    // Names are interned once; whatever varies per request goes into attributes, never into a name.
+    // The checks below compare names. Tempo.name("x") interns "x" once; the String overloads used in the
+    // handler look "x" up in the same table, so both give the same Name.
     static final Tempo.Name HELLO = Tempo.name("GET /hello"), PARSE = Tempo.name("parse"),
             LOOKUP = Tempo.name("lookup"), LOAD = Tempo.name("load"),
             RENDER = Tempo.name("render"), STORE = Tempo.name("store"), BYTES = Tempo.name("bytes");
 
     public static void main(String[] args) throws Exception {
-        // The root span opens here, on this thread; strict turns any misuse into an AssertionError.
-        Tempo.Trace t = Tempo.trace(HELLO, new Tempo.Options().strict(true));
+        // The trace's root span opens here, on this thread; strict turns any misuse into an AssertionError.
+        // It is declared before the try so that it can still be read after it closed.
+        Tempo.Trace t = Tempo.trace("GET /hello", new Tempo.Options().strict(true));
         try (t) {
-            handle(t, "name=Ada");
+            handle("name=Ada");
         }
         // Closed, but still readable: everything below reads the finished trace.
 
@@ -47,6 +51,7 @@ public final class FirstTrace {
         Demo.check(Demo.attribute(t, LOAD, BYTES) == 5, "load carries bytes=5");
         Demo.check(Demo.count(t, v -> !thread.equals(v.thread())) == 0, "every span ran on " + thread);
         Demo.check(Demo.count(t, v -> v.failed() || v.open()) == 0, "no span failed or was left open");
+        Demo.check(Tempo.current() == Tempo.NOOP, "outside the trace a span opens nothing: Tempo.current() is NOOP");
 
         Demo.say("Runtime: the total in seconds, plus the labelled phases (none here; see StopwatchSteps).");
         Demo.say("Server-Timing: the same in milliseconds, W3C format, shown by the browser's dev tools.");
@@ -63,31 +68,38 @@ public final class FirstTrace {
         Demo.check(t.toHeader().isEmpty(), "a released trace reads empty");
     }
 
-    /** The request handler. A span nests under the innermost open span of its thread. */
-    static String handle(Tempo.Span root, String query) {
-        // call and run wrap a lambda in a span; a throw from the body flags the span failed.
-        String name = root.call(PARSE, () -> {
+    /** The request handler. It receives no span: each span it opens nests under the innermost open one. */
+    static String handle(String query) {
+        // Tempo.call and Tempo.run wrap a lambda in a span; a throw from the body flags the span failed.
+        String name = Tempo.call("parse", () -> {
             Demo.cpu(1500);
             return query.substring(query.indexOf('=') + 1);
         });
 
-        // try-with-resources for a block. The handle belongs to this thread and is reused once the trace is
-        // released, so use it inside the block (set and fail also work right after it closes).
+        // try-with-resources for a block. The handle belongs to this thread and to this span until the
+        // trace is released, so use it inside the block (set and fail also work right after it closes).
         String greeting;
-        try (Tempo.Span s = root.span(LOOKUP)) {
+        try (Tempo.Span lookup = Tempo.span("lookup")) {
             Demo.cpu(100);
-            try (Tempo.Span l = s.span(LOAD)) {   // opened inside lookup, so it is lookup's child
-                Demo.io(3);
-                greeting = "Hello";
-                l.set(BYTES, greeting.length());   // a number on the span (see AttributesAndFailures)
-            }
+            greeting = load();      // load opens its span inside lookup: a child of lookup
+            lookup.set("hit", 1);
         }
 
-        String body = root.call(RENDER, () -> {
+        String body = Tempo.call("render", () -> {
             Demo.cpu(300);
             return greeting + ", " + name + "!";
         });
-        root.run(STORE, () -> Demo.io(2));   // store the visit count
+        Tempo.run("store", () -> Demo.io(2));   // store the visit count
         return body;
+    }
+
+    /** Any code can open a span; it lands under whatever span its caller has open. */
+    static String load() {
+        try (Tempo.Span load = Tempo.span("load")) {
+            Demo.io(3);
+            String value = "Hello";
+            load.set("bytes", value.length());   // a number on the span (see AttributesAndFailures)
+            return value;
+        }
     }
 }

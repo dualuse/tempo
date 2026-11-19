@@ -23,8 +23,8 @@ import java.util.function.Predicate;
  *
  * <p>The demo source set compiles with {@code -Xlint:all -Werror}. javac's {@code try} lint warns about
  * {@code try (Tempo.Span s = ...) { work(); }} when the block never names {@code s}, which is the usual
- * way to time a block; a demo either uses the handle in the block or puts {@code @SuppressWarnings("try")}
- * on the method or class, with a comment.
+ * way to time a block. A demo uses the handle in the block, uses {@code Tempo.run} or {@code Tempo.call}
+ * instead, or puts {@code @SuppressWarnings("try")} on the method or class (src/demo/README.md).
  */
 public final class Demo {
     private Demo() {
