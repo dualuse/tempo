@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadPoolExecutor;
 
@@ -18,7 +19,7 @@ import java.util.concurrent.ThreadPoolExecutor;
  *
  * <p>It shows
  * <ul>
- * <li>one limit for all timing headers: render the legacy ones first, give {@code toHeader(left)} the rest,
+ * <li>one limit for all timing headers: render {@code Runtime} and {@code Server-Timing} first, give {@code toHeader(left)} the rest,
  * and the link what is left after that;</li>
  * <li>the ladder: one large trace at three limits, and {@code x=folded.dropped} counting what was left out;</li>
  * <li>{@code toLink(base, maxBytes)} under a byte limit: a null base opens the viewer of
@@ -36,16 +37,15 @@ import java.util.concurrent.ThreadPoolExecutor;
  * snapshot after release, with the four {@code match} tasks on {@code cpu-1} and {@code cpu-2} and
  * their queue waits; the ladder table, where fewer records go on the wire as the limit shrinks, while
  * the records that are not aggregates, the folded and the dropped spans always add up to the 2,002
- * spans recorded; and in the lanes, {@code decode} and {@code rerank} on {@code main}, with
- * {@code load} and the waiting {@code join} under {@code rerank}. The printed {@code Tempo-Link}
+ * spans recorded; and in the lanes, the phases {@code decode} and {@code rerank} on the bar of
+ * {@code GET /search}, with {@code load} and the waiting {@code join} below it, during {@code rerank}. The printed {@code Tempo-Link}
  * points at {@code tempo.example.org}, which does not exist: {@code tools/tempo '<link>'} decodes a
  * link without opening it.
  */
 public final class ResponseHeaders {
     static final Tempo.Name SEARCH = Tempo.name("GET /search"), DECODE = Tempo.name("decode"),
             RERANK = Tempo.name("rerank"), LOAD = Tempo.name("load"), MATCH = Tempo.name("match"),
-            JOIN = Tempo.name("join"), BYTES = Tempo.name("bytes"), QUEUED = Tempo.name("queued"),
-            HITS = Tempo.name("hits");
+            JOIN = Tempo.name("join"), BYTES = Tempo.name("bytes"), HITS = Tempo.name("hits");
 
     static final Tempo.Name UPDATE = Tempo.name("POST /index"), SHARD = Tempo.name("shard"),
             TOKENIZE = Tempo.name("tokenize"), DOCS = Tempo.name("docs"), TERMS = Tempo.name("terms");
@@ -66,10 +66,12 @@ public final class ResponseHeaders {
 
     public static void main(String[] args) throws Exception {
         ThreadPoolExecutor cpu = Demo.pool("cpu", 2), index = Demo.pool("index", 4);
+        // Each pool wrapped once: every submit to it is a task of that name.
+        ExecutorService matcher = Tempo.executor(cpu, MATCH), indexer = Tempo.executor(index, SHARD);
         try {
-            Response response = search(cpu);
+            Response response = search(matcher);
             readBack(response.tempo);
-            ladder(index);
+            ladder(indexer);
             send(response);
         } finally {
             Demo.shutdown(cpu, index);
@@ -107,31 +109,28 @@ public final class ResponseHeaders {
         }
     }
 
-    static Response search(ThreadPoolExecutor cpu) throws Exception {
+    static Response search(ExecutorService matcher) throws Exception {
         // linkBase: every Tempo-Link of this trace opens our own viewer instead of the public one.
         Tempo.Trace t = Tempo.trace(SEARCH, new Tempo.Options().linkBase(VIEWER).strict(true)).records(Tempo.STEP);
         List<String> hits = new ArrayList<>();
         try (t) {
-            Tempo.Span s = t;
-            s.phase(DECODE).label("Decode Query");
+            // Labelled phases of the root are what Runtime and Server-Timing print.
+            t.phase(DECODE).label("Decode Query");
             Demo.cpu(2_000); // parse the query
-            s.phase(RERANK).label("rerank");
-            try (Tempo.Span load = s.step(LOAD)) {
+            t.phase(RERANK).label("rerank");
+            try (Tempo.Span load = Tempo.step(LOAD)) {
                 Demo.io(3); // read the candidates
                 load.set(BYTES, 48_213);
             }
             List<Future<String>> matches = new ArrayList<>();
             for (int i = 0; i < 4; i++) {
                 String doc = "doc-" + (17 + 9 * i);
-                Tempo.CallableTask<String> match = Tempo.callable(MATCH, () -> {
+                matches.add(matcher.submit(() -> {
                     Demo.cpu(1_500); // match one candidate
                     return doc;
-                });
-                match.set(QUEUED, cpu.getQueue().size());
-                cpu.submit(match);
-                matches.add(match);
+                }));
             }
-            try (Tempo.Span join = s.span(JOIN).waiting()) {
+            try (Tempo.Span join = Tempo.span(JOIN).waiting()) {
                 for (Future<String> f : matches) hits.add(f.get());
                 join.set(HITS, hits.size());
             }
@@ -141,7 +140,7 @@ public final class ResponseHeaders {
         // the body, so it copies once, while the response is built, and renders everything from that.
         Tempo.Snapshot snap = t.snapshot();
 
-        // One limit for the timing headers: the legacy ones are short and come first, the whole tree
+        // One limit for the timing headers: Runtime and Server-Timing are short and come first, the whole tree
         // gets what is left. Count UTF-8 bytes, not chars: a label may hold any character.
         String runtime = snap.toRuntime(3), serverTiming = snap.toServerTiming();
         int left = HEADER_LIMIT - Demo.bytes(runtime) - Demo.bytes(serverTiming);
@@ -165,7 +164,7 @@ public final class ResponseHeaders {
                 total, HEADER_LIMIT));
 
         Demo.check(total <= HEADER_LIMIT, "the four timing headers fit the shared limit together");
-        Demo.check(Demo.bytes(tempoTiming) <= left, "Tempo-Timing fits what the legacy headers left");
+        Demo.check(Demo.bytes(tempoTiming) <= left, "Tempo-Timing fits what Runtime and Server-Timing left");
         Demo.check(Demo.bytes(tempoLink) <= linkLeft, "Tempo-Link fits what Tempo-Timing left");
         Demo.check(Demo.field(tempoTiming, "x") == null, "the small search trace fits whole: no x=, nothing folded or dropped");
         Demo.check(tempoLink.startsWith(VIEWER) && tempoLink.contains("#t="),
@@ -189,6 +188,7 @@ public final class ResponseHeaders {
         tempo.forEachSpan(v -> {
             StringBuilder line = new StringBuilder(String.format(Locale.ROOT, "%-18s %-6s %7.3f ms",
                     "  ".repeat(v.depth()) + v.name(), v.thread(), ms(v.durationNanos())));
+            if (v.phase()) line.append("  phase");
             if (v.handoff()) line.append(String.format(Locale.ROOT, "  queue wait %.3f ms", ms(v.waitNanos())));
             if (v.waiting()) line.append("  waiting");
             for (int i = 0; i < v.attributes(); i++) line.append("  ").append(v.attributeKey(i)).append('=').append(v.longAttribute(i));
@@ -206,7 +206,7 @@ public final class ResponseHeaders {
             Demo.say(String.format(Locale.ROOT, "  labelled phase %-22s %7.3f ms", steps.get(steps.size() - 1), ms(duration)));
         });
 
-        Demo.check(matches[0] == 4 && onPool[0] == 4, "the four match tasks are handoffs that ran on cpu-* threads");
+        Demo.check(matches[0] == 4 && onPool[0] == 4, "the four match tasks ran on cpu-* threads, each after its queue wait");
         Demo.check(waits[0] == 1, "join is marked as a blocking wait");
         Demo.check(steps.equals(List.of("decode \"Decode Query\"", "rerank \"rerank\"")),
                 "the labelled phases are decode and rerank, in that order");
@@ -214,27 +214,23 @@ public final class ResponseHeaders {
 
     // ------------------------------------------------------------------ 3. a trace too large for its limit
 
-    static void ladder(ThreadPoolExecutor index) throws Exception {
+    static void ladder(ExecutorService indexer) throws Exception {
         // A large budget records all 2,000 spans as rows, so that rendering, not recording, decides what
         // to fold: the same trace can then go out whole as JSON and trimmed in a header.
         Tempo.Trace t = Tempo.trace(UPDATE, new Tempo.Options().budget(4_096).strict(true)).records(Tempo.STEP);
         try (t) {
-            Tempo.Span s = t;
             List<Future<?>> shards = new ArrayList<>();
             for (int i = 0; i < SHARDS; i++) {
-                Tempo.Task h = Tempo.task(SHARD).set(DOCS, DOCS_PER_SHARD);
-                shards.add(index.submit(() -> {
-                    try (Tempo.Span shard = h.tryBegin()) {
-                        for (int d = 0; d < DOCS_PER_SHARD; d++) {
-                            try (Tempo.Span tokenize = shard.step(TOKENIZE)) {
-                                Demo.cpu(5);
-                                tokenize.set(TERMS, 40 + d);
-                            }
+                shards.add(indexer.submit(() -> {
+                    for (int d = 0; d < DOCS_PER_SHARD; d++) {
+                        try (Tempo.Span tokenize = Tempo.step(TOKENIZE)) {   // under the shard task
+                            Demo.cpu(5);
+                            tokenize.set(TERMS, 40 + d);
                         }
                     }
                 }));
             }
-            try (Tempo.Span join = s.span(JOIN).waiting()) {
+            try (Tempo.Span join = Tempo.span(JOIN).waiting()) {
                 for (Future<?> f : shards) f.get();
                 join.set(DOCS, SHARDS * DOCS_PER_SHARD);
             }
