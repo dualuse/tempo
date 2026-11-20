@@ -672,6 +672,53 @@ class BlockTest {
         }
     }
 
+    /** Add counts in its block and the scopes enclosing it, from inside the block, its task and after it. */
+    @Test
+    void addCountsInTheBlockFromInsideItsTasksAndAfter() throws Exception {
+        Trace req = Tempo.trace(SEARCH, opts().cpu(false));
+        Trace outer = Tempo.trace(INDEX);
+        Trace in = Tempo.trace(RERANK);
+        in.add(LOAD, 1);                               // in the block: its lane's entry
+        Tempo.current().add(LOAD, 2);
+        RunnableTask task = Tempo.runnable(MATCH, () -> Tempo.current().add(LOAD, 4));
+        in.close();
+        outer.close();
+        in.add(LOAD, 8);                               // after the block closed: lane-less
+        assertNull(onThread("worker-1", task::run));  // in the block's task, on its worker's lane
+        assertNull(onThread("worker-2", () -> in.add(LOAD, 16))); // a thread outside the trace
+        req.add(LOAD, 32);
+        req.close();
+        assertEquals("count=5 sum=31 mean=6 min=1 max=16 waitSum=0 waitMax=0", in.total(LOAD).toString());
+        assertEquals("count=5 sum=31 mean=6 min=1 max=16 waitSum=0 waitMax=0", outer.total(LOAD).toString());
+        assertEquals("count=6 sum=63 mean=10 min=1 max=32 waitSum=0 waitMax=0", req.total(LOAD).toString());
+        assertEquals(in.total(LOAD).toString(), in.snapshot().total(LOAD).toString());
+        assertEquals(req.total(LOAD).toString(), req.snapshot().total(LOAD).toString());
+        req.release();
+    }
+
+    /** Add in a block allocates nothing past the block's Trace, also in a block called hundreds of times. */
+    @Test
+    void addInABlockAllocatesNothing() {
+        int n = 400;
+        for (int round = 0; round < 10; round++) {
+            Trace req = Tempo.trace(SEARCH, opts().budget(Integer.MAX_VALUE));
+            long blocks = allocatedBy(() -> {
+                for (int i = 0; i < n; i++) Tempo.trace(RERANK).close();
+            });
+            long adds = allocatedBy(() -> {
+                for (int i = 0; i < n; i++) {
+                    Trace in = Tempo.trace(RERANK);
+                    in.add(LOAD, 5);
+                    in.close();
+                }
+            });
+            req.close();
+            req.release();
+            if (round >= 3 && adds == blocks && blocks % n == 0) return;
+            if (round == 9) assertEquals(blocks, adds, "bytes of " + n + " block calls with an add each");
+        }
+    }
+
     // ---- immutable options ---------------------------------------------------------------------------
 
     @Test

@@ -146,6 +146,7 @@ public final class CostGate {
             new Gate(BLOCKS, "nestedTrace", Unit.PER_OP, NESTED + NOTHING),
             new Gate(BLOCKS, "blockCallWithTask", Unit.PER_OP, NESTED + RUNNABLE_TASK + NOTHING),
             new Gate(BLOCKS, "blockCallWithTask", Unit.GROWTH, FLAT),
+            new Gate(BLOCKS, "addInBlock", Unit.PER_OP, NESTED + NOTHING),
 
             new Gate(REST, "folded", Unit.PER_OP, NOTHING),
             new Gate(REST, "add", Unit.PER_OP, NOTHING),

@@ -2613,6 +2613,24 @@ public final class Tempo {
         }
 
         /**
+         * {@link Span#add} of name {@code id} in block {@code sc} of {@code ctx}, on the calling thread. On the
+         * thread's current lane, while that lane records inside the block (the block's own lane while it is
+         * open, or the lane of a task of it), it goes to the lane's undrawn entry of the name in the block's
+         * scope, like an undrawn step: no allocation once the entry exists, and the block's totals and those
+         * of the scopes enclosing it read it. Elsewhere, e.g. after the block closed, it goes to the
+         * lane-less totals of the block and of every scope enclosing it.
+         */
+        static void add(Context ctx, Trace sc, int id, long nanos) {
+            Lane l = SLOT.get().current;
+            if (l != null && l.ctx == ctx && Trace.within(l.scope, sc)) {
+                int e = l.aggregate(-1, 0, -1, id, Aggs.HIDDEN, sc);
+                if (e >= 0) l.aggs.add(e, 0, nanos, 0, -1, 0, false);
+            } else {
+                sc.addTotal(id, false, nanos);
+            }
+        }
+
+        /**
          * An occurrence of name {@code id} that no render shows, for the totals: a phase of the folded or
          * undrawn span at depth {@code d}, in that span's scope.
          */
@@ -6200,9 +6218,12 @@ public final class Tempo {
         /**
          * Adds one occurrence of {@code name} lasting {@code nanos}, measured elsewhere, to the trace's
          * totals ({@link Trace#total}) and calls the name's listeners on the calling thread. No span is
-         * drawn. Any thread, also after close; allocation-free once the trace has seen the name. Outside a
-         * trace it only calls the global listeners. Ignored after release, and counted as misuse once the
-         * handle's lane has retired too.
+         * drawn. Any thread, also after close; allocation-free once the trace has seen the name. In a
+         * self-contained block it counts in the block's totals too: on the thread recording inside the block
+         * it goes to its lane's aggregate of the name in the block, allocation-free like an undrawn step;
+         * elsewhere (e.g. after the block closed) to lane-less totals of the block. Outside a trace it only
+         * calls the global listeners. Ignored after release, and counted as misuse once the handle's lane has
+         * retired too.
          */
         public Span add(Name name, long nanos) {
             // Any thread, so it reads the binding between two reads of the stamp (see bind and detach).
@@ -6220,7 +6241,11 @@ public final class Tempo {
             }
             if (c.released) return this; // a task still running after release
             long v = Math.max(0, nanos);
-            if (!l.free) sc.addTotal(sc.attrKey(name), false, v);
+            if (!l.free) {
+                int id = sc.attrKey(name);
+                if (sc.up == null) sc.totals().add(id, false, v);
+                else Lane.add(c, sc, id, v);
+            }
             Throwable t = name != null && c.listening ? c.notify(sc, name, v) : null;
             if (t != null && sc.strict) throw Context.listenerThrew(t);
             return this;

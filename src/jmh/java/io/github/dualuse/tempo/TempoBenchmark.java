@@ -481,6 +481,19 @@ public class TempoBenchmark {
         return in;
     }
 
+    /**
+     * {@code add} in a block called many times: the duration goes to the lane's undrawn entry of the name in
+     * the block, so the call allocates its {@code Trace} only.
+     */
+    @Benchmark
+    public Tempo.Trace addInBlock(Blocks s) {
+        s.cycle();
+        Tempo.Trace in = Tempo.trace(BLOCK);
+        in.add(CHILD, 1000);
+        in.close();
+        return in;
+    }
+
     /** Explicit handle, a trace of steps over its budget: a folded step (two clock reads, an aggregate update). */
     @Benchmark
     public Tempo.Span folded(Folding s) {
