@@ -113,9 +113,10 @@ phases.
 flagged healed, and the misuse is counted. Outside a trace, `Tempo.span`, `step` and `tick` cost
 one `ThreadLocal` read and return `Tempo.NOOP`, unless the name of a span or step has a global
 listener (see [Totals and listeners](#totals-and-listeners)), which then hears its duration. A trace
-started inside another trace joins it: its root is a span under the innermost open one, and
-the inner `Trace` renders its own subtree. A trace left open on a pool thread therefore takes
-in the later traces of that thread, so close every trace.
+started inside another trace joins it as a self-contained block (see
+[Self-contained blocks](#self-contained-blocks)): its root is a span under the innermost open one,
+and the inner `Trace` reports on its own subtree. A trace left open on a pool thread therefore
+takes in the later traces of that thread, so close every trace.
 
 ### Spans, steps and ticks
 
@@ -361,6 +362,61 @@ stopwatch for a metric, inside a trace or not.
 `t.printOnClose(log::info, "import")` passes `import: ` and the `Runtime` text to the logger
 when the trace closes, as a drop-in for a stopwatch log line.
 
+### Self-contained blocks
+
+A larger piece of functionality inside a service (an index rebuild, a thumbnail renderer, a
+report generator: what once had a stopwatch of its own) starts its own trace and reads its own
+numbers. It does not need to know whether it runs alone or inside a request. Alone, its
+`Tempo.trace` is a trace like any other. Started on a thread that is inside a trace already, it
+joins that trace as a subtree, a block, and still works for the block exactly as if it were
+top-level:
+
+```java
+static final Tempo.Options RENDERER = new Tempo.Options().budget(64).strict(true); // shared, immutable
+
+Tempo.Trace in = Tempo.trace("render", RENDERER).records(Tempo.STEP);
+in.on("scale", nanos -> scaleTimes.add(nanos));      // the block's scale tasks only
+in.printOnClose(log::info, "render");                // render: 0.012s = 0.004s (Read) + ...
+try (in) {
+  for (Picture p : pictures) {
+    try (Tempo.Span d = Tempo.step("decode")) {      // drawn: the block records steps
+      decode(p);
+    }
+  }
+  for (Future<?> f : scaleAll(pictures)) f.get();    // tasks through Tempo.executor(pool, "scale")
+}
+long decoded = in.total("decode").count();           // the block's own decodes, alone or nested
+in.release();                                        // does nothing inside a request
+```
+
+- **Totals.** `in.total(name)` counts the block's subtree only, its tasks on other threads
+  included, computed when it is read (a walk over the subtree's rows and the block's aggregate
+  entries), so recording pays nothing for it. The request's `total` still counts everything, the
+  block's work with the rest. A snapshot of the block reads the same totals.
+- **Listeners.** `in.on(name, l)` hears the block's subtree only, including its tasks that end
+  after the block closed; it is dropped with the request's release. An ending span walks the
+  chain of blocks it is in, so the cost grows with how deeply blocks nest, never with the number
+  of listeners or blocks, and nothing is paid where no listener exists.
+- **Granularity.** `in.records(level)` widens the block's subtree only, before the first step or
+  tick in it (strict mode throws if late there); inside, the wider of the request's level and the
+  block's holds, also in the block's tasks. The request's level is untouched, and its tree shows
+  what the block drew. A step in a block fixes the request's level too, as it is in its subtree.
+- **Options.** `clock` and `lanes` stay the request's: one timeline, one lane registry. The block
+  honours `headerBytes` and `linkBase` for its own output; `strict` for its subtree (strictness
+  only widens: a strict request stays strict inside a lenient block); `cpu` for its subtree (left
+  unset, it follows the request's); and `budget` as a sub-budget: the block draws at most that
+  many steps, ticks and tasks, taken from what the request has left, never more. All of these
+  carry into the block's tasks.
+- **Reporting** stays per trace: `toRuntime`, `toServerTiming`, `toHeader`, `toLink`,
+  `snapshot` and `printOnClose` render the block's subtree, with times from its start.
+- **Blocks nest.** A block inside a block is a scope of its own; the outer block's totals and
+  listeners include the inner one's.
+
+A block that opens inside a task the request folded past its budget unfolds that task: the task
+becomes a drawn record, a small and bounded overrun of the budget, so the block's report is
+complete and the request's tree shows where it ran. A nested trace allocates one object, its
+`Trace`; spans and undrawn steps inside a block allocate nothing, as outside.
+
 ### Handles, misuse and strict mode
 
 A `Span` or `Phase` handle belongs to the thread that opened it. Each recorded span has a
@@ -383,15 +439,21 @@ or shares a handle, so every stale use throws: use it in tests.
 
 ### Options
 
+`Options` are immutable: every setter returns a new `Options` with that one setting changed, so
+a constant configured once is safe to share, and a setting derived from it never leaks back
+(`static final Tempo.Options BLOCK = new Tempo.Options().budget(64).strict(true)`). A
+self-contained block takes `clock` and `lanes` from the outer trace and honours the rest for
+its subtree (see [Self-contained blocks](#self-contained-blocks)).
+
 | Option | Default | Sets |
 |---|---|---|
-| `budget(n)` | 512 | Steps, ticks and tasks drawn individually before they fold. |
-| `cpu(on)` | when the trace records steps | Whether lane roots measure thread CPU time. |
+| `budget(n)` | 512 | Steps, ticks and tasks drawn individually before they fold; of a block, its sub-budget. |
+| `cpu(on)` | when the trace records steps | Whether lane roots measure thread CPU time; a block left unset follows the outer trace. |
 | `headerBytes(n)` | 3,000 | Byte limit of `toHeader()` and of the value `toLink()` carries. |
 | `linkBase(url)` | the build's base | The viewer `toLink()` points at. |
-| `clock(supplier)` | `System::nanoTime` | The nanosecond clock of every timestamp; for tests. |
-| `lanes(n)` | 256 | Lanes (one per thread) of one trace. |
-| `strict(on)` | off | `AssertionError` on misuse, no pooled handles. |
+| `clock(supplier)` | `System::nanoTime` | The nanosecond clock of every timestamp; for tests. A block keeps the outer trace's. |
+| `lanes(n)` | 256 | Lanes (one per thread) of one trace. A block keeps the outer trace's. |
+| `strict(on)` | off | `AssertionError` on misuse, no pooled handles; in a block, for its subtree, only ever widening. |
 
 ### Reading a trace
 
@@ -402,10 +464,11 @@ copy that stays readable after `release()`, for rendering later or on another th
 
 ## Demos
 
-`src/demo` holds eleven small programs that use Tempo the way an application does, graded
+`src/demo` holds twelve small programs that use Tempo the way an application does, graded
 simple, medium and complex: a first trace, phases, failures, steps and ticks on request,
 thread pools with queue wait and CPU time, totals and listeners, headers under a byte limit,
-and services with several pools, pipelines, fan-out, deadlines and early exits. They need
+a component with its own trace used alone and as a block inside a request, and services with
+several pools, pipelines, fan-out, deadlines and early exits. They need
 nothing but the library and start no servers. Each one checks what it claims about its own
 trace. See [src/demo/README.md](src/demo/README.md) for the reading order.
 
@@ -686,7 +749,8 @@ CI holds every recording operation to its allocation, and the four cost promises
 gates, on JDK 11, 17 and 21 (`./gradlew jmhGate`): 0 B per recorded span, one object per task
 plus a one-time lane setup of at most 256 B for each trace and worker thread (248 B measured,
 gated like `traceLifecycle`), an unrecorded tick under half a clock read, and a recorded static
-span at most 6.4 clock reads.
+span at most 6.4 clock reads. The same holds inside a self-contained block, where a span and an
+undrawn step allocate nothing and a nested trace allocates its one `Trace`, 128 B.
 
 ## Building and testing
 

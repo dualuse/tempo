@@ -34,12 +34,33 @@ were taken on.
 | 3. An undrawn step allocates nothing | `stepUndrawn` | 27.4 ns = 2.74 x, 0.0002 B/op | 0.01 B/op; time reported |
 | 4. A recorded static span costs at most 6.4 clock reads | `spanStatic` | 37.4 ns = 3.73 x `baselineNanoTime` (10.0 ns) | 6.4 x |
 
+## Self-contained blocks
+
+A trace started inside another one is a self-contained block (README, "Self-contained blocks").
+The four promises hold with a block open, and the gate checks the block paths in a group of
+their own (`./gradlew jmhGate`, 2026-11-20, `baselineNanoTime` 10.3 ns):
+
+| Path | Benchmark | Measured | Gate |
+|---|---|---|---|
+| A recorded span inside an open block, static API | `spanInBlock` | 0.0002 B/op (552 B per trace: the trace and its block); 36.9 ns = 3.59 x | 0.01 B/op; time reported |
+| An undrawn step inside an open block | `stepUndrawnInBlock` | 0.0002 B/op; 28.4 ns = 2.76 x | 0.01 B/op; time reported |
+| A nested trace, opened and closed | `nestedTrace` | 128.0003 B/op | 128.01 B/op: the one `Trace` |
+
+A block is its `Trace`: the block's span handle and its scope (level, sub-budget, strictness, CPU
+setting, listeners, lane-less totals and output settings) in one object of 128 B. The lane
+carries the innermost open block and switches it where a block opens or a task of another block
+begins; without blocks nothing switches, so a span in a block costs what one outside does
+(`spanInBlock` beside `spanStatic`). The first block on a thread sets up two small arrays of its
+lane's kit (the scopes from before each switch), which the thread's later lanes reuse. A task
+carries its block in a field it already had (the waiting-list link, which only a folded task
+uses; a folded task's block is its aggregate's), so tasks stay 48 and 56 B.
+
 Promise 1 holds because a recorded span takes its handle from its thread's pool, which a
 released trace refills. A handle allocated per span, in one trace or in every trace, would grow
 with the cycle length and show in the per-op figure (see below).
 
 Promise 2: sizes are for a 64-bit JVM with compressed oops. A task carries its lane, name,
-submit time, state and queue wait, 48 B; a supplier task adds its body within the same 48 B. A
+submit time, state, queue wait and its scope (or, folded, its link in the waiting list), 48 B; a supplier task adds its body within the same 48 B. A
 runnable or callable task also holds its body, its outcome and the thread that runs it, as a
 `FutureTask` does, 56 B. Running a task allocates nothing, drawn, folded or undrawn, on the
 submitting thread or on another one. The `across` groups run the task on a thread of their own,
@@ -88,7 +109,10 @@ lanes of earlier traces.
 | `executorCallableTask` | 56.0005 B/op (400 B per trace) | 56.01 B/op: the `CallableTask` itself |
 | `across` | 24.0014 B/op (630 B per trace, both threads) | 24.01 B/op; 1,024 B per trace |
 | `acrossUndrawn` | 28.0001 B/op (630 B per trace, both threads) | 28.01 B/op; 1,024 B per trace |
-| `traceLifecycle` | 400 B per trace | 1,024 B |
+| `traceLifecycle` | 424 B per trace (2026-11-20: the root `Trace` holds the trace's scope) | 1,024 B |
+| `spanInBlock` | 0.0002 B/op (552 B per trace) | 0.01 B/op |
+| `stepUndrawnInBlock` | 0.0002 B/op | 0.01 B/op |
+| `nestedTrace` | 128.0003 B/op (424 B per trace) | 128.01 B/op: the one `Trace` |
 | `snapshotToHeader` (300 spans) | 5,304 B per render | 6,144 B |
 | `toHeader` (300 spans) | 22,712 B per render | 24,576 B |
 | `snapshotWriteJson` (300 spans, into a reused builder) | 1,960 B per render | 2,560 B |

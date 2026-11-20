@@ -34,10 +34,16 @@ node tests/check_site_headless.mjs   # Tempo Timeline in headless Chrome: sample
   4. A recorded span through the static API costs at most 6.4 times one `System.nanoTime()`,
      measured in the same run.
 
+  The promises hold with a self-contained block (a nested trace) open as well: a recorded span
+  or an undrawn step inside a block allocates nothing, and a nested trace allocates one object,
+  its `Trace`, which is both the block's span and its scope. Without a block the recording path
+  pays nothing for blocks; with one, at most the scope bookkeeping.
+
   A change that cannot keep a promise is discussed first; a gate is never loosened to let it
   pass. Rendering may allocate its output, within the ceilings of the gate.
 - **Exact tests.** Tests use the fake clock (`Options.clock`) and assert exact numbers; no
-  sleeps for timing.
+  sleeps for timing. `Options` are immutable, so a test derives what it needs from a base
+  (`opts().strict(true)`) without changing the base.
 - **Misuse heals.** Outside strict mode the library never throws into the caller: misuse is
   healed and counted. In strict mode (`Options.strict`) every misuse is an `AssertionError`.
 - **The format is a contract.** [FORMAT.md](FORMAT.md) is normative. A change to the wire or
