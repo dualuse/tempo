@@ -225,6 +225,39 @@ public class TempoBenchmark {
         }
     }
 
+    /** Like {@link Drawing}, with a self-contained block open in the trace the whole time: its tasks are the block's. */
+    @State(Scope.Thread)
+    public static class DrawingInBlock {
+        @Param({"1000", "8000"})
+        int cycle;
+        Tempo.Trace trace, block;
+        int used;
+
+        @Setup(Level.Trial)
+        public void setUp() {
+            trace = Tempo.trace(ROOT, DRAWN).records(Tempo.STEP);
+            block = Tempo.trace(BLOCK);
+        }
+
+        @TearDown(Level.Trial)
+        public void tearDown() {
+            block.close();
+            trace.close();
+            trace.release();
+        }
+
+        void cycle() {
+            if (++used == cycle) {
+                block.close();
+                trace.close();
+                trace.release();
+                trace = Tempo.trace(ROOT, DRAWN).records(Tempo.STEP);
+                block = Tempo.trace(BLOCK);
+                used = 0;
+            }
+        }
+    }
+
     /** A trace of spans only with a self-contained block open in it for the whole trial: steps in it are undrawn. */
     @State(Scope.Thread)
     public static class SpansOnlyInBlock {
@@ -465,6 +498,22 @@ public class TempoBenchmark {
         Tempo.Trace in = Tempo.trace(BLOCK);
         in.close();
         return in;
+    }
+
+    /**
+     * A drawn task run inline in an open block: its record at the submit and its run, in the block's scope,
+     * and the one {@code RunnableTask} object (cost promise 2).
+     */
+    @Benchmark
+    public void taskInBlock(DrawingInBlock s) {
+        s.cycle();
+        Tempo.runnable(CHILD, NOTHING).run();
+    }
+
+    /** An undrawn task run inline in an open block: its totals in the block's entry, the one {@code RunnableTask}. */
+    @Benchmark
+    public void taskUndrawnInBlock(SpansOnlyInBlock s) {
+        Tempo.runnable(CHILD, NOTHING).run();
     }
 
     /**
