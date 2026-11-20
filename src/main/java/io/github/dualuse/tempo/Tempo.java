@@ -1048,10 +1048,12 @@ public final class Tempo {
 
         /**
          * The rows of each lane in the subtree of row {@code rootRow} of lane {@code rootLane}: that row, the
-         * rows whose parent is in it, and the rows linked into it ({@code laneId << 32 | row}, -1 for none):
-         * a task's run to its record at the submit, a span of an undrawn task to the span it was submitted
-         * from, an unfolded task to that span. Iterated until nothing changes, as a link may point to a lane
-         * of any id. By lane id, empty for a lane not read or a root that is not a row.
+         * rows linked into it ({@code laneId << 32 | row}, -1 for none), and the rows without a link whose
+         * parent is in it. A link decides first, so a task belongs with everything in it to where it was
+         * submitted, wherever it ran: a task's run or cancel links to its record at the submit, a span of an
+         * undrawn task or of a task begun inline in another scope to the span it was submitted from, an
+         * unfolded task to that span. Iterated until nothing changes, as a link may point to a lane of any id.
+         * By lane id, empty for a lane not read or a root that is not a row.
          */
         static boolean[][] subtree(int rootLane, int rootRow, int[] rows, int[][] parent, long[][] link) {
             int n = rows.length;
@@ -1067,11 +1069,13 @@ public final class Tempo {
                     long[] k = link[i];
                     for (int r = 0; r < rows[i]; r++) {
                         if (b[r]) continue;
-                        int q = p[r];
-                        boolean y = q >= 0 && q < r && b[q];
-                        if (!y && k != null && k[r] >= 0) {
+                        boolean y;
+                        if (k != null && k[r] >= 0) { // a linked row is where its link points, wherever it ran
                             int x = (int) (k[r] >>> 32), xr = (int) k[r];
                             y = x < n && xr >= 0 && xr < rows[x] && in[x][xr];
+                        } else {
+                            int q = p[r];
+                            y = q >= 0 && q < r && b[q];
                         }
                         if (y) {
                             b[r] = true;
@@ -1427,6 +1431,8 @@ public final class Tempo {
         Phase[] rowless;
         Trace[] outer;
         int[] outerAt;
+        Lane[] crossLane;
+        int[] crossRow;
         Kit link; // the next kit in its slot's pool
     }
 
@@ -1533,8 +1539,9 @@ public final class Tempo {
         // state = epoch * EPOCH + kind; the epoch counts the owner's IDLE -> ACTIVE moves, so a reader that
         // finds the same IDLE state before and after its reads knows nothing was written in between.
         static final int IDLE = 0, ACTIVE = 1, RETIRED = 2, KIND = 3, EPOCH = 4, FRAME = -1;
-        // rowAt values without a row: NO_ROW in a folded task begun outside the trace; CROSS in an undrawn
-        // task begun outside the trace whose spans hang from row acrossRow of lane across.
+        // rowAt values without a row: NO_ROW in a folded task begun outside the trace; CROSS in a task whose
+        // spans hang from row crossRow[d] of lane crossLane[d], where it was submitted: an undrawn task begun
+        // outside the trace, or an undrawn or folded task begun inline in another scope than its own.
         static final int NO_ROW = -1, CROSS = -2;
         static final long OPEN = Long.MIN_VALUE;
 
@@ -1598,9 +1605,10 @@ public final class Tempo {
         private Task waiting;
         private int waitingRoom; // pushes until the list has doubled
 
-        // While rowAt[0] is CROSS: the lane and row that spans opened in the undrawn task at the root hang from.
-        private Lane across;
-        private int acrossRow;
+        // While rowAt[d] is CROSS: the lane and row that spans opened at d + 1 hang from (linked by XPARENT),
+        // so they count where the task was submitted. From the kit, created with the lane's first.
+        private Lane[] crossLane;
+        private int[] crossRow;
 
         // CPU time at open of the rows at the depths whose bit is set in cpuMask; created on first use.
         long cpuMask;
@@ -1666,6 +1674,8 @@ public final class Tempo {
             rowless = k.rowless;
             outer = k.outer;
             outerAt = k.outerAt;
+            crossLane = k.crossLane;
+            crossRow = k.crossRow;
             scope = ctx.root;
         }
 
@@ -1781,8 +1791,8 @@ public final class Tempo {
             }
             Lane at = this;
             if (p == CROSS) {
-                at = across;
-                p = acrossRow;
+                at = crossLane[depth - 1];
+                p = crossRow[depth - 1];
             }
             t.init(at, p < 0 ? NO_ROW : p, bits | Task.UNDRAWN, ctx.now(), sc);
         }
@@ -1876,8 +1886,10 @@ public final class Tempo {
          * The task of a folded handoff, whose TASKS entry is {@code ~h.row()} in the submitter's lane. It writes
          * no row: begun, it is a frame whose occurrence (with its queue wait) ends into this lane's RAN entry
          * of that TASKS entry; cancelled, a zero-length UNRUN occurrence. Only the owner writes either, and a
-         * render merges them into the TASKS entry. {@link #NOOP} when cancelled or retired, null at a cap.
-         * The queue wait ends at {@code now}, as in {@link #task}.
+         * render merges them into the TASKS entry. Begun inline in another scope than the one it was
+         * submitted in, its spans hang from the span it was submitted from (CROSS), as an undrawn task's do.
+         * {@link #NOOP} when cancelled or retired, null at a cap. The queue wait ends at {@code now}, as in
+         * {@link #task}.
          */
         private Span foldedTask(Task h, boolean run, long now) {
             int d = depth, target = ~h.row();
@@ -1903,9 +1915,12 @@ public final class Tempo {
                 if (root) idle();
                 return NOOP;
             }
-            if (sc != scope) enterScope(sc, d);
+            boolean foreign = sc != scope;
+            if (foreign) enterScope(sc, d);
             Span s = openFrame(Name.byId(id), e, wait, now, null);
             s.folded = true;
+            int anchor = t.keys[target * Aggs.KEY + Aggs.ANCHOR];
+            if (foreign && !root && anchor >= 0) cross(d, h.lane, anchor); // inline in another scope: under its submit
             if (root) {
                 saved = slot.current;
                 slot.current = this;
@@ -1917,7 +1932,9 @@ public final class Tempo {
          * An undrawn task: like a folded one it writes no row, but its occurrence goes to a RAN or UNRUN
          * entry of no TASKS entry (lane -1), which only the totals read. Begun outside the trace, its spans
          * hang from the row the task kept at its submit (CROSS), on this thread; inline, from the innermost
-         * recorded span here. {@link #NOOP} when cancelled or retired, null at a cap.
+         * recorded span here, unless it was submitted in another scope (a block, or outside the block open
+         * here): then from the row kept at its submit too, so they count where it was submitted. {@link
+         * #NOOP} when cancelled or retired, null at a cap.
          */
         private Span undrawnTask(Task h, boolean run, long now) {
             int d = depth;
@@ -1940,16 +1957,13 @@ public final class Tempo {
                 return NOOP;
             }
             if (root && sc.measuresCpu()) sampleCpu(0);
-            if (sc != scope) enterScope(sc, d);
+            boolean foreign = sc != scope;
+            if (foreign) enterScope(sc, d);
             Span s = openFrame(h.name, e, wait, now, null);
             s.hidden = true;
+            int r = h.row();
+            if (r >= 0 && (root || foreign)) cross(d, h.lane, r);
             if (root) {
-                int r = h.row();
-                if (r >= 0) {
-                    rowAt[0] = CROSS;
-                    across = h.lane;
-                    acrossRow = r;
-                }
                 saved = slot.current;
                 slot.current = this;
             }
@@ -2209,7 +2223,8 @@ public final class Tempo {
          */
         private Span openFrame(Name n, int agg, long wait, long now, Trace t) {
             int d = depth;
-            rowAt[d] = d == 0 ? NO_ROW : rowAt[d - 1]; // NO_ROW: a folded task's root, no row below
+            int p = rowAt[d] = d == 0 ? NO_ROW : rowAt[d - 1]; // NO_ROW: a folded task's root, no row below
+            if (p == CROSS) cross(d, crossLane[d - 1], crossRow[d - 1]);
             depth = d + 1;
             timed &= ~(1L << d);
             Span h = t != null ? t : frameHandle(d);
@@ -2223,6 +2238,17 @@ public final class Tempo {
             h.wait = wait;
             h.time = now;
             return h;
+        }
+
+        /** Spans opened above depth {@code d} hang from row {@code r} of lane {@code l}, linked; see {@link #CROSS}. */
+        private void cross(int d, Lane l, int r) {
+            if (crossLane == null) {
+                crossLane = new Lane[MAX_DEPTH];
+                crossRow = new int[MAX_DEPTH];
+            }
+            rowAt[d] = CROSS;
+            crossLane[d] = l;
+            crossRow[d] = r;
         }
 
         /**
@@ -2349,7 +2375,7 @@ public final class Tempo {
             int p = d == 0 ? NO_ROW : rowAt[d - 1];
             int r = row(n, flags, Math.max(NO_ROW, p));
             if (r < 0) return NOOP;
-            if (p == CROSS) append(r, XPARENT, (long) across.id << 32 | acrossRow); // in an undrawn task, under its submitter
+            if (p == CROSS) append(r, XPARENT, (long) crossLane[d - 1].id << 32 | crossRow[d - 1]); // under where its task was submitted
             DUR.setOpaque(rows[r >>> CHUNK_BITS].dur, r & MASK, OPEN);
             rowAt[d] = r;
             depth = d + 1;
@@ -3010,7 +3036,7 @@ public final class Tempo {
             Aggs a = aggs;
             aggs = null;
             waiting = null;
-            across = null;
+            if (crossLane != null) Arrays.fill(crossLane, null);
             labels = null;
             if (slot == null || free) return;
             Kit k = kit;
@@ -3022,6 +3048,8 @@ public final class Tempo {
             k.phaseAt = phaseAt;
             k.outer = outer;
             k.outerAt = outerAt;
+            k.crossLane = crossLane;
+            k.crossRow = crossRow;
             if (a != null && a.keys.length <= Kit.KEEP_AGGS * Aggs.KEY) {
                 Arrays.fill(a.scopes, null); // a pooled table reaches no trace
                 k.aggs = a;

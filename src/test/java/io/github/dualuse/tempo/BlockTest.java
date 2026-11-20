@@ -210,6 +210,76 @@ class BlockTest {
         }
     }
 
+    /**
+     * A task belongs, with everything in it, to the scope it was submitted from, wherever it runs: one
+     * submitted in a block that closed and run inline in a sibling block counts and is heard in the first
+     * only, drawn, folded or undrawn, and its spans are drawn where it was submitted.
+     */
+    @Test
+    void aTaskSubmittedInOneBlockAndRunInAnotherBelongsToTheFirst() {
+        String[] trees = {
+                lines("search 0+5",            // undrawn: its span hangs from the span it was submitted from
+                        "  index 0+0",
+                        "    load 2+3",
+                        "  shard 0+5"),
+                lines("search 0+5",            // drawn: at its record in the first block
+                        "  index 0+0",
+                        "    match 0+3 handoff~2",
+                        "      load 2+3",
+                        "  shard 0+5"),
+                lines("search 0+5",            // folded: its span hangs from the span it was submitted from
+                        "  index 0+0",
+                        "    match 0+3 agg*1 min=3 max=3 maxAt=0 extent=5 handoff~2/2",
+                        "    load 2+3",
+                        "  shard 0+5")};
+        for (int kind = 0; kind < 3; kind++) {
+            Trace req = Tempo.trace(SEARCH, opts().cpu(false).budget(kind == 2 ? 0 : 512)).records(kind == 0 ? SPAN : STEP);
+            List<Long> first = new ArrayList<>(), second = new ArrayList<>();
+            Trace b1 = Tempo.trace(INDEX).on(MATCH, first::add).on(LOAD, first::add);
+            RunnableTask t = Tempo.runnable(MATCH, () -> span(LOAD, 3));
+            b1.close();
+            Trace b2 = Tempo.trace(SHARD).on(MATCH, second::add).on(LOAD, second::add);
+            clock.add(2);
+            t.run();
+            b2.close();
+            req.close();
+            String what = "kind " + kind;
+            assertEquals("1/1", b1.total(MATCH).count() + "/" + b1.total(LOAD).count(), what);
+            assertEquals("0/0", b2.total(MATCH).count() + "/" + b2.total(LOAD).count(), what);
+            assertEquals("1/1", req.total(MATCH).count() + "/" + req.total(LOAD).count(), what);
+            assertEquals(b1.total(LOAD).toString(), b1.snapshot().total(LOAD).toString(), what);
+            assertEquals(b2.total(LOAD).toString(), b2.snapshot().total(LOAD).toString(), what);
+            assertEquals(b1.total(MATCH).toString(), b1.snapshot().total(MATCH).toString(), what);
+            assertEquals(List.of(3L, 3L), first, what);
+            assertEquals(List.of(), second, what);
+            assertEquals(trees[kind], tree(req), what);
+            assertEquals(0, req.misuses() + req.dropped(), what);
+            req.release();
+        }
+    }
+
+    /** A task of the request run inline inside a block is the request's, not the block's. */
+    @Test
+    void aRequestsTaskRunInsideABlockIsNotTheBlocks() {
+        for (int level = SPAN; level <= STEP; level++) {
+            Trace req = Tempo.trace(SEARCH, opts().cpu(false)).records(level);
+            RunnableTask t = Tempo.runnable(MATCH, () -> {
+                span(LOAD, 3);
+                step(DECODE, 4);
+            });
+            List<Long> heard = new ArrayList<>();
+            Trace in = Tempo.trace(RERANK).on(MATCH, heard::add).on(LOAD, heard::add).on(DECODE, heard::add);
+            t.run();
+            in.close();
+            req.close();
+            assertEquals("0/0/0", in.total(MATCH).count() + "/" + in.total(LOAD).count() + "/" + in.total(DECODE).count(), "level " + level);
+            assertEquals("1/1/1", req.total(MATCH).count() + "/" + req.total(LOAD).count() + "/" + req.total(DECODE).count(), "level " + level);
+            assertEquals(List.of(), heard);
+            assertEquals(lines("rerank 0+7"), tree(in), "level " + level);
+            req.release();
+        }
+    }
+
     @Test
     void aFoldedTaskInABlockCountsInTheBlock() {
         Trace req = Tempo.trace(SEARCH, opts().cpu(false).budget(0)).records(STEP);
