@@ -137,9 +137,9 @@ public final class Tempo {
      * sub-budget, taken from what the outer trace has left) hold in the subtree and its tasks. What its
      * options leave unset it inherits from the outer trace: the header limit, viewer, strictness and CPU
      * setting as the outer trace has them, and without a budget of its own it draws from what the outer
-     * trace has left. {@link Options#clock} and {@link Options#lanes} stay the outer trace's, and {@link Trace#release()} leaves
-     * the buffers to it. Blocks nest. The call allocates the one {@code Trace}. A trace left open on a pool
-     * thread takes in every later trace there: close each one.
+     * trace has left. {@link Options#clock} and {@link Options#lanes} stay the outer trace's, and {@link
+     * Trace#release()} leaves the buffers to it. Blocks nest. The call allocates the one {@code Trace}. A
+     * trace left open on a pool thread takes in every later trace there: close each one.
      */
     public static Trace trace(Name name, Options options) {
         long zero = options == null ? SYSTEM_CLOCK.getAsLong() : options.clock.getAsLong(); // DEFAULTS.clock is SYSTEM_CLOCK
@@ -676,7 +676,7 @@ public final class Tempo {
      */
     static final class Context {
         private static final AtomicLong IDS = new AtomicLong();
-        private static final VarHandle LANES, DROPPED, UNFOLDS;
+        private static final VarHandle LANES, DROPPED, UNFOLDS, UNATTRIBUTED;
 
         static {
             try {
@@ -684,6 +684,7 @@ public final class Tempo {
                 LANES = l.findVarHandle(Context.class, "lanes", Lane.class);
                 DROPPED = l.findVarHandle(Context.class, "dropped", int.class);
                 UNFOLDS = l.findVarHandle(Context.class, "unfolds", int.class);
+                UNATTRIBUTED = l.findVarHandle(Context.class, "unattributed", int.class);
             } catch (ReflectiveOperationException e) {
                 throw new ExceptionInInitializerError(e);
             }
@@ -698,6 +699,7 @@ public final class Tempo {
         final int maxLanes;
         final int unfoldCap;            // folded tasks a block may unfold, past the budget (Lane#unfold)
         @SuppressWarnings("unused") private volatile int unfolds; // via UNFOLDS
+        private volatile int unattributed; // occurrences of blocks kept in an enclosing scope's entry (Lane#aggregate)
         final AtomicInteger misuses = new AtomicInteger();
         // The level and whether a step, tick or task was seen, in one word of each scope (Trace#mode), so a
         // step reads the level it is opened at in the same atomic step that fixes it, and records(level)
@@ -902,10 +904,13 @@ public final class Tempo {
         }
 
         /** Occurrences in blocks kept in an enclosing scope's aggregate entry, for want of room; see {@link Lane#aggregate}. */
-        int unattributed() {
-            int n = 0;
-            for (Lane l = lanes; l != null; l = l.next) n += l.unattributed;
-            return n;
+        int unattributedCount() {
+            return unattributed;
+        }
+
+        /** Counts one such occurrence; any lane, rarely (past a lane's room for blocks). */
+        void unattributed() {
+            UNATTRIBUTED.getAndAdd(this, 1);
         }
 
         /**
@@ -1721,7 +1726,6 @@ public final class Tempo {
         private Span[] frames; // created with the first frame
         private Span issued, issuedTail;
         int depth, rowCount, eventCount, dropped;
-        int unattributed; // occurrences of a block kept in an enclosing scope's entry for want of room (Aggs#SCOPED)
         int credit, folded; // step and tick budget held by this lane; those folded for want of it
 
         // Folded and undrawn spans; replaced by a grown copy via AGGS.setRelease, like labels.
@@ -2478,7 +2482,7 @@ public final class Tempo {
                     e = create(anchor, lane, parent, name, kind, s);
                 }
                 if (e >= 0) {
-                    unattributed++;
+                    ctx.unattributed();
                     return e;
                 }
             }
@@ -5472,7 +5476,8 @@ public final class Tempo {
      * included; it renders that subtree with its own {@link Options#headerBytes} and {@link
      * Options#linkBase}; its {@link Options#strict}, {@link Options#cpu} and {@link Options#budget} (a
      * sub-budget) hold inside it and in its tasks. What its options leave unset comes from the outer trace
-     * (see {@link Options}). The outer trace still counts and draws everything, the block's spans with the rest.
+     * (see {@link Options}). A task belongs, with everything in it, to the block it was submitted from,
+     * wherever it runs. The outer trace still counts and draws everything, the block's spans with the rest.
      *
      * <pre>{@code
      * static final Tempo.Options BLOCK = new Tempo.Options().budget(64);
@@ -5864,8 +5869,12 @@ public final class Tempo {
          * the same whatever the trace drew. Exact once the contributing threads are done, best effort while
          * they run; empty after release. Reads the lanes in place: no copy, one allocation, time linear in
          * the trace's rows, events and aggregates. On a block, those of the block's subtree, its tasks on
-         * other threads included, computed when read (so recording pays nothing for it): a few arrays per
-         * read, by lane, and time linear in the trace's rows, events and aggregates.
+         * other threads included (a task counts where it was submitted, wherever it ran), computed when read,
+         * so recording pays nothing for it. The read is as large as the block: its rows, events and
+         * aggregates on its own lane from its start to its end, and the lanes its tasks ran on; it allocates
+         * one bit per row read and a few small arrays. Blocks fill at most three quarters of a lane's 4,096
+         * aggregate entries; a block's occurrences past that count in the enclosing scope's totals instead,
+         * so the block's undercount while the trace's stay exact.
          */
         public Total total(Name name) {
             if (name == null || lane == null) return Total.EMPTY;
@@ -6047,7 +6056,7 @@ public final class Tempo {
          * aggregates (see {@link Aggs#SCOPED}): the trace's totals have them, the blocks' do not.
          */
         int unattributed() {
-            return ctx.unattributed();
+            return ctx.unattributedCount();
         }
     }
 
