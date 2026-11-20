@@ -1,10 +1,13 @@
 package io.github.dualuse.tempo;
 
+import io.github.dualuse.tempo.Tempo.Context;
+import io.github.dualuse.tempo.Tempo.Lane;
 import io.github.dualuse.tempo.Tempo.Name;
 import io.github.dualuse.tempo.Tempo.Options;
 import io.github.dualuse.tempo.Tempo.RunnableTask;
 import io.github.dualuse.tempo.Tempo.Span;
 import io.github.dualuse.tempo.Tempo.Task;
+import io.github.dualuse.tempo.Tempo.ThreadSlot;
 import io.github.dualuse.tempo.Tempo.Trace;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -260,6 +263,43 @@ class BlockTest {
         assertEquals("count=2 sum=7 mean=3 min=2 max=5 waitSum=25 waitMax=15", req.total(MATCH).toString());
         assertEquals(0, req.misuses() + req.dropped());
         req.release();
+    }
+
+    /**
+     * A folded task begun as its trace is released may read its submitter's TASKS table after the retired
+     * lane gave it to its thread's next lane, of another trace (emulated by pointing the submitter at that
+     * table): the task never takes that trace's scope, so it neither counts nor throws there.
+     */
+    @Test
+    void aLateFoldedTaskNeverTakesTheScopeOfAnotherTrace() throws Exception {
+        Context first = new Context(opts().budget(0).cpu(false));
+        first.level(STEP);
+        Lane sub = first.register(new Lane(first, new ThreadSlot()));
+        sub.openRoot(SEARCH, 0, -1);
+        Trace block = new Trace(sub, first, sub.depth, sub.scope, new Options());
+        sub.nest(block, RERANK, 0);
+        Task late = new Task(sub, MATCH, null, 0);     // folded: TASKS entry 0, in the block
+        assertSame(block, late.scope());
+
+        Context second = new Context(opts().budget(0).cpu(false));
+        second.level(STEP);
+        Lane next = second.register(new Lane(second, new ThreadSlot()));
+        next.openRoot(SEARCH, 0, -1);
+        Trace strict = new Trace(next, second, next.depth, next.scope, new Options().strict(true));
+        next.nest(strict, RERANK, 0);
+        new Task(next, MATCH, null, 0);                // TASKS entry 0 of the second trace, in its strict block
+        java.lang.reflect.Field aggs = Lane.class.getDeclaredField("aggs");
+        aggs.setAccessible(true);
+        aggs.set(sub, aggs.get(next));                 // the recycled table, as a late reader holds it
+
+        assertSame(first.root, late.scope());
+        Lane worker = first.register(new Lane(first, new ThreadSlot()));
+        Span s = worker.task(late, true, 5);
+        assertNotSame(NOOP, s);
+        worker.openSpan((Name) null, 0).close();       // misuse: in the first trace, lenient; never the strict block's
+        s.close();
+        assertEquals(1, first.misuses.get());
+        assertEquals(0, second.misuses.get());
     }
 
     // ---- granularity ---------------------------------------------------------------------------------

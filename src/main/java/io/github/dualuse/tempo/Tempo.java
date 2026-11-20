@@ -1874,8 +1874,9 @@ public final class Tempo {
             }
             boolean root = d == 0;
             if (root && !activate()) return NOOP;
-            int id = h.lane.taskName(target);
-            Trace sc = id < 0 ? scope : h.lane.taskScope(target);
+            Aggs t = (Aggs) AGGS.getAcquire(h.lane); // read once: the name and the scope come from one table
+            int id = t == null ? -1 : t.keys[target * Aggs.KEY + Aggs.NAME];
+            Trace sc = id < 0 ? scope : h.lane.scopeIn(t, target);
             int e = id < 0 ? -1 : aggregate(target, h.lane.id, -1, id, run ? Aggs.RAN : Aggs.UNRUN, sc);
             if (e < 0) {
                 if (root) idle();
@@ -1942,17 +1943,20 @@ public final class Tempo {
             return s;
         }
 
-        /** The name id of TASKS entry {@code e} of this lane, from any thread; -1 once the lane is retired. */
-        int taskName(int e) {
-            Aggs a = (Aggs) AGGS.getAcquire(this);
-            return a == null ? -1 : a.keys[e * Aggs.KEY + Aggs.NAME];
+        /** The scope of TASKS entry {@code e} of this lane, from any thread; see {@link #scopeIn}. */
+        Trace taskScope(int e) {
+            return scopeIn((Aggs) AGGS.getAcquire(this), e);
         }
 
-        /** The scope of TASKS entry {@code e} of this lane, from any thread; the trace's own once the lane is retired. */
-        Trace taskScope(int e) {
-            Aggs a = (Aggs) AGGS.getAcquire(this);
+        /**
+         * The scope of TASKS entry {@code e} in {@code a}, a table of this lane read by any thread; the trace's
+         * own root once the lane is retired. A reader racing {@link Context#release()} may hold the table
+         * after the retired lane gave it to its thread's next lane, of another trace: a scope of that trace
+         * is never handed out, so a late task never counts, credits or throws there.
+         */
+        Trace scopeIn(Aggs a, int e) {
             Trace s = a == null ? null : a.scopes[e];
-            return s == null ? ctx.root : s;
+            return s != null && s.ctx == ctx ? s : ctx.root;
         }
 
         /** The anchor row of TASKS entry {@code e} of this lane, from any thread; -1 for none or once retired. */
