@@ -596,6 +596,82 @@ class BlockTest {
         }
     }
 
+    /**
+     * A block called thousands of times in one request, each call with an undrawn task: the request's totals
+     * stay exact. Each call's entry is the block's own until blocks fill their share of the lane's
+     * aggregates; past it a call's task counts in the request's entry, unattributed, and that block's total
+     * undercounts.
+     */
+    @Test
+    void manyBlockCallsKeepTheRequestsTotalsExact() {
+        Trace req = Tempo.trace(SEARCH, opts().cpu(false));
+        Trace first = null, last = null;
+        for (int i = 0; i < 6_000; i++) {
+            Trace in = Tempo.trace(RERANK);
+            Tempo.runnable(MATCH, () -> clock.add(1)).run();
+            in.close();
+            if (i == 0) first = in;
+            last = in;
+        }
+        req.close();
+        assertEquals("count=6000 sum=6000 mean=1 min=1 max=1 waitSum=0 waitMax=0", req.total(MATCH).toString());
+        assertEquals(0, req.dropped());
+        assertEquals(6_000 - Tempo.Aggs.SCOPED, req.unattributed());
+        assertEquals(1, first.total(MATCH).count());
+        assertEquals(0, last.total(MATCH).count());
+        req.release();
+    }
+
+    /** The entries of one name in many blocks do not share a probe chain: a find costs the same for each. */
+    @Test
+    void aBlocksEntriesSpreadOverTheIndex() {
+        int n = 2_000;
+        Trace req = Tempo.trace(SEARCH, opts());
+        Trace[] blocks = new Trace[n];
+        for (int i = 0; i < n; i++) {
+            blocks[i] = Tempo.trace(RERANK);
+            step(MATCH, 1);                            // undrawn: an entry of the block's own
+            blocks[i].close();
+        }
+        req.close();
+        Tempo.Aggs a = req.lane.table();
+        long probes = 0;
+        for (Trace b : blocks) probes += a.probes(-1, 0, -1, MATCH.id, Tempo.Aggs.HIDDEN, b);
+        assertTrue(probes <= 2L * n, probes + " probes to find " + n + " entries");
+        req.release();
+    }
+
+    /**
+     * A request that calls a block hundreds of times, each with an undrawn task, allocates per call the
+     * block's Trace and the task only, once its thread's aggregates have grown: the table is kept for the
+     * next trace.
+     */
+    @Test
+    void manyBlockCallsWithATaskAllocateTheirTraceAndTaskOnly() {
+        int n = 400;
+        Runnable nothing = () -> { };
+        for (int round = 0; round < 10; round++) {
+            Trace req = Tempo.trace(SEARCH, opts().budget(Integer.MAX_VALUE).cpu(false));
+            long tasks = allocatedBy(() -> {
+                for (int i = 0; i < n; i++) Tempo.runnable(MATCH, nothing).run();
+            });
+            long blocks = allocatedBy(() -> {
+                for (int i = 0; i < n; i++) Tempo.trace(RERANK).close();
+            });
+            long both = allocatedBy(() -> {
+                for (int i = 0; i < n; i++) {
+                    Trace in = Tempo.trace(RERANK);
+                    Tempo.runnable(MATCH, nothing).run();
+                    in.close();
+                }
+            });
+            req.close();
+            req.release();
+            if (round >= 3 && both == tasks + blocks && blocks % n == 0 && tasks % n == 0) return;
+            if (round == 9) assertEquals(tasks + blocks, both, "bytes of " + n + " block calls with a task each");
+        }
+    }
+
     // ---- immutable options ---------------------------------------------------------------------------
 
     @Test

@@ -244,6 +244,40 @@ public class TempoBenchmark {
         }
     }
 
+    /**
+     * A trace of spans that calls a self-contained block {@code cycle} times, each call with an undrawn task,
+     * then the next trace. Each call keeps an aggregate entry of its own (the block's totals read it), so
+     * a lane's table grows with the calls; up to {@code Kit.KEEP_AGGS} entries the thread keeps it for its
+     * next trace. The cycles stay below that, so the per-trace setup is the same at both.
+     */
+    @State(Scope.Thread)
+    public static class Blocks {
+        @Param({"100", "500"})
+        int cycle;
+        Tempo.Trace trace;
+        int used;
+
+        @Setup(Level.Trial)
+        public void setUp() {
+            trace = Tempo.trace(ROOT, UNBUDGETED);
+        }
+
+        @TearDown(Level.Trial)
+        public void tearDown() {
+            trace.close();
+            trace.release();
+        }
+
+        void cycle() {
+            if (++used == cycle) {
+                trace.close();
+                trace.release();
+                trace = Tempo.trace(ROOT, UNBUDGETED);
+                used = 0;
+            }
+        }
+    }
+
     @Benchmark
     public long baselineNanoTime() {
         return System.nanoTime();
@@ -429,6 +463,20 @@ public class TempoBenchmark {
     public Tempo.Trace nestedTrace(Cycling s) {
         s.cycled();
         Tempo.Trace in = Tempo.trace(BLOCK);
+        in.close();
+        return in;
+    }
+
+    /**
+     * A block called many times in one trace, each call with an undrawn task run inline: the block's {@code
+     * Trace} and the {@code RunnableTask} are the call's allocations, and its cost does not grow with the
+     * calls before it (its entry is found in constant time).
+     */
+    @Benchmark
+    public Tempo.Trace blockCallWithTask(Blocks s) {
+        s.cycle();
+        Tempo.Trace in = Tempo.trace(BLOCK);
+        Tempo.runnable(CHILD, NOTHING).run();
         in.close();
         return in;
     }

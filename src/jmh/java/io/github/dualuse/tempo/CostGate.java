@@ -77,9 +77,10 @@ public final class CostGate {
     static final double ACROSS_SETUP = 1024; // B per trace of the across groups: the submitter's trace and the worker's lane
     static final double ENCODE = 6 * 1024, RENDER = 24 * 1024, JSON = 2560; // B per render of the 300-span trace
     static final double TICK = 0.5, TICK_STATIC = 1.0, SPAN_STATIC = 6.4; // times one clock read
+    static final double FLAT = 1.5;      // times: an operation at the longer cycle to the same at the shorter
     static final String BASELINE = "baselineNanoTime";
 
-    enum Unit { PER_OP, SETUP_PER_TRACE, PER_TRACE, PER_RENDER, TIMES_BASELINE }
+    enum Unit { PER_OP, SETUP_PER_TRACE, PER_TRACE, PER_RENDER, TIMES_BASELINE, GROWTH }
 
     /** One check: a benchmark, what is measured, and its limit; {@code limit < 0} only reports. */
     static final class Gate {
@@ -143,6 +144,8 @@ public final class CostGate {
             new Gate(BLOCKS, "stepUndrawnInBlock", Unit.PER_OP, NOTHING),
             new Gate(BLOCKS, "stepUndrawnInBlock", Unit.TIMES_BASELINE, -1),
             new Gate(BLOCKS, "nestedTrace", Unit.PER_OP, NESTED + NOTHING),
+            new Gate(BLOCKS, "blockCallWithTask", Unit.PER_OP, NESTED + RUNNABLE_TASK + NOTHING),
+            new Gate(BLOCKS, "blockCallWithTask", Unit.GROWTH, FLAT),
 
             new Gate(REST, "folded", Unit.PER_OP, NOTHING),
             new Gate(REST, "add", Unit.PER_OP, NOTHING),
@@ -185,7 +188,8 @@ public final class CostGate {
                 System.out.println();
                 System.out.println(group = g.group);
             }
-            Map<Integer, Double> byCycle = (g.unit == Unit.TIMES_BASELINE ? nanos : bytes).get(g.benchmark);
+            boolean time = g.unit == Unit.TIMES_BASELINE || g.unit == Unit.GROWTH;
+            Map<Integer, Double> byCycle = (time ? nanos : bytes).get(g.benchmark);
             if (byCycle == null || g.unit == Unit.TIMES_BASELINE && baseline == null) {
                 missing.add(g.benchmark);
                 ok = false;
@@ -221,6 +225,12 @@ public final class CostGate {
                     double ns = byCycle.get(longest), ratio = ns / baseline;
                     ok &= check(g, ratio, String.format("%.1f ns = %.2f x %s %.1f ns", ns, ratio, BASELINE, baseline));
                     break;
+                case GROWTH: {
+                    int c1 = Collections.min(byCycle.keySet());
+                    double n1 = byCycle.get(c1), n2 = byCycle.get(longest);
+                    ok &= check(g, n2 / n1, String.format("%.1f ns at %d per trace = %.2f x %.1f ns at %d", n2, longest, n2 / n1, n1, c1));
+                    break;
+                }
             }
         }
         if (!missing.isEmpty()) {
@@ -243,7 +253,7 @@ public final class CostGate {
         }
         boolean pass = value <= g.limit;
         String limit = g.limit == Math.rint(g.limit) ? String.format("%.0f", g.limit) : String.valueOf(g.limit);
-        if (g.unit == Unit.TIMES_BASELINE) limit += " x";
+        if (g.unit == Unit.TIMES_BASELINE || g.unit == Unit.GROWTH) limit += " x";
         System.out.printf("%s  %-17s %s (gate %s)%n", pass ? "ok  " : "FAIL", g.benchmark, shown, limit);
         return pass;
     }

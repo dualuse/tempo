@@ -888,6 +888,13 @@ public final class Tempo {
             return n;
         }
 
+        /** Occurrences in blocks kept in an enclosing scope's aggregate entry, for want of room; see {@link Lane#aggregate}. */
+        int unattributed() {
+            int n = 0;
+            for (Lane l = lanes; l != null; l = l.next) n += l.unattributed;
+            return n;
+        }
+
         /**
          * {@link Snapshot#total} read in place: the same rows, task waits and lane aggregates, summed
          * without a copy. A read racing {@link #release()} may see recycled chunks; like a Snapshot's, it
@@ -1401,8 +1408,13 @@ public final class Tempo {
      * reader of a released trace may see the arrays in use by a later lane, and discards what it read.
      */
     static final class Kit {
-        /** Aggregates up to this many entries are pooled with the kit; a larger table goes to the GC. */
-        static final int KEEP_AGGS = 64;
+        /**
+         * Aggregates up to this many entries are pooled with the kit, so a thread's next trace reuses the table
+         * however many entries the last one grew it to: 512 entries take 152 B each, 76 KB per kit (one per
+         * lane a thread has open at once). It covers a trace that calls a block a few hundred times per lane,
+         * each with an undrawn task or step, whose entries are kept per block. A larger table goes to the GC.
+         */
+        static final int KEEP_AGGS = 512;
 
         final Rows[] rows = new Rows[Lane.CHUNKS];
         final int[] rowAt = new int[Lane.MAX_DEPTH];
@@ -1573,6 +1585,7 @@ public final class Tempo {
         private Span[] frames; // created with the first frame
         private Span issued, issuedTail;
         int depth, rowCount, eventCount, dropped;
+        int unattributed; // occurrences of a block kept in an enclosing scope's entry for want of room (Aggs#SCOPED)
         int credit, folded; // step and tick budget held by this lane; those folded for want of it
 
         // Folded and undrawn spans; replaced by a grown copy via AGGS.setRelease, like labels.
@@ -2061,6 +2074,7 @@ public final class Tempo {
                 return null;
             }
             if (rowAt[d - 1] == NO_ROW) unfold();
+            if (rowAt[d - 1] == NO_ROW) t.row = FRAME; // before it is a scope: its entries hash by it (Aggs#scopeKey)
             enterScope(t, d);
             if (rowAt[d - 1] == NO_ROW) {
                 Span h = openFrame(n, entry(n, Aggs.SPANS), 0, 0, t);
@@ -2230,9 +2244,12 @@ public final class Tempo {
         }
 
         /**
-         * The entry of an aggregate key in scope {@code sc}, created if new; -1 past {@link Aggs#MAX} entries
-         * (counted as a drop). Entries of the same key in other scopes stay apart, so the totals of a block
-         * read its own; without blocks every entry is in the trace's own scope.
+         * The entry of an aggregate key in scope {@code sc}, created if new. Entries of the same key in other
+         * scopes stay apart, so the totals of a block read its own; without blocks every entry is in the
+         * trace's own scope. A block's entries take at most {@link Aggs#SCOPED} of the table; past that its
+         * occurrence goes to the entry of the key in the nearest enclosing scope that has one, ultimately the
+         * trace's own, which may fill the rest: the trace's totals stay exact, the block's undercount, and the
+         * occurrence counts as unattributed. -1 past {@link Aggs#MAX} entries (counted as a drop).
          */
         private int aggregate(int anchor, int lane, int parent, int name, int kind, Trace sc) {
             Aggs a = aggs;
@@ -2245,10 +2262,23 @@ public final class Tempo {
             }
             int e = a.find(anchor, lane, parent, name, kind, sc);
             if (e >= 0) return e;
-            if (a.size() == Aggs.MAX) {
-                dropped++;
-                return -1;
+            if (a.size() < (sc.up == null ? Aggs.MAX : Aggs.SCOPED)) return create(anchor, lane, parent, name, kind, sc);
+            for (Trace s = sc.up; s != null; s = s.up) {
+                if ((e = a.find(anchor, lane, parent, name, kind, s)) < 0 && s.up == null && a.size() < Aggs.MAX) {
+                    e = create(anchor, lane, parent, name, kind, s);
+                }
+                if (e >= 0) {
+                    unattributed++;
+                    return e;
+                }
             }
+            dropped++;
+            return -1;
+        }
+
+        /** A new entry, the table grown first if it is full. */
+        private int create(int anchor, int lane, int parent, int name, int kind, Trace sc) {
+            Aggs a = aggs;
             if (a.full()) AGGS.setRelease(this, a = a.grow());
             return a.create(anchor, lane, parent, name, kind, sc);
         }
@@ -2256,6 +2286,11 @@ public final class Tempo {
         int aggregates() {
             Aggs a = aggs;
             return a == null ? 0 : a.size();
+        }
+
+        /** Tests: the aggregates, or null before the first. */
+        Aggs table() {
+            return aggs;
         }
 
         /**
@@ -3079,7 +3114,9 @@ public final class Tempo {
      * read its own. Without blocks every entry is in the trace's own scope.
      */
     static final class Aggs {
-        static final int MAX = 4096, KEY = 5, ANCHOR = 0, LANE = 1, PARENT = 2, NAME = 3, KIND = 4;
+        // MAX entries in all; the entries of blocks (scopes other than the trace's root) take at most SCOPED,
+        // so the trace's own entries, where a block's occurrences go past it, always have room.
+        static final int MAX = 4096, SCOPED = MAX / 4 * 3, KEY = 5, ANCHOR = 0, LANE = 1, PARENT = 2, NAME = 3, KIND = 4;
         static final int SPANS = 0, TASKS = 1, RAN = 2, UNRUN = 3, HIDDEN = 4;
         // Over the ended occurrences; a handoff's starts at its submit and ends at submit + wait + duration.
         static final int CELLS = 15, COUNT = 0, SUM = 1, MIN = 2, MAX_DUR = 3, FIRST = 4, LAST = 5, MAX_AT = 6, CPU = 7,
@@ -3127,7 +3164,7 @@ public final class Tempo {
 
         int find(int anchor, int lane, int parent, int name, int kind, Trace scope) {
             int mask = index.length - 1;
-            for (int i = hash(anchor, lane, parent, name, kind) & mask; ; i = (i + 1) & mask) {
+            for (int i = hash(anchor, lane, parent, name, kind, scope) & mask; ; i = (i + 1) & mask) {
                 int e = index[i] - 1, k = e * KEY;
                 if (e < 0) return -1;
                 if (keys[k] == anchor && keys[k + LANE] == lane && keys[k + PARENT] == parent && keys[k + NAME] == name
@@ -3155,7 +3192,7 @@ public final class Tempo {
 
         private void index(int e) {
             int k = e * KEY, mask = index.length - 1;
-            int i = hash(keys[k], keys[k + LANE], keys[k + PARENT], keys[k + NAME], keys[k + KIND]) & mask;
+            int i = hash(keys[k], keys[k + LANE], keys[k + PARENT], keys[k + NAME], keys[k + KIND], scopes[e]) & mask;
             while (index[i] != 0) i = (i + 1) & mask;
             index[i] = e + 1;
         }
@@ -3219,10 +3256,34 @@ public final class Tempo {
             c[b + WAIT_MAX] = Math.max(c[b + WAIT_MAX], q[a + WAIT_MAX]);
         }
 
-        private static int hash(int anchor, int lane, int parent, int name, int kind) {
-            int h = (((anchor * 31 + lane) * 31 + parent) * 31 + name) * 31 + kind;
+        /**
+         * The hash of a key with its scope, so the entries of one name in many blocks (a block called many
+         * times, each with an undrawn step or task) spread over the index instead of sharing one probe chain:
+         * a find costs the same however many blocks the lane has seen.
+         */
+        private static int hash(int anchor, int lane, int parent, int name, int kind, Trace scope) {
+            int h = ((((anchor * 31 + lane) * 31 + parent) * 31 + name) * 31 + kind) * 31 + scopeKey(scope);
             h *= 0x9E3779B9;
             return h ^ (h >>> 16);
+        }
+
+        /**
+         * A stable number for a scope: the row of its span, unique in its lane and set before it is a scope
+         * anywhere (the trace's root is row 0); a block that is a frame, which has no row, its identity hash.
+         */
+        static int scopeKey(Trace s) {
+            int r = s.row;
+            return r != Lane.FRAME ? r : System.identityHashCode(s);
+        }
+
+        /** Tests: the index slots a find of the key probes, the one that answers included. */
+        int probes(int anchor, int lane, int parent, int name, int kind, Trace scope) {
+            int mask = index.length - 1, n = 1;
+            for (int i = hash(anchor, lane, parent, name, kind, scope) & mask; ; i = (i + 1) & mask, n++) {
+                int e = index[i] - 1, k = e * KEY;
+                if (e < 0 || keys[k] == anchor && keys[k + LANE] == lane && keys[k + PARENT] == parent
+                        && keys[k + NAME] == name && keys[k + KIND] == kind && scopes[e] == scope) return n;
+            }
         }
     }
 
@@ -5690,6 +5751,14 @@ public final class Tempo {
         /** Steps and ticks folded into aggregates for want of budget so far, open ones included. */
         int folded() {
             return ctx.folded();
+        }
+
+        /**
+         * Occurrences in blocks that went to an enclosing scope's totals for want of room in a lane's
+         * aggregates (see {@link Aggs#SCOPED}): the trace's totals have them, the blocks' do not.
+         */
+        int unattributed() {
+            return ctx.unattributed();
         }
     }
 
