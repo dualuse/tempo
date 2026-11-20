@@ -390,9 +390,15 @@ in.release();                                        // does nothing inside a re
 ```
 
 - **Totals.** `in.total(name)` counts the block's subtree only, its tasks on other threads
-  included, computed when it is read (a walk over the subtree's rows and the block's aggregate
-  entries), so recording pays nothing for it. The request's `total` still counts everything, the
-  block's work with the rest. A snapshot of the block reads the same totals.
+  included, computed when it is read, so recording pays nothing for it. The read is as large as
+  the block, not the request: the block's rows, events and aggregate entries on its own lane from
+  its start to its end, and the lanes where its tasks ran, with one bit per row read. The
+  request's `total` still counts everything, the block's work with the rest. A snapshot of the
+  block reads the same totals.
+- **Tasks** belong, with everything in them, to the scope they were submitted from, wherever they
+  run: a task of the block counts and is heard in the block also when it runs on a pool thread,
+  after the block closed, or inline inside another block; a task of the request run inline inside
+  the block is the request's. Its spans are drawn where it was submitted.
 - **Listeners.** `in.on(name, l)` hears the block's subtree only, including its tasks that end
   after the block closed; it is dropped with the request's release. An ending span walks the
   chain of blocks it is in, so the cost grows with how deeply blocks nest, never with the number
@@ -403,19 +409,38 @@ in.release();                                        // does nothing inside a re
   what the block drew. A step in a block fixes the request's level too, as it is in its subtree.
 - **Options.** `clock` and `lanes` stay the request's: one timeline, one lane registry. The block
   honours `headerBytes` and `linkBase` for its own output; `strict` for its subtree (strictness
-  only widens: a strict request stays strict inside a lenient block); `cpu` for its subtree (left
-  unset, it follows the request's); and `budget` as a sub-budget: the block draws at most that
-  many steps, ticks and tasks, taken from what the request has left, never more. All of these
-  carry into the block's tasks.
+  only widens: a strict request stays strict inside a lenient block); `cpu` for its subtree; and
+  `budget` as a sub-budget: the block draws at most that many steps, ticks and tasks, taken from
+  what the request has left, never more. What the block's `Options` leave unset it inherits from
+  the request: the header limit, viewer, CPU setting and strictness as the request has them, and
+  without a budget of its own it has no sub-budget and draws from what the request has left. So
+  `Tempo.trace("render")` inside a request writes with the request's settings, while a top-level
+  trace takes the defaults. All of these carry into the block's tasks.
 - **Reporting** stays per trace: `toRuntime`, `toServerTiming`, `toHeader`, `toLink`,
   `snapshot` and `printOnClose` render the block's subtree, with times from its start.
 - **Blocks nest.** A block inside a block is a scope of its own; the outer block's totals and
   listeners include the inner one's.
 
 A block that opens inside a task the request folded past its budget unfolds that task: the task
-becomes a drawn record, a small and bounded overrun of the budget, so the block's report is
-complete and the request's tree shows where it ran. A nested trace allocates one object, its
-`Trace`; spans and undrawn steps inside a block allocate nothing, as outside.
+becomes the drawn handoff record of its submit, with its queue wait and thread, so the block's
+report is complete and the request's tree shows where it ran. A trace unfolds at most
+`max(8, budget / 8)` tasks, so the overrun of its budget stays bounded however many folded tasks
+open blocks. Past that the task stays folded and the block's row hangs from the span the task was
+submitted from: the block's own report is still complete, and the request's tree only leaves out
+the task between them.
+
+A block keeps its undrawn steps and tasks, folded spans and `add`s in aggregate entries of its
+own, so each call of a block adds entries to its lane's table. A thread keeps a table of up to
+512 entries for its next trace (152 B an entry, 76 KB for each lane a thread has open at once),
+so a request that calls a block a few hundred times per thread allocates nothing for them once
+warm, and finding an entry costs the same however many calls came before. Blocks fill at most
+three quarters of a lane's 4,096 entries; past that a block's occurrence goes to the entry of
+the enclosing block or, ultimately, the request, counted as unattributed: the request's totals
+stay exact, and that block's totals undercount.
+
+A nested trace allocates one object, its `Trace`. Spans, undrawn steps and tasks inside a block
+allocate as they do outside, and so does `add` (nothing) on the thread recording inside the
+block.
 
 ### Handles, misuse and strict mode
 
@@ -443,17 +468,18 @@ or shares a handle, so every stale use throws: use it in tests.
 a constant configured once is safe to share, and a setting derived from it never leaks back
 (`static final Tempo.Options BLOCK = new Tempo.Options().budget(64).strict(true)`). A
 self-contained block takes `clock` and `lanes` from the outer trace and honours the rest for
-its subtree (see [Self-contained blocks](#self-contained-blocks)).
+its subtree; what it leaves unset it inherits from the outer trace (see
+[Self-contained blocks](#self-contained-blocks)).
 
 | Option | Default | Sets |
 |---|---|---|
-| `budget(n)` | 512 | Steps, ticks and tasks drawn individually before they fold; of a block, its sub-budget. |
+| `budget(n)` | 512 | Steps, ticks and tasks drawn individually before they fold; of a block, its sub-budget (unset: none, it draws from what the outer trace has left). |
 | `cpu(on)` | when the trace records steps | Whether lane roots measure thread CPU time; a block left unset follows the outer trace. |
-| `headerBytes(n)` | 3,000 | Byte limit of `toHeader()` and of the value `toLink()` carries. |
-| `linkBase(url)` | the build's base | The viewer `toLink()` points at. |
+| `headerBytes(n)` | 3,000 | Byte limit of `toHeader()` and of the value `toLink()` carries; a block left unset takes the outer trace's. |
+| `linkBase(url)` | the build's base | The viewer `toLink()` points at; a block left unset takes the outer trace's. |
 | `clock(supplier)` | `System::nanoTime` | The nanosecond clock of every timestamp; for tests. A block keeps the outer trace's. |
 | `lanes(n)` | 256 | Lanes (one per thread) of one trace. A block keeps the outer trace's. |
-| `strict(on)` | off | `AssertionError` on misuse, no pooled handles; in a block, for its subtree, only ever widening. |
+| `strict(on)` | off | `AssertionError` on misuse, no pooled handles; in a block, for its subtree, only ever widening (unset: as strict as the outer trace). |
 
 ### Reading a trace
 
@@ -749,8 +775,11 @@ CI holds every recording operation to its allocation, and the four cost promises
 gates, on JDK 11, 17 and 21 (`./gradlew jmhGate`): 0 B per recorded span, one object per task
 plus a one-time lane setup of at most 256 B for each trace and worker thread (248 B measured,
 gated like `traceLifecycle`), an unrecorded tick under half a clock read, and a recorded static
-span at most 6.4 clock reads. The same holds inside a self-contained block, where a span and an
-undrawn step allocate nothing and a nested trace allocates its one `Trace`, 128 B.
+span at most 6.4 clock reads. The same holds inside a self-contained block, where a span, an
+undrawn step and an `add` allocate nothing, a task its one object, and a nested trace its one
+`Trace`, 128 B; a block called hundreds of times in a trace, each call with an undrawn task,
+allocates the `Trace` and the task per call, and costs the same at the 500th call as at the
+100th.
 
 ## Building and testing
 

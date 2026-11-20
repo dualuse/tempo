@@ -56,9 +56,15 @@ import java.util.TreeMap;
  *
  * <p>Self-contained blocks (nested traces) keep the same promises with a block open: a recorded span
  * inside an open block ({@code spanInBlock}) and an undrawn step in it ({@code stepUndrawnInBlock}) allocate
- * nothing in steady state, and a nested trace ({@code nestedTrace}) allocates one object, its {@code Trace},
- * which is the block's span handle and its scope at once: 128 B (64-bit JVM, compressed oops). The time
- * of a span in a block is reported beside {@code spanStatic}.
+ * nothing in steady state, a task in it ({@code taskInBlock} drawn, {@code taskUndrawnInBlock}) its one
+ * {@code RunnableTask}, and a nested trace ({@code nestedTrace}) one object, its {@code Trace}, which is the
+ * block's span handle and its scope at once: 128 B (64-bit JVM, compressed oops). The time of a span in a
+ * block is reported beside {@code spanStatic}. A block called many times in one trace keeps aggregate
+ * entries per call: {@code blockCallWithTask} (a call with an undrawn task) is held to its {@code Trace}
+ * and task, and {@code addInBlock} (a call with an {@code add}) to its {@code Trace}, both at 100 and 500
+ * calls per trace, within the table a thread keeps for its next trace. Their time is held flat in the
+ * calls per trace ({@code GROWTH}: the longer cycle's ns/op at most {@code FLAT} times the shorter's), and
+ * so is a call that reads its block's total when it ends ({@code blockTotal}), whose bytes are reported.
  *
  * <p>Rendering the 300-span trace of {@code Rendered} is held to ceilings: the encoder alone ({@code
  * snapshotToHeader}) to its one output String (3,440 characters, 3.5 KB) plus about 2 KB of per-render
@@ -100,7 +106,7 @@ public final class CostGate {
             P2 = "Promise 2: one object per task",
             P3 = "Promise 3: an unrecorded tick costs about a branch; an undrawn step allocates nothing",
             P4 = "Promise 4: a recorded static span costs at most 6.4 clock reads",
-            BLOCKS = "Blocks: a span or undrawn step in an open block allocates nothing; a nested trace is one object",
+            BLOCKS = "Blocks: in a block, spans, undrawn steps and adds allocate nothing, a task itself; a nested trace is one object, its cost flat in the calls",
             REST = "Allocation of the other operations, and the render ceilings";
 
     static final List<Gate> GATES = List.of(

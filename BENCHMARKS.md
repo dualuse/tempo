@@ -6,7 +6,8 @@ gated benchmarks once with `-prof gc` and checks two things:
 
 - **Allocation** per operation (`gc.alloc.rate.norm`), which is deterministic.
 - **Time**, only for the cost promises, and only as a ratio to `baselineNanoTime` (one
-  `System.nanoTime()`) measured in the same run. Absolute times differ from machine to
+  `System.nanoTime()`) measured in the same run; and for blocks called many times, as the ratio
+  of the time per call at 500 calls per trace to the time at 100. Absolute times differ from machine to
   machine; the ratio much less. Each time is the median of the measurement iterations, so one
   slow iteration on a busy machine does not decide the gate.
 
@@ -38,13 +39,18 @@ were taken on.
 
 A trace started inside another one is a self-contained block (README, "Self-contained blocks").
 The four promises hold with a block open, and the gate checks the block paths in a group of
-their own (`./gradlew jmhGate`, 2026-11-20, `baselineNanoTime` 10.3 ns):
+their own (`./gradlew jmhGate`, 2026-11-20, after the review fixes, `baselineNanoTime` 9.0 ns):
 
 | Path | Benchmark | Measured | Gate |
 |---|---|---|---|
-| A recorded span inside an open block, static API | `spanInBlock` | 0.0002 B/op (552 B per trace: the trace and its block); 36.9 ns = 3.59 x | 0.01 B/op; time reported |
-| An undrawn step inside an open block | `stepUndrawnInBlock` | 0.0002 B/op; 28.4 ns = 2.76 x | 0.01 B/op; time reported |
+| A recorded span inside an open block, static API | `spanInBlock` | 0.0002 B/op (560 B per trace: the trace and its block); 35.6 ns = 3.94 x | 0.01 B/op; time reported |
+| An undrawn step inside an open block | `stepUndrawnInBlock` | 0.0002 B/op; 28.4 ns = 3.14 x | 0.01 B/op; time reported |
+| A drawn task run inline in an open block | `taskInBlock` | 56.0005 B/op | 56.01 B/op: the one `RunnableTask` |
+| An undrawn task run inline in an open block | `taskUndrawnInBlock` | 56.0003 B/op | 56.01 B/op |
 | A nested trace, opened and closed | `nestedTrace` | 128.0003 B/op | 128.01 B/op: the one `Trace` |
+| A block called 100 and 500 times per trace, each call with an undrawn task | `blockCallWithTask` | 184.0009 B/op; 128.6 ns at 500 calls = 1.03 x 124.4 ns at 100 | 184.01 B/op: the `Trace` and the task; 1.5 x |
+| The same, each call with an `add` | `addInBlock` | 128.0005 B/op | 128.01 B/op: the `Trace` |
+| The same, each call reading its block's total when it ends | `blockTotal` | 536 B/op; 140.9 ns at 500 calls = 0.98 x 143.5 ns at 100 | 1.5 x; bytes reported |
 
 A block is its `Trace`: the block's span handle and its scope (level, sub-budget, strictness, CPU
 setting, listeners, lane-less totals and output settings) in one object of 128 B. The lane
@@ -54,6 +60,26 @@ begins; without blocks nothing switches, so a span in a block costs what one out
 lane's kit (the scopes from before each switch), which the thread's later lanes reuse. A task
 carries its block in a field it already had (the waiting-list link, which only a folded task
 uses; a folded task's block is its aggregate's), so tasks stay 48 and 56 B.
+
+A block keeps its own aggregate entries (its undrawn steps and tasks, folded spans and `add`s),
+so a block called many times adds entries to its lane's table with each call. The table hashes
+an entry's block with its key, so finding one costs the same at any count, and a thread keeps a
+table of up to 512 entries (152 B each, 76 KB per lane a thread has open at once) for its next
+trace. Within that, the `blockCallWithTask` and `addInBlock` calls allocate nothing besides
+their `Trace` and task; the gate holds them to it at 100 and 500 calls per trace, and their time
+to at most 1.5 times the 100-call figure at 500 calls. Before the fix the same benchmark took
+476 B and 720 ns per call at 500 calls (2.6 times its 100-call time): the entries of one name
+shared a probe chain and a grown table went to the GC with every trace. Past 512 entries a
+trace grows its table again and pays for that. Blocks fill at most three quarters of a lane's
+4,096 entries; a block's occurrence past that goes to the entry of the enclosing scope, ultimately
+the trace's, counted as unattributed, so the trace's totals stay exact and that block's
+undercount.
+
+A block's `total` reads the block, not the trace: its rows, events and aggregates on its own
+lane from its start to its end, and the lanes its tasks ran on, with one bit per row read
+(`blockTotal`: 536 B per call with the read, the `Trace` included, at any count). Read after
+each of 1,000 and 4,000 calls of a block of three spans, it took 0.7 and 0.6 µs per call,
+against 6.6 and 24.4 µs when it read every lane of the trace.
 
 Promise 1 holds because a recorded span takes its handle from its thread's pool, which a
 released trace refills. A handle allocated per span, in one trace or in every trace, would grow
@@ -109,10 +135,15 @@ lanes of earlier traces.
 | `executorCallableTask` | 56.0005 B/op (400 B per trace) | 56.01 B/op: the `CallableTask` itself |
 | `across` | 24.0014 B/op (630 B per trace, both threads) | 24.01 B/op; 1,024 B per trace |
 | `acrossUndrawn` | 28.0001 B/op (630 B per trace, both threads) | 28.01 B/op; 1,024 B per trace |
-| `traceLifecycle` | 424 B per trace (2026-11-20: the root `Trace` holds the trace's scope) | 1,024 B |
-| `spanInBlock` | 0.0002 B/op (552 B per trace) | 0.01 B/op |
+| `traceLifecycle` | 432 B per trace (2026-11-20: the root `Trace` holds the trace's scope, the context its block counts) | 1,024 B |
+| `spanInBlock` | 0.0002 B/op (560 B per trace) | 0.01 B/op |
 | `stepUndrawnInBlock` | 0.0002 B/op | 0.01 B/op |
-| `nestedTrace` | 128.0003 B/op (424 B per trace) | 128.01 B/op: the one `Trace` |
+| `nestedTrace` | 128.0003 B/op (432 B per trace) | 128.01 B/op: the one `Trace` |
+| `taskInBlock` | 56.0005 B/op (560 B per trace) | 56.01 B/op: the one `RunnableTask` |
+| `taskUndrawnInBlock` | 56.0003 B/op | 56.01 B/op |
+| `blockCallWithTask` | 184.0009 B/op (432 B per trace) | 184.01 B/op: the `Trace` and the `RunnableTask` |
+| `addInBlock` | 128.0005 B/op (432 B per trace) | 128.01 B/op: the `Trace` |
+| `blockTotal` | 536.0009 B/op (432 B per trace) | reported |
 | `snapshotToHeader` (300 spans) | 5,304 B per render | 6,144 B |
 | `toHeader` (300 spans) | 22,712 B per render | 24,576 B |
 | `snapshotWriteJson` (300 spans, into a reused builder) | 1,960 B per render | 2,560 B |

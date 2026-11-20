@@ -34,10 +34,14 @@ node tests/check_site_headless.mjs   # Tempo Timeline in headless Chrome: sample
   4. A recorded span through the static API costs at most 6.4 times one `System.nanoTime()`,
      measured in the same run.
 
-  The promises hold with a self-contained block (a nested trace) open as well: a recorded span
-  or an undrawn step inside a block allocates nothing, and a nested trace allocates one object,
-  its `Trace`, which is both the block's span and its scope. Without a block the recording path
-  pays nothing for blocks; with one, at most the scope bookkeeping.
+  The promises hold with a self-contained block (a nested trace) open as well: a recorded span,
+  an undrawn step or an `add` inside a block allocates nothing, a task its one object, and a
+  nested trace one object, its `Trace`, which is both the block's span and its scope. A block
+  keeps aggregate entries of its own, and a thread keeps its lane's table of up to 512 entries
+  (76 KB) for its next trace, so a block called a few hundred times per trace allocates per call
+  its `Trace` only, and a call costs the same however many came before. Without a block the
+  recording path pays nothing for blocks; with one, at most the scope bookkeeping. Reading a
+  block's totals is as large as the block, not the trace.
 
   A change that cannot keep a promise is discussed first; a gate is never loosened to let it
   pass. Rendering may allocate its output, within the ceilings of the gate.
