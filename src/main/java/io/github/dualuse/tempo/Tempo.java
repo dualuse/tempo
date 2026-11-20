@@ -129,10 +129,15 @@ public final class Tempo {
      * is the trace's zero point and the root's start, so all of Tempo's setup is counted in the root's time.
      *
      * <p>Started on a thread that is inside a trace already (one not released), it joins that trace
-     * instead: it opens a span under the innermost one, and the returned {@code Trace} renders the subtree
-     * of that span. {@code options} are then ignored, and {@link Trace#total}, {@link Trace#on} and {@link
-     * Trace#records(int)} act on the whole trace; {@link Trace#release()} leaves the buffers to the outer
-     * trace. So a trace left open on a pool thread takes in every later trace there: close each one.
+     * instead, as a self-contained block: it opens a span under the innermost one, and the returned {@code
+     * Trace} works for that span's subtree as if it were top-level. Its {@link Trace#total}, {@link
+     * Trace#on} and {@link Trace#records(int)} cover the subtree, its tasks on other threads included; its
+     * renders are of the subtree, with the block's {@link Options#headerBytes} and {@link
+     * Options#linkBase}; its {@link Options#strict}, {@link Options#cpu} and {@link Options#budget} (a
+     * sub-budget, taken from what the outer trace has left) hold in the subtree and its tasks. {@link
+     * Options#clock} and {@link Options#lanes} stay the outer trace's, and {@link Trace#release()} leaves
+     * the buffers to it. Blocks nest. The call allocates the one {@code Trace}. A trace left open on a pool
+     * thread takes in every later trace there: close each one.
      */
     public static Trace trace(Name name, Options options) {
         long zero = options == null ? SYSTEM_CLOCK.getAsLong() : options.clock.getAsLong(); // DEFAULTS.clock is SYSTEM_CLOCK
@@ -358,7 +363,7 @@ public final class Tempo {
     private static ExecutorService pool(ExecutorService pool) {
         if (pool != null) return pool;
         Lane l = SLOT.get().current;
-        if (l != null) l.ctx.misuse("null pool");
+        if (l != null) l.scope.misuse("null pool");
         return new TaskExecutor.Inline();
     }
 
@@ -649,16 +654,13 @@ public final class Tempo {
      */
     static final class Context {
         private static final AtomicLong IDS = new AtomicLong();
-        private static final VarHandle LANES, TOTALS, DROPPED, CREDITS, MODE;
+        private static final VarHandle LANES, DROPPED;
 
         static {
             try {
                 MethodHandles.Lookup l = MethodHandles.lookup();
                 LANES = l.findVarHandle(Context.class, "lanes", Lane.class);
-                TOTALS = l.findVarHandle(Context.class, "totals", Totals.class);
                 DROPPED = l.findVarHandle(Context.class, "dropped", int.class);
-                CREDITS = l.findVarHandle(Context.class, "credits", int.class);
-                MODE = l.findVarHandle(Context.class, "mode", int.class);
             } catch (ReflectiveOperationException e) {
                 throw new ExceptionInInitializerError(e);
             }
@@ -670,26 +672,26 @@ public final class Tempo {
 
         final long id, epoch, wall; // wall: epoch milliseconds at the start
         final LongSupplier clock, cpuClock;
-        final boolean strict;
-        final int budget, block, headerBytes, maxLanes, cpu;
-        final String linkBase; // null: Link.base()
+        final int maxLanes;
         final AtomicInteger misuses = new AtomicInteger();
-        // The level and whether a step, tick or task was seen, in one word, so a step reads the level it is
-        // opened at in the same atomic step that fixes it, and records(level) cannot widen in between:
-        // (level + 1) << 1 | SEEN, which keeps the levels in order (below SPAN is Context.NONE's).
+        // The level and whether a step, tick or task was seen, in one word of each scope (Trace#mode), so a
+        // step reads the level it is opened at in the same atomic step that fixes it, and records(level)
+        // cannot widen in between: (level + 1) << 1 | SEEN, which keeps the levels in order (below SPAN is
+        // Context.NONE's).
         static final int SEEN = 1, STEP_MODE = (STEP + 1) << 1, TICK_MODE = (TICK + 1) << 1;
-        volatile int mode;
+        /**
+         * The trace's own scope: its root {@link Trace}, which holds the level, budget, strictness, CPU
+         * setting, listeners and lane-less totals of the whole trace. A self-contained block nested in it
+         * is a scope of its own whose chain ({@link Trace#up}) ends here.
+         */
+        final Trace root;
         volatile boolean released;
-        boolean widened; // guarded by this
         // Written under this lock; a thread sees a listener added elsewhere once it synchronizes with that
         // thread, e.g. through a task submitted after it. Listeners is immutable, so even a racy read
         // sees it whole.
-        boolean listening; // a global listener existed at start, or a per-trace listener was added
-        Listeners on;
+        boolean listening; // a global listener existed at start, or a listener of the trace or a block was added
         private volatile Lane lanes;    // CAS-linked registry, newest first
-        private volatile Totals totals; // created with the first lane-less record
         private volatile int dropped;   // tasks left unrecorded at the lane cap
-        private volatile int credits;   // step and tick budget not handed out to a lane
         private long[] lost;            // guarded by this: (laneId << 32 | row, submit) of handoffs whose task has no record
         private int lostCount;
 
@@ -700,12 +702,9 @@ public final class Tempo {
             // or Tempo.NOOP would be built while Context.NONE is still null.
             clock = System::nanoTime;
             cpuClock = null;
-            strict = false;
-            budget = block = headerBytes = maxLanes = 0;
-            linkBase = null;
-            cpu = CPU_OFF;
-            this.mode = (level + 1) << 1;
+            maxLanes = 0;
             this.listening = listening;
+            root = new Trace(this, level);
         }
 
         /**
@@ -723,97 +722,69 @@ public final class Tempo {
             id = IDS.incrementAndGet();
             clock = o.clock;
             cpuClock = o.cpuClock;
-            strict = o.strict;
-            cpu = o.cpu;
-            budget = credits = o.budget;
-            block = Math.max(1, budget / 64);
-            headerBytes = o.headerBytes;
-            linkBase = o.linkBase;
             maxLanes = o.lanes;
-            mode = (SPAN + 1) << 1;
             listening = Name.anySink;
+            root = new Trace(this, o);
         }
 
         long now() {
             return clock.getAsLong() - epoch;
         }
 
-        /** Whether a span opening now has its CPU time measured. */
+        /** Whether a span opening now at the trace's own level has its CPU time measured. */
         boolean cpu() {
-            return cpu == CPU_ON || cpu == CPU_AUTO && mode >= STEP_MODE;
+            return root.measuresCpu();
         }
 
         /** What the trace records: {@link #SPAN}, {@link #STEP} or {@link #TICK}. */
         int level() {
-            return (mode >> 1) - 1;
+            return root.level();
         }
 
         /** Tests: sets the level as if widened, without the checks. */
         void level(int level) {
-            mode = (level + 1) << 1 | mode & SEEN;
+            root.level(level);
         }
 
         long cpuNow() {
             return cpuClock == null ? Cpu.now() : cpuClock.getAsLong();
         }
 
+        /** A misuse at the trace's own level: counted, and thrown in strict mode. */
         void misuse(String what) {
-            misuses.incrementAndGet();
-            if (strict) throw new AssertionError("Tempo misuse: " + what);
+            root.misuse(what);
         }
 
-        /**
-         * Marks that a step, tick or task was opened: from now on the trace's level is fixed. Returns the
-         * mode it is fixed at, read in the same atomic step, so a widening either came before it or fails.
-         */
+        /** Tests: {@link Trace#sawStep()} of the trace's own scope. */
         int sawStep() {
-            int m = mode;
-            return (m & SEEN) != 0 ? m : markSeen();
+            return root.sawStep();
         }
 
-        private int markSeen() {
-            int m;
-            while (((m = mode) & SEEN) == 0 && !MODE.compareAndSet(this, m, m | SEEN)) { }
-            return m | SEEN;
-        }
-
-        /**
-         * Widens the level to {@code level}, unless a step, tick or task was seen first. Called under the
-         * lock, which orders it against another widening; the seen mark is a CAS, which this one races.
-         */
+        /** Tests: {@link Trace#widen(int)} of the trace's own scope. */
         boolean widen(int level) {
-            int m;
-            do {
-                m = mode;
-                if ((m & SEEN) != 0) return false;
-            } while (!MODE.compareAndSet(this, m, (level + 1) << 1));
-            return true;
+            return root.widen(level);
         }
 
-        /**
-         * The name of a {@code String} parameter: interned in the global table; past its cap {@code <other>},
-         * counted as misuse. {@code null} stays null, for the caller to count.
-         */
+        /** {@link Trace#nameOf(String)} at the trace's own level. */
         Name name(String text) {
-            if (text == null) return null;
-            Name n = Name.intern(text, true);
-            if (Name.overflowed(n, text)) misuse("name table full: " + Name.DYNAMIC_CAP + " names from strings");
-            return n;
+            return root.nameOf(text);
         }
 
         /**
-         * Calls the global listeners and this trace's listeners of {@code n}, each on its own: a throwable is
-         * caught and counted as misuse, so the others still run and the recording stays consistent; the
-         * first one is returned for strict mode.
+         * Calls the global listeners of {@code n}, then the listeners of {@code scope} and of every scope
+         * enclosing it up to the trace's own, each on its own: a throwable is caught and counted as
+         * misuse, so the others still run and the recording stays consistent; the first one is returned
+         * for strict mode. The walk is as long as the nesting of blocks, whatever their listeners.
          */
-        Throwable notify(Name n, long nanos) {
+        Throwable notify(Trace scope, Name n, long nanos) {
             Throwable first = null;
             for (LongConsumer s : n.sinks) {
                 Throwable t = call(s, nanos);
                 if (first == null) first = t;
             }
-            Listeners l = on;
-            if (l != null) {
+            for (Trace sc = scope; sc != null; sc = sc.up) {
+                Listeners l = sc.on;
+                if (l == null) continue;
                 for (int i = 0; i < l.ids.length; i++) {
                     if (l.ids[i] != n.id) continue;
                     Throwable t = call(l.sinks[i], nanos);
@@ -835,12 +806,6 @@ public final class Tempo {
 
         static AssertionError listenerThrew(Throwable t) {
             return new AssertionError("Tempo misuse: a listener threw " + t, t);
-        }
-
-        int key(Name key) {
-            if (key != null) return key.id;
-            misuse("null attribute key");
-            return Name.UNKNOWN.id;
         }
 
         boolean full() {
@@ -872,9 +837,15 @@ public final class Tempo {
 
         Lane[] lanesById() {
             Lane head = lanes;
-            Lane[] out = new Lane[head.id + 1];
+            Lane[] out = new Lane[head == null ? 0 : head.id + 1];
             for (Lane l = head; l != null; l = l.next) out[l.id] = l;
             return out;
+        }
+
+        /** The lane with id {@code id}, or null. */
+        Lane lane(int id) {
+            for (Lane l = lanes; l != null; l = l.next) if (l.id == id) return l;
+            return null;
         }
 
         void release() {
@@ -953,37 +924,143 @@ public final class Tempo {
                 throw e;
             }
             VarHandle.acquireFence();
-            return released ? Total.EMPTY : Totals.merge(totals, id, count, sum, min, max, waits, waitSum, waitMax);
+            return released ? Total.EMPTY : Totals.merge(root.totals, id, count, sum, min, max, waits, waitSum, waitMax);
         }
 
-        /** Hands a lane up to one block of the step and tick budget; 0 when it is spent. */
-        int credits() {
-            int c, n;
-            do {
-                c = credits;
-                if (c <= 0) return 0;
-                n = Math.min(block, c);
-            } while (!CREDITS.compareAndSet(this, c, c - n));
-            return n;
+        /**
+         * The totals of {@code id} in the subtree of self-contained block {@code block}, computed on read:
+         * the rows below the block's row (on its lane, and on the lanes of its tasks through their links),
+         * the queue waits of the task rows among them, the aggregate entries of the block's scope and of the
+         * blocks nested in it (folded spans and tasks, undrawn steps and tasks), and the lane-less adds and
+         * waits of that scope. Recording pays nothing for it. A read racing {@link #release()} is thrown
+         * away, as in {@link #total(int)}.
+         */
+        Total total(int id, Trace block) {
+            if (released) return Total.EMPTY;
+            long count = 0, sum = 0, min = Long.MAX_VALUE, max = 0, waits = 0, waitSum = 0, waitMax = 0;
+            try {
+                Lane[] lanes = lanesById();
+                int n = lanes.length;
+                int[] rows = new int[n], events = new int[n];
+                int[][] parent = new int[n][];
+                long[][] link = new long[n][];
+                for (int i = 0; i < n; i++) {
+                    Lane l = lanes[i];
+                    if (l == null || l.retired()) {
+                        parent[i] = new int[0];
+                        continue;
+                    }
+                    long commit = l.committed();
+                    rows[i] = (int) (commit >>> 32);
+                    events[i] = (int) commit;
+                    parent[i] = new int[rows[i]];
+                    for (int r = 0; r < rows[i]; r++) parent[i][r] = l.rows[r >>> Lane.CHUNK_BITS].parent[r & Lane.MASK];
+                    for (int e = 0; e < events[i]; e++) {
+                        Events c = l.events[e >>> Lane.CHUNK_BITS];
+                        int k = e & Lane.MASK;
+                        if ((c.key[k] & KIND_MASK) != XPARENT) continue;
+                        if (link[i] == null) Arrays.fill(link[i] = new long[rows[i]], -1);
+                        if (c.row[k] < rows[i]) link[i][c.row[k]] = c.value[k];
+                    }
+                }
+                Lane bl = block.lane;
+                boolean[][] in = subtree(bl == null ? -1 : bl.id, block.row, rows, parent, link);
+                for (int i = 0; i < n; i++) {
+                    Lane l = lanes[i];
+                    if (l == null || l.retired()) continue;
+                    boolean[] mine = in[i];
+                    for (int r = 0; r < rows[i]; r++) {
+                        if (!mine[r]) continue;
+                        Rows c = l.rows[r >>> Lane.CHUNK_BITS];
+                        int k = r & Lane.MASK, f = c.flags[k];
+                        if (c.name[k] != id || (f & (HANDOFF | UNRUN)) != 0) continue;
+                        long d = (long) Lane.DUR.getOpaque(c.dur, k);
+                        if (d == Lane.OPEN) continue;
+                        count++;
+                        sum += d;
+                        min = Math.min(min, d);
+                        max = Math.max(max, d);
+                    }
+                    for (int e = 0; e < events[i]; e++) {
+                        Events c = l.events[e >>> Lane.CHUNK_BITS];
+                        int k = e & Lane.MASK, r = c.row[k];
+                        if ((c.key[k] & KIND_MASK) != QWAIT || r >= rows[i] || !mine[r] || l.nameOf(r) != id) continue;
+                        long w = c.value[k];
+                        waits++;
+                        waitSum += w;
+                        waitMax = Math.max(waitMax, w);
+                    }
+                    Aggs a = (Aggs) Lane.AGGS.getAcquire(l);
+                    for (int e = 0, m = a == null ? 0 : a.size(); e < m; e++) {
+                        int k = e * Aggs.KEY, b = e * Aggs.CELLS, kind = a.keys[k + Aggs.KIND];
+                        if (a.keys[k + Aggs.NAME] != id || a.cells[b + Aggs.COUNT] == 0 || kind == Aggs.TASKS
+                                || kind == Aggs.SPANS && a.keys[k] >= rows[i] || !Trace.within(a.scopes[e], block)) continue;
+                        if (kind != Aggs.UNRUN) {
+                            count += a.cells[b + Aggs.COUNT];
+                            sum += a.cells[b + Aggs.SUM];
+                            min = Math.min(min, a.cells[b + Aggs.MIN]);
+                            max = Math.max(max, a.cells[b + Aggs.MAX_DUR]);
+                        }
+                        if (kind == Aggs.RAN || kind == Aggs.UNRUN) {
+                            waits += a.cells[b + Aggs.COUNT];
+                            waitSum += a.cells[b + Aggs.WAIT_SUM];
+                            waitMax = Math.max(waitMax, a.cells[b + Aggs.WAIT_MAX]);
+                        }
+                    }
+                }
+            } catch (RuntimeException e) {
+                VarHandle.acquireFence();
+                if (released) return Total.EMPTY;
+                throw e;
+            }
+            VarHandle.acquireFence();
+            return released ? Total.EMPTY : Totals.merge(block.totals, id, count, sum, min, max, waits, waitSum, waitMax);
         }
 
-        void refund(int n) {
-            CREDITS.getAndAdd(this, n);
+        /**
+         * The rows of each lane in the subtree of row {@code rootRow} of lane {@code rootLane}: that row, the
+         * rows whose parent is in it, and the rows linked into it ({@code laneId << 32 | row}, -1 for none):
+         * a task's run to its record at the submit, a span of an undrawn task to the span it was submitted
+         * from, an unfolded task to that span. Iterated until nothing changes, as a link may point to a lane
+         * of any id. By lane id, empty for a lane not read or a root that is not a row.
+         */
+        static boolean[][] subtree(int rootLane, int rootRow, int[] rows, int[][] parent, long[][] link) {
+            int n = rows.length;
+            boolean[][] in = new boolean[n][];
+            for (int i = 0; i < n; i++) in[i] = new boolean[rows[i]];
+            if (rootLane < 0 || rootLane >= n || rootRow < 0 || rootRow >= rows[rootLane]) return in;
+            in[rootLane][rootRow] = true;
+            for (boolean changed = true; changed; ) {
+                changed = false;
+                for (int i = 0; i < n; i++) {
+                    boolean[] b = in[i];
+                    int[] p = parent[i];
+                    long[] k = link[i];
+                    for (int r = 0; r < rows[i]; r++) {
+                        if (b[r]) continue;
+                        int q = p[r];
+                        boolean y = q >= 0 && q < r && b[q];
+                        if (!y && k != null && k[r] >= 0) {
+                            int x = (int) (k[r] >>> 32), xr = (int) k[r];
+                            y = x < n && xr >= 0 && xr < rows[x] && in[x][xr];
+                        }
+                        if (y) {
+                            b[r] = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            return in;
         }
 
+        /** Tests: the trace's own step and tick budget not handed out to a lane. */
         int unspent() {
-            return credits;
+            return root.unspent();
         }
 
         Totals frozenTotals() {
-            Totals t = totals;
-            return t == null ? null : t.copy();
-        }
-
-        Totals totals() {
-            Totals t = totals;
-            if (t == null && !TOTALS.compareAndSet(this, null, t = new Totals(8))) t = totals;
-            return t;
+            return root.frozenTotals();
         }
 
         /**
@@ -994,7 +1071,7 @@ public final class Tempo {
         void lost(Task h, boolean count) {
             if (count) DROPPED.getAndAdd(this, 1);
             if (released) return;
-            totals().add(h.name.id, true, h.wait);
+            h.scope().addTotal(h.name.id, true, h.wait);
             if (h.undrawn()) return;
             int row = h.row();
             synchronized (this) {
@@ -1314,6 +1391,8 @@ public final class Tempo {
         long[] times, cpuAt;
         int[] phaseAt;
         Phase[] rowless;
+        Trace[] outer;
+        int[] outerAt;
         Kit link; // the next kit in its slot's pool
     }
 
@@ -1494,6 +1573,18 @@ public final class Tempo {
 
         private Throwable thrown; // strict mode: a listener's throwable, rethrown once the operation is done
 
+        // The scope: the innermost self-contained block open here (a nested Trace), or the trace's own root
+        // when none is, which the spans at depths >= scopeAt belong to. Its level, budget, strictness and CPU
+        // setting are what the lane records by, and its listeners and those of its enclosing blocks hear
+        // what ends there. A block switches it at its depth, and so does a task submitted in another scope
+        // than the one it begins in: outer[d] and outerAt[d] keep the scope and scopeAt from before the
+        // switch at depth d, until the span there closes. Without blocks scopeAt stays -1 and nothing here
+        // is touched. The arrays come with the kit, created with the lane's first switch.
+        Trace scope;
+        int scopeAt = -1;
+        private Trace[] outer;
+        private int[] outerAt;
+
         // Phases and hand timing of the open span at depth d, valid while bit d of timed is set: opening a
         // span at d clears the bit, and its first phase, lap, start or stop sets the state up (the arrays
         // come with the lane's first). times, at d * 4: MARK the last boundary, the span's start before the
@@ -1538,6 +1629,49 @@ public final class Tempo {
             cpuAt = k.cpuAt;
             phaseAt = k.phaseAt;
             rowless = k.rowless;
+            outer = k.outer;
+            outerAt = k.outerAt;
+            scope = ctx.root;
+        }
+
+        /**
+         * Makes {@code s} the scope of the span opening at depth {@code d} and of everything above it, until
+         * that span closes ({@link #leaveScopes}). Budget held for the scope before goes back to it.
+         */
+        private void enterScope(Trace s, int d) {
+            if (outer == null) {
+                outer = new Trace[MAX_DEPTH];
+                outerAt = new int[MAX_DEPTH];
+            }
+            if (credit != 0) {
+                scope.refund(credit);
+                credit = 0;
+            }
+            outer[d] = scope;
+            outerAt[d] = scopeAt;
+            scope = s;
+            scopeAt = d;
+        }
+
+        /** Restores the scope from before every switch at depth {@code d} or above; the spans there have ended. */
+        private void leaveScopes(int d) {
+            while (scopeAt >= d) {
+                if (credit != 0) {
+                    scope.refund(credit);
+                    credit = 0;
+                }
+                int at = scopeAt;
+                scope = outer[at];
+                scopeAt = outerAt[at];
+                outer[at] = null;
+            }
+        }
+
+        /** The scope of the open span at depth {@code d}. */
+        Trace scopeOf(int d) {
+            Trace s = scope;
+            for (int at = scopeAt; d < at; at = outerAt[at]) s = outer[at];
+            return s;
         }
 
         /** This lane, weakly, for its owner's slot; made once, so a lane found again costs nothing. Owner only. */
@@ -1574,27 +1708,28 @@ public final class Tempo {
          */
         void submit(Task t, Name n, String text, int bits) {
             int flags = 0;
+            Trace sc = scope;
             if (text != null) {
-                n = ctx.name(text);
+                n = sc.nameOf(text);
                 if (Name.overflowed(n, text)) flags = MISUSE;
             }
             if (n == null) {
-                ctx.misuse("null name");
+                sc.misuse("null name");
                 n = Name.UNKNOWN;
                 flags = MISUSE;
             }
-            int mode = ctx.sawStep();
+            int mode = sc.sawStep();
             t.name = n;
             int p = rowAt[depth - 1];
             if (mode >= Context.STEP_MODE) {
-                if (p >= 0 && (credit != 0 || (credit = ctx.credits()) != 0)) {
+                if (p >= 0 && (credit != 0 || (credit = sc.credits()) != 0)) {
                     int r = row(n, flags | HANDOFF, p);
                     if (r >= 0) {
                         credit--;
                         long now = ctx.now();
                         closed(r, now, 0);
                         publish();
-                        t.init(this, r, bits, now);
+                        t.init(this, r, bits, now, sc);
                         return;
                     }
                 } else {
@@ -1603,8 +1738,8 @@ public final class Tempo {
                         long now = ctx.now();
                         aggs.submit(e, now);
                         folded++;
-                        t.init(this, ~e, bits, now);
-                        queue(t);
+                        t.init(this, ~e, bits, now, sc);
+                        queue(t); // the waiting list takes its link: its scope is its TASKS entry's
                         return;
                     }
                 }
@@ -1614,19 +1749,19 @@ public final class Tempo {
                 at = across;
                 p = acrossRow;
             }
-            t.init(at, p < 0 ? NO_ROW : p, bits | Task.UNDRAWN, ctx.now());
+            t.init(at, p < 0 ? NO_ROW : p, bits | Task.UNDRAWN, ctx.now(), sc);
         }
 
         /** Pushes folded task {@code h} on the waiting list, first unlinking those that left it if it has doubled. */
         private void queue(Task h) {
             if (--waitingRoom < 0) {
                 int n = 0;
-                for (Task x = waiting, prev = null; x != null; x = x.next) {
+                for (Task x = waiting, prev = null; x != null; x = (Task) x.next) {
                     if (x.waiting()) {
                         n++;
                         prev = x;
                     } else if (prev == null) {
-                        waiting = x.next;
+                        waiting = (Task) x.next;
                     } else {
                         prev.next = x.next;
                     }
@@ -1643,7 +1778,7 @@ public final class Tempo {
             if (h == null) return null;
             long[] since = new long[entries];
             Arrays.fill(since, Long.MAX_VALUE);
-            for (; h != null; h = h.next) {
+            for (; h != null; h = (Task) h.next) {
                 int e = ~h.row();
                 if (e < entries && h.waiting() && h.submit < since[e]) since[e] = h.submit;
             }
@@ -1670,12 +1805,15 @@ public final class Tempo {
             }
             Name n = h.name;
             Span s = NOOP;
-            int r = -1;
+            int r = -1, d = depth;
             if (eventCount > MAX_EVENTS - 2) {
                 dropped++;
             } else if (run) {
+                Trace sc = h.scope();
+                if (sc != scope) enterScope(sc, d); // a task carries the scope it was submitted in
                 s = stack(n, TASK);
                 r = s == NOOP ? -1 : s.row;
+                if (r < 0 && scopeAt >= d) leaveScopes(d);
             } else {
                 r = row(n, TASK | CANCELLED | UNRUN, root ? -1 : Math.max(NO_ROW, rowAt[depth - 1]));
             }
@@ -1683,7 +1821,7 @@ public final class Tempo {
                 if (root) idle();
                 return null;
             }
-            if (run && root && ctx.cpu()) sampleCpu(0); // after the start: the read is run time, not queue wait
+            if (run && root && scope.measuresCpu()) sampleCpu(0); // after the start: the read is run time, not queue wait
             Rows c = rows[r >>> CHUNK_BITS];
             c.start[r & MASK] = now;
             if (!run) DUR.setOpaque(c.dur, r & MASK, 0L);
@@ -1715,19 +1853,21 @@ public final class Tempo {
             boolean root = d == 0;
             if (root && !activate()) return NOOP;
             int id = h.lane.taskName(target);
-            int e = id < 0 ? -1 : aggregate(target, h.lane.id, -1, id, run ? Aggs.RAN : Aggs.UNRUN);
+            Trace sc = id < 0 ? scope : h.lane.taskScope(target);
+            int e = id < 0 ? -1 : aggregate(target, h.lane.id, -1, id, run ? Aggs.RAN : Aggs.UNRUN, sc);
             if (e < 0) {
                 if (root) idle();
                 return id < 0 ? NOOP : null; // released, or past the aggregate cap (counted)
             }
             long wait = Math.max(0, now - h.submit);
-            if (run && root && ctx.cpu()) sampleCpu(0);
+            if (run && root && sc.measuresCpu()) sampleCpu(0);
             aggs.submit(e, h.submit);
             if (!run) {
                 aggs.add(e, h.submit, 0, wait, -1, CANCELLED | UNRUN, true);
                 if (root) idle();
                 return NOOP;
             }
+            if (sc != scope) enterScope(sc, d);
             Span s = openFrame(Name.byId(id), e, wait, now, null);
             s.folded = true;
             if (root) {
@@ -1751,7 +1891,8 @@ public final class Tempo {
             }
             boolean root = d == 0;
             if (root && !activate()) return NOOP;
-            int e = aggregate(-1, -1, -1, h.name.id, run ? Aggs.RAN : Aggs.UNRUN);
+            Trace sc = h.scope();
+            int e = aggregate(-1, -1, -1, h.name.id, run ? Aggs.RAN : Aggs.UNRUN, sc);
             if (e < 0) {
                 if (root) idle();
                 return null;
@@ -1762,7 +1903,8 @@ public final class Tempo {
                 if (root) idle();
                 return NOOP;
             }
-            if (root && ctx.cpu()) sampleCpu(0);
+            if (root && sc.measuresCpu()) sampleCpu(0);
+            if (sc != scope) enterScope(sc, d);
             Span s = openFrame(h.name, e, wait, now, null);
             s.hidden = true;
             if (root) {
@@ -1782,6 +1924,19 @@ public final class Tempo {
         int taskName(int e) {
             Aggs a = (Aggs) AGGS.getAcquire(this);
             return a == null ? -1 : a.keys[e * Aggs.KEY + Aggs.NAME];
+        }
+
+        /** The scope of TASKS entry {@code e} of this lane, from any thread; the trace's own once the lane is retired. */
+        Trace taskScope(int e) {
+            Aggs a = (Aggs) AGGS.getAcquire(this);
+            Trace s = a == null ? null : a.scopes[e];
+            return s == null ? ctx.root : s;
+        }
+
+        /** The anchor row of TASKS entry {@code e} of this lane, from any thread; -1 for none or once retired. */
+        int taskAnchor(int e) {
+            Aggs a = (Aggs) AGGS.getAcquire(this);
+            return a == null ? -1 : a.keys[e * Aggs.KEY + Aggs.ANCHOR];
         }
 
         /**
@@ -1816,7 +1971,7 @@ public final class Tempo {
             if (free) return n != null && n.listened() ? freeFrame(n) : NOOP;
             if (timed != 0 && underStop()) flags |= afterStop();
             if (n == null) {
-                ctx.misuse("null name");
+                scope.misuse("null name");
                 return push(Name.UNKNOWN, flags | MISUSE);
             }
             return push(n, flags);
@@ -1824,17 +1979,17 @@ public final class Tempo {
 
         Span openSpan(String text) {
             if (free) return openSpan(Name.find(text), 0);
-            Name n = ctx.name(text);
+            Name n = scope.nameOf(text);
             return openSpan(n, Name.overflowed(n, text) ? MISUSE : 0);
         }
 
         /** A step: drawn when the trace records steps, against the budget; else an undrawn frame. */
         Span openStep(Name n, int flags) {
             if (free) return n != null && n.listened() ? freeFrame(n) : NOOP;
-            int mode = ctx.sawStep();
+            int mode = scope.sawStep();
             if (timed != 0 && underStop()) flags |= afterStop();
             if (n == null) {
-                ctx.misuse("null name");
+                scope.misuse("null name");
                 n = Name.UNKNOWN;
                 flags |= MISUSE;
             }
@@ -1843,16 +1998,17 @@ public final class Tempo {
 
         Span openStep(String text) {
             if (free) return openStep(Name.find(text), 0);
-            Name n = ctx.name(text);
+            Name n = scope.nameOf(text);
             return openStep(n, Name.overflowed(n, text) ? MISUSE : 0);
         }
 
         /** A tick: drawn when the trace records ticks, against the budget; else {@link #NOOP}. */
         Span openTick(Name n, int flags) {
-            if (ctx.mode < Context.TICK_MODE && (free || ctx.sawStep() < Context.TICK_MODE)) return NOOP;
+            Trace sc = scope;
+            if (sc.mode < Context.TICK_MODE && (free || sc.sawStep() < Context.TICK_MODE)) return NOOP;
             if (timed != 0 && underStop()) flags |= afterStop();
             if (n == null) {
-                ctx.misuse("null name");
+                sc.misuse("null name");
                 n = Name.UNKNOWN;
                 flags |= MISUSE;
             }
@@ -1860,29 +2016,68 @@ public final class Tempo {
         }
 
         Span openTick(String text) {
-            if (ctx.mode < Context.TICK_MODE && (free || ctx.sawStep() < Context.TICK_MODE)) return NOOP;
-            Name n = ctx.name(text);
+            Trace sc = scope;
+            if (sc.mode < Context.TICK_MODE && (free || sc.sawStep() < Context.TICK_MODE)) return NOOP;
+            Name n = sc.nameOf(text);
             return openTick(n, Name.overflowed(n, text) ? MISUSE : 0);
         }
 
         /**
-         * A nested trace: a span at the top of this lane, with {@code t} as its handle, which renders its
-         * subtree; in a folded task, which has no row to hang it from, a frame. Null at a cap.
+         * A nested trace, a self-contained block: a span at the top of this lane, with {@code t} as its handle,
+         * which renders its subtree, and {@code t} the lane's scope until it closes. In a folded task, which
+         * has no row to hang it from, the task is unfolded first ({@link #unfold}); at the row cap the block
+         * is a frame. Its CPU time is measured from its start when its scope measures CPU. Null at a cap.
          */
         Span nest(Trace t, Name n, int flags) {
-            if (rowAt[depth - 1] == NO_ROW) {
-                if (depth == MAX_DEPTH) {
-                    dropped++;
-                    return null;
-                }
+            int d = depth;
+            if (d == MAX_DEPTH) {
+                dropped++;
+                return null;
+            }
+            if (rowAt[d - 1] == NO_ROW) unfold();
+            enterScope(t, d);
+            if (rowAt[d - 1] == NO_ROW) {
                 Span h = openFrame(n, entry(n, Aggs.SPANS), 0, 0, t);
+                if (t.measuresCpu()) sampleCpu(d);
                 h.time = ctx.now();
                 return h;
             }
             Span h = stack(n, flags, t);
-            if (h == NOOP) return null;
+            if (h == NOOP) {
+                leaveScopes(d);
+                return null;
+            }
+            if (t.measuresCpu()) sampleCpu(d);
             start(h);
             return h;
+        }
+
+        /**
+         * The folded task at the root of this lane, which has no row, becomes a drawn task: a row past the
+         * budget (a small, bounded overrun), with its start, queue wait, flags and CPU time so far, linked to
+         * the span it was submitted from, so a block opening in it has a row to hang from and the trace shows
+         * where it ran. Its occurrence leaves its aggregate, which keeps it as begun. The folded spans open
+         * above it stay folded; what opens from now on hangs from its row. At the row cap it stays folded.
+         */
+        private void unfold() {
+            Span h = handles[0];
+            Aggs a = aggs;
+            if (h.row != FRAME || h.agg < 0 || a.keys[h.agg * Aggs.KEY + Aggs.KIND] != Aggs.RAN) return;
+            int k = h.agg * Aggs.KEY, target = a.keys[k + Aggs.ANCHOR], from = a.keys[k + Aggs.LANE];
+            int r = row(h.frame, TASK | h.flags, NO_ROW);
+            if (r < 0) return;
+            Rows c = rows[r >>> CHUNK_BITS];
+            c.start[r & MASK] = h.time;
+            DUR.setOpaque(c.dur, r & MASK, OPEN);
+            Lane sub = ctx.lane(from);
+            int anchor = sub == null ? -1 : sub.taskAnchor(target);
+            if (anchor >= 0) append(r, XPARENT, (long) from << 32 | anchor);
+            append(r, QWAIT, h.wait);
+            h.row = r;
+            h.agg = -1;
+            h.folded = false;
+            for (int x = 0; x < depth && rowAt[x] == NO_ROW; x++) rowAt[x] = r;
+            publish();
         }
 
         /** Closes everything above depth {@code d}, healed, so a span can open on top of {@code d}: misuse. */
@@ -1892,8 +2087,9 @@ public final class Tempo {
             boolean healed = unwind(d, now);
             publish();
             if (ctx.listening) fire(d + 1, top);
+            if (scopeAt > d) leaveScopes(d + 1);
             if (thrown != null) rethrow();
-            if (healed) ctx.misuse("span opened under a span that is not the innermost");
+            if (healed) scope.misuse("span opened under a span that is not the innermost");
         }
 
         /** A frame of the free lane: no row and no aggregate, timed for its name's global listeners. */
@@ -1934,7 +2130,7 @@ public final class Tempo {
          */
         Span budgeted(Name n, int flags) {
             if (rowAt[depth - 1] == NO_ROW) return frame(n);
-            if (credit == 0 && (credit = ctx.credits()) == 0) {
+            if (credit == 0 && (credit = scope.credits()) == 0) {
                 Span h = frame(n);
                 if (h != NOOP && h.agg >= 0) { // past the aggregate cap the frame counted a drop
                     h.folded = true;
@@ -1978,6 +2174,7 @@ public final class Tempo {
             timed &= ~(1L << d);
             Span h = t != null ? t : frameHandle(d);
             handles[d] = h;
+            if (t == null) h.scope = scope;
             h.row = FRAME;
             h.frame = n;
             h.agg = agg;
@@ -2001,8 +2198,17 @@ public final class Tempo {
             return aggregate(rowAt[d - 1], 0, p == a ? -1 : handles[p].frame.id, n.id, kind);
         }
 
-        /** The entry of an aggregate key, created if new; -1 past {@link Aggs#MAX} entries (counted as a drop). */
+        /** {@link #aggregate(int, int, int, int, int, Trace)} in the lane's scope. */
         private int aggregate(int anchor, int lane, int parent, int name, int kind) {
+            return aggregate(anchor, lane, parent, name, kind, scope);
+        }
+
+        /**
+         * The entry of an aggregate key in scope {@code sc}, created if new; -1 past {@link Aggs#MAX} entries
+         * (counted as a drop). Entries of the same key in other scopes stay apart, so the totals of a block
+         * read its own; without blocks every entry is in the trace's own scope.
+         */
+        private int aggregate(int anchor, int lane, int parent, int name, int kind, Trace sc) {
             Aggs a = aggs;
             if (a == null) {
                 a = kit.aggs;
@@ -2011,14 +2217,14 @@ public final class Tempo {
                 kit.aggs = null;
                 AGGS.setRelease(this, a);
             }
-            int e = a.find(anchor, lane, parent, name, kind);
+            int e = a.find(anchor, lane, parent, name, kind, sc);
             if (e >= 0) return e;
             if (a.size() == Aggs.MAX) {
                 dropped++;
                 return -1;
             }
             if (a.full()) AGGS.setRelease(this, a = a.grow());
-            return a.create(anchor, lane, parent, name, kind);
+            return a.create(anchor, lane, parent, name, kind, sc);
         }
 
         int aggregates() {
@@ -2098,7 +2304,7 @@ public final class Tempo {
          * new. Strict mode never reuses a handle, so a stale one always stays stale.
          */
         private Span issue(int d) {
-            if (ctx.strict) return new Span(this, ctx, d);
+            if (scope.strict) return new Span(this, ctx, d);
             Span h = slot.take();
             if (h == null) h = new Span(this, ctx, d);
             else h.bind(this, d);
@@ -2113,7 +2319,7 @@ public final class Tempo {
          * Strict mode gives each frame a handle of its own, so a use after close is always caught.
          */
         private Span frameHandle(int d) {
-            if (ctx.strict) return new Span(this, ctx, d);
+            if (scope.strict) return new Span(this, ctx, d);
             Span[] f = frames;
             if (f == null) frames = f = new Span[MAX_DEPTH];
             Span h = f[d];
@@ -2157,11 +2363,16 @@ public final class Tempo {
             Span h = handles[d];
             if (h instanceof Trace && ((Trace) h).printer != null && h.row != FRAME) {
                 Throwable t = print(((Trace) h).printer, h.row);
-                if (t != null && ctx.strict && thrown == null) thrown = t;
+                if (t != null && ((Trace) h).strict && thrown == null) thrown = t;
+            }
+            Trace sc = scope;
+            if (scopeAt >= d) {
+                sc = scopeOf(d);
+                leaveScopes(d);
             }
             if (d == 0 && !free) exitRoot();
             if (thrown != null) rethrow();
-            if (healed) ctx.misuse("span closed while a child span was open");
+            if (healed) sc.misuse("span closed while a child span was open");
         }
 
         /** Ends every row above depth {@code d}; returns whether one of them was healed. */
@@ -2212,16 +2423,20 @@ public final class Tempo {
          * inside the operation that ended the spans, so they must not open or close spans on this thread.
          */
         private void fire(int d, int top) {
+            Trace sc = scope;
+            int at = scopeAt;
             for (int k = top - 1; k >= d; k--) {
+                for (; k < at; at = outerAt[at]) sc = outer[at];
                 Span h = handles[k];
-                if (h.row == FRAME) notify(h.frame, h.wait);
-                else notify(Name.byId(nameOf(h.row)), rows[h.row >>> CHUNK_BITS].dur[h.row & MASK]);
+                if (h.row == FRAME) notify(sc, h.frame, h.wait);
+                else notify(sc, Name.byId(nameOf(h.row)), rows[h.row >>> CHUNK_BITS].dur[h.row & MASK]);
             }
         }
 
-        private void notify(Name n, long nanos) {
-            Throwable t = ctx.notify(n, nanos);
-            if (t != null && ctx.strict && thrown == null) thrown = t;
+        /** Calls the listeners of an occurrence of {@code n} in scope {@code sc}; see {@link Context#notify}. */
+        private void notify(Trace sc, Name n, long nanos) {
+            Throwable t = ctx.notify(sc, n, nanos);
+            if (t != null && sc.strict && thrown == null) thrown = t;
         }
 
         /** Passes the {@code Runtime} text of the trace at {@code row} to {@code out}; returns what it threw, counted as misuse. */
@@ -2270,7 +2485,7 @@ public final class Tempo {
         /** Whether the span at depth {@code d} was stopped; misuse if so, for a call that must come before. */
         private boolean stoppedAlready(int d, String call) {
             if ((phaseAt[d << 2 | MODE] & STOPPED) == 0) return false;
-            ctx.misuse(call + " after stop");
+            scopeOf(d).misuse(call + " after stop");
             return true;
         }
 
@@ -2329,17 +2544,20 @@ public final class Tempo {
                 c.flags[r & MASK] |= flags;
                 DUR.setOpaque(c.dur, r & MASK, dur);
             } else if (handles[d].row == FRAME) {
-                hidden(phaseAt[d << 2 | NAME], times[d << 2 | START], dur);
+                hidden(d, phaseAt[d << 2 | NAME], times[d << 2 | START], dur);
             } else {
                 return;
             }
-            if (ctx.listening) notify(Name.byId(phaseAt[d << 2 | NAME]), dur);
+            if (ctx.listening) notify(scopeOf(d), Name.byId(phaseAt[d << 2 | NAME]), dur);
         }
 
-        /** An occurrence of name {@code id} that no render shows, for the totals: a phase of a folded or undrawn span. */
-        private void hidden(int id, long start, long dur) {
+        /**
+         * An occurrence of name {@code id} that no render shows, for the totals: a phase of the folded or
+         * undrawn span at depth {@code d}, in that span's scope.
+         */
+        private void hidden(int d, int id, long start, long dur) {
             if (free) return;
-            int e = aggregate(-1, 0, -1, id, Aggs.HIDDEN);
+            int e = aggregate(-1, 0, -1, id, Aggs.HIDDEN, scopeOf(d));
             if (e >= 0) aggs.add(e, start, dur, 0, -1, 0, false);
         }
 
@@ -2355,7 +2573,7 @@ public final class Tempo {
             long now = ctx.now();
             if (phaseAt[d << 2 | ROW] != NO_PHASE) {
                 boolean mismatch = n != null && (flags & MISUSE) == 0 && n.id != phaseAt[d << 2 | NAME];
-                if (mismatch) ctx.misuse("done(" + n + ") while phase " + Name.byId(phaseAt[d << 2 | NAME]) + " is open");
+                if (mismatch) scopeOf(d).misuse("done(" + n + ") while phase " + Name.byId(phaseAt[d << 2 | NAME]) + " is open");
                 endPhase(d, now, mismatch ? MISUSE : 0);
             } else if (n != null) {
                 long from = times[d << 2 | MARK], dur = Math.max(0, now - from);
@@ -2364,8 +2582,8 @@ public final class Tempo {
                 Span h = handles[d];
                 int r = h.row == FRAME ? -1 : row(n, flags | PHASE | RETRO, h.row);
                 if (r >= 0) closed(r, from, dur);
-                else if (h.row == FRAME) hidden(n.id, from, dur);
-                if ((r >= 0 || h.row == FRAME) && ctx.listening) notify(n, dur);
+                else if (h.row == FRAME) hidden(d, n.id, from, dur);
+                if ((r >= 0 || h.row == FRAME) && ctx.listening) notify(scopeOf(d), n, dur);
             }
             publish();
             if (thrown != null) rethrow();
@@ -2383,7 +2601,7 @@ public final class Tempo {
             if (clamped) flagRow(d);
             publish();
             if (thrown != null) rethrow();
-            if (clamped) ctx.misuse("lap(nanos) before the last boundary or after now");
+            if (clamped) scopeOf(d).misuse("lap(nanos) before the last boundary or after now");
         }
 
         /**
@@ -2419,7 +2637,7 @@ public final class Tempo {
             boolean clamped = at != want;
             if (clamped) flagRow(d);
             publish();
-            if (clamped) ctx.misuse("start(nanos) outside the parent's time window");
+            if (clamped) scopeOf(d).misuse("start(nanos) outside the parent's time window");
         }
 
         /**
@@ -2444,8 +2662,8 @@ public final class Tempo {
             if (clamped) flagRow(d);
             publish();
             if (thrown != null) rethrow();
-            if (open) ctx.misuse("stop(nanos) while a child span is open");
-            else if (clamped) ctx.misuse("stop(nanos) before the last boundary or a child's end, or after now");
+            if (open) scopeOf(d).misuse("stop(nanos) while a child span is open");
+            else if (clamped) scopeOf(d).misuse("stop(nanos) before the last boundary or a child's end, or after now");
         }
 
         /**
@@ -2479,7 +2697,7 @@ public final class Tempo {
 
         /** Counts a child opened under a stopped span (strict mode throws first); its row is flagged. */
         private int afterStop() {
-            ctx.misuse("span opened under a span stopped by hand");
+            scope.misuse("span opened under a span stopped by hand");
             return MISUSE;
         }
 
@@ -2523,10 +2741,11 @@ public final class Tempo {
 
         /** A handle of its own for phase row {@code r} of the span at depth {@code d}: pooled, or new in strict mode. */
         private Phase issuePhase(int d, int r) {
-            Phase p = ctx.strict ? null : slot.takePhase();
+            boolean strict = scopeOf(d).strict;
+            Phase p = strict ? null : slot.takePhase();
             if (p == null) p = new Phase();
             p.bind(this, handles[d], d, r);
-            if (!ctx.strict) {
+            if (!strict) {
                 if (issuedPhases == null) issuedPhasesTail = p;
                 p.link = issuedPhases;
                 issuedPhases = p;
@@ -2539,7 +2758,7 @@ public final class Tempo {
          * mode one of its own.
          */
         private Phase rowless(int d) {
-            if (ctx.strict) {
+            if (scopeOf(d).strict) {
                 Phase p = new Phase();
                 p.bind(this, handles[d], d, FRAME);
                 return p;
@@ -2659,7 +2878,7 @@ public final class Tempo {
         // Unspent budget goes back to the trace first, so no idle lane strands credits.
         private void idle() {
             if (credit != 0) {
-                ctx.refund(credit);
+                scope.refund(credit);
                 credit = 0;
             }
             state = state & ~KIND;
@@ -2722,7 +2941,12 @@ public final class Tempo {
             k.times = times;
             k.cpuAt = cpuAt;
             k.phaseAt = phaseAt;
-            if (a != null && a.keys.length <= Kit.KEEP_AGGS * Aggs.KEY) k.aggs = a;
+            k.outer = outer;
+            k.outerAt = outerAt;
+            if (a != null && a.keys.length <= Kit.KEEP_AGGS * Aggs.KEY) {
+                Arrays.fill(a.scopes, null); // a pooled table reaches no trace
+                k.aggs = a;
+            }
             slot.giveKit(k);
         }
 
@@ -2824,6 +3048,9 @@ public final class Tempo {
      * its lane. So every entry has one writer, the owner, and a render merges the occurrences into their
      * {@code TASKS} entry. The owner appends entries and updates them in place; a reader takes the size
      * with acquire and reads the entries below it, exact once the lane is idle and best effort while it records.
+     * Each entry also belongs to a scope ({@link Lane#scope}), the innermost self-contained block it was
+     * recorded in or the trace's own root: entries of one key in two scopes stay apart, so a block's totals
+     * read its own. Without blocks every entry is in the trace's own scope.
      */
     static final class Aggs {
         static final int MAX = 4096, KEY = 5, ANCHOR = 0, LANE = 1, PARENT = 2, NAME = 3, KIND = 4;
@@ -2846,12 +3073,14 @@ public final class Tempo {
 
         final int[] keys;
         final long[] cells;
+        final Trace[] scopes;      // the scope of each entry
         private final int[] index; // entry + 1 by key hash, 0 free; owner only, at most half full
         @SuppressWarnings("unused") private int size; // via SIZE
 
         Aggs(int capacity) {
             keys = new int[capacity * KEY];
             cells = new long[capacity * CELLS];
+            scopes = new Trace[capacity];
             index = new int[capacity * 2];
         }
 
@@ -2870,23 +3099,24 @@ public final class Tempo {
             return size == keys.length / KEY;
         }
 
-        int find(int anchor, int lane, int parent, int name, int kind) {
+        int find(int anchor, int lane, int parent, int name, int kind, Trace scope) {
             int mask = index.length - 1;
             for (int i = hash(anchor, lane, parent, name, kind) & mask; ; i = (i + 1) & mask) {
                 int e = index[i] - 1, k = e * KEY;
                 if (e < 0) return -1;
                 if (keys[k] == anchor && keys[k + LANE] == lane && keys[k + PARENT] == parent && keys[k + NAME] == name
-                        && keys[k + KIND] == kind) return e;
+                        && keys[k + KIND] == kind && scopes[e] == scope) return e;
             }
         }
 
-        int create(int anchor, int lane, int parent, int name, int kind) {
+        int create(int anchor, int lane, int parent, int name, int kind, Trace scope) {
             int e = size, k = e * KEY;
             keys[k] = anchor;
             keys[k + LANE] = lane;
             keys[k + PARENT] = parent;
             keys[k + NAME] = name;
             keys[k + KIND] = kind;
+            scopes[e] = scope;
             int b = e * CELLS;
             Arrays.fill(cells, b, b + CELLS, 0L);
             cells[b + MIN] = cells[b + FIRST] = cells[b + SUBMIT_FIRST] = Long.MAX_VALUE;
@@ -2909,6 +3139,7 @@ public final class Tempo {
             Aggs a = new Aggs(2 * keys.length / KEY);
             System.arraycopy(keys, 0, a.keys, 0, keys.length);
             System.arraycopy(cells, 0, a.cells, 0, cells.length);
+            System.arraycopy(scopes, 0, a.scopes, 0, scopes.length);
             for (int e = 0; e < size; e++) a.index(e);
             a.size = size;
             return a;
@@ -2995,6 +3226,7 @@ public final class Tempo {
         final long[] waitingSince;  // by TASKS entry: the earliest submit of a task not begun nor cancelled; null if none
         int[] bodyLane, bodyRow;    // by handoff row: the task row linked to it, or -1
         boolean[] hidden;           // not in its parent's child list: a task drawn at its handoff, or a lost handoff
+        boolean[] aggIn;            // of a block's snapshot: the aggregate entries in the block's scope or one nested in it
         // Child lists over the nodes: rows, a virtual parent of the lane roots, aggregates. Entries are nodes
         // of any lane, numbered across the snapshot from each lane's base (Snapshot#nodeOf), -1 for none: a
         // span in an undrawn task begun on another thread is a child of the span the task was submitted from.
@@ -3003,19 +3235,28 @@ public final class Tempo {
 
         /** Null for a lane that is retired or whose trace is released. */
         static Shape of(Lane l) {
-            return of(l, l.state());
+            return of(l, l.state(), null);
+        }
+
+        /** {@link #of(Lane)} for the snapshot of self-contained block {@code block}, null for a whole trace. */
+        static Shape of(Lane l, Trace block) {
+            return of(l, l.state(), block);
         }
 
         /** The copy given the state read before it; separate so a test can write in between. */
         static Shape of(Lane l, int before) {
+            return of(l, before, null);
+        }
+
+        private static Shape of(Lane l, int before, Trace block) {
             if ((before & Lane.KIND) == Lane.RETIRED || l.ctx.released) return null;
-            Shape s = new Shape(l, l.committed());
+            Shape s = new Shape(l, l.committed(), block);
             VarHandle.acquireFence(); // the copy's reads stay before the second read of the state
             s.live = (before & Lane.KIND) != Lane.IDLE || l.state() != before;
             return s;
         }
 
-        private Shape(Lane l, long commit) {
+        private Shape(Lane l, long commit, Trace block) {
             lane = l.id;
             thread = l.owner.getName();
             rows = (int) (commit >>> 32);
@@ -3082,6 +3323,10 @@ public final class Tempo {
             if (aggs > 0) {
                 System.arraycopy(a.keys, 0, aggKey, 0, aggKey.length);
                 System.arraycopy(a.cells, 0, aggCell, 0, aggCell.length);
+                if (block != null) {
+                    aggIn = new boolean[aggs];
+                    for (int e = 0; e < aggs; e++) aggIn[e] = Trace.within(a.scopes[e], block);
+                }
             }
             waitingSince = aggs > 0 ? l.waitingSince(aggs) : null;
         }
@@ -3283,6 +3528,7 @@ public final class Tempo {
         final int rootLane, rootRow;
         final long base;
         final boolean subtree;
+        private boolean[][] rowIn; // of a block's snapshot: by lane id and row, the rows in its subtree
 
         private Snapshot() {
             shapes = new Shape[0];
@@ -3298,16 +3544,20 @@ public final class Tempo {
          * read chunks that went back to the pool; it is thrown away, also when what it read made it fail.
          */
         static Snapshot of(Context ctx) {
-            return of(ctx, 0, 0, false);
+            return of(ctx, 0, 0, null);
         }
 
-        /** The subtree of {@code row} in lane {@code lane}, or with {@code subtree} false the whole trace. */
-        static Snapshot of(Context ctx, int lane, int row, boolean subtree) {
+        /**
+         * The subtree of {@code row} in lane {@code lane}, the row of self-contained block {@code block}, with
+         * the block's totals and output settings; with {@code block} null the whole trace.
+         */
+        static Snapshot of(Context ctx, int lane, int row, Trace block) {
             if (ctx.released || ctx.id < 0) return EMPTY;
+            boolean subtree = block != null;
             try {
-                Snapshot s = new Snapshot(ctx, lane, row, subtree);
+                Snapshot s = new Snapshot(ctx, lane, row, block);
                 VarHandle.acquireFence();
-                return ctx.released || subtree && s.shapes[lane] == null ? EMPTY : s;
+                return ctx.released || subtree && (lane >= s.shapes.length || s.shapes[lane] == null) ? EMPTY : s;
             } catch (RuntimeException e) {
                 VarHandle.acquireFence();
                 if (ctx.released) return EMPTY;
@@ -3315,20 +3565,21 @@ public final class Tempo {
             }
         }
 
-        private Snapshot(Context ctx, int lane, int row, boolean subtree) {
+        private Snapshot(Context ctx, int lane, int row, Trace block) {
             now = ctx.now();
-            headerBytes = ctx.headerBytes;
-            linkBase = ctx.linkBase;
+            Trace own = block != null ? block : ctx.root;
+            headerBytes = own.headerBytes;
+            linkBase = own.linkBase;
             Lane[] lanes = ctx.lanesById();
             shapes = new Shape[lanes.length];
-            for (int i = 0; i < lanes.length; i++) if (lanes[i] != null) shapes[i] = Shape.of(lanes[i]);
-            this.subtree = subtree;
+            for (int i = 0; i < lanes.length; i++) if (lanes[i] != null) shapes[i] = Shape.of(lanes[i], block);
+            boolean subtree = this.subtree = block != null;
             rootLane = lane;
             rootRow = row;
             Shape top = lane < shapes.length ? shapes[lane] : null;
             base = subtree && top != null && row < top.rows ? top.start[row] : 0;
             wall = ctx.wall > 0 ? ctx.wall + base / 1_000_000 : ctx.wall;
-            totals = ctx.frozenTotals();
+            totals = own.frozenTotals();
             misuses = ctx.misuses.get();
             dropped = subtree ? 0 : ctx.dropped(); // what a lane drops is not known by subtree
             int lostFolded = 0;
@@ -3374,17 +3625,29 @@ public final class Tempo {
                 s.settle(now);
                 s.tree();
             }
-            // A span opened in an undrawn task on another thread joins the children of the span the task was
-            // submitted from; left out while that span is not visible.
+            // A span opened in an undrawn task on another thread, or a folded task unfolded for a block (Lane#unfold),
+            // joins the children of the span the task was submitted from; left out while that span is not visible.
             for (Shape s : shapes) {
                 if (s == null || s.link == null) continue;
                 for (int r = 0; r < s.rows; r++) {
                     long x = s.link[r];
-                    if (x < 0 || (s.flags[r] & TASK) != 0) continue;
+                    if (x < 0) continue; // a task's run linked to its handoff row joins it there, not here
                     Shape t = shape(x);
                     int p = (int) x;
                     if (t != null && p < t.rows && (t.flags[p] & (HANDOFF | PHASE)) == 0) adopt(t, p, s.base + r);
                 }
+            }
+            if (subtree) { // the rows a block's totals read, as Context#total(int, Trace) reads them in place
+                int[] rows = new int[shapes.length];
+                int[][] parent = new int[shapes.length][];
+                long[][] link = new long[shapes.length][];
+                for (int i = 0; i < shapes.length; i++) {
+                    Shape s = shapes[i];
+                    rows[i] = s == null ? 0 : s.rows;
+                    parent[i] = s == null ? new int[0] : s.parent;
+                    link[i] = s == null ? null : s.link;
+                }
+                rowIn = Context.subtree(lane, row, rows, parent, link);
             }
         }
 
@@ -3558,7 +3821,8 @@ public final class Tempo {
         }
 
         /**
-         * Like {@link Trace#total(Name)}, as the snapshot was taken: of the whole trace, also for a nested one.
+         * Like {@link Trace#total(Name)}, as the snapshot was taken: of the whole trace, or of a nested one's
+         * subtree, as that trace's total reads it.
          */
         public Total total(Name name) {
             if (name == null) return Total.EMPTY;
@@ -3566,9 +3830,10 @@ public final class Tempo {
             long count = 0, sum = 0, min = Long.MAX_VALUE, max = 0, waits = 0, waitSum = 0, waitMax = 0;
             for (Shape s : shapes) {
                 if (s == null) continue;
+                boolean[] in = rowIn == null ? null : rowIn[s.lane];
                 for (int r = 0; r < s.rows; r++) {
                     int f = s.flags[r];
-                    if (s.name[r] != id || (f & HANDOFF) != 0) continue;
+                    if (s.name[r] != id || (f & HANDOFF) != 0 || in != null && !in[r]) continue;
                     boolean task = (f & TASK) != 0;
                     if (task) {
                         long w = s.wait == null ? 0 : s.wait[r];
@@ -3586,7 +3851,7 @@ public final class Tempo {
                 for (int e = 0; e < s.aggs; e++) { // as Trace.total: never-started tasks have no wait yet
                     int k = e * Aggs.KEY, b = e * Aggs.CELLS, kind = s.aggKey[k + Aggs.KIND];
                     if (s.aggKey[k + Aggs.NAME] != id || s.aggCell[b + Aggs.COUNT] == 0 || kind == Aggs.TASKS
-                            || kind == Aggs.SPANS && s.aggKey[k] >= s.rows) continue;
+                            || kind == Aggs.SPANS && s.aggKey[k] >= s.rows || subtree && (s.aggIn == null || !s.aggIn[e])) continue;
                     if (kind != Aggs.UNRUN) {
                         count += s.aggCell[b + Aggs.COUNT];
                         sum += s.aggCell[b + Aggs.SUM];
@@ -4867,65 +5132,276 @@ public final class Tempo {
     /**
      * One request's recording, and its outermost span: {@code t.span(n)} opens a child as {@code
      * Tempo.span(n)} does. Not pooled. Reads stay valid after {@link #close()} until {@link #release()}.
-     * A trace started inside another one ({@link Tempo#trace(Name, Options)}) joins it as a subtree.
+     *
+     * <p>A trace started inside another one ({@link Tempo#trace(Name, Options)}) joins it as a subtree and
+     * works as a self-contained block: for the block it behaves as if it were top-level. Its {@link
+     * #total}, {@link #on} and {@link #records(int)} cover its own subtree, its tasks on other threads
+     * included; it renders that subtree with its own {@link Options#headerBytes} and {@link
+     * Options#linkBase}; its {@link Options#strict}, {@link Options#cpu} and {@link Options#budget} (a
+     * sub-budget) hold inside it and in its tasks. The outer trace still counts and draws everything,
+     * the block's spans with the rest.
+     *
+     * <pre>{@code
+     * static final Tempo.Options BLOCK = new Tempo.Options().budget(64);
+     *
+     * Tempo.Trace in = Tempo.trace("rebuild-index", BLOCK); // top-level, or a block of the caller's trace
+     * try (in) {
+     *     index.rebuild();
+     * }
+     * log.info(in.toRuntime(3) + ", " + in.total("load").count() + " loads"); // the block's own
+     * in.release(); // nothing to give back when it is a block: the buffers are the outer trace's
+     * }</pre>
      */
     public static final class Trace extends Span {
-        /** The trace that records nothing: what a nested trace is when its span has no room. */
-        static final Trace NOOP_TRACE = new Trace(null, Context.NONE, 0, false);
+        private static final VarHandle MODE, CREDITS, TOTALS;
+
+        static {
+            try {
+                MethodHandles.Lookup l = MethodHandles.lookup();
+                MODE = l.findVarHandle(Trace.class, "mode", int.class);
+                CREDITS = l.findVarHandle(Trace.class, "credits", int.class);
+                TOTALS = l.findVarHandle(Trace.class, "totals", Totals.class);
+            } catch (ReflectiveOperationException e) {
+                throw new ExceptionInInitializerError(e);
+            }
+        }
 
         private final boolean nested; // joined an outer trace: renders its subtree, releases nothing
         Consumer<String> printer;     // printOnClose; written and read by the owner thread
 
-        Trace(Lane lane, Context ctx, int depth, boolean nested) {
+        // The scope: what the trace's subtree records by, and what it keeps. A trace's root is the scope of
+        // the whole trace (Context#root); a nested trace is a block, a scope of its own inside up's, which the
+        // lane carries while it is open and its tasks carry where they run (Lane#scope). Effective values:
+        // a block's strictness and CPU setting already include its enclosing scope's where they apply.
+        final Trace up;               // the enclosing scope; null for the trace's root
+        final boolean strict;         // strict here: its own, or any enclosing scope's
+        final int cpu, block;         // CPU_ON, CPU_OFF or CPU_AUTO; budget handed to a lane at a time
+        final int headerBytes;        // of its own output
+        final String linkBase;        // of its own output; null: Link.base()
+        volatile int mode;            // (level + 1) << 1 | SEEN; once seen, the effective level, fixed
+        private volatile int credits; // budget of steps, ticks and tasks not handed out to a lane
+        volatile Totals totals;       // lane-less: Span#add and the queue waits of lost tasks
+        boolean widened;              // guarded by ctx
+        Listeners on;                 // guarded by ctx; replaced whole when one is added
+
+        /** The root of a trace starting with {@code o}: its lane is attached when the trace opens. */
+        Trace(Context ctx, Options o) {
+            super(null, ctx, 0);
+            scope = this;
+            nested = false;
+            up = null;
+            strict = o.strict;
+            cpu = o.cpu;
+            credits = o.budget;
+            block = Math.max(1, o.budget / 64);
+            headerBytes = o.headerBytes;
+            linkBase = o.linkBase;
+            mode = (SPAN + 1) << 1;
+        }
+
+        /** The root of {@link Context#NONE} or {@link Context#FREE}: records nothing at {@code level}. */
+        Trace(Context ctx, int level) {
+            super(null, ctx, 0);
+            scope = this;
+            nested = false;
+            up = null;
+            strict = false;
+            cpu = CPU_OFF;
+            credits = block = headerBytes = 0;
+            linkBase = null;
+            mode = (level + 1) << 1;
+        }
+
+        /** A block opening at {@code depth} of {@code lane}, inside scope {@code up}, with options {@code o}. */
+        Trace(Lane lane, Context ctx, int depth, Trace up, Options o) {
             super(lane, ctx, depth);
-            this.nested = nested;
+            scope = this;
+            nested = true;
+            this.up = up;
+            strict = up.strict || o.strict;
+            cpu = o.cpu == CPU_AUTO ? up.cpu : o.cpu;
+            credits = o.budget;
+            block = Math.max(1, o.budget / 64);
+            headerBytes = o.headerBytes;
+            linkBase = o.linkBase;
+            mode = (SPAN + 1) << 1;
         }
 
         /** {@link Tempo#trace}: {@code zero} is the clock read first, {@code text} the name when given as a String. */
         static Trace open(Name name, String text, Options options, long zero) {
             ThreadSlot slot = SLOT.get();
             Lane cur = slot.current;
-            if (cur != null && !cur.ctx.released) return nest(cur, name, text);
+            if (cur != null && !cur.ctx.released) return nest(cur, name, text, options);
             Context ctx = new Context(options == null ? Options.DEFAULTS : options, zero); // zero: the root's start
+            Trace t = ctx.root;
             // Right after: CPU covers the root like its wall time, and the first CPU read of a JVM (it loads
             // the management bean, milliseconds) happens here, counted in the root's own time.
-            long cpu = ctx.cpu() ? ctx.cpuNow() : -1;
+            long cpu = t.measuresCpu() ? ctx.cpuNow() : -1;
             int flags = 0;
             if (text != null) {
-                name = ctx.name(text);
+                name = t.nameOf(text);
                 if (Name.overflowed(name, text)) flags = MISUSE;
             }
             if (name == null) {
-                ctx.misuse("null name");
+                t.misuse("null name");
                 name = Name.UNKNOWN;
                 flags = MISUSE;
             }
             Lane lane = ctx.register(new Lane(ctx, slot));
-            Trace t = new Trace(lane, ctx, 0, false);
+            t.lane = lane;
+            t.owner = lane.owner;
             lane.openRoot(t, name, flags, cpu);
             return t;
         }
 
-        /** A trace started inside the trace of {@code cur}, the thread's current lane: a span of it on top. */
-        private static Trace nest(Lane cur, Name name, String text) {
+        /**
+         * A trace started inside the trace of {@code cur}, the thread's current lane: a block, a span of it on
+         * top whose subtree is a scope of its own, inside the lane's scope. The one object of the call.
+         */
+        private static Trace nest(Lane cur, Name name, String text, Options options) {
             Context ctx = cur.ctx;
+            Trace t = new Trace(cur, ctx, cur.depth, cur.scope, options == null ? Options.DEFAULTS : options);
             int flags = 0;
             if (text != null) {
-                name = ctx.name(text);
+                name = t.nameOf(text);
                 if (Name.overflowed(name, text)) flags = MISUSE;
             }
             if (name == null) {
-                ctx.misuse("null name");
+                t.misuse("null name");
                 name = Name.UNKNOWN;
                 flags = MISUSE;
             }
-            Trace t = new Trace(cur, ctx, cur.depth, true);
-            return cur.nest(t, name, flags) == null ? NOOP_TRACE : t;
+            return cur.nest(t, name, flags) == null ? Context.NONE.root : t;
         }
 
-        /** What the trace records: {@link #SPAN} (from the start), {@link #STEP} or {@link #TICK}. */
+        // ---- the scope (any thread unless said otherwise) ----
+
+        /**
+         * Marks that a step, tick or task was opened in this scope: from now on its level is fixed, and so
+         * are the levels of the scopes enclosing it, whose subtree it is in too. Returns the mode it is
+         * fixed at, read in the same atomic step, so a widening either came before it or fails. A block's
+         * fixed level is the wider of its own and its enclosing scope's.
+         */
+        int sawStep() {
+            int m = mode;
+            return (m & Context.SEEN) != 0 ? m : markSeen();
+        }
+
+        private int markSeen() {
+            int u = up == null ? 0 : up.sawStep() & ~Context.SEEN;
+            int m;
+            while (((m = mode) & Context.SEEN) == 0 && !MODE.compareAndSet(this, m, Math.max(m, u) | Context.SEEN)) { }
+            return mode;
+        }
+
+        /**
+         * Widens this scope's level to {@code level}, unless a step, tick or task was seen in it first. Called
+         * under the context's lock, which orders it against another widening; the seen mark is a CAS, which
+         * this one races.
+         */
+        boolean widen(int level) {
+            int m;
+            do {
+                m = mode;
+                if ((m & Context.SEEN) != 0) return false;
+            } while (!MODE.compareAndSet(this, m, (level + 1) << 1));
+            return true;
+        }
+
+        /** The level of this scope: once seen, fixed; before, the wider of its own and its enclosing scope's. */
+        int level() {
+            int m = mode, own = (m >> 1) - 1;
+            return (m & Context.SEEN) != 0 || up == null ? own : Math.max(own, up.level());
+        }
+
+        /** Tests: sets the level as if widened, without the checks. */
+        void level(int level) {
+            mode = (level + 1) << 1 | mode & Context.SEEN;
+        }
+
+        /** Whether a span opening now in this scope has its CPU time measured. */
+        boolean measuresCpu() {
+            return cpu == CPU_ON || cpu == CPU_AUTO && level() >= STEP;
+        }
+
+        /**
+         * Hands a lane up to one block of this scope's budget, taken from every enclosing scope's too: a
+         * block draws at most its own budget and never more than the trace has left. 0 when spent.
+         */
+        int credits() {
+            return take(block);
+        }
+
+        private int take(int want) {
+            int c, n;
+            do {
+                c = credits;
+                if (c <= 0) return 0;
+                n = Math.min(want, c);
+            } while (!CREDITS.compareAndSet(this, c, c - n));
+            if (up == null) return n;
+            int got = up.take(n);
+            if (got < n) CREDITS.getAndAdd(this, n - got);
+            return got;
+        }
+
+        /** Gives back budget a lane held for this scope, to it and to every enclosing scope. */
+        void refund(int n) {
+            for (Trace s = this; s != null; s = s.up) CREDITS.getAndAdd(s, n);
+        }
+
+        int unspent() {
+            return credits;
+        }
+
+        Totals totals() {
+            Totals t = totals;
+            if (t == null && !TOTALS.compareAndSet(this, null, t = new Totals(8))) t = totals;
+            return t;
+        }
+
+        Totals frozenTotals() {
+            Totals t = totals;
+            return t == null ? null : t.copy();
+        }
+
+        /** Adds a lane-less occurrence or queue wait of name {@code id} to this scope and every one enclosing it. */
+        void addTotal(int id, boolean wait, long nanos) {
+            for (Trace s = this; s != null; s = s.up) s.totals().add(id, wait, nanos);
+        }
+
+        /** Whether scope {@code s} is {@code block} or nested in it. */
+        static boolean within(Trace s, Trace block) {
+            for (; s != null; s = s.up) if (s == block) return true;
+            return false;
+        }
+
+        /**
+         * The name of a {@code String} parameter: interned in the global table; past its cap {@code <other>},
+         * counted as misuse in this scope. {@code null} stays null, for the caller to count.
+         */
+        Name nameOf(String text) {
+            if (text == null) return null;
+            Name n = Name.intern(text, true);
+            if (Name.overflowed(n, text)) misuse("name table full: " + Name.DYNAMIC_CAP + " names from strings");
+            return n;
+        }
+
+        /** The id of attribute key {@code key}; null is misuse in this scope, recorded as {@code ?}. */
+        int attrKey(Name key) {
+            if (key != null) return key.id;
+            misuse("null attribute key");
+            return Name.UNKNOWN.id;
+        }
+
+        // ---- the public API ----
+
+        /**
+         * What the trace records: {@link #SPAN} (from the start), {@link #STEP} or {@link #TICK}. Of a block,
+         * what its subtree records: the wider of its own level and the outer trace's.
+         */
         public int records() {
-            return ctx.level();
+            return level();
         }
 
         /**
@@ -4936,7 +5412,8 @@ public final class Tempo {
          * Options#cpu}) reads the CPU clock once on the calling thread, so the JVM's one-time setup of that
          * clock (milliseconds) is paid here, in the trace's wall time, never inside a pool task; called on the
          * owner thread while the trace is open, the trace's own CPU time is measured from that read on. On a
-         * nested trace it widens the whole trace.
+         * block it widens the block's subtree only, its tasks included, before the first step or tick opens
+         * in that subtree; the outer trace's level is untouched, and its tree shows what the block drew.
          */
         public Trace records(int level) {
             if (lane == null) return this;
@@ -4944,19 +5421,19 @@ public final class Tempo {
             String refused = null;
             boolean cpuOn = false;
             synchronized (ctx) {
-                if (to <= ctx.level()) return this;
-                boolean before = ctx.cpu();
-                if (ctx.widened) {
+                if (to <= level()) return this;
+                boolean before = measuresCpu();
+                if (widened) {
                     refused = "records widened twice";
-                } else if (!ctx.widen(to)) {
+                } else if (!widen(to)) {
                     refused = "records widened after a step or tick opened";
                 } else {
-                    ctx.widened = true;
-                    cpuOn = !before && ctx.cpu();
+                    widened = true;
+                    cpuOn = !before && measuresCpu();
                 }
             }
             if (refused != null) {
-                ctx.misuse(refused);
+                misuse(refused);
             } else if (cpuOn) {
                 long cpu = ctx.cpuNow(); // the first read of a JVM sets the clock up, on this thread
                 Lane l = lane;
@@ -4971,7 +5448,7 @@ public final class Tempo {
          * and never throws, so take a {@link #snapshot()} first to render later. A thread still inside a
          * task of this trace keeps its lane until the task ends; tasks begun after release record nothing,
          * and still cancel.
-         * On a nested trace it does nothing: the buffers are the outer trace's.
+         * On a block it does nothing: the buffers are the outer trace's, released with it.
          */
         public void release() {
             if (lane != null && !nested) ctx.release();
@@ -4982,16 +5459,17 @@ public final class Tempo {
          * of {@code name} that ends from now on: spans, steps, recorded ticks, phases, tasks and {@link Span#add}.
          * Like {@link Tempo#on} it runs on the ending thread without a lock, so it must be thread-safe. Any
          * thread may add one; another thread hears it once it synchronizes with the adding one, e.g. through
-         * a task submitted after it. On a nested trace it listens to the whole trace.
+         * a task submitted after it. On a block it hears the block's subtree only, including the tasks
+         * submitted in it that end after the block closed; it is dropped with the outer trace's release.
          */
         public Trace on(Name name, LongConsumer nanos) {
             if (lane == null) return this;
             if (name == null || nanos == null) {
-                ctx.misuse("null listener");
+                misuse("null listener");
                 return this;
             }
             synchronized (ctx) {
-                ctx.on = new Listeners(ctx.on, name.id, nanos);
+                on = new Listeners(on, name.id, nanos);
                 ctx.listening = true;
             }
             return this;
@@ -4999,7 +5477,7 @@ public final class Tempo {
 
         /** Like {@link #on(Name, LongConsumer)}, the name looked up as for {@link Tempo#span(String)}. */
         public Trace on(String name, LongConsumer nanos) {
-            return lane == null ? this : on(ctx.name(name), nanos);
+            return lane == null ? this : on(nameOf(name), nanos);
         }
 
         /**
@@ -5007,11 +5485,14 @@ public final class Tempo {
          * and tasks (drawn, folded over the budget or undrawn), recorded ticks, phases and {@link Span#add};
          * and the queue waits of its tasks, of tasks left unrecorded at a cap, begun or cancelled. The numbers are
          * the same whatever the trace drew. Exact once the contributing threads are done, best effort while
-         * they run; empty after release. On a nested trace, those of the whole trace. Reads the lanes in
-         * place: no copy, one allocation, time linear in the trace's rows, events and aggregates.
+         * they run; empty after release. Reads the lanes in place: no copy, one allocation, time linear in
+         * the trace's rows, events and aggregates. On a block, those of the block's subtree, its tasks on
+         * other threads included, computed when read (so recording pays nothing for it): a few arrays per
+         * read, by lane, and time linear in the trace's rows, events and aggregates.
          */
         public Total total(Name name) {
-            return name == null || lane == null ? Total.EMPTY : ctx.total(name.id);
+            if (name == null || lane == null) return Total.EMPTY;
+            return nested ? ctx.total(name.id, this) : ctx.total(name.id);
         }
 
         /** Like {@link #total(Name)}; empty for a name never interned. */
@@ -5101,12 +5582,12 @@ public final class Tempo {
 
         /**
          * An immutable copy of the trace as it is now, which stays readable after {@link #release()}: take
-         * it before releasing when the trace is rendered later. Of a nested trace, its subtree, with times
-         * from its start. Empty after release.
+         * it before releasing when the trace is rendered later. Of a block, its subtree, with times from its
+         * start, its totals and its output settings. Empty after release.
          */
         public Snapshot snapshot() {
             if (lane == null || row == Lane.FRAME) return Snapshot.EMPTY;
-            return Snapshot.of(ctx, lane.id, row, nested);
+            return Snapshot.of(ctx, lane.id, row, nested ? this : null);
         }
 
         /**
@@ -5156,16 +5637,16 @@ public final class Tempo {
         public Trace printOnClose(Consumer<String> out, String label) {
             if (lane == null) return this;
             if (out == null) {
-                ctx.misuse("null printer");
+                misuse("null printer");
             } else if (Thread.currentThread() != owner) {
-                ctx.misuse("printer added on a foreign thread");
+                misuse("printer added on a foreign thread");
             } else {
                 Consumer<String> p = label == null ? out : line -> out.accept(label + ": " + line);
                 if (depth < lane.depth && lane.handles[depth] == this) {
                     printer = p;
                 } else if (row != Lane.FRAME) {
                     Throwable t = lane.print(p, row);
-                    if (t != null && ctx.strict) throw Context.listenerThrew(t);
+                    if (t != null && strict) throw Context.listenerThrew(t);
                 }
             }
             return this;
@@ -5266,6 +5747,10 @@ public final class Tempo {
         Context ctx;
         Thread owner;
         AtomicInteger misuses; // of the trace it was last issued in; kept while pooled, for stale uses
+        // The scope its children open in, as its lane's was when it was issued (a frame's when it opened): the
+        // innermost self-contained block, or the trace's own root; a block's is the block itself. Its level
+        // decides a tick through it, its strictness every misuse of it. Context.NONE's root while pooled.
+        Trace scope;
         int depth;
         @SuppressWarnings("unused") private long stamp; // via STAMP
         Span link; // the next handle in its lane's issued list, or in its slot's pool
@@ -5283,6 +5768,7 @@ public final class Tempo {
             this.ctx = ctx;
             this.owner = lane == null ? null : lane.owner;
             this.misuses = ctx.misuses;
+            this.scope = lane == null ? ctx.root : lane.scope; // the root of Context.NONE, FREE: set by its Trace
             this.depth = depth;
             this.stamp = ctx.id;
         }
@@ -5294,6 +5780,7 @@ public final class Tempo {
             ctx = c;
             owner = l.owner;
             misuses = c.misuses;
+            scope = l.scope;
             depth = d;
             folded = hidden = false;
             STAMP.setRelease(this, c.id);
@@ -5308,6 +5795,7 @@ public final class Tempo {
             VarHandle.storeStoreFence();
             lane = Lane.POOLED;
             ctx = Context.NONE;
+            scope = Context.NONE.root;
         }
 
         /** Whether the trace of this handle is released and its lane retired, or the handle is pooled. Not {@link #NOOP}. */
@@ -5323,7 +5811,7 @@ public final class Tempo {
         /** Counts a misuse of this handle in its trace, or in the trace it was last issued in; strict mode throws. */
         void misuse(String what) {
             misuses.incrementAndGet();
-            if (ctx.strict) throw new AssertionError("Tempo misuse: " + what);
+            if (scope.strict) throw new AssertionError("Tempo misuse: " + what);
         }
 
         /**
@@ -5374,7 +5862,7 @@ public final class Tempo {
          * foreign handle never fixes the level.
          */
         public Span tick(Name name) {
-            Context c = ctx;
+            Trace c = scope;
             int m = c.mode;
             if (m < Context.TICK_MODE && ((m & Context.SEEN) != 0 && !c.strict || unrecorded())) return NOOP;
             Lane l = top();
@@ -5383,7 +5871,7 @@ public final class Tempo {
 
         /** Like {@link #tick(Name)}, the name looked up as for {@link Tempo#span(String)}. */
         public Span tick(String name) {
-            Context c = ctx;
+            Trace c = scope;
             int m = c.mode;
             if (m < Context.TICK_MODE && ((m & Context.SEEN) != 0 && !c.strict || unrecorded())) return NOOP;
             Lane l = top();
@@ -5398,7 +5886,7 @@ public final class Tempo {
          */
         private boolean unrecorded() {
             Lane l = lane;
-            return l == null || l.free || !live() || ctx.sawStep() < Context.TICK_MODE;
+            return l == null || l.free || !live() || scope.sawStep() < Context.TICK_MODE;
         }
 
         /**
@@ -5479,7 +5967,7 @@ public final class Tempo {
         /** Like {@link #phase(Name)}, the name looked up as for {@link Tempo#span(String)}. */
         public Phase phase(String name) {
             if (lane == null) return Phase.NOOP;
-            Name n = ctx.name(name);
+            Name n = scope.nameOf(name);
             return phase(n, n != null && Name.overflowed(n, name) ? MISUSE : 0);
         }
 
@@ -5516,7 +6004,7 @@ public final class Tempo {
         /** Like {@link #done(Name)}, the name looked up as for {@link Tempo#span(String)}. */
         public Span done(String name) {
             if (lane == null) return this;
-            Name n = ctx.name(name);
+            Name n = scope.nameOf(name);
             if (n == null) return done((Name) null);
             if (live()) lane.done(depth, n, Name.overflowed(n, name) ? MISUSE : 0);
             return this;
@@ -5574,12 +6062,12 @@ public final class Tempo {
          * or undrawn span it adds to the aggregate's CPU time.
          */
         public Span cpu() {
-            if (live() && ctx.cpu()) lane.sampleCpu(depth);
+            if (live() && scope.measuresCpu()) lane.sampleCpu(depth);
             return this;
         }
 
         private Name nullName() {
-            ctx.misuse("null name");
+            scope.misuse("null name");
             return Name.UNKNOWN;
         }
 
@@ -5595,7 +6083,7 @@ public final class Tempo {
 
         /** Like {@link #set(Name, long)}, the key looked up as for {@link Tempo#span(String)}. */
         public Span set(String key, long value) {
-            return lane == null || lane.free ? this : set(ctx.name(key), value);
+            return lane == null || lane.free ? this : set(scope.nameOf(key), value);
         }
 
         public Span set(Name key, double value) {
@@ -5606,11 +6094,11 @@ public final class Tempo {
 
         /** Like {@link #set(Name, double)}, the key looked up as for {@link Tempo#span(String)}. */
         public Span set(String key, double value) {
-            return lane == null || lane.free ? this : set(ctx.name(key), value);
+            return lane == null || lane.free ? this : set(scope.nameOf(key), value);
         }
 
         private int key(Name key) {
-            return ctx.key(key);
+            return scope.attrKey(key);
         }
 
         /**
@@ -5626,25 +6114,26 @@ public final class Tempo {
             Lane l = lane;
             Context c = ctx;
             AtomicInteger m = misuses;
+            Trace sc = scope;
             VarHandle.loadLoadFence();
             if (l == null) return this;
             if (s != (long) STAMP.getOpaque(this) || s != c.id || l.retired()) {
                 m.incrementAndGet(); // pooled handles are never strict
-                if (c.strict) throw new AssertionError("Tempo misuse: " + STALE);
+                if (sc.strict) throw new AssertionError("Tempo misuse: " + STALE);
                 return this;
             }
             if (c.released) return this; // a task still running after release
             long v = Math.max(0, nanos);
-            if (!l.free) c.totals().add(c.key(name), false, v);
-            Throwable t = name != null && c.listening ? c.notify(name, v) : null;
-            if (t != null && c.strict) throw Context.listenerThrew(t);
+            if (!l.free) sc.addTotal(sc.attrKey(name), false, v);
+            Throwable t = name != null && c.listening ? c.notify(sc, name, v) : null;
+            if (t != null && sc.strict) throw Context.listenerThrew(t);
             return this;
         }
 
         /** Like {@link #add(Name, long)}, the name looked up as for {@link Tempo#span(String)}. */
         public Span add(String name, long nanos) {
             if (lane == null) return this;
-            return add(lane.free ? Name.find(name) : ctx.name(name), nanos);
+            return add(lane.free ? Name.find(name) : scope.nameOf(name), nanos);
         }
 
         /**
@@ -5827,9 +6316,15 @@ public final class Tempo {
             return lane.retired() || (long) STAMP.getAcquire(this) != ctx.id;
         }
 
+        /** The scope of the span this phase sections, whose strictness and names it uses. */
+        private Trace scope() {
+            Span s = span;
+            return s != null ? s.scope : ctx.root;
+        }
+
         private void misuse(String what) {
             misuses.incrementAndGet();
-            if (ctx.strict) throw new AssertionError("Tempo misuse: " + what);
+            if (scope().strict) throw new AssertionError("Tempo misuse: " + what);
         }
 
         /** Owner thread and not stale; else counts the misuse. False for {@link #NOOP}. */
@@ -5855,27 +6350,27 @@ public final class Tempo {
         /** Attaches a number to this phase, also after it ended; ignored on a phase without a row. */
         @Override
         public Phase set(Name key, long value) {
-            if (owned() && row != Lane.FRAME && !lane.event(row, ctx.key(key) << KIND_BITS | ATTR_LONG, value)) misuse(Span.STALE);
+            if (owned() && row != Lane.FRAME && !lane.event(row, scope().attrKey(key) << KIND_BITS | ATTR_LONG, value)) misuse(Span.STALE);
             return this;
         }
 
         /** Like {@link #set(Name, long)}, the key looked up as for {@link Tempo#span(String)}. */
         @Override
         public Phase set(String key, long value) {
-            return lane == null || lane.free ? this : set(ctx.name(key), value);
+            return lane == null || lane.free ? this : set(scope().nameOf(key), value);
         }
 
         @Override
         public Phase set(Name key, double value) {
             if (owned() && row != Lane.FRAME
-                    && !lane.event(row, ctx.key(key) << KIND_BITS | ATTR_DOUBLE, Double.doubleToRawLongBits(value))) misuse(Span.STALE);
+                    && !lane.event(row, scope().attrKey(key) << KIND_BITS | ATTR_DOUBLE, Double.doubleToRawLongBits(value))) misuse(Span.STALE);
             return this;
         }
 
         /** Like {@link #set(Name, double)}, the key looked up as for {@link Tempo#span(String)}. */
         @Override
         public Phase set(String key, double value) {
-            return lane == null || lane.free ? this : set(ctx.name(key), value);
+            return lane == null || lane.free ? this : set(scope().nameOf(key), value);
         }
 
         /** Marks the phase failed, also after it ended. */
@@ -6213,7 +6708,11 @@ public final class Tempo {
         Name name;
         long submit;
         volatile int state;
-        Task next;  // folded: the next older one in the submitting lane's waiting list
+        // Folded: the next older Task in the submitting lane's waiting list (its scope is its TASKS entry's).
+        // Drawn or undrawn: the scope it was submitted in, the Trace of the innermost self-contained block or
+        // the trace's own root, which it carries to the lane where it runs. One field for both, so a task
+        // stays one object of the size it had before blocks.
+        Timing next;
         long wait;  // the queue wait, once it began or was cancelled; best effort off that thread
 
         /** A task of {@code name}, or of {@code text} looked up as for {@link Tempo#span(String)}. */
@@ -6231,11 +6730,18 @@ public final class Tempo {
             }
         }
 
-        /** Lane.submit: the record at the submit. */
-        void init(Lane l, int row, int bits, long now) {
+        /** Lane.submit: the record at the submit, in scope {@code scope}. */
+        void init(Lane l, int row, int bits, long now, Trace scope) {
             lane = l;
             submit = now;
+            next = scope;
             STATE.set(this, row << ROW | bits);
+        }
+
+        /** The scope the task was submitted in, in a trace; of a folded one, its TASKS entry's. */
+        Trace scope() {
+            int s = state;
+            return (s & UNDRAWN) != 0 || s >> ROW >= 0 ? (Trace) next : lane.taskScope(~(s >> ROW));
         }
 
         int row() {
@@ -6257,7 +6763,7 @@ public final class Tempo {
 
         private void misuse(String what) {
             Lane l = lane;
-            if (l != null) l.ctx.misuse(what);
+            if (l != null) scope().misuse(what);
         }
 
         /**
@@ -6368,7 +6874,7 @@ public final class Tempo {
         /** Like {@link #set(Name, long)}, the key looked up as for {@link Tempo#span(String)}. */
         public Task set(String key, long value) {
             Lane l = lane;
-            return l == null ? this : set(l.ctx.name(key), value);
+            return l == null ? this : set(scope().nameOf(key), value);
         }
 
         public Task set(Name key, double value) {
@@ -6378,7 +6884,7 @@ public final class Tempo {
         /** Like {@link #set(Name, double)}, the key looked up as for {@link Tempo#span(String)}. */
         public Task set(String key, double value) {
             Lane l = lane;
-            return l == null ? this : set(l.ctx.name(key), value);
+            return l == null ? this : set(scope().nameOf(key), value);
         }
 
         private Task event(Name key, int kind, long value) {
@@ -6386,7 +6892,7 @@ public final class Tempo {
             int s = state, r = s >> ROW;
             if (l == null || (s & UNDRAWN) != 0 || r < 0) return this; // nothing recorded at the submit
             if (Thread.currentThread() != l.owner) misuse("task used on a foreign thread");
-            else if (!l.event(r, l.ctx.key(key) << KIND_BITS | kind, value)) misuse(Span.STALE);
+            else if (!l.event(r, scope().attrKey(key) << KIND_BITS | kind, value)) misuse(Span.STALE);
             return this;
         }
 

@@ -500,7 +500,7 @@ class BudgetTest {
         java.lang.reflect.Field head = Tempo.Lane.class.getDeclaredField("waiting");
         head.setAccessible(true);
         int kept = 0;
-        for (Task h = (Task) head.get(first.lane); h != null; h = h.next) kept++;
+        for (Task h = (Task) head.get(first.lane); h != null; h = (Task) h.next) kept++;
         assertTrue(kept <= 16, "handoffs kept: " + kept);
         clock.add(10_000);
         t.close();

@@ -933,7 +933,7 @@ class TempoTest {
         assertSame(s, s.done(RERANK));
         assertSame(NOOP, s.tick(LOAD));
         assertSame(NOOP, s.tick("load"));
-        assertEquals(0, Tempo.Context.NONE.mode); // never marked seen
+        assertEquals(0, Tempo.Context.NONE.root.mode); // never marked seen
         s.close();
         assertEquals(13, t.misuses());
         assertNull(onThread("other", () -> s.add(MATCH, 5)));
@@ -1872,7 +1872,7 @@ class TempoTest {
         Trace inner;
         try (Span d = Tempo.span(DECODE)) {
             clock.add(5_000);
-            inner = Tempo.trace(RERANK, strict()); // its options are ignored: it is part of the outer trace
+            inner = Tempo.trace(RERANK, strict()); // a block: strict in its subtree, on the outer trace's clock
             assertSame(inner, Tempo.current());
             inner.on(MATCH, heard::add);
             inner.phase(LOAD).label("Load");
@@ -1906,7 +1906,7 @@ class TempoTest {
         assertEquals(5_000, inner.elapsedNanos());
         assertEquals(5_000, inner.snapshot().elapsedNanos());
         assertEquals(List.of(0L), heard);
-        assertEquals(1, inner.total(MATCH).count()); // the totals of the whole trace
+        assertEquals(1, inner.total(MATCH).count()); // the block's own subtree (BlockTest has more)
         assertEquals(1, outer.total(MATCH).count());
         assertEquals(0, outer.misuses());
         outer.release();
