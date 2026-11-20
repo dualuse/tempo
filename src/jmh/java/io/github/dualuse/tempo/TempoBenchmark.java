@@ -42,7 +42,7 @@ import java.util.function.Supplier;
 public class TempoBenchmark {
 
     static final Tempo.Name ROOT = Tempo.name("bench"), CHILD = Tempo.name("child"), KEY = Tempo.name("key"),
-            RATIO = Tempo.name("ratio");
+            RATIO = Tempo.name("ratio"), BLOCK = Tempo.name("block");
     /** Drawn tasks count against the budget; the cycling benchmarks record every one of theirs. */
     static final Tempo.Options UNBUDGETED = new Tempo.Options().budget(Integer.MAX_VALUE);
     /** For the traces that draw their tasks (records steps), without CPU time, as at the level of spans. */
@@ -184,6 +184,61 @@ public class TempoBenchmark {
 
         @TearDown(Level.Trial)
         public void tearDown() {
+            trace.close();
+            trace.release();
+        }
+    }
+
+    /**
+     * Like {@link Cycling}, with a self-contained block (a nested trace) open in the trace the whole time, so
+     * every operation records inside the block's scope.
+     */
+    @State(Scope.Thread)
+    public static class InBlock {
+        @Param({"1000", "16000"})
+        int cycle;
+        Tempo.Trace trace, block;
+        int used;
+
+        @Setup(Level.Trial)
+        public void setUp() {
+            trace = Tempo.trace(ROOT, UNBUDGETED);
+            block = Tempo.trace(BLOCK);
+        }
+
+        @TearDown(Level.Trial)
+        public void tearDown() {
+            block.close();
+            trace.close();
+            trace.release();
+        }
+
+        void cycle() {
+            if (++used == cycle) {
+                block.close();
+                trace.close();
+                trace.release();
+                trace = Tempo.trace(ROOT, UNBUDGETED);
+                block = Tempo.trace(BLOCK);
+                used = 0;
+            }
+        }
+    }
+
+    /** A trace of spans only with a self-contained block open in it for the whole trial: steps in it are undrawn. */
+    @State(Scope.Thread)
+    public static class SpansOnlyInBlock {
+        Tempo.Trace trace, block;
+
+        @Setup(Level.Trial)
+        public void setUp() {
+            trace = Tempo.trace(ROOT, UNBUDGETED);
+            block = Tempo.trace(BLOCK);
+        }
+
+        @TearDown(Level.Trial)
+        public void tearDown() {
+            block.close();
             trace.close();
             trace.release();
         }
@@ -346,6 +401,36 @@ public class TempoBenchmark {
         Tempo.Span d = s.trace.step(CHILD);
         d.close();
         return d;
+    }
+
+    /**
+     * A recorded span through the static API inside an open self-contained block: the block's scope is the
+     * lane's, so it costs what a span outside does, 0 B in steady state.
+     */
+    @Benchmark
+    public void spanInBlock(InBlock s) {
+        s.cycle();
+        Tempo.span(CHILD).close();
+    }
+
+    /** An undrawn step inside an open block, through the block: timed into its lane's entry of the block's scope, 0 B. */
+    @Benchmark
+    public Tempo.Span stepUndrawnInBlock(SpansOnlyInBlock s) {
+        Tempo.Span d = s.block.step(CHILD);
+        d.close();
+        return d;
+    }
+
+    /**
+     * A nested trace, opened and closed in a trace: a self-contained block, whose one allocation is its
+     * {@code Trace}, the block's span handle and scope in one object.
+     */
+    @Benchmark
+    public Tempo.Trace nestedTrace(Cycling s) {
+        s.cycled();
+        Tempo.Trace in = Tempo.trace(BLOCK);
+        in.close();
+        return in;
     }
 
     /** Explicit handle, a trace of steps over its budget: a folded step (two clock reads, an aggregate update). */

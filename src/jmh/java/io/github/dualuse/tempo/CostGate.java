@@ -54,6 +54,12 @@ import java.util.TreeMap;
  * one clock read.
  * </ol>
  *
+ * <p>Self-contained blocks (nested traces) keep the same promises with a block open: a recorded span
+ * inside an open block ({@code spanInBlock}) and an undrawn step in it ({@code stepUndrawnInBlock}) allocate
+ * nothing in steady state, and a nested trace ({@code nestedTrace}) allocates one object, its {@code Trace},
+ * which is the block's span handle and its scope at once: 128 B (64-bit JVM, compressed oops). The time
+ * of a span in a block is reported beside {@code spanStatic}.
+ *
  * <p>Rendering the 300-span trace of {@code Rendered} is held to ceilings: the encoder alone ({@code
  * snapshotToHeader}) to its one output String (3,440 characters, 3.5 KB) plus about 2 KB of per-render
  * tables and walk state; {@code toHeader} adds the copy of the trace that {@code snapshot()} takes. That
@@ -66,6 +72,7 @@ public final class CostGate {
 
     static final double NOTHING = 0.01;  // B/op: allocates nothing
     static final double TASK = 48, RUNNABLE_TASK = 56; // B per task: exactly one object
+    static final double NESTED = 128;    // B per nested trace: exactly one object, its Trace
     static final double SETUP = 1024;    // B per trace start + close + release
     static final double ACROSS_SETUP = 1024; // B per trace of the across groups: the submitter's trace and the worker's lane
     static final double ENCODE = 6 * 1024, RENDER = 24 * 1024, JSON = 2560; // B per render of the 300-span trace
@@ -92,6 +99,7 @@ public final class CostGate {
             P2 = "Promise 2: one object per task",
             P3 = "Promise 3: an unrecorded tick costs about a branch; an undrawn step allocates nothing",
             P4 = "Promise 4: a recorded static span costs at most 6.4 clock reads",
+            BLOCKS = "Blocks: a span or undrawn step in an open block allocates nothing; a nested trace is one object",
             REST = "Allocation of the other operations, and the render ceilings";
 
     static final List<Gate> GATES = List.of(
@@ -129,6 +137,12 @@ public final class CostGate {
 
             new Gate(P4, "spanStatic", Unit.TIMES_BASELINE, SPAN_STATIC),
             new Gate(P4, "span", Unit.TIMES_BASELINE, -1),
+
+            new Gate(BLOCKS, "spanInBlock", Unit.PER_OP, NOTHING),
+            new Gate(BLOCKS, "spanInBlock", Unit.TIMES_BASELINE, -1),
+            new Gate(BLOCKS, "stepUndrawnInBlock", Unit.PER_OP, NOTHING),
+            new Gate(BLOCKS, "stepUndrawnInBlock", Unit.TIMES_BASELINE, -1),
+            new Gate(BLOCKS, "nestedTrace", Unit.PER_OP, NESTED + NOTHING),
 
             new Gate(REST, "folded", Unit.PER_OP, NOTHING),
             new Gate(REST, "add", Unit.PER_OP, NOTHING),
