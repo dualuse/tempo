@@ -509,25 +509,56 @@ public final class Tempo {
         }
     }
 
-    /** Settings for one trace; read once at {@link Tempo#trace(Name, Options)}. */
+    /**
+     * Settings for one trace; read once at {@link Tempo#trace(Name, Options)}. Immutable: every setter
+     * returns a new {@code Options} with that one setting changed and leaves this one as it was, so a
+     * constant configured once is safe to share between threads and traces, and a setting derived from it
+     * never leaks back:
+     *
+     * <pre>{@code
+     * static final Tempo.Options BLOCK = new Tempo.Options().budget(64).strict(true);
+     * static final Tempo.Options DEBUG = BLOCK.cpu(true); // BLOCK still measures as the trace decides
+     * }</pre>
+     *
+     * A trace started inside another one, a self-contained block (see {@link Tempo#trace(Name, Options)}),
+     * takes {@code clock} and {@code lanes} from the outer trace and honours the rest for its own subtree.
+     */
     public static final class Options {
-        static final Options DEFAULTS = new Options(); // never handed out, so never mutated
+        static final Options DEFAULTS = new Options();
 
-        int budget = 512, headerBytes = 3000, lanes = 256, cpu = CPU_AUTO;
-        boolean strict;
-        LongSupplier clock = SYSTEM_CLOCK, cpuClock; // cpuClock: tests only; null reads the thread's CPU time
-        LongSupplier wallClock = System::currentTimeMillis; // tests only
-        String linkBase; // null: Link.base()
+        final int budget, headerBytes, lanes, cpu;
+        final boolean strict;
+        final LongSupplier clock, cpuClock; // cpuClock: tests only; null reads the thread's CPU time
+        final LongSupplier wallClock;       // tests only
+        final String linkBase;              // null: Link.base()
+
+        /** The defaults: a budget of 512, 3,000 header bytes, 256 lanes, CPU time as the level decides, lenient. */
+        public Options() {
+            this(512, 3000, 256, CPU_AUTO, false, SYSTEM_CLOCK, null, System::currentTimeMillis, null);
+        }
+
+        private Options(int budget, int headerBytes, int lanes, int cpu, boolean strict, LongSupplier clock,
+                LongSupplier cpuClock, LongSupplier wallClock, String linkBase) {
+            this.budget = budget;
+            this.headerBytes = headerBytes;
+            this.lanes = lanes;
+            this.cpu = cpu;
+            this.strict = strict;
+            this.clock = clock;
+            this.cpuClock = cpuClock;
+            this.wallClock = wallClock;
+            this.linkBase = linkBase;
+        }
 
         /**
          * Steps, ticks and tasks drawn individually per trace, default 512; past it they fold into
          * aggregates ({@link SpanView#aggregate()}), tasks with their queue waits.
          * Lanes take the budget in blocks of {@code max(1, budget / 64)} and give back what they did not use
-         * when their task ends.
+         * when their task ends. In a self-contained block it is a sub-budget: the block draws at most this
+         * many in its subtree, taken from what the outer trace has left, never more. Returns a copy.
          */
         public Options budget(int spans) {
-            this.budget = Math.max(0, spans);
-            return this;
+            return new Options(Math.max(0, spans), headerBytes, lanes, cpu, strict, clock, cpuClock, wallClock, linkBase);
         }
 
         /**
@@ -540,32 +571,29 @@ public final class Tempo {
          * measuring ({@link Trace#records(int)}), in the root's time, so no task's queue wait or run time ever
          * includes it. A task reads the clock as soon as it
          * wins its begin, before it sets up its thread's lane or reads its CPU time: both are run time,
-         * not queue wait.
+         * not queue wait. A self-contained block that leaves it unset follows the outer trace's setting.
+         * Returns a copy.
          */
         public Options cpu(boolean on) {
-            this.cpu = on ? CPU_ON : CPU_OFF;
-            return this;
+            return new Options(budget, headerBytes, lanes, on ? CPU_ON : CPU_OFF, strict, clock, cpuClock, wallClock, linkBase);
         }
 
-        /** A fake CPU clock for tests, read on the calling thread like the real one; -1 is "not measured". */
+        /** A fake CPU clock for tests, read on the calling thread like the real one; -1 is "not measured". A copy. */
         Options cpuClock(LongSupplier cpuNanos) {
-            this.cpuClock = cpuNanos;
-            return this;
+            return new Options(budget, headerBytes, lanes, cpu, strict, clock, cpuNanos, wallClock, linkBase);
         }
 
-        /** A fake wall clock in epoch milliseconds for tests, read once when the trace starts. */
+        /** A fake wall clock in epoch milliseconds for tests, read once when the trace starts. A copy. */
         Options wallClock(LongSupplier millis) {
-            this.wallClock = millis;
-            return this;
+            return new Options(budget, headerBytes, lanes, cpu, strict, clock, cpuClock, millis, linkBase);
         }
 
         /**
          * Byte limit of the detailed header ({@link Trace#toHeader()}) and of the value a {@link Trace#toLink()}
-         * carries; default 3000. {@link Trace#toHeader(int)} takes a limit per call.
+         * carries; default 3000. {@link Trace#toHeader(int)} takes a limit per call. Returns a copy.
          */
         public Options headerBytes(int max) {
-            this.headerBytes = Math.max(0, max);
-            return this;
+            return new Options(budget, Math.max(0, max), lanes, cpu, strict, clock, cpuClock, wallClock, linkBase);
         }
 
         /**
@@ -573,21 +601,23 @@ public final class Tempo {
          * tempo.linkBase}, else the base the library was built with: {@code -PlinkBase}, else the GitHub
          * Pages site of the repository it was built from ({@code GITHUB_REPOSITORY} in GitHub Actions,
          * else the git remote {@code origin}), {@code https://dualuse.github.io/tempo/} for this one. A
-         * copy of this file built elsewhere uses that address. Null restores the default.
+         * copy of this file built elsewhere uses that address. Null restores the default. Returns a copy.
          *
          * @throws IllegalArgumentException if {@code base} is not an absolute URL, or has a {@code #},
          *                                  a {@code ,}, whitespace or a non-ASCII character
          */
         public Options linkBase(String base) {
             if (base != null && !Link.valid(base)) throw new IllegalArgumentException("not a Tempo-Link base: " + base);
-            this.linkBase = base;
-            return this;
+            return new Options(budget, headerBytes, lanes, cpu, strict, clock, cpuClock, wallClock, base);
         }
 
-        /** Nanosecond clock for every timestamp of the trace; default {@code System::nanoTime}. For tests. */
+        /**
+         * Nanosecond clock for every timestamp of the trace; default {@code System::nanoTime}. For tests. A
+         * self-contained block keeps the outer trace's: one trace, one timeline. Returns a copy.
+         */
         public Options clock(LongSupplier nanoClock) {
-            this.clock = nanoClock == null ? SYSTEM_CLOCK : nanoClock;
-            return this;
+            return new Options(budget, headerBytes, lanes, cpu, strict, nanoClock == null ? SYSTEM_CLOCK : nanoClock,
+                    cpuClock, wallClock, linkBase);
         }
 
         /**
@@ -596,17 +626,20 @@ public final class Tempo {
          * only for a task that begins while that lane is open under another trace's task. A pool
          * of platform threads stays far below the cap; with a thread per task (virtual threads) the tasks
          * begun past it are not recorded. Such a task's record at the submit is left out of the tree, its
-         * queue wait is added to {@link Trace#total(Name)} of its name, and it counts as dropped.
+         * queue wait is added to {@link Trace#total(Name)} of its name, and it counts as dropped. A
+         * self-contained block keeps the outer trace's lanes. Returns a copy.
          */
         public Options lanes(int max) {
-            this.lanes = Math.max(1, max);
-            return this;
+            return new Options(budget, headerBytes, Math.max(1, max), cpu, strict, clock, cpuClock, wallClock, linkBase);
         }
 
-        /** Throws {@link AssertionError} at the offending call on misuse instead of healing silently. */
+        /**
+         * Throws {@link AssertionError} at the offending call on misuse instead of healing silently. In a
+         * self-contained block it holds for the block's subtree; strictness only widens there, so a strict
+         * outer trace stays strict inside a lenient block. Returns a copy.
+         */
         public Options strict(boolean on) {
-            this.strict = on;
-            return this;
+            return new Options(budget, headerBytes, lanes, cpu, on, clock, cpuClock, wallClock, linkBase);
         }
     }
 
