@@ -958,7 +958,7 @@ class BlockTest {
 
     @Test
     void optionsAreImmutableAndEverySetterReturnsACopy() {
-        Options base = new Options();
+        Options base = Options.DEFAULTS;
         Options[] derived = {
                 base.budget(64), base.cpu(true), base.cpuClock(() -> 1), base.wallClock(() -> 1), base.headerBytes(1),
                 base.linkBase("https://viewer.example.org/"), base.clock(() -> 1), base.lanes(1), base.strict(true)};

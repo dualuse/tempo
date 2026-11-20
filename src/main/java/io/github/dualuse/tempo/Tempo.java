@@ -523,7 +523,7 @@ public final class Tempo {
      * never leaks back:
      *
      * <pre>{@code
-     * static final Tempo.Options BLOCK = new Tempo.Options().budget(64).strict(true);
+     * static final Tempo.Options BLOCK = Tempo.Options.DEFAULTS.budget(64).strict(true);
      * static final Tempo.Options DEBUG = BLOCK.cpu(true); // BLOCK still measures as the trace decides
      * }</pre>
      *
@@ -535,7 +535,12 @@ public final class Tempo {
      * each setter says. A top-level trace takes the defaults for what is unset.
      */
     public static final class Options {
-        static final Options DEFAULTS = new Options();
+        /**
+         * The defaults, what a trace takes without {@code Options}; the same as {@link #Options()}. Every
+         * setter returns a copy, so this is the place to derive a configuration from:
+         * {@code Tempo.Options.DEFAULTS.strict(true)}.
+         */
+        public static final Options DEFAULTS = new Options();
         // Bits of `set`: the settings given by a setter, which a block takes instead of the outer trace's.
         static final int BUDGET = 1, HEADER_BYTES = 1 << 1, LINK_BASE = 1 << 2;
 
@@ -546,7 +551,10 @@ public final class Tempo {
         final String linkBase;              // null: Link.base()
         final int set;                      // BUDGET, HEADER_BYTES, LINK_BASE: given by a setter (cpu: not CPU_AUTO)
 
-        /** The defaults: a budget of 512, 3,000 header bytes, 256 lanes, CPU time as the level decides, lenient. */
+        /**
+         * The defaults, equal to {@link #DEFAULTS}: a budget of 512, 3,000 header bytes, 256 lanes, CPU time
+         * as the level decides, lenient.
+         */
         public Options() {
             this(512, 3000, 256, CPU_AUTO, false, SYSTEM_CLOCK, null, System::currentTimeMillis, null, 0);
         }
@@ -5480,7 +5488,7 @@ public final class Tempo {
      * wherever it runs. The outer trace still counts and draws everything, the block's spans with the rest.
      *
      * <pre>{@code
-     * static final Tempo.Options BLOCK = new Tempo.Options().budget(64);
+     * static final Tempo.Options BLOCK = Tempo.Options.DEFAULTS.budget(64);
      *
      * Tempo.Trace in = Tempo.trace("rebuild-index", BLOCK); // top-level, or a block of the caller's trace
      * try (in) {

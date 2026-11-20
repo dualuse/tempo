@@ -372,7 +372,7 @@ joins that trace as a subtree, a block, and still works for the block exactly as
 top-level:
 
 ```java
-static final Tempo.Options RENDERER = new Tempo.Options().budget(64).strict(true); // shared, immutable
+static final Tempo.Options RENDERER = Tempo.Options.DEFAULTS.budget(64).strict(true); // shared, immutable
 
 Tempo.Trace in = Tempo.trace("render", RENDERER).records(Tempo.STEP);
 in.on("scale", nanos -> scaleTimes.add(nanos));      // the block's scale tasks only
@@ -466,7 +466,8 @@ or shares a handle, so every stale use throws: use it in tests.
 
 `Options` are immutable: every setter returns a new `Options` with that one setting changed, so
 a constant configured once is safe to share, and a setting derived from it never leaks back
-(`static final Tempo.Options BLOCK = new Tempo.Options().budget(64).strict(true)`). A
+(`static final Tempo.Options BLOCK = Tempo.Options.DEFAULTS.budget(64).strict(true)`;
+`Options.DEFAULTS` is what a trace takes without `Options`, the same as `new Tempo.Options()`). A
 self-contained block takes `clock` and `lanes` from the outer trace and honours the rest for
 its subtree; what it leaves unset it inherits from the outer trace (see
 [Self-contained blocks](#self-contained-blocks)).
