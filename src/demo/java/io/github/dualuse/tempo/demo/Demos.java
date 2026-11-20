@@ -45,6 +45,7 @@ public final class Demos {
             new Entry("medium", "WorkerPool", "Tempo.executor: queue wait, CPU time, caller-runs, rejection, Future.cancel"),
             new Entry("medium", "MetricsAndListeners", "listeners and totals: metrics from spans, queue wait of undrawn tasks"),
             new Entry("medium", "ResponseHeaders", "headers under a byte limit, Tempo-Link, JSON in the body, reading a trace"),
+            new Entry("medium", "SelfContainedBlocks", "a component with its own trace, alone and as a block inside a request"),
 
             new Entry("complex", "SearchRequest", "a search request fanned out to an I/O pool and a compute pool, with early exit"),
             new Entry("complex", "IngestPipeline", "an upload through hand-written stage workers, bounded queues, backpressure"),

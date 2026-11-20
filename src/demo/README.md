@@ -1,6 +1,6 @@
 # Demos
 
-Eleven small programs that use Tempo the way an application does, from a first trace to a
+Twelve small programs that use Tempo the way an application does, from a first trace to a
 service with several thread pools. They live in their own source set (`src/demo/java`), see
 `main` and nothing else, and ship nowhere.
 
@@ -67,7 +67,8 @@ span anyway (to set a number on it), or `Tempo.run` fits, no annotation is neede
 
 Read them in the order of the tables below. Each grade builds on the one before: the simple
 demos run on one thread, the medium ones introduce one concept each (steps and ticks, thread
-pools, totals and listeners, headers), and the complex ones combine them into a service.
+pools, totals and listeners, headers, self-contained blocks), and the complex ones combine them
+into a service.
 
 ### Simple: one thread, one trace
 
@@ -85,6 +86,7 @@ pools, totals and listeners, headers), and the complex ones combine them into a 
 | `WorkerPool` | Work submitted to thread pools: queue wait, CPU time per task, a blocking join, and the ways a task ends without running on the pool (caller-runs, rejected, cancelled through its future by an early exit). | `Tempo.executor`, `Future.cancel`, `waiting`, `Tempo.current` in a task, CPU time at `STEP` |
 | `MetricsAndListeners` | Spans that also feed a service's metrics, totals of steps and of pool tasks that the trace does not draw, with the tasks' queue wait, and a measurement taken elsewhere. | `Tempo.on`, `Trace.on`, `Trace.total` (`count`, `mean`, `waitSum`, `waitMax`), `Span.add`, `Tempo.run` outside a trace |
 | `ResponseHeaders` | Getting a trace out of a service: four headers under one byte limit, a link to a self-hosted viewer, JSON in the body, reading a trace in code. | `toHeader(maxBytes)`, `toLink(base, maxBytes)`, `Options.linkBase`, `snapshot`, `Snapshot.writeJson`, `x=folded.dropped` |
+| `SelfContainedBlocks` | A component that starts its own trace, run alone by a nightly job and inside a request: as a block of the request it keeps its own totals, listener, level (`records(STEP)` while the request records spans) and settings, its tasks on a pool included, and logs the same report either way. | nested `Tempo.trace` as a block, block `total` / `on` / `records`, a shared immutable `Options` constant (sub-budget, `strict`), `printOnClose` |
 
 ### Complex: a service
 
