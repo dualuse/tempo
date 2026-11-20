@@ -368,7 +368,7 @@ class BlockTest {
         Trace req = Tempo.trace(SEARCH, opts().budget(3)).records(STEP);
         step(MATCH, 1);
         step(MATCH, 1);
-        Trace in = Tempo.trace(RERANK); // the default budget, 512, of which the request has 1 left
+        Trace in = Tempo.trace(RERANK); // no sub-budget: what the request has left, 1
         for (int i = 0; i < 3; i++) step(LOAD, 1);
         in.close();
         req.close();
@@ -381,6 +381,41 @@ class BlockTest {
                 "    load 3+2 agg*2 min=1 max=1 maxAt=0 extent=2"), tree(req));
         assertEquals(0, req.ctx.unspent());
         req.release();
+    }
+
+    /** What a block's Options leave unset comes from the request; what they set applies, a null link base too. */
+    @Test
+    void aBlockInheritsWhatItsOptionsLeaveUnset() {
+        TempoTest.Clock cpu = new TempoTest.Clock();
+        Trace req = Tempo.trace(SEARCH, opts().cpuClock(cpu).cpu(true).budget(600).headerBytes(256)
+                .linkBase("https://viewer.example.org/request/")).records(STEP);
+        Trace in = Tempo.trace(RERANK, new Options());
+        for (int i = 0; i < 550; i++) step(LOAD, 1); // no sub-budget: the request's 600, not a default 512
+        in.close();
+        assertEquals(0, req.folded());
+        assertEquals(50, req.ctx.unspent());
+        assertTrue(in.measuresCpu());
+        assertTrue(in.toHeader().length() <= 256 && in.toHeader().contains("x="), in.toHeader());
+        assertTrue(in.toLink().startsWith("https://viewer.example.org/request/#"), in.toLink());
+
+        Trace own = Tempo.trace(INDEX, new Options().budget(2).headerBytes(3000).linkBase(null).cpu(false));
+        for (int i = 0; i < 4; i++) step(MATCH, 1);
+        for (int i = 0; i < 40; i++) span(LOAD, 1);
+        own.close();
+        req.close();
+        assertEquals(2, req.folded());
+        assertEquals(48, req.ctx.unspent());
+        assertFalse(own.measuresCpu());
+        assertTrue(own.toHeader().length() > 256 && own.toHeader().contains(";x=2.0;"), own.toHeader()); // its own limit: no ladder
+        assertFalse(own.toLink().startsWith("https://viewer.example.org/"), own.toLink());
+        req.release();
+
+        Trace strict = Tempo.trace(SEARCH, opts().strict(true));
+        Trace lenient = Tempo.trace(RERANK, new Options());
+        assertThrows(AssertionError.class, () -> Tempo.span((Name) null));
+        lenient.close();
+        strict.close();
+        strict.release();
     }
 
     @Test

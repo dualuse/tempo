@@ -134,8 +134,10 @@ public final class Tempo {
      * Trace#on} and {@link Trace#records(int)} cover the subtree, its tasks on other threads included; its
      * renders are of the subtree, with the block's {@link Options#headerBytes} and {@link
      * Options#linkBase}; its {@link Options#strict}, {@link Options#cpu} and {@link Options#budget} (a
-     * sub-budget, taken from what the outer trace has left) hold in the subtree and its tasks. {@link
-     * Options#clock} and {@link Options#lanes} stay the outer trace's, and {@link Trace#release()} leaves
+     * sub-budget, taken from what the outer trace has left) hold in the subtree and its tasks. What its
+     * options leave unset it inherits from the outer trace: the header limit, viewer, strictness and CPU
+     * setting as the outer trace has them, and without a budget of its own it draws from what the outer
+     * trace has left. {@link Options#clock} and {@link Options#lanes} stay the outer trace's, and {@link Trace#release()} leaves
      * the buffers to it. Blocks nest. The call allocates the one {@code Trace}. A trace left open on a pool
      * thread takes in every later trace there: close each one.
      */
@@ -527,23 +529,30 @@ public final class Tempo {
      *
      * A trace started inside another one, a self-contained block (see {@link Tempo#trace(Name, Options)}),
      * takes {@code clock} and {@code lanes} from the outer trace and honours the rest for its own subtree.
+     * What its {@code Options} leave unset it inherits from the outer trace: {@code headerBytes}, {@code
+     * linkBase}, {@code cpu} and {@code strict} as the outer trace has them, and without a {@code budget}
+     * of its own it has no sub-budget and draws from what the outer trace has left. What is set applies as
+     * each setter says. A top-level trace takes the defaults for what is unset.
      */
     public static final class Options {
         static final Options DEFAULTS = new Options();
+        // Bits of `set`: the settings given by a setter, which a block takes instead of the outer trace's.
+        static final int BUDGET = 1, HEADER_BYTES = 1 << 1, LINK_BASE = 1 << 2;
 
         final int budget, headerBytes, lanes, cpu;
         final boolean strict;
         final LongSupplier clock, cpuClock; // cpuClock: tests only; null reads the thread's CPU time
         final LongSupplier wallClock;       // tests only
         final String linkBase;              // null: Link.base()
+        final int set;                      // BUDGET, HEADER_BYTES, LINK_BASE: given by a setter (cpu: not CPU_AUTO)
 
         /** The defaults: a budget of 512, 3,000 header bytes, 256 lanes, CPU time as the level decides, lenient. */
         public Options() {
-            this(512, 3000, 256, CPU_AUTO, false, SYSTEM_CLOCK, null, System::currentTimeMillis, null);
+            this(512, 3000, 256, CPU_AUTO, false, SYSTEM_CLOCK, null, System::currentTimeMillis, null, 0);
         }
 
         private Options(int budget, int headerBytes, int lanes, int cpu, boolean strict, LongSupplier clock,
-                LongSupplier cpuClock, LongSupplier wallClock, String linkBase) {
+                LongSupplier cpuClock, LongSupplier wallClock, String linkBase, int set) {
             this.budget = budget;
             this.headerBytes = headerBytes;
             this.lanes = lanes;
@@ -553,6 +562,12 @@ public final class Tempo {
             this.cpuClock = cpuClock;
             this.wallClock = wallClock;
             this.linkBase = linkBase;
+            this.set = set;
+        }
+
+        /** Whether setting {@code bit} was given by a setter. */
+        boolean isSet(int bit) {
+            return (set & bit) != 0;
         }
 
         /**
@@ -560,10 +575,12 @@ public final class Tempo {
          * aggregates ({@link SpanView#aggregate()}), tasks with their queue waits.
          * Lanes take the budget in blocks of {@code max(1, budget / 64)} and give back what they did not use
          * when their task ends. In a self-contained block it is a sub-budget: the block draws at most this
-         * many in its subtree, taken from what the outer trace has left, never more. Returns a copy.
+         * many in its subtree, taken from what the outer trace has left, never more; a block without one
+         * draws from what the outer trace has left, in the outer trace's blocks. Returns a copy.
          */
         public Options budget(int spans) {
-            return new Options(Math.max(0, spans), headerBytes, lanes, cpu, strict, clock, cpuClock, wallClock, linkBase);
+            return new Options(Math.max(0, spans), headerBytes, lanes, cpu, strict, clock, cpuClock, wallClock, linkBase,
+                    set | BUDGET);
         }
 
         /**
@@ -580,25 +597,27 @@ public final class Tempo {
          * Returns a copy.
          */
         public Options cpu(boolean on) {
-            return new Options(budget, headerBytes, lanes, on ? CPU_ON : CPU_OFF, strict, clock, cpuClock, wallClock, linkBase);
+            return new Options(budget, headerBytes, lanes, on ? CPU_ON : CPU_OFF, strict, clock, cpuClock, wallClock, linkBase, set);
         }
 
         /** A fake CPU clock for tests, read on the calling thread like the real one; -1 is "not measured". A copy. */
         Options cpuClock(LongSupplier cpuNanos) {
-            return new Options(budget, headerBytes, lanes, cpu, strict, clock, cpuNanos, wallClock, linkBase);
+            return new Options(budget, headerBytes, lanes, cpu, strict, clock, cpuNanos, wallClock, linkBase, set);
         }
 
         /** A fake wall clock in epoch milliseconds for tests, read once when the trace starts. A copy. */
         Options wallClock(LongSupplier millis) {
-            return new Options(budget, headerBytes, lanes, cpu, strict, clock, cpuClock, millis, linkBase);
+            return new Options(budget, headerBytes, lanes, cpu, strict, clock, cpuClock, millis, linkBase, set);
         }
 
         /**
          * Byte limit of the detailed header ({@link Trace#toHeader()}) and of the value a {@link Trace#toLink()}
-         * carries; default 3000. {@link Trace#toHeader(int)} takes a limit per call. Returns a copy.
+         * carries; default 3000. {@link Trace#toHeader(int)} takes a limit per call. A self-contained block
+         * that leaves it unset writes with the outer trace's limit. Returns a copy.
          */
         public Options headerBytes(int max) {
-            return new Options(budget, Math.max(0, max), lanes, cpu, strict, clock, cpuClock, wallClock, linkBase);
+            return new Options(budget, Math.max(0, max), lanes, cpu, strict, clock, cpuClock, wallClock, linkBase,
+                    set | HEADER_BYTES);
         }
 
         /**
@@ -606,14 +625,16 @@ public final class Tempo {
          * tempo.linkBase}, else the base the library was built with: {@code -PlinkBase}, else the GitHub
          * Pages site of the repository it was built from ({@code GITHUB_REPOSITORY} in GitHub Actions,
          * else the git remote {@code origin}), {@code https://dualuse.github.io/tempo/} for this one. A
-         * copy of this file built elsewhere uses that address. Null restores the default. Returns a copy.
+         * copy of this file built elsewhere uses that address. Null restores the default. A self-contained
+         * block that leaves it unset links to the outer trace's viewer; one given null, to the default.
+         * Returns a copy.
          *
          * @throws IllegalArgumentException if {@code base} is not an absolute URL, or has a {@code #},
          *                                  a {@code ,}, whitespace or a non-ASCII character
          */
         public Options linkBase(String base) {
             if (base != null && !Link.valid(base)) throw new IllegalArgumentException("not a Tempo-Link base: " + base);
-            return new Options(budget, headerBytes, lanes, cpu, strict, clock, cpuClock, wallClock, base);
+            return new Options(budget, headerBytes, lanes, cpu, strict, clock, cpuClock, wallClock, base, set | LINK_BASE);
         }
 
         /**
@@ -622,7 +643,7 @@ public final class Tempo {
          */
         public Options clock(LongSupplier nanoClock) {
             return new Options(budget, headerBytes, lanes, cpu, strict, nanoClock == null ? SYSTEM_CLOCK : nanoClock,
-                    cpuClock, wallClock, linkBase);
+                    cpuClock, wallClock, linkBase, set);
         }
 
         /**
@@ -635,16 +656,17 @@ public final class Tempo {
          * self-contained block keeps the outer trace's lanes. Returns a copy.
          */
         public Options lanes(int max) {
-            return new Options(budget, headerBytes, Math.max(1, max), cpu, strict, clock, cpuClock, wallClock, linkBase);
+            return new Options(budget, headerBytes, Math.max(1, max), cpu, strict, clock, cpuClock, wallClock, linkBase, set);
         }
 
         /**
          * Throws {@link AssertionError} at the offending call on misuse instead of healing silently. In a
          * self-contained block it holds for the block's subtree; strictness only widens there, so a strict
-         * outer trace stays strict inside a lenient block. Returns a copy.
+         * outer trace stays strict inside a lenient block, and a block that leaves it unset is as strict as
+         * the outer trace. Returns a copy.
          */
         public Options strict(boolean on) {
-            return new Options(budget, headerBytes, lanes, cpu, on, clock, cpuClock, wallClock, linkBase);
+            return new Options(budget, headerBytes, lanes, cpu, on, clock, cpuClock, wallClock, linkBase, set);
         }
     }
 
@@ -5138,8 +5160,8 @@ public final class Tempo {
      * #total}, {@link #on} and {@link #records(int)} cover its own subtree, its tasks on other threads
      * included; it renders that subtree with its own {@link Options#headerBytes} and {@link
      * Options#linkBase}; its {@link Options#strict}, {@link Options#cpu} and {@link Options#budget} (a
-     * sub-budget) hold inside it and in its tasks. The outer trace still counts and draws everything,
-     * the block's spans with the rest.
+     * sub-budget) hold inside it and in its tasks. What its options leave unset comes from the outer trace
+     * (see {@link Options}). The outer trace still counts and draws everything, the block's spans with the rest.
      *
      * <pre>{@code
      * static final Tempo.Options BLOCK = new Tempo.Options().budget(64);
@@ -5220,10 +5242,11 @@ public final class Tempo {
             this.up = up;
             strict = up.strict || o.strict;
             cpu = o.cpu == CPU_AUTO ? up.cpu : o.cpu;
-            credits = o.budget;
-            block = Math.max(1, o.budget / 64);
-            headerBytes = o.headerBytes;
-            linkBase = o.linkBase;
+            boolean own = o.isSet(Options.BUDGET); // else no sub-budget: the outer trace's remainder, in its blocks
+            credits = own ? o.budget : Integer.MAX_VALUE;
+            block = own ? Math.max(1, o.budget / 64) : up.block;
+            headerBytes = o.isSet(Options.HEADER_BYTES) ? o.headerBytes : up.headerBytes;
+            linkBase = o.isSet(Options.LINK_BASE) ? o.linkBase : up.linkBase;
             mode = (SPAN + 1) << 1;
         }
 
