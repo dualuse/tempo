@@ -326,7 +326,7 @@ class BlockTest {
         assertEquals(lines(
                 "search 0+17",
                 "  match 0+2 agg*1 min=2 max=2 maxAt=0 extent=17 handoff~15/15 @worker-1",
-                "  match 10+5 @worker-1",
+                "  match 0+5 handoff~10 @worker-1",
                 "    rerank 11+3 @worker-1",
                 "      decode 11+3 phase 'Decode' @worker-1",
                 "      load 11+3 @worker-1"), tree(req));
@@ -370,6 +370,33 @@ class BlockTest {
         s.close();
         assertEquals(1, first.misuses.get());
         assertEquals(0, second.misuses.get());
+    }
+
+    /**
+     * An unfolded task is drawn as the handoff record of its submit (FORMAT.md 6.5): it starts at the submit
+     * and carries its queue wait and thread, as a drawn task does.
+     */
+    @Test
+    void anUnfoldedTaskIsDrawnAsTheHandoffOfItsSubmit() throws Exception {
+        Trace req = Tempo.trace(SEARCH, opts().cpu(false).budget(0)).records(STEP);
+        RunnableTask r = Tempo.runnable(MATCH, () -> {
+            clock.add(1_000);
+            Trace in = Tempo.trace(RERANK);
+            span(LOAD, 3_000);
+            in.close();
+            clock.add(1_000);
+        });
+        clock.add(10_000);
+        assertNull(onThread("worker-1", r::run));
+        req.close();
+        assertEquals(lines(
+                "search 0+15000",
+                "  match 0+5000 handoff~10000 @worker-1",
+                "    rerank 11000+3000 @worker-1",
+                "      load 11000+3000 @worker-1"), tree(req));
+        assertTrue(req.toHeader().contains(";S=00.0.f/11.0.5@1~a/22.b.3/33.0.3;"), req.toHeader());
+        assertEquals("count=1 sum=5000 mean=5000 min=5000 max=5000 waitSum=10000 waitMax=10000", req.total(MATCH).toString());
+        req.release();
     }
 
     /**

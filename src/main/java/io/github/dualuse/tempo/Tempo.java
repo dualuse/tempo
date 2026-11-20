@@ -3397,6 +3397,7 @@ public final class Tempo {
         final long[] waitingSince;  // by TASKS entry: the earliest submit of a task not begun nor cancelled; null if none
         int[] bodyLane, bodyRow;    // by handoff row: the task row linked to it, or -1
         boolean[] hidden;           // not in its parent's child list: a task drawn at its handoff, or a lost handoff
+        boolean[] unfolded;         // a task row linked to the span it was submitted from (Lane#unfold): drawn as a handoff
         boolean[] aggIn;            // of a block's snapshot: the aggregate entries in the block's scope or one nested in it
         // Child lists over the nodes: rows, a virtual parent of the lane roots, aggregates. Entries are nodes
         // of any lane, numbered across the snapshot from each lane's base (Snapshot#nodeOf), -1 for none: a
@@ -3565,9 +3566,18 @@ public final class Tempo {
             }
         }
 
-        /** Start of a row (of an inline handoff, its task's), or the first start of an aggregate node. */
+        /**
+         * Start of a row (of an inline handoff, its task's; of an unfolded task, its submit), or the first start
+         * of an aggregate node.
+         */
         long startOf(int x) {
-            return x < rows ? start[inline(x) ? x + 1 : x] : aggCell[(x - rows - 1) * Aggs.CELLS + Aggs.FIRST];
+            if (x >= rows) return aggCell[(x - rows - 1) * Aggs.CELLS + Aggs.FIRST];
+            return unfolded(x) ? start[x] - wait[x] : start[inline(x) ? x + 1 : x];
+        }
+
+        /** Whether row {@code r} is a task unfolded for a block, drawn as the handoff record of its submit. */
+        boolean unfolded(int r) {
+            return unfolded != null && r < rows && unfolded[r];
         }
 
         /**
@@ -3773,7 +3783,12 @@ public final class Tempo {
                     s.hide(r);
                     Shape t = shape(x);
                     int h = (int) x;
-                    if (t != null && h < t.rows && (t.flags[h] & HANDOFF) != 0) t.link(h, s.lane, r);
+                    if (t != null && h < t.rows && (t.flags[h] & HANDOFF) != 0) {
+                        t.link(h, s.lane, r);
+                    } else if ((s.flags[r] & TASK) != 0 && s.wait != null) { // unfolded (Lane#unfold): a handoff from that span
+                        if (s.unfolded == null) s.unfolded = new boolean[s.rows];
+                        s.unfolded[r] = true;
+                    }
                 }
             }
             // The tasks of folded handoffs, kept where they ran or were cancelled, join their TASKS entry.
@@ -3961,21 +3976,21 @@ public final class Tempo {
                 return;
             }
             int flags = s.flags[r];
-            boolean handoff = (flags & HANDOFF) != 0, begun = handoff && s.begun(r);
+            boolean handoff = (flags & HANDOFF) != 0, begun = handoff && s.begun(r), unfolded = s.unfolded(r);
             Shape b = begun ? shapes[s.bodyLane[r]] : s;
             int br = begun ? s.bodyRow[r] : r;
-            long dur = b.dur[br];
+            long dur = b.dur[br], waited = unfolded ? s.wait[r] : 0; // an unfolded task: the record of its submit
             v.shape = b;
             v.live = b.live;
             v.name = Name.byId(b.name[br]);
-            v.start = s.start[r];
+            v.start = s.start[r] - waited;
             v.open = dur == Lane.OPEN;
             v.duration = v.open ? Math.max(0, now - b.start[br]) : dur;
             v.flags = begun ? flags | b.flags[br] : flags;
-            v.handoff = handoff;
-            v.begun = begun;
+            v.handoff = handoff || unfolded;
+            v.begun = begun || unfolded;
             v.inline = begun && s.inline(r);
-            v.wait = v.waitMax = begun ? (b.wait == null ? 0 : b.wait[br]) : handoff ? Math.max(0, now - v.start) : 0;
+            v.wait = v.waitMax = begun ? (b.wait == null ? 0 : b.wait[br]) : unfolded ? waited : handoff ? Math.max(0, now - v.start) : 0;
             v.cpu = b.cpu == null || handoff && !begun ? -1 : b.cpu[br];
             v.label = b.label == null ? null : b.label[br];
             v.attrFrom = b.from[br];
