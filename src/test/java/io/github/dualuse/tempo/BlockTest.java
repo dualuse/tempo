@@ -125,6 +125,111 @@ class BlockTest {
         req.release();
     }
 
+    /**
+     * A block's total reads the block, not the request: on its lane only from its open to its end, so the
+     * same block reads the same whether the request recorded a hundred spans before it or ten thousand.
+     */
+    @Test
+    void aBlocksTotalReadsTheBlockNotTheRequest() {
+        Trace req = Tempo.trace(SEARCH, opts());
+        Trace[] blocks = new Trace[2];
+        long[] bytes = new long[2];
+        for (int k = 0; k < 2; k++) {
+            for (int i = 0; i < (k == 0 ? 100 : 10_000); i++) span(MATCH, 1);
+            Trace in = blocks[k] = Tempo.trace(RERANK);
+            step(LOAD, 2);                             // undrawn: an entry of the block
+            for (int i = 0; i < 3; i++) span(LOAD, 1);
+            in.close();
+            in.total(LOAD);
+            bytes[k] = allocatedBy(() -> in.total(LOAD));
+        }
+        req.close();
+        assertEquals(bytes[0], bytes[1], "bytes of a block's total read after 100 and after 10,000 spans");
+        for (Trace in : blocks) {
+            assertEquals("count=4 sum=5 mean=1 min=1 max=2 waitSum=0 waitMax=0", in.total(LOAD).toString());
+            assertEquals(in.total(LOAD).toString(), in.snapshot().total(LOAD).toString());
+        }
+        req.release();
+    }
+
+    /**
+     * The totals of every block, read in place from the block's own lanes, match its snapshot, which
+     * decides its subtree over every lane: blocks nested at random, with tasks drawn, folded and undrawn,
+     * run on other threads, inline in other blocks, after their block ended and from inside other tasks,
+     * cancelled, and blocks opened in them.
+     */
+    @Test
+    void aBlocksTotalsReadInPlaceMatchItsSnapshot() throws Exception {
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(3);
+        try {
+            for (int seed = 0; seed < 24; seed++) {
+                java.util.Random random = new java.util.Random(seed);
+                Trace req = Tempo.trace(SEARCH, opts().cpu(false).budget(seed % 3 == 0 ? 0 : 6 + seed)).records(seed % 4 == 1 ? SPAN : STEP);
+                List<Trace> blocks = Collections.synchronizedList(new ArrayList<>());
+                List<RunnableTask> later = new ArrayList<>();
+                List<java.util.concurrent.Future<?>> running = new ArrayList<>();
+                java.util.ArrayDeque<Trace> open = new java.util.ArrayDeque<>();
+                for (int op = 0; op < 120; op++) {
+                    switch (random.nextInt(9)) {
+                        case 0: case 1:
+                            if (open.size() < 3) {
+                                Trace in = Tempo.trace(open.size() % 2 == 0 ? RERANK : INDEX, random.nextBoolean() ? null : new Options().budget(3));
+                                blocks.add(in);
+                                open.push(in);
+                            }
+                            break;
+                        case 2:
+                            if (!open.isEmpty()) open.pop().close();
+                            break;
+                        case 3:
+                            span(LOAD, 1);
+                            break;
+                        case 4:
+                            step(LOAD, 2);
+                            break;
+                        case 5: {
+                            boolean nested = random.nextBoolean();
+                            RunnableTask t = Tempo.runnable(MATCH, () -> {
+                                step(LOAD, 1);
+                                if (nested) {
+                                    Trace in = Tempo.trace(SHARD);
+                                    blocks.add(in);
+                                    span(DECODE, 1);
+                                    Tempo.runnable(MATCH, () -> span(DECODE, 1)).run();
+                                    in.close();
+                                }
+                            });
+                            if (random.nextBoolean()) running.add(pool.submit(t));
+                            else later.add(t);
+                            break;
+                        }
+                        case 6:
+                            if (!later.isEmpty()) later.remove(random.nextInt(later.size())).run(); // inline, anywhere
+                            break;
+                        case 7:
+                            if (!later.isEmpty()) later.remove(random.nextInt(later.size())).cancel();
+                            break;
+                        default:
+                            Tempo.current().add(DECODE, 3);
+                    }
+                }
+                for (java.util.concurrent.Future<?> f : running) f.get();
+                for (RunnableTask t : later) running.add(pool.submit(t));
+                for (java.util.concurrent.Future<?> f : running) f.get();
+                while (!open.isEmpty()) open.pop().close();
+                req.close();
+                for (Trace in : blocks) {
+                    Tempo.Snapshot snap = in.snapshot();
+                    for (Name n : new Name[]{LOAD, MATCH, DECODE}) assertEquals(snap.total(n).toString(), in.total(n).toString(), "seed " + seed + " " + n);
+                }
+                assertEquals(0, req.misuses(), "seed " + seed);
+                req.release();
+            }
+        } finally {
+            pool.shutdown();
+        }
+    }
+
     // ---- listeners: the block's subtree --------------------------------------------------------------
 
     @Test

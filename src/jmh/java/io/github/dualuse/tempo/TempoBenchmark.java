@@ -494,6 +494,20 @@ public class TempoBenchmark {
         return in;
     }
 
+    /**
+     * A block called many times in one trace, each call reading its own total when it ends: the read covers
+     * the block's rows, events and aggregates on its lane, not the trace's, so it costs the same however
+     * many calls came before.
+     */
+    @Benchmark
+    public Tempo.Total blockTotal(Blocks s) {
+        s.cycle();
+        Tempo.Trace in = Tempo.trace(BLOCK);
+        Tempo.span(CHILD).close();
+        in.close();
+        return in.total(CHILD);
+    }
+
     /** Explicit handle, a trace of steps over its budget: a folded step (two clock reads, an aggregate update). */
     @Benchmark
     public Tempo.Span folded(Folding s) {

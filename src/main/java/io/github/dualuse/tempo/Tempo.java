@@ -971,84 +971,24 @@ public final class Tempo {
 
         /**
          * The totals of {@code id} in the subtree of self-contained block {@code block}, computed on read:
-         * the rows below the block's row (on its lane, and on the lanes of its tasks through their links),
-         * the queue waits of the task rows among them, the aggregate entries of the block's scope and of the
-         * blocks nested in it (folded spans and tasks, undrawn steps and tasks), and the lane-less adds and
-         * waits of that scope. Recording pays nothing for it. A read racing {@link #release()} is thrown
-         * away, as in {@link #total(int)}.
+         * the rows of the subtree, the queue waits of the task rows among them, the aggregate entries of the
+         * block's scope and of the blocks nested in it (folded spans and tasks, undrawn steps and tasks, adds),
+         * and the lane-less adds and waits of that scope. Recording pays nothing for it. The read is as large
+         * as the block, not the trace: on the block's own lane it reads the rows, events and aggregates from
+         * its open to its end, and further lanes only where a task of the block began or was cancelled (on
+         * its own lane after it ended too), whole. It allocates one bit per row read and one {@link Total}.
+         * A block that is a frame has no rows: its aggregates, on every lane. A read racing {@link
+         * #release()} is thrown away, as in {@link #total(int)}.
          */
         Total total(int id, Trace block) {
             if (released) return Total.EMPTY;
-            long count = 0, sum = 0, min = Long.MAX_VALUE, max = 0, waits = 0, waitSum = 0, waitMax = 0;
+            long[] sum = {0, 0, Long.MAX_VALUE, 0, 0, 0, 0}; // count, sum, min, max, waits, waitSum, waitMax
             try {
-                Lane[] lanes = lanesById();
-                int n = lanes.length;
-                int[] rows = new int[n], events = new int[n];
-                int[][] parent = new int[n][];
-                long[][] link = new long[n][];
-                for (int i = 0; i < n; i++) {
-                    Lane l = lanes[i];
-                    if (l == null || l.retired()) {
-                        parent[i] = new int[0];
-                        continue;
-                    }
-                    long commit = l.committed();
-                    rows[i] = (int) (commit >>> 32);
-                    events[i] = (int) commit;
-                    parent[i] = new int[rows[i]];
-                    for (int r = 0; r < rows[i]; r++) parent[i][r] = l.rows[r >>> Lane.CHUNK_BITS].parent[r & Lane.MASK];
-                    for (int e = 0; e < events[i]; e++) {
-                        Events c = l.events[e >>> Lane.CHUNK_BITS];
-                        int k = e & Lane.MASK;
-                        if ((c.key[k] & KIND_MASK) != XPARENT) continue;
-                        if (link[i] == null) Arrays.fill(link[i] = new long[rows[i]], -1);
-                        if (c.row[k] < rows[i]) link[i][c.row[k]] = c.value[k];
-                    }
-                }
-                Lane bl = block.lane;
-                boolean[][] in = subtree(bl == null ? -1 : bl.id, block.row, rows, parent, link);
-                for (int i = 0; i < n; i++) {
-                    Lane l = lanes[i];
-                    if (l == null || l.retired()) continue;
-                    boolean[] mine = in[i];
-                    for (int r = 0; r < rows[i]; r++) {
-                        if (!mine[r]) continue;
-                        Rows c = l.rows[r >>> Lane.CHUNK_BITS];
-                        int k = r & Lane.MASK, f = c.flags[k];
-                        if (c.name[k] != id || (f & (HANDOFF | UNRUN)) != 0) continue;
-                        long d = (long) Lane.DUR.getOpaque(c.dur, k);
-                        if (d == Lane.OPEN) continue;
-                        count++;
-                        sum += d;
-                        min = Math.min(min, d);
-                        max = Math.max(max, d);
-                    }
-                    for (int e = 0; e < events[i]; e++) {
-                        Events c = l.events[e >>> Lane.CHUNK_BITS];
-                        int k = e & Lane.MASK, r = c.row[k];
-                        if ((c.key[k] & KIND_MASK) != QWAIT || r >= rows[i] || !mine[r] || l.nameOf(r) != id) continue;
-                        long w = c.value[k];
-                        waits++;
-                        waitSum += w;
-                        waitMax = Math.max(waitMax, w);
-                    }
-                    Aggs a = (Aggs) Lane.AGGS.getAcquire(l);
-                    for (int e = 0, m = a == null ? 0 : a.size(); e < m; e++) {
-                        int k = e * Aggs.KEY, b = e * Aggs.CELLS, kind = a.keys[k + Aggs.KIND];
-                        if (a.keys[k + Aggs.NAME] != id || a.cells[b + Aggs.COUNT] == 0 || kind == Aggs.TASKS
-                                || kind == Aggs.SPANS && a.keys[k] >= rows[i] || !Trace.within(a.scopes[e], block)) continue;
-                        if (kind != Aggs.UNRUN) {
-                            count += a.cells[b + Aggs.COUNT];
-                            sum += a.cells[b + Aggs.SUM];
-                            min = Math.min(min, a.cells[b + Aggs.MIN]);
-                            max = Math.max(max, a.cells[b + Aggs.MAX_DUR]);
-                        }
-                        if (kind == Aggs.RAN || kind == Aggs.UNRUN) {
-                            waits += a.cells[b + Aggs.COUNT];
-                            waitSum += a.cells[b + Aggs.WAIT_SUM];
-                            waitMax = Math.max(waitMax, a.cells[b + Aggs.WAIT_MAX]);
-                        }
-                    }
+                if (block.row == Lane.FRAME) {
+                    for (Lane l = lanes; l != null; l = l.next) if (!l.retired()) aggregates(l, 0, -1, id, block, sum);
+                } else {
+                    Reach in = Reach.of(block);
+                    if (in != null) in.sum(id, sum);
                 }
             } catch (RuntimeException e) {
                 VarHandle.acquireFence();
@@ -1056,7 +996,34 @@ public final class Tempo {
                 throw e;
             }
             VarHandle.acquireFence();
-            return released ? Total.EMPTY : Totals.merge(block.totals, id, count, sum, min, max, waits, waitSum, waitMax);
+            return released ? Total.EMPTY : Totals.merge(block.totals, id, sum[0], sum[1], sum[2], sum[3], sum[4], sum[5], sum[6]);
+        }
+
+        /**
+         * Adds to {@code sum} the aggregate entries of {@code id} of lane {@code l} from {@code from} up to {@code
+         * to} (-1: all published) whose scope is {@code block} or in it, read as {@link #total(int)} reads them.
+         */
+        static void aggregates(Lane l, int from, int to, int id, Trace block, long[] sum) {
+            Aggs a = (Aggs) Lane.AGGS.getAcquire(l);
+            if (a == null) return;
+            int rows = (int) (l.committed() >>> 32), n = a.size();
+            if (to >= 0) n = Math.min(n, to);
+            for (int e = from; e < n; e++) {
+                int k = e * Aggs.KEY, b = e * Aggs.CELLS, kind = a.keys[k + Aggs.KIND];
+                if (a.keys[k + Aggs.NAME] != id || a.cells[b + Aggs.COUNT] == 0 || kind == Aggs.TASKS
+                        || kind == Aggs.SPANS && a.keys[k] >= rows || !Trace.within(a.scopes[e], block)) continue;
+                if (kind != Aggs.UNRUN) {
+                    sum[0] += a.cells[b + Aggs.COUNT];
+                    sum[1] += a.cells[b + Aggs.SUM];
+                    sum[2] = Math.min(sum[2], a.cells[b + Aggs.MIN]);
+                    sum[3] = Math.max(sum[3], a.cells[b + Aggs.MAX_DUR]);
+                }
+                if (kind == Aggs.RAN || kind == Aggs.UNRUN) {
+                    sum[4] += a.cells[b + Aggs.COUNT];
+                    sum[5] += a.cells[b + Aggs.WAIT_SUM];
+                    sum[6] = Math.max(sum[6], a.cells[b + Aggs.WAIT_MAX]);
+                }
+            }
         }
 
         /**
@@ -1131,6 +1098,155 @@ public final class Tempo {
         /** Pairs of {@code (laneId << 32 | row, submit)}; a folded task's row is {@code ~entry}. */
         synchronized long[] lost() {
             return lost == null ? new long[0] : Arrays.copyOf(lost, lostCount);
+        }
+    }
+
+    /**
+     * The rows of a drawn block's subtree, read for its totals ({@link Context#total(int, Trace)}) on the lanes
+     * they can be on: its own lane from its row to where it ended (to the commit while it is open, or once a
+     * task of it ran there after it ended), and each lane where a task of it began or was cancelled, whole
+     * ({@link Trace#lanesRan}). A row is in it as {@link Context#subtree} decides: by its link if it has
+     * one, else by its parent; the block's row is. One bit per row read; links between the lanes read are
+     * followed until nothing changes, which takes one pass over each lane unless a link points to a lane
+     * read later.
+     */
+    static final class Reach {
+        final Trace block;
+        final Lane[] lane;
+        final int[] from, to, events, eventsTo, aggs, aggsTo;
+        final long[][] in;
+        int n;
+
+        private Reach(Trace block, int lanes) {
+            this.block = block;
+            lane = new Lane[lanes];
+            from = new int[lanes];
+            to = new int[lanes];
+            events = new int[lanes];
+            eventsTo = new int[lanes];
+            aggs = new int[lanes];
+            aggsTo = new int[lanes];
+            in = new long[lanes][];
+        }
+
+        /** The subtree of drawn block {@code block}, its rows decided; null if its row is not published yet. */
+        static Reach of(Trace block) {
+            Lane own = block.lane;
+            Context ctx = own.ctx;
+            long commit = own.committed();
+            int rows = (int) (commit >>> 32), r = block.row;
+            if (own.retired() || r >= rows) return null;
+            int ran = block.lanesRan(), mine = 1 << Math.min(own.id, 31);
+            long closed = block.closedAt();
+            int lanes = 1 + Integer.bitCount(ran & ~mine & 0x7FFF_FFFF);
+            if (ran < 0) lanes += Math.max(0, (ctx.lanes == null ? 0 : ctx.lanes.id + 1) - 31);
+            Reach x = new Reach(block, lanes);
+            Aggs a = (Aggs) Lane.AGGS.getAcquire(own);
+            int size = a == null ? 0 : a.size();
+            if (closed != 0 && (ran & mine) == 0) { // ended, and none of its tasks ran here since: up to its end
+                x.add(own, r, Math.min(rows, (int) (closed & 0x1F_FFFF) - 1), block.eventsBefore(),
+                        Math.min((int) commit, (int) (closed >>> 21 & 0x1F_FFFF)), block.aggsBefore(), Math.min(size, (int) (closed >>> 42)));
+            } else {
+                x.add(own, r, rows, block.eventsBefore(), (int) commit, block.aggsBefore(), size);
+            }
+            for (Lane l = ctx.lanes; l != null && ran != 0; l = l.next) {
+                if (l == own || l.retired() || (ran & 1 << Math.min(l.id, 31)) == 0) continue;
+                long c = l.committed();
+                Aggs t = (Aggs) Lane.AGGS.getAcquire(l);
+                x.add(l, 0, (int) (c >>> 32), 0, (int) c, 0, t == null ? 0 : t.size());
+            }
+            while (x.pass()) { }
+            return x;
+        }
+
+        private void add(Lane l, int rowsFrom, int rowsTo, int eventsFrom, int eventsTo, int aggsFrom, int aggsTo) {
+            if (n == lane.length) return; // a lane registered after the count
+            lane[n] = l;
+            from[n] = rowsFrom;
+            to[n] = Math.max(rowsFrom, rowsTo);
+            events[n] = eventsFrom;
+            this.eventsTo[n] = Math.max(eventsFrom, eventsTo);
+            aggs[n] = aggsFrom;
+            this.aggsTo[n] = Math.max(aggsFrom, aggsTo);
+            in[n] = new long[(to[n] - rowsFrom + 63) >>> 6];
+            n++;
+        }
+
+        /**
+         * One pass over every lane read, in order, deciding the rows not in yet. Its links (XPARENT events)
+         * come in row order, each written with its row, so they are read alongside. Returns whether another
+         * pass is needed: a link pointed to a row of a lane read later in this pass that is not in yet.
+         */
+        private boolean pass() {
+            boolean again = false;
+            for (int k = 0; k < n; k++) {
+                Lane l = lane[k];
+                long[] b = in[k];
+                int lo = from[k], hi = to[k], e = events[k], eEnd = eventsTo[k];
+                for (int r = lo; r < hi; r++) {
+                    long link = -1;
+                    for (; e < eEnd; e++) {
+                        Events c = l.events[e >>> Lane.CHUNK_BITS];
+                        int i = e & Lane.MASK;
+                        if ((c.key[i] & KIND_MASK) != XPARENT) continue;
+                        if (c.row[i] > r) break;
+                        if (c.row[i] == r) link = c.value[i];
+                    }
+                    if ((b[(r - lo) >>> 6] & 1L << (r - lo)) != 0) continue;
+                    boolean y;
+                    if (k == 0 && r == lo) {
+                        y = true; // the block's own row
+                    } else if (link >= 0) {
+                        int j = index((int) (link >>> 32)), t = (int) link;
+                        y = j >= 0 && has(j, t);
+                        if (!y && j > k && t >= from[j] && t < to[j]) again = true;
+                    } else {
+                        int p = l.rows[r >>> Lane.CHUNK_BITS].parent[r & Lane.MASK];
+                        y = p >= lo && p < r && (b[(p - lo) >>> 6] & 1L << (p - lo)) != 0;
+                    }
+                    if (y) b[(r - lo) >>> 6] |= 1L << (r - lo);
+                }
+            }
+            return again;
+        }
+
+        private int index(int laneId) {
+            for (int k = 0; k < n; k++) if (lane[k].id == laneId) return k;
+            return -1;
+        }
+
+        private boolean has(int k, int r) {
+            int lo = from[k];
+            return r >= lo && r < to[k] && (in[k][(r - lo) >>> 6] & 1L << (r - lo)) != 0;
+        }
+
+        /** Adds to {@code sum} what {@link Context#total(int, Trace)} counts of {@code id} on the lanes read. */
+        void sum(int id, long[] sum) {
+            for (int k = 0; k < n; k++) {
+                Lane l = lane[k];
+                for (int r = from[k]; r < to[k]; r++) {
+                    if (!has(k, r)) continue;
+                    Rows c = l.rows[r >>> Lane.CHUNK_BITS];
+                    int i = r & Lane.MASK, f = c.flags[i];
+                    if (c.name[i] != id || (f & (HANDOFF | UNRUN)) != 0) continue;
+                    long d = (long) Lane.DUR.getOpaque(c.dur, i);
+                    if (d == Lane.OPEN) continue;
+                    sum[0]++;
+                    sum[1] += d;
+                    sum[2] = Math.min(sum[2], d);
+                    sum[3] = Math.max(sum[3], d);
+                }
+                for (int e = events[k]; e < eventsTo[k]; e++) { // every task row, begun or cancelled, has one QWAIT
+                    Events c = l.events[e >>> Lane.CHUNK_BITS];
+                    int i = e & Lane.MASK, r = c.row[i];
+                    if ((c.key[i] & KIND_MASK) != QWAIT || !has(k, r) || l.nameOf(r) != id) continue;
+                    long w = c.value[i];
+                    sum[4]++;
+                    sum[5] += w;
+                    sum[6] = Math.max(sum[6], w);
+                }
+                Context.aggregates(l, aggs[k], aggsTo[k], id, block, sum);
+            }
         }
     }
 
@@ -1711,6 +1827,29 @@ public final class Tempo {
             scopeAt = d;
         }
 
+        /**
+         * Tells every drawn block opened at depth {@code d} or above, which has just ended, where its rows,
+         * events and aggregates on this lane end ({@link Trace#closed}); before {@link #leaveScopes}.
+         */
+        private void closeBlocks(int d) {
+            for (int at = scopeAt; at >= d; at = outerAt[at]) {
+                Span h = handles[at];
+                if (h instanceof Trace && ((Trace) h).up != null && h.row != FRAME) ((Trace) h).closed(rowCount, eventCount, aggregates());
+            }
+        }
+
+        /**
+         * A task of scope {@code sc} begins or is cancelled on this lane: marks the lane on every block from
+         * {@code sc} out, but on a block open on this lane, whose own rows cover it, so the block's totals
+         * read this lane ({@link Context#total(int, Trace)}). Nothing outside blocks.
+         */
+        private void ran(Trace sc) {
+            for (Trace s = sc; s.up != null; s = s.up) {
+                if (s.row == FRAME || s.lane == this && s.depth < depth && handles[s.depth] == s) continue;
+                s.ran(id);
+            }
+        }
+
         /** Restores the scope from before every switch at depth {@code d} or above; the spans there have ended. */
         private void leaveScopes(int d) {
             while (scopeAt >= d) {
@@ -1864,10 +2003,11 @@ public final class Tempo {
             Name n = h.name;
             Span s = NOOP;
             int r = -1, d = depth;
+            Trace sc = h.scope();
+            if (sc.up != null) ran(sc);
             if (eventCount > MAX_EVENTS - 2) {
                 dropped++;
             } else if (run) {
-                Trace sc = h.scope();
                 if (sc != scope) enterScope(sc, d); // a task carries the scope it was submitted in
                 s = stack(n, TASK);
                 r = s == NOOP ? -1 : s.row;
@@ -1915,6 +2055,7 @@ public final class Tempo {
             Aggs t = (Aggs) AGGS.getAcquire(h.lane); // read once: the name and the scope come from one table
             int id = t == null ? -1 : t.keys[target * Aggs.KEY + Aggs.NAME];
             Trace sc = id < 0 ? scope : h.lane.scopeIn(t, target);
+            if (id >= 0 && sc.up != null) ran(sc);
             int e = id < 0 ? -1 : aggregate(target, h.lane.id, -1, id, run ? Aggs.RAN : Aggs.UNRUN, sc);
             if (e < 0) {
                 if (root) idle();
@@ -1958,6 +2099,7 @@ public final class Tempo {
             boolean root = d == 0;
             if (root && !activate()) return NOOP;
             Trace sc = h.scope();
+            if (sc.up != null) ran(sc);
             int e = aggregate(-1, -1, -1, h.name.id, run ? Aggs.RAN : Aggs.UNRUN, sc);
             if (e < 0) {
                 if (root) idle();
@@ -2114,6 +2256,7 @@ public final class Tempo {
                 h.time = ctx.now();
                 return h;
             }
+            t.opened(eventCount, aggregates());
             Span h = stack(n, flags, t);
             if (h == NOOP) {
                 leaveScopes(d);
@@ -2179,7 +2322,10 @@ public final class Tempo {
             boolean healed = unwind(d, now);
             publish();
             if (ctx.listening) fire(d + 1, top);
-            if (scopeAt > d) leaveScopes(d + 1);
+            if (scopeAt > d) {
+                closeBlocks(d + 1);
+                leaveScopes(d + 1);
+            }
             if (thrown != null) rethrow();
             if (healed) scope.misuse("span opened under a span that is not the innermost");
         }
@@ -2493,6 +2639,7 @@ public final class Tempo {
             Trace sc = scope;
             if (scopeAt >= d) {
                 sc = scopeOf(d);
+                closeBlocks(d);
                 leaveScopes(d);
             }
             if (d == 0 && !free) exitRoot();
@@ -5339,7 +5486,7 @@ public final class Tempo {
      * }</pre>
      */
     public static final class Trace extends Span {
-        private static final VarHandle MODE, CREDITS, TOTALS;
+        private static final VarHandle MODE, CREDITS, TOTALS, CLOSED, RAN;
 
         static {
             try {
@@ -5347,6 +5494,8 @@ public final class Tempo {
                 MODE = l.findVarHandle(Trace.class, "mode", int.class);
                 CREDITS = l.findVarHandle(Trace.class, "credits", int.class);
                 TOTALS = l.findVarHandle(Trace.class, "totals", Totals.class);
+                CLOSED = l.findVarHandle(Span.class, "wait", long.class);
+                RAN = l.findVarHandle(Span.class, "flags", int.class);
             } catch (ReflectiveOperationException e) {
                 throw new ExceptionInInitializerError(e);
             }
@@ -5550,6 +5699,47 @@ public final class Tempo {
         Totals frozenTotals() {
             Totals t = totals;
             return t == null ? null : t.copy();
+        }
+
+        // A drawn block's place on its lane, for its totals (Context#total(int, Trace)), kept in three fields of
+        // its handle that only a frame uses (a block that is a frame has no rows): `time`, written as it opens,
+        // the lane's events and aggregates before it; `wait`, written as it ends, the lane's rows + 1, events
+        // and aggregates then (0 while open); `flags`, the lanes besides its own open span where a task of it,
+        // or of a block in it, began or was cancelled, by bit: the lane's id, 31 for any id from 31 on.
+
+        /** Lane, as a drawn block opens: what its lane had of events and aggregates before it. */
+        void opened(int events, int aggs) {
+            time = (long) aggs << 32 | events;
+        }
+
+        /** Lane, as a drawn block ends: what its lane has of rows, events and aggregates now. */
+        void closed(int rows, int events, int aggs) {
+            CLOSED.setRelease(this, (long) aggs << 42 | (long) events << 21 | rows + 1);
+        }
+
+        /** Any thread: a task of this drawn block began or was cancelled on lane {@code laneId}. */
+        void ran(int laneId) {
+            int bit = 1 << Math.min(laneId, 31);
+            if (((int) RAN.getOpaque(this) & bit) == 0) RAN.getAndBitwiseOr(this, bit);
+        }
+
+        /** The events of its lane before it opened; and its aggregates ({@link #aggsBefore}). */
+        int eventsBefore() {
+            return (int) time;
+        }
+
+        int aggsBefore() {
+            return (int) (time >>> 32);
+        }
+
+        /** {@link #closed} packed, or 0 while open. Any thread. */
+        long closedAt() {
+            return (long) CLOSED.getAcquire(this);
+        }
+
+        /** The lanes by bit, see {@link #ran}. Any thread. */
+        int lanesRan() {
+            return (int) RAN.getAcquire(this);
         }
 
         /** Adds a lane-less occurrence or queue wait of name {@code id} to this scope and every one enclosing it. */
