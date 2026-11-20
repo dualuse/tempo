@@ -372,6 +372,39 @@ class BlockTest {
         assertEquals(0, second.misuses.get());
     }
 
+    /**
+     * A trace unfolds at most max(8, budget / 8) folded tasks for blocks. Past that a folded task that opens
+     * a block stays folded, and the block's row hangs from the span the task was submitted from: its own
+     * report is still complete, and the tree only leaves out the task between them.
+     */
+    @Test
+    void aTraceUnfoldsABoundedNumberOfTasksForBlocks() throws Exception {
+        Trace req = Tempo.trace(SEARCH, opts().cpu(false).budget(0)).records(STEP);
+        List<Trace> blocks = Collections.synchronizedList(new ArrayList<>());
+        List<RunnableTask> tasks = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            tasks.add(Tempo.runnable(MATCH, () -> {
+                Trace in = Tempo.trace(RERANK);
+                span(LOAD, 1);
+                in.close();
+                blocks.add(in);
+            }));
+        }
+        clock.add(5);
+        assertNull(onThread("worker-1", () -> tasks.forEach(RunnableTask::run)));
+        req.close();
+        for (Trace in : blocks) assertEquals(lines("rerank 0+1", "  load 0+1"), tree(in));
+        String t = tree(req);
+        assertEquals(8, t.lines().filter(l -> l.startsWith("  match ") && !l.contains("agg")).count(), t);
+        assertEquals(2, t.lines().filter(l -> l.startsWith("  rerank ")).count(), t); // past the cap: under the root
+        assertTrue(t.contains("  match 0+2 agg*2 min=1 max=1 maxAt="), t);           // the two tasks still folded
+        assertEquals("count=10 sum=10 mean=1 min=1 max=1 waitSum=0 waitMax=0", req.total(LOAD).toString());
+        assertEquals(10, req.total(MATCH).count());
+        assertEquals(req.total(MATCH).toString(), req.snapshot().total(MATCH).toString());
+        assertEquals(0, req.misuses() + req.dropped());
+        req.release();
+    }
+
     // ---- granularity ---------------------------------------------------------------------------------
 
     @Test

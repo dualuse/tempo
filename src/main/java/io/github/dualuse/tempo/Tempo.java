@@ -676,13 +676,14 @@ public final class Tempo {
      */
     static final class Context {
         private static final AtomicLong IDS = new AtomicLong();
-        private static final VarHandle LANES, DROPPED;
+        private static final VarHandle LANES, DROPPED, UNFOLDS;
 
         static {
             try {
                 MethodHandles.Lookup l = MethodHandles.lookup();
                 LANES = l.findVarHandle(Context.class, "lanes", Lane.class);
                 DROPPED = l.findVarHandle(Context.class, "dropped", int.class);
+                UNFOLDS = l.findVarHandle(Context.class, "unfolds", int.class);
             } catch (ReflectiveOperationException e) {
                 throw new ExceptionInInitializerError(e);
             }
@@ -695,6 +696,8 @@ public final class Tempo {
         final long id, epoch, wall; // wall: epoch milliseconds at the start
         final LongSupplier clock, cpuClock;
         final int maxLanes;
+        final int unfoldCap;            // folded tasks a block may unfold, past the budget (Lane#unfold)
+        @SuppressWarnings("unused") private volatile int unfolds; // via UNFOLDS
         final AtomicInteger misuses = new AtomicInteger();
         // The level and whether a step, tick or task was seen, in one word of each scope (Trace#mode), so a
         // step reads the level it is opened at in the same atomic step that fixes it, and records(level)
@@ -724,7 +727,7 @@ public final class Tempo {
             // or Tempo.NOOP would be built while Context.NONE is still null.
             clock = System::nanoTime;
             cpuClock = null;
-            maxLanes = 0;
+            maxLanes = unfoldCap = 0;
             this.listening = listening;
             root = new Trace(this, level);
         }
@@ -745,6 +748,7 @@ public final class Tempo {
             clock = o.clock;
             cpuClock = o.cpuClock;
             maxLanes = o.lanes;
+            unfoldCap = Math.max(8, o.budget / 8);
             listening = Name.anySink;
             root = new Trace(this, o);
         }
@@ -833,6 +837,15 @@ public final class Tempo {
         boolean full() {
             Lane head = lanes;
             return head != null && head.id + 1 >= maxLanes;
+        }
+
+        /** Takes one of the {@link #unfoldCap} unfolds of the trace; false once they are spent. */
+        boolean unfold() {
+            int n;
+            do {
+                if ((n = unfolds) >= unfoldCap) return false;
+            } while (!UNFOLDS.compareAndSet(this, n, n + 1));
+            return true;
         }
 
         /** Adds a lane to the registry; null when the trace has its maximum of lanes. */
@@ -2078,8 +2091,11 @@ public final class Tempo {
         /**
          * A nested trace, a self-contained block: a span at the top of this lane, with {@code t} as its handle,
          * which renders its subtree, and {@code t} the lane's scope until it closes. In a folded task, which
-         * has no row to hang it from, the task is unfolded first ({@link #unfold}); at the row cap the block
-         * is a frame. Its CPU time is measured from its start when its scope measures CPU. Null at a cap.
+         * has no row to hang it from, the task is unfolded first ({@link #unfold}); once the trace's unfolds
+         * are spent the task stays folded and the block's row hangs, linked, from the span the task was
+         * submitted from (a lane root if it has none), so the block's own report is still complete. At the
+         * row cap the block is a frame.
+         * Its CPU time is measured from its start when its scope measures CPU. Null at a cap.
          */
         Span nest(Trace t, Name n, int flags) {
             int d = depth;
@@ -2087,10 +2103,12 @@ public final class Tempo {
                 dropped++;
                 return null;
             }
-            if (rowAt[d - 1] == NO_ROW) unfold();
-            if (rowAt[d - 1] == NO_ROW) t.row = FRAME; // before it is a scope: its entries hash by it (Aggs#scopeKey)
+            boolean hang = rowAt[d - 1] == NO_ROW && !unfold() && rowCount < MAX_ROWS; // a row, the task still folded
+            long under = hang ? submitter() : -1;
+            boolean frame = rowAt[d - 1] == NO_ROW && !hang;
+            if (frame) t.row = FRAME; // before it is a scope: its entries hash by it (Aggs#scopeKey)
             enterScope(t, d);
-            if (rowAt[d - 1] == NO_ROW) {
+            if (frame) {
                 Span h = openFrame(n, entry(n, Aggs.SPANS), 0, 0, t);
                 if (t.measuresCpu()) sampleCpu(d);
                 h.time = ctx.now();
@@ -2101,6 +2119,7 @@ public final class Tempo {
                 leaveScopes(d);
                 return null;
             }
+            if (under >= 0) append(h.row, XPARENT, under);
             if (t.measuresCpu()) sampleCpu(d);
             start(h);
             return h;
@@ -2108,18 +2127,22 @@ public final class Tempo {
 
         /**
          * The folded task at the root of this lane, which has no row, becomes a drawn task: a row past the
-         * budget (a small, bounded overrun), with its start, queue wait, flags and CPU time so far, linked to
-         * the span it was submitted from, so a block opening in it has a row to hang from and the trace shows
-         * where it ran. Its occurrence leaves its aggregate, which keeps it as begun. The folded spans open
-         * above it stay folded; what opens from now on hangs from its row. At the row cap it stays folded.
+         * budget, with its start, queue wait, flags and CPU time so far, linked to the span it was submitted
+         * from, so a block opening in it has a row to hang from and the trace shows where it ran. Its
+         * occurrence leaves its aggregate, which keeps it as begun. The folded spans open above it stay
+         * folded; what opens from now on hangs from its row. A trace unfolds at most {@link
+         * Context#unfoldCap} tasks, {@code max(8, budget / 8)}, so the overrun stays bounded however many
+         * folded tasks open blocks; past that, and at the row cap, the task stays folded. Returns whether
+         * it was unfolded.
          */
-        private void unfold() {
+        private boolean unfold() {
             Span h = handles[0];
             Aggs a = aggs;
-            if (h.row != FRAME || h.agg < 0 || a.keys[h.agg * Aggs.KEY + Aggs.KIND] != Aggs.RAN) return;
+            if (h.row != FRAME || h.agg < 0 || a.keys[h.agg * Aggs.KEY + Aggs.KIND] != Aggs.RAN) return false;
             int k = h.agg * Aggs.KEY, target = a.keys[k + Aggs.ANCHOR], from = a.keys[k + Aggs.LANE];
+            if (rowCount == MAX_ROWS || !ctx.unfold()) return false;
             int r = row(h.frame, TASK | h.flags, NO_ROW);
-            if (r < 0) return;
+            if (r < 0) return false;
             Rows c = rows[r >>> CHUNK_BITS];
             c.start[r & MASK] = h.time;
             DUR.setOpaque(c.dur, r & MASK, OPEN);
@@ -2132,6 +2155,21 @@ public final class Tempo {
             h.folded = false;
             for (int x = 0; x < depth && rowAt[x] == NO_ROW; x++) rowAt[x] = r;
             publish();
+            return true;
+        }
+
+        /**
+         * The span the folded task at the root of this lane was submitted from, as {@code laneId << 32 | row},
+         * or -1 if it has none (submitted in a folded task) or is not a folded task.
+         */
+        private long submitter() {
+            Span h = handles[0];
+            Aggs a = aggs;
+            if (h.row != FRAME || h.agg < 0 || a.keys[h.agg * Aggs.KEY + Aggs.KIND] != Aggs.RAN) return -1;
+            int k = h.agg * Aggs.KEY, from = a.keys[k + Aggs.LANE];
+            Lane sub = from < 0 ? null : ctx.lane(from);
+            int anchor = sub == null ? -1 : sub.taskAnchor(a.keys[k + Aggs.ANCHOR]);
+            return anchor < 0 ? -1 : (long) from << 32 | anchor;
         }
 
         /** Closes everything above depth {@code d}, healed, so a span can open on top of {@code d}: misuse. */
